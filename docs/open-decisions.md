@@ -404,7 +404,9 @@ ID: OD-024
 ```text
 ID: OD-026
 상태: DECIDED
-결정: Repository의 canonical key는 GitHub의 숫자 `id`다. `owner/name`은 표시용이며 key로 쓰지 않는다.
+결정: Repository의 canonical key는 GitHub의 숫자 databaseId다. `owner/name`은 표시용이며 key로 쓰지 않는다.
+      취득 경로는 `gh api repos/<owner>/<repo>`의 `.id`다. `gh repo view --json id`는 GraphQL node ID
+      문자열을 주므로 쓰지 않는다.
 근거:
   - repository rename과 owner 이전에도 숫자 id는 유지되므로 같은 repository를 같은 entity로 인식한다는 S0 출구 조건을 만족한다.
   - fork는 별도 id를 가지므로 자동으로 구분된다.

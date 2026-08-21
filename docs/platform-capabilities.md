@@ -487,6 +487,15 @@ Stop hook payload의 키: `session_id`, `transcript_path`, `cwd`, `prompt_id`, `
 
 `gh pr view --json`, `gh pr diff`, `gh pr checks`와 REST API에서 PR title/body/branch/commit/files/stats/reviews/comments/checks/merge 사실을 읽을 수 있다.
 
+**식별자 주의**: `gh repo view --json id`가 반환하는 `id`는 GraphQL node ID 문자열(`R_kgDOT_u5Gg`)이며 숫자 databaseId가 아니다. 숫자 id는 REST 경로에서 얻는다.
+
+```text
+gh api repos/<owner>/<repo>        → .id (숫자), .node_id, .full_name
+gh api repos/<owner>/<repo>/pulls/<n> → .id, .number, .base.repo.id (숫자)
+```
+
+`gh api`는 `gh`의 인증을 그대로 쓰므로 별도 토큰이 필요 없다.
+
 `statusCheckRollup` 원소:
 
 ```json
