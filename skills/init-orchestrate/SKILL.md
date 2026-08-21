@@ -74,8 +74,7 @@ HANDOFF 문서가 있고 그 안의 run_id가 orca orchestration run-list에 살
 ## 4. Fresh boot
 
 1. 이해한 목적과 범위, 그리고 명시적 제외 범위를 제시한다.
-2. 제안 Task DAG를 제시한다. 스펙에 **배치 정책**이 있으면 각 Task의 agent·model·effort를
-   그 정책에 따라 명시하고, 정책이 없으면 배치안을 제안한다.
+2. 제안 Task DAG를 제시한다. 각 Task에 §9의 배치 정책을 적용한 agent·model·effort를 함께 명시한다.
 3. 구현 전에 답이 필요한 불확실성을 질문으로 정리한다.
 4. §6의 롤오버 계약을 사용자에게 확인받는다.
 5. **사용자가 방향을 정하기 전에는 coding worker를 dispatch하거나 코드를 수정하지 않는다.**
@@ -153,8 +152,7 @@ Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승
 - worker는 PR을 만들며 최종 merge를 직접 수행하지 않는다.
 - reviewer는 승인 또는 수정 요청을 근거와 함께 coordinator에게 반환한다.
 - coordinator가 review 결과를 최종 확인하고 merge한다.
-- 각 Task의 agent·model·effort는 스펙의 배치 정책을 따른다. 정책에 없는 작업 종류는
-  임의 배치하지 않고 기본값을 쓰되 그 사실을 기록한다.
+- 각 Task의 agent·model·effort는 §9의 배치 정책을 따른다.
 - 수정 요청은 가능한 한 원 worker에게 돌리고 재검토한다. 같은 terminal을 재사용하면
   이전 배치가 유지된다.
 - merge 뒤에는 다음 ready task를 자동으로 지시한다.
@@ -167,7 +165,44 @@ Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승
 - **사용자의 제품 판단 없이는 결정할 수 없을 때만** 해당 Task에 Orca Gate를 만든다.
 - Gate가 열리면 그 결정에 의존하는 Task만 멈춘다. 독립 Task는 계속한다.
 
-## 9. Handoff 유지
+## 9. Agent 배치 정책
+
+Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·model·effort를 선택한다.
+모든 worker를 같은 기본 agent로 배치하지 않는다.
+
+| # | 작업 종류 | 판정 기준 | agent | model | effort |
+|---|---|---|---|---|---|
+| 1 | 아키텍처·스키마·계약 설계 | 되돌리기 비싼 구조 결정, 여러 대안의 trade-off 비교가 필요 | `claude` | `opus` | `max` |
+| 2 | 어려운 구현 | 동시성·상태기계·성능 등 정확성 논증이 필요하고 테스트로 전부 잡히지 않음 | `claude` | `opus` | `xhigh` |
+| 3 | 기본 코드 구현과 테스트 작성 | 스펙이 정해진 기능 구현, 새 테스트 설계 | `claude` | `opus` | `high` |
+| 4 | 버그 재현·디버깅 | 원인 가설 → 반증 관측 절차가 필요 | `claude` | `opus` | `xhigh` |
+| 5 | 단순 반복·기계적 작업 | 판단 없이 확정된 규칙만 적용 (rename, import 정리, 정형 케이스 추가, 규칙이 확정된 대량 마이그레이션) | `codex` | `gpt-5.6-luna` | `medium` |
+| 6 | 병렬 리서치·조사 | 여러 소스를 넓게 훑어 사실을 수집 | `codex` | `gpt-5.6-sol` | `ultra` |
+| 7 | PR 리뷰 | | `codex` | `gpt-5.6-sol` | `xhigh` |
+| 8 | 추론이 필요한 문서·스펙 집필 | 설계 판단이 문서 내용에 들어감 | `codex` | `gpt-5.6-sol` | `high` ~ `xhigh` |
+| 9 | 사실 정리형 문서 | 확정된 사실을 구조화 (레퍼런스, README, 변경 요약) | `codex` | `gpt-5.6-terra` | `medium` |
+| 10 | 리뷰 지적 반영 수정 | | 원 Dispatch와 동일 배치 | | |
+
+어느 행에도 명확히 해당하지 않는 작업은 임의로 배치하지 않고 3행을 기본값으로 쓰되 그 사실을 기록한다.
+대상 repository의 스펙이 배치를 따로 정하면 그쪽이 이 표를 override한다.
+
+지켜야 할 제약:
+
+- **적용 결과를 요청값으로 가정하지 않는다.** `worker-start` receipt의 `launch.effective`로 실제
+  적용된 model/effort를 확인하고 `launch.requested`와 다르면 기록한다. worker server가
+  launch-preference를 지원하지 않으면 옵션이 전달되지 않는다.
+- **배치가 다른 후속 Task에 terminal을 재사용하지 않는다.** `--model`/`--effort`는 `--terminal`과
+  결합할 수 없어 재사용 경로는 이전 배치를 유지한다. 다른 배치가 필요하면 `worker-release` 후
+  새 agent terminal을 만든다.
+- **모델이 지원하지 않는 effort를 지정하지 않는다.** `ultra`는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만
+  있고 Claude에는 없다. Claude의 최대는 `max`다.
+- `gpt-5.4`와 `gpt-5.4-mini`는 은퇴 예정이므로 쓰지 않는다.
+- service tier(`fast`)는 `worker-start`로 지정할 수 없다. 필요하다고 판단되면 임의로 supervised
+  경로를 벗어나지 말고 사용자에게 올린다.
+
+모델 slug와 effort 단계는 provider가 바꾸는 값이다. 유효 값을 추측하지 말고 확인한다.
+
+## 10. Handoff 유지
 
 - 위치와 schema는 대상 repository의 계약을 따른다. 계약이 없으면 repository 루트의
   `HANDOFF.md`를 쓰고, schema 확정이 필요하다는 사실을 사용자에게 올린다.
@@ -176,7 +211,7 @@ Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승
   가장 정확한 기록을 남길 것이라고 기대하지 않는다.
 - secret과 장문 transcript는 복사하지 않는다.
 
-## 10. 롤오버 절차
+## 11. 롤오버 절차
 
 rollover-monitor의 지시를 받거나 스스로 열화를 감지하면 다음 순서로만 진행한다.
 
@@ -198,7 +233,7 @@ rollover-monitor의 지시를 받거나 스스로 열화를 감지하면 다음 
 - 승계 도중 실패해도 handoff와 실제 Orca/Git 상태는 보존한다.
 - **자동 전환을 실제로 확인하지 못했으면 "자동 재개됨"이라고 보고하지 않는다.**
 
-## 11. 흐릿한 지점에서 하는 일
+## 12. 흐릿한 지점에서 하는 일
 
 - 기술적 사실로 해소할 수 있으면 공인된 1차 자료와 실제 관측으로 처리한다.
 - 확정 스펙, 코드, live 상태로 답할 수 있으면 답한다.
@@ -208,12 +243,11 @@ rollover-monitor의 지시를 받거나 스스로 열화를 감지하면 다음 
 - 사용자 판단에 반대할 근거가 있으면 명시한다.
 - **"동작합니다"는 실행 명령과 출력을 함께 제시할 때만 말한다.** 실행하지 않았으면 그렇게 적는다.
 
-## 12. 이 스킬이 지정하지 않는 것
+## 13. 이 스킬이 지정하지 않는 것
 
 다음은 대상 repository의 계약에 속한다. 이 스킬이 값을 정하지 않으며, 계약이 없으면 묻는다.
 
 - handoff 문서의 정확한 schema와 archive 정책
-- reviewer agent의 model·effort 프로파일
 - PR에 실을 Run/Task/Dispatch correlation metadata 형식
 - worker `ask`와 생성된 Gate를 잇는 correlation 형식
 - reviewer 판정을 어디에 durable하게 기록할지
