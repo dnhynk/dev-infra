@@ -453,3 +453,66 @@ gate-resolve 후 → task status = ready
 ### 8.9 정리하지 못한 상태
 
 `run-delete`에 해당하는 명령이 orchestration 29개 명령에 없다. throwaway Run `run_a48566be983b`과 그 task/gate는 로컬 Orca DB에 남아 있다. 제거하려면 범위가 넓은 `orchestration reset --all|--tasks`를 써야 하므로 실행하지 않았다. Bridge가 Run을 발견할 때 이 Run을 만나게 되므로, objective 문자열로 식별 가능하도록 `THROWAWAY`를 명시해 두었다.
+
+## 9. Claude Code Channel 스모크 테스트 (2026-08-21, 미완결)
+
+### 9.1 공식 계약 확보
+
+[Channels reference](https://code.claude.com/docs/en/channels-reference)에서 custom channel 계약을 확정 확인했다.
+
+- capability 선언: `capabilities.experimental['claude/channel'] = {}` (필수, 항상 `{}`. 이 키의 존재가 listener를 등록시킨다)
+- 양방향이면 `capabilities.tools = {}` 추가, permission relay는 `capabilities.experimental['claude/channel/permission'] = {}`
+- push 방식: `notifications/claude/channel`, params는 `content: string`과 `meta: Record<string,string>`
+- 세션 컨텍스트 도달 형태: `<channel source="<서버명>" <meta키>="<값>">content</channel>`
+- `source` 속성은 서버 이름에서 자동으로 채워진다
+- **`meta` 키는 식별자여야 한다. 문자·숫자·밑줄만 허용되고 하이픈이 든 키는 조용히 버려진다.** `gate_id`는 되지만 `gate-id`는 사라진다
+- ACK 없음. `mcp.notification()`의 await는 transport write까지만 보장한다
+- **공식 권고: 전달 확인이 필요하면 서버가 event 상태를 추적하고 Claude가 호출할 reply tool을 노출하라.** OD-059(application receipt 반환 경로)의 공식 근거다
+
+### 9.2 flag 존재 확인 — 기존 우려 해소
+
+로컬 2.1.238에서 두 flag 모두 존재한다. `--channels foo`는 다음 문법 오류를 반환했다.
+
+```text
+--channels entries must be tagged: foo
+  plugin:<name>@<marketplace>  — plugin-provided channel (allowlist enforced)
+  server:<name>                — manually configured MCP server
+```
+
+공식 문서도 명시한다: "Neither `--channels` nor `--dangerously-load-development-channels` appears in `claude --help` while the feature is in preview. The flags work even though they aren't listed."
+
+따라서 §2의 "help에 노출되지 않는다"는 관측은 미지원 근거가 아니며, 이 항목의 불확실성은 해소됐다.
+
+### 9.3 시도한 스모크 테스트
+
+의존성 없는 raw JSON-RPC stdio MCP 서버를 작성했다(`initialize`에서 `experimental: { 'claude/channel': {} }`와 `tools: {}` 선언, `notifications/initialized` 수신 1.2초 뒤 channel notification push, 도달 증명용 `report_receipt` reply tool, 다음 턴 강제용 `wait_a_moment` tool).
+
+| # | 구성 | 결과 |
+|---|---|---|
+| 1 | `--mcp-config` + `--strict-mcp-config` + `--dangerously-load-development-channels server:...`, `-p` 단일 턴 | 서버 handshake 성공, push 성공, Claude가 tool 미호출 |
+| 2 | 위 + `wait_a_moment`로 두 번째 턴 강제, `--output-format stream-json` | push(t+1.2s)가 tool 호출(t+10s)보다 선행했는데도 `report_receipt(content="NONE")` |
+| 3 | `--channels server:...`로 교체 | 동일하게 `NONE` |
+| 4 | `--mcp-config` 대신 프로젝트 `.mcp.json`, `-p` | 동일하게 `NONE`, **stderr에 경고 한 줄도 없음** |
+
+시도 2의 stream-json `init` 이벤트는 `mcp_servers: [{"name":"orca-slack-smoke","status":"connected"}]`와 두 tool 등록을 보여줬으나 **channel 등록 흔적은 전혀 없었다.**
+
+즉 서버는 일반 MCP server로는 정상 연결되지만 channel로는 등록되지 않았고, notification은 문서가 경고한 대로 조용히 drop됐다.
+
+### 9.4 배제된 가설
+
+- **"다음 턴이 없어서 큐에 남았다"** — 반증. 두 번째 턴이 실제로 있었고 push가 그보다 먼저였다.
+- **"`--channels server:<name>`가 정답 경로"** — 반증. 공식 문서: "During the research preview, `--channels` only accepts plugins from an Anthropic-maintained allowlist." bare server는 development flag 경로다.
+- **"`--mcp-config`와 `.mcp.json`의 차이"** — 반증. 둘 다 동일 결과.
+- **"flag가 이 버전에 없다"** — 배제. 두 flag 모두 존재하고 문서가 동작을 명시한다.
+
+### 9.5 남은 가설
+
+1. **development bypass가 대화형 확인을 요구한다.** 문서: "The development flag bypasses the allowlist for specific entries **after a confirmation prompt**." `-p` 비대화형에는 이 프롬프트에 답할 수단이 없다. 확인 없이 bypass가 성립하지 않으면 channel은 등록되지 않고, 관측된 무경고 silent drop과 일치한다.
+2. **조직 정책 `channelsEnabled`가 꺼져 있다.** 문서: "If the setting is disabled or unset, the MCP server still connects and its tools work, but channel messages won't arrive." **관측 증상과 정확히 일치한다.** 단 이 경우 startup warning이 나와야 하는데 `-p`에서는 보이지 않았다. claude.ai Team/Enterprise는 기본 차단이고, 조직 없는 Pro/Max는 이 검사를 건너뛴다.
+3. raw JSON-RPC 구현이 MCP SDK와 미묘하게 다르다. 문서의 capability 형태를 그대로 따랐으므로 가능성은 낮지만 배제하지 못했다.
+
+가설 1과 2는 이 세션의 비-TTY 환경에서 확인할 수 없다. **대화형 터미널에서 1회 실행하면 두 가설이 동시에 갈린다** — 확인 프롬프트가 뜨는지, allowlist/정책 경고가 뜨는지가 startup notice에 나온다.
+
+### 9.6 결론
+
+**D3의 전제인 "custom Slack Channel end-to-end inbound delivery"는 아직 검증되지 않았다.** 계약과 flag는 확인됐고 남은 것은 세션 등록 경로다. [로드맵](roadmap.md#3-bridge-사전-size-gate)의 "Channel이 현재 로컬 버전에서 동작하지 않으면 D3을 다른 slice와 묶지 않는다"는 조건은 아직 유효하다.
