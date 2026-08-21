@@ -114,7 +114,7 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 
 coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·model·effort를 선택한다. 모든 worker를 같은 기본 agent로 배치하지 않는다.
 
-배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §12](../platform-capabilities.md#28-agent-배치-표면)를 따른다.
+배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §2.8](../platform-capabilities.md#28-agent-배치-표면)를 따른다.
 
 배치 정책:
 

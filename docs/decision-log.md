@@ -119,7 +119,7 @@
 - 자동 rollover 승인은 **Run 시작 시 1회**다. `/init-orchestrate` 시점에 합의하면 이후 열화마다 사용자에게 묻지 않고 승계한다.
 - 근거: 데몬 없이 성립하고, 승계 시점 판단을 Run 상태를 아는 주체가 한다. 매 rollover 승인은 "작업실에 없어도 계속 돈다"는 B의 목표와 충돌한다.
 - 이 방식의 약점은 명시한다. **predecessor가 successor 생성과 인수 확인 사이에 죽으면 아무도 되살리지 않는다.** durable `HANDOFF.md`가 남으므로 데이터는 잃지 않지만 그 구간에서 무인성이 깨진다. (D) 범위에서 도입될 daemon에 watchdog을 얹어 이 구간만 나중에 덮는다.
-- Run 시작 시 1회 승인은 UX 선택이 아니라 기술적 전제조건이다. rollover 지시를 주입하는 hook은 자기 권위를 주장할 수 없고, 모델이 이를 prompt injection으로 판단해 거부하는 것을 실측했다([플랫폼 검증 §12](platform-capabilities.md#36-hook-기반-세션-제어와-컨텍스트-측정)).
+- Run 시작 시 1회 승인은 UX 선택이 아니라 기술적 전제조건이다. rollover 지시를 주입하는 hook은 자기 권위를 주장할 수 없고, 모델이 이를 prompt injection으로 판단해 거부하는 것을 실측했다([플랫폼 검증 §3.6](platform-capabilities.md#36-hook-기반-세션-제어와-컨텍스트-측정)).
 - 감지·생성 수단의 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-014, OD-015 확정 기록에 있다.
 
 ### DL-018 · 호스트 전제조건을 재현 절차로 관리한다

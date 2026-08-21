@@ -74,7 +74,8 @@ HANDOFF 문서가 있고 그 안의 run_id가 orca orchestration run-list에 살
 ## 4. Fresh boot
 
 1. 이해한 목적과 범위, 그리고 명시적 제외 범위를 제시한다.
-2. 제안 Task DAG와 worker/reviewer 배치를 제시한다.
+2. 제안 Task DAG를 제시한다. 스펙에 **배치 정책**이 있으면 각 Task의 agent·model·effort를
+   그 정책에 따라 명시하고, 정책이 없으면 배치안을 제안한다.
 3. 구현 전에 답이 필요한 불확실성을 질문으로 정리한다.
 4. §6의 롤오버 계약을 사용자에게 확인받는다.
 5. **사용자가 방향을 정하기 전에는 coding worker를 dispatch하거나 코드를 수정하지 않는다.**
@@ -146,7 +147,10 @@ Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승
 - worker는 PR을 만들며 최종 merge를 직접 수행하지 않는다.
 - reviewer는 승인 또는 수정 요청을 근거와 함께 coordinator에게 반환한다.
 - coordinator가 review 결과를 최종 확인하고 merge한다.
-- 수정 요청은 가능한 한 원 worker에게 돌리고 재검토한다.
+- 각 Task의 agent·model·effort는 스펙의 배치 정책을 따른다. 정책에 없는 작업 종류는
+  임의 배치하지 않고 기본값을 쓰되 그 사실을 기록한다.
+- 수정 요청은 가능한 한 원 worker에게 돌리고 재검토한다. 같은 terminal을 재사용하면
+  이전 배치가 유지된다.
 - merge 뒤에는 다음 ready task를 자동으로 지시한다.
 - 한 Task가 사람 결정을 기다려도 그 결정과 독립인 ready task와 worker는 계속 실행한다.
 
@@ -203,7 +207,7 @@ rollover-monitor의 지시를 받거나 스스로 열화를 감지하면 다음 
 다음은 대상 repository의 계약에 속한다. 이 스킬이 값을 정하지 않으며, 계약이 없으면 묻는다.
 
 - handoff 문서의 정확한 schema와 archive 정책
-- reviewer agent의 model·effort·tier 프로파일
+- reviewer agent의 model·effort 프로파일
 - PR에 실을 Run/Task/Dispatch correlation metadata 형식
 - worker `ask`와 생성된 Gate를 잇는 correlation 형식
 - reviewer 판정을 어디에 durable하게 기록할지

@@ -173,7 +173,7 @@ ID: OD-003
 
 ## 2026-08-21 관측이 바꾼 항목
 
-아직 닫지 않았지만 제약이 좁혀졌다. 근거는 [플랫폼 검증 §8](platform-capabilities.md#24-gate).
+아직 닫지 않았지만 제약이 좁혀졌다. 근거는 [플랫폼 검증 §2.4](platform-capabilities.md#24-gate).
 
 - **OD-050** (Gate option/recommendation/impact metadata): 실측 결과 Orca Gate schema에 권장안·이유·영향·선택지 설명·선택지 ID·임의 metadata 필드가 **전혀 없다**. "제공되는지 확인"이 아니라 "Bridge 또는 coordinator가 반드시 만들어야 한다"로 성격이 바뀌었다. 남은 선택지는 `question`/`options` 문자열 인코딩, Bridge sidecar store, 카드 축소 셋 중 하나다.
 - **OD-051** (crash window와 outbox atomicity): `--retry-request`가 같은 요청의 재시도를 멱등화하고 `mutation.replayed`로 재생을 판정할 수 있다. 그러나 **이미 resolved된 Gate를 다른 요청이 조용히 덮어쓴다.** 따라서 (1) resolve 직전 status 재확인은 필수이고, (2) status 확인과 resolve 사이 TOCTOU를 막을 Gate 단위 직렬화가 Bridge 측에 필요하다.
@@ -183,7 +183,7 @@ ID: OD-003
 
 ## 2026-08-22 Channel 검증이 바꾼 항목
 
-근거는 [플랫폼 검증 §9.6~9.8](platform-capabilities.md#34-검증된-동작과-운영-제약).
+근거는 [플랫폼 검증 §3.4](platform-capabilities.md#34-검증된-동작과-운영-제약).
 
 - **OD-056** (Channel custom 개발·allowlist·배포 경로): 로컬 2.1.238에서 `--dangerously-load-development-channels server:<name>` + `--mcp-config` 절대경로 조합으로 custom channel이 실제 등록·전달됨을 확인했다. preview 동안은 이 경로가 유일하며 `--channels`는 Anthropic allowlist plugin만 받는다. plugin 패키징으로 옮기는 시점은 여전히 OPEN이다.
 - **OD-059** (coordinator application receipt 반환 계약): reply tool이 실제 receipt 경로로 동작함을 관측했다. 서버가 이벤트 상태를 추적하고 Claude가 tool을 호출해 수신을 보고하는 구조가 성립한다. payload와 멱등성 설계는 여전히 OPEN이다.
@@ -194,7 +194,7 @@ ID: OD-003
 
 ## 2026-08-22 GitHub 실측이 바꾼 항목
 
-근거는 [플랫폼 검증 §10](platform-capabilities.md#53-대상-repository-실측).
+근거는 [플랫폼 검증 §5.3](platform-capabilities.md#53-대상-repository-실측).
 
 - **OD-028** (reviewer verdict의 durable source): 성격이 바뀌었다. 사용자 repository 4곳 전부에서 `reviewDecision`이 null이고, review가 존재하는 1곳도 전부 `COMMENTED`다. PR author와 review author가 같은 계정이라 GitHub이 self-approve를 막으므로 **현재 workflow에서는 formal verdict가 원리적으로 불가능하다.** "GitHub과 Orca 중 어디를 계약으로 삼을지"가 아니라 "workflow를 어떻게 바꿀지"의 문제이며, 이는 Bridge 단독 결정이 아니라 AB workstream(`/init-orchestrate`의 reviewer 계약)과 함께 정해야 한다.
 - **OD-033** (review 핵심 comment 선택 규칙): `vertical-live` 규약의 `## Findings` 아래 `[blocker]`/`[major]`/`[minor]` 태그가 추출 대상으로 직접 쓰인다. 다만 이 규약은 4개 repo 중 1곳에만 존재하므로 전역 계약으로 만들어야 의존할 수 있다.
@@ -223,7 +223,7 @@ ID: OD-028
 
 ## 2026-08-22 AB-0 환경 관측이 바꾼 항목
 
-근거는 [플랫폼 검증 §11](platform-capabilities.md#27-run--coordinator-session--repository-identity).
+근거는 [플랫폼 검증 §2.7](platform-capabilities.md#27-run--coordinator-session--repository-identity).
 
 - **OD-020** (Run↔repo↔coordinator session identity): 실측 경로가 확보됐다. coordinator 세션의 `ORCA_TERMINAL_HANDLE`/`ORCA_PANE_KEY`가 Run row의 `coordinator_handle`/`coordinator_pane_key`와 동일 값이고, `ORCA_WORKTREE_ID`가 로컬 경로를 담아 Git remote를 거쳐 GitHub repository로 이어진다. 남은 미결은 (1) 환경변수를 어느 신뢰 수준으로 취급할지, (2) `<uuid>::<path>` 형식의 안정성, (3) coordinator 재시작 시 handle 유지 여부다.
 - **OD-053** (Run↔현재 coordinator Channel routing): Channel Adapter가 MCP 서브프로세스로서 위 identity를 그대로 상속하고 `CLAUDE_CODE_SESSION_ID`는 자기 세션 값으로 받는 것을 실측했다. Adapter 자기소개 payload의 재료가 확정 가능하다. 단 coordinator pane 안의 자식 세션도 같은 `ORCA_*`를 상속하므로 세션 구분에는 `CLAUDE_CODE_SESSION_ID`가 필요하다. `CLAUDE_PID`는 조상 값이 상속되므로 사용 금지.
@@ -233,7 +233,7 @@ ID: OD-028
 
 ## 2026-08-22 AB-0 부팅·롤오버 실측이 바꾼 항목
 
-근거는 [플랫폼 검증 §12](platform-capabilities.md#3-claude-code).
+근거는 [플랫폼 검증 §3](platform-capabilities.md#3-claude-code).
 
 - **OD-016** (single-writer와 권한 이관): 승계 절차의 골격이 정해졌다. predecessor가 임계값에서 스스로 신규 dispatch·merge를 멈추고(self-fence) → handoff를 확정한 뒤 → `terminal create`로 successor를 만들고 → successor가 그 터미널에서 `run-use --takeover-legacy`를 실행한다. predecessor가 successor 생성 **이전에** 자기 fence를 걸므로 두 coordinator의 mutation 구간이 시간적으로 겹치지 않는다. 남은 미결은 (1) `run-use`가 `consumer_generation`을 증가시켜 predecessor가 자신이 밀려났음을 **감지**할 fencing token이 되는지, (2) predecessor가 successor 생성 직후·인수 확인 전에 죽었을 때의 복구 주체다. 사용자는 자가증식 방식을 택했고 이 실패 구간은 (D)에서 도입될 daemon으로 나중에 덮기로 했다(DL-017).
 - **OD-013** (`HANDOFF.md` 위치·schema): OD-012의 fresh/resume 자동 판별이 `HANDOFF.md`에서 `run_id`를 읽는 것을 전제하므로, schema에 Orca Run ID가 기계적으로 읽히는 필드로 포함돼야 한다는 제약이 추가됐다.
