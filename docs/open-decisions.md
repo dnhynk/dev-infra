@@ -178,3 +178,14 @@ ID: OD-003
 - **OD-067** (blocker taxonomy): `gate-create`가 task를 `blocked`로, `gate-resolve`가 `ready`로 자동 전이시키는 것을 관측했다. `blocked Task`는 Bridge가 계산하지 않고 Orca status를 그대로 쓸 수 있다. `permission pause`는 `worker-show`의 `observation.agentWait`가 source 후보다.
 - **OD-023** (ingestion 방식): Gate 생성·해결이 `inbox`에 메시지를 만들지 않는다. Gate 변화는 push로 오지 않으므로 polling 또는 재조회가 필요하다. 또한 Observer는 `check --ack`를 호출하면 coordinator의 배치를 소비하므로 `inbox` 또는 `check --peek/--all`로 제한해야 한다.
 - **OD-020** (Run↔repository↔coordinator identity): Task row의 `created_by_process_incarnation`에 작업 디렉터리(`D:/dev-infra`)가 포함되고, `run-create` 시 `coordinator_handle`·`coordinator_pane_key`가 자동으로 채워진다. 두 경로 모두 후보이며 파싱 안정성은 미검증이다.
+
+## 2026-08-22 Channel 검증이 바꾼 항목
+
+근거는 [플랫폼 검증 §9.6~9.8](platform-capabilities.md#96-대화형-세션에서-end-to-end-전달-검증-성공).
+
+- **OD-056** (Channel custom 개발·allowlist·배포 경로): 로컬 2.1.238에서 `--dangerously-load-development-channels server:<name>` + `--mcp-config` 절대경로 조합으로 custom channel이 실제 등록·전달됨을 확인했다. preview 동안은 이 경로가 유일하며 `--channels`는 Anthropic allowlist plugin만 받는다. plugin 패키징으로 옮기는 시점은 여전히 OPEN이다.
+- **OD-059** (coordinator application receipt 반환 계약): reply tool이 실제 receipt 경로로 동작함을 관측했다. 서버가 이벤트 상태를 추적하고 Claude가 tool을 호출해 수신을 보고하는 구조가 성립한다. payload와 멱등성 설계는 여전히 OPEN이다.
+- **OD-054** (pending/attempted/delivered/processed/resumed 정의): `TRANSPORT_WRITE_ATTEMPTED`(서버의 `PUSHED` 기록)와 `APPLICATION_RECEIPT_RECEIVED`(reply tool 호출)를 실제로 구분해 관측했다. 두 상태의 물리적 근거가 확보됐다.
+- **OD-062** (허용 지연): push부터 Claude가 receipt를 호출하기까지 약 7~10초를 관측했다. 유휴 세션·단일 이벤트 조건의 값이며 모델 턴 시간을 포함한다.
+- **OD-063** (daemon 자동 시작 방식): **channel 이벤트는 대화형 세션에만 도달한다.** `-p` 비대화형 세션에서는 같은 구성으로 4회 모두 미도달이었다. 따라서 wake-up 대상 coordinator 세션은 대화형으로 유지돼야 하며, daemon 자동 시작 설계는 coordinator를 headless로 대체하는 방향을 취할 수 없다.
+- **OD-057** (notification 중복 시 coordinator 멱등성): 이번 관측에서는 유실 0·중복 0이었고 큐 순서도 보존됐다. 다만 세션 재시작과 장시간 운용은 검증하지 않았으므로 항목은 OPEN을 유지한다.

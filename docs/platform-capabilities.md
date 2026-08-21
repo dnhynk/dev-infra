@@ -532,6 +532,61 @@ push가 tool 호출보다 5초 이상 앞섰는데도 이벤트가 도달하지 
 
 이 가설은 **대화형 터미널에서 1회 실행**해야 확인된다. 비-TTY 도구 환경에서는 검증할 수 없다.
 
-### 9.6 결론
+### 9.6 대화형 세션에서 end-to-end 전달 검증 성공
 
-**D3의 전제인 "custom Slack Channel end-to-end inbound delivery"는 아직 검증되지 않았다.** 계약과 flag는 확인됐고 남은 것은 세션 등록 경로다. [로드맵](roadmap.md#3-bridge-사전-size-gate)의 "Channel이 현재 로컬 버전에서 동작하지 않으면 D3을 다른 slice와 묶지 않는다"는 조건은 아직 유효하다.
+앞선 `-p` 실패들과 달리, **대화형 세션에서는 전달이 정상 동작했다.**
+
+실행: `claude --mcp-config <절대경로>/.mcp.json --strict-mcp-config --dangerously-load-development-channels server:orca-slack-smoke-sdk`
+
+서버는 15초마다 `seq`를 증가시키며 push하고, Claude는 매 이벤트마다 `report_receipt` reply tool로 수신 내용을 돌려줬다. 서버 로그 발췌:
+
+```text
+[15:02:31.445Z] connected
+[15:02:32.959Z] PUSHED seq=1 at 15:02:32
+[15:02:56.526Z] TOOL report_receipt: {"content":"SMOKE_TOKEN_7X4K seq=1 at 15:02:32 — ...","source":"orca-slack-smoke-sdk"}
+[15:03:02.722Z] TOOL report_receipt: {"content":"... seq=2 ...","source":"orca-slack-smoke-sdk"}
+[15:03:09.224Z] TOOL report_receipt: {"content":"... seq=3 ...","source":"orca-slack-smoke-sdk"}
+...
+[15:06:46.554Z] PUSHED seq=18 at 15:06:46
+[15:06:53.454Z] TOOL report_receipt: {"content":"... seq=18 ...","source":"orca-slack-smoke-sdk"}
+```
+
+확인된 사실:
+
+- **유실 0, 중복 0.** `seq=1`부터 `18`까지 모두 정확히 한 번씩 도달했다.
+- **`source` 속성이 서버 이름으로 자동 설정된다**(`orca-slack-smoke-sdk`). 문서 서술과 일치한다.
+- **초기 3건이 그룹으로 처리됐다.** `seq=1,2`가 첫 턴 중에 도착해 큐에 쌓였고 15:02:56 / 15:03:02 / 15:03:09에 순서대로 소비됐다. 문서의 "delivered together on the next turn and Claude handles them as a group"와 일치한다.
+- **Claude가 사용자 입력 없이 매 이벤트에 자율적으로 반응했다.** 한 번 지시한 뒤에는 새 이벤트가 올 때마다 스스로 reply tool을 호출했다. D3이 요구하는 coordinator wake-up 동작 그 자체다.
+- **reply tool이 application receipt로 실제 작동한다.** 문서 권고("track event state in your server and expose a reply tool")가 구현 가능함을 확인했다. OD-059의 근거가 추정에서 관측으로 바뀌었다.
+
+관측된 지연(push → Claude가 receipt 호출 완료):
+
+| seq | push | receipt | 경과 |
+|---|---|---|---|
+| 4 | 15:03:16.473 | 15:03:26.522 | 10.05s |
+| 5 | 15:03:31.483 | 15:03:39.353 | 7.87s |
+| 6 | 15:03:46.496 | 15:03:53.256 | 6.76s |
+| 8 | 15:04:16.496 | 15:04:23.234 | 6.74s |
+| 18 | 15:06:46.554 | 15:06:53.454 | 6.90s |
+
+이 값은 transport 지연이 아니라 **모델 턴 처리 시간을 포함한 end-to-end 반응 시간**이다. 대략 7~10초 범위였다. OD-062(허용 지연) 산정의 1차 근거로 쓸 수 있으나, 이벤트 1건과 유휴 세션이라는 조건에서의 값임을 유지해야 한다.
+
+### 9.7 확정된 운영 제약
+
+**channel 이벤트는 대화형 세션에만 도달한다. `-p` 비대화형 세션에서는 도달하지 않는다.** 같은 서버·같은 flag·같은 절대경로 설정으로 `-p`는 4회 모두 실패했고 대화형은 성공했다.
+
+이것은 Bridge 설계에 직접 영향을 준다.
+
+- Bridge가 깨울 coordinator 세션은 **대화형으로 떠 있어야 한다.** daemon이 `-p`로 coordinator를 띄우는 방식은 wake-up 경로로 성립하지 않는다.
+- [제품 비전 §6](product-vision.md#6-최종-사용자-경험)의 "PC를 켜면 Bridge가 자동 시작된다"는 daemon에는 적용되지만, coordinator 세션까지 무인 headless로 만드는 방향과는 충돌한다. OD-063에 이 제약을 반영한다.
+
+`-p` 실패의 정확한 원인(development bypass의 확인 프롬프트를 표시할 수 없어서인지, `-p` 모드 자체가 channel listener를 등록하지 않아서인지)은 아직 구분하지 못했다. 다만 어느 쪽이든 위 운영 제약은 동일하게 성립한다.
+
+### 9.8 결론
+
+**D3의 전제인 custom Channel end-to-end inbound delivery가 로컬 Claude Code 2.1.238, 조직 없는 개인 Max 계정, Windows 11 환경에서 검증됐다.** [로드맵](roadmap.md#3-bridge-사전-size-gate)의 "Channel이 현재 로컬 버전에서 동작하지 않으면 D3을 다른 slice와 묶어 구현하지 않는다"는 유보 조건은 해소됐다.
+
+미검증으로 남는 것:
+
+- 이 결과는 preview 기능에 대한 특정 버전 관측이다. release 전 재확인 대상이다.
+- 장시간 세션에서의 안정성, 세션 재시작 시 pending 이벤트 처리, 여러 coordinator 세션에 대한 라우팅은 D3 구현 중에 검증한다.
