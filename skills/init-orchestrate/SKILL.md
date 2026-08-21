@@ -92,8 +92,9 @@ handoff 문서만 읽고 바로 mutation하지 않는다.
 5. 차이는 live system을 기준으로 reconcile하고 그 사실을 기록한다.
 6. predecessor의 ownership 반납이 확인된 뒤에만 mutation 권한을 얻는다
    (`orca orchestration run-use --id <run_id> --takeover-legacy`, 이 터미널에서 실행).
-7. 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은 PR을 중복 merge하지 않는다.
-8. 두 번 실패한 디버깅 접근을 다시 시도하지 않는다. handoff의 기각 기록을 확인한다.
+7. §7의 Run 마커를 이 세션 값으로 갱신한다. 갱신하지 않으면 monitor가 이 세션을 coordinator로 인식하지 못한다.
+8. 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은 PR을 중복 merge하지 않는다.
+9. 두 번 실패한 디버깅 접근을 다시 시도하지 않는다. handoff의 기각 기록을 확인한다.
 
 사용자에게 올릴 것은 스펙 충돌, handoff 모호성, coordinator 권한 중복, 민감한 신규 판단뿐이다.
 기존 합의 범위 안의 안전한 연속 작업은 반복 승인을 요구하지 않는다.
@@ -135,8 +136,13 @@ rollover-monitor는 마커가 없으면 아무것도 하지 않는다.
 - Orca run_id
 - worktree 절대 경로
 - 이 coordinator의 Claude Code session id
+- **이 세션의 컨텍스트 창 크기**
 - 롤오버 사전 승인 여부
 - handoff 문서 경로
+
+창 크기를 세션이 직접 기록해야 하는 이유는 transcript가 그것을 알려주지 않기 때문이다. transcript의 `model` 필드는 같은 모델의 컨텍스트 창 변형을 구분하지 않는다. 자기 창 크기를 아는 주체는 세션 자신뿐이다.
+
+session id와 창 크기는 **세션마다 다르다.** 승계할 때마다 새 coordinator가 마커를 자기 값으로 갱신해야 monitor가 그 세션을 감시한다.
 
 Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승계가 시도된다.
 

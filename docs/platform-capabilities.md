@@ -290,6 +290,13 @@ effort 단계의 벤더 정의:
 
 사용자 표기 `sol high fast`는 서로 다른 세 축이다: model `gpt-5.6-sol` + effort `high` + service tier `priority`. **`worker-start`에 service tier 인자가 없으므로 tier는 이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나 `worker_done` 권위를 잃는다.
 
+### 2.9 Wake-up 표면
+
+- Orca terminal 입력과 orchestration inbox는 서로 다른 표면이다.
+- `terminal send`는 live terminal에 직접 입력한다.
+- `orchestration send`는 durable inbox/worker relay다.
+- Orca에 Claude Channel을 관리하는 전용 명령은 없다.
+
 ### 2.10 Terminal 표면
 
 세션 생성·입력·대기·읽기는 orchestration이 아니라 terminal 표면이 제공한다.
@@ -315,13 +322,6 @@ successor coordinator 승계에 필요한 네 동작이 모두 여기 있다.
 `run-use --takeover-legacy`는 "must run in the live coordinator agent terminal it binds"를 요구하므로 위에서 만든 터미널이 그 조건을 만족한다.
 
 `terminal read`의 기본 읽기는 escape sequence가 제거된 누적 스트림이라 TUI 화면 판정에 부적합하다. ACK 확인에는 `--screen`을 쓴다.
-
-### 2.9 Wake-up 표면
-
-- Orca terminal 입력과 orchestration inbox는 서로 다른 표면이다.
-- `terminal send`는 live terminal에 직접 입력한다.
-- `orchestration send`는 durable inbox/worker relay다.
-- Orca에 Claude Channel을 관리하는 전용 명령은 없다.
 
 ## 3. Claude Code
 
@@ -407,6 +407,12 @@ claude --dangerously-load-development-channels server:<mcp-server-name>  # 개�
 
 > **운영 제약: channel 이벤트는 대화형 세션에만 도착한다.** 같은 서버·flag·설정으로 `-p` 비대화형 세션은 4가지 구성 모두 미도달이었다. Bridge가 깨울 coordinator 세션은 대화형으로 유지돼야 하며, daemon이 `-p`로 coordinator를 대신 띄우는 설계는 성립하지 않는다.
 
+### 3.5 `@Claude`와의 차이
+
+Claude Code의 Slack coding integration은 coding intent에서 새 cloud/web session과 fresh sandbox를 시작한다. 기존 로컬 coordinator session으로 push하는 요구와 다르다. [Claude Code in Slack](https://code.claude.com/docs/en/slack) · [Channels comparison](https://code.claude.com/docs/en/channels#how-channels-compare)
+
+standard Slack MCP integration은 Claude가 질의할 때 동작하며 외부→세션 push를 제공하지 않는다.
+
 ### 3.6 Hook 기반 세션 제어와 컨텍스트 측정
 
 **Stop hook이 `{"decision":"block","reason":"<text>"}`를 반환하면 세션이 종료되지 않고 `reason`을 지시로 받아 턴을 이어간다.**
@@ -432,13 +438,9 @@ Stop hook payload의 키: `session_id`, `transcript_path`, `cwd`, `prompt_id`, `
  "output_tokens":592,"service_tier":"standard"}
 ```
 
-`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`가 그 턴의 입력 컨텍스트다. 같은 레코드의 `model` 필드로 창 크기를 판정한다. 열화 감지는 모델의 자기 판단이 아니라 외부 monitor의 **측정**으로 할 수 있다.
+`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`가 그 턴의 입력 컨텍스트다. 열화 감지는 모델의 자기 판단이 아니라 외부 monitor의 **측정**으로 할 수 있다.
 
-### 3.5 `@Claude`와의 차이
-
-Claude Code의 Slack coding integration은 coding intent에서 새 cloud/web session과 fresh sandbox를 시작한다. 기존 로컬 coordinator session으로 push하는 요구와 다르다. [Claude Code in Slack](https://code.claude.com/docs/en/slack) · [Channels comparison](https://code.claude.com/docs/en/channels#how-channels-compare)
-
-standard Slack MCP integration은 Claude가 질의할 때 동작하며 외부→세션 push를 제공하지 않는다.
+> ⚠️ **창 크기는 transcript로 판정할 수 없다.** `model` 필드가 컨텍스트 창 변형을 구분하지 않는다. 1M 창으로 실행 중인 세션의 transcript에도 `"model":"claude-opus-5"`만 기록되고 `[1m]` 표기가 없다(해당 transcript의 model 계열 키 전수 조회 결과 이 값 하나). 창 크기는 세션 자신만 아는 값이므로 coordinator가 Run 마커에 기록하고 monitor는 그 값을 읽어야 한다. 마커에 값이 없으면 monitor는 발동하지 않는다.
 
 ## 4. Slack
 

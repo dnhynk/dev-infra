@@ -290,12 +290,15 @@ ID: OD-014
 결정: 열화 감지 주체는 Claude Code Stop hook이다. 신호는 transcript의 마지막 assistant 레코드
       `message.usage`의 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`다.
       임계 정책은 점유율(%)이 아니라 **남은 여유 토큰 절대값**으로 표현한다.
-      모델별 창 크기는 같은 레코드의 `model`로 판정하고, 모르는 모델이면 발동하지 않는다(fail-safe).
+      창 크기는 transcript로 판정할 수 없으므로 coordinator가 부팅 시 Run 마커에 기록하고
+      monitor는 그 값을 읽는다. 마커에 창 크기가 없으면 발동하지 않는다(fail-safe).
       초기 임계값은 미검증 값으로 두고 1차 실제 rollover 관측에서 재보정한다.
 근거:
-  - `message.usage` 필드가 transcript에 실재하고 hook이 `transcript_path`를 받는 것을 실측했다(§12.4).
+  - `message.usage` 필드가 transcript에 실재하고 hook이 `transcript_path`를 받는 것을 실측했다(§3.6).
+  - 같은 레코드의 `model`은 창 크기를 알려주지 않는다. 1M 창 세션의 transcript에도
+    `claude-opus-5`만 기록되고 변형 표기가 없다. 창 크기를 아는 주체는 세션 자신뿐이다.
   - Stop hook의 `{"decision":"block","reason":...}` 주입이 실제로 동작하고 `stop_hook_active`가
-    무한 루프를 막는 것을 실측했다(§12.2). 턴 종료는 무인 coordinator의 자연스러운 안전 checkpoint다.
+    무한 루프를 막는 것을 실측했다(§3.6). 턴 종료는 무인 coordinator의 자연스러운 안전 checkpoint다.
   - rollover 절차 자체(handoff 확정·successor 생성·인수 확인)는 거의 고정 비용이므로,
     창 크기가 달라져도 필요한 여유분은 비슷하다. 따라서 비율이 아니라 절대값이 맞다.
   - fail-safe를 "발동하지 않음"으로 두는 이유: 잘못된 rollover는 진행 중 작업을 끊지만,
@@ -307,6 +310,7 @@ ID: OD-014
     보조 신호로만 둔다.
 영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §8, 향후 rollover-monitor hook과 ~/.claude/settings.json
 검증 방법: 격리 프로젝트에서 Stop hook block/reason 왕복과 usage 필드 존재를 실측(2026-08-22).
+          transcript의 model 계열 키 전수 조회로 창 크기 판정 불가를 확인(2026-08-22).
           임계값 숫자와 handoff 절차의 실제 토큰 비용은 미측정.
 결정일: 2026-08-22
 후속: 초기 임계값 확정과 재보정은 첫 실제 rollover 관측에서 수행한다.
