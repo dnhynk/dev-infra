@@ -511,7 +511,26 @@ gate-resolve 후 → task status = ready
 2. **조직 정책 `channelsEnabled`가 꺼져 있다.** 문서: "If the setting is disabled or unset, the MCP server still connects and its tools work, but channel messages won't arrive." **관측 증상과 정확히 일치한다.** 단 이 경우 startup warning이 나와야 하는데 `-p`에서는 보이지 않았다. claude.ai Team/Enterprise는 기본 차단이고, 조직 없는 Pro/Max는 이 검사를 건너뛴다.
 3. raw JSON-RPC 구현이 MCP SDK와 미묘하게 다르다. 문서의 capability 형태를 그대로 따랐으므로 가능성은 낮지만 배제하지 못했다.
 
-가설 1과 2는 이 세션의 비-TTY 환경에서 확인할 수 없다. **대화형 터미널에서 1회 실행하면 두 가설이 동시에 갈린다** — 확인 프롬프트가 뜨는지, allowlist/정책 경고가 뜨는지가 startup notice에 나온다.
+### 9.5.1 추가 관측으로 가설 2, 3 제거
+
+**가설 2 배제**: 사용자 계정은 조직에 속하지 않은 개인 Max다. 공식 문서: "Pro and Max users without an organization skip these checks entirely: channels are available and users opt in per session with `--channels`." 따라서 `channelsEnabled` 정책은 이 환경에 적용되지 않는다.
+
+**가설 3 반증**: 문서의 레퍼런스 구현과 동일하게 공식 `@modelcontextprotocol/sdk` 1.30.0의 `Server` + `StdioServerTransport`로 같은 채널 서버를 다시 작성해 같은 `-p` 조건에서 실행했다. 결과는 raw 구현과 완전히 동일했다.
+
+```text
+[14:45:22.818Z] connected
+[14:45:24.321Z] PUSHED notifications/claude/channel
+[14:45:29.935Z] TOOL wait_a_moment: {}
+[14:45:36.340Z] TOOL report_receipt: {"content":"NONE"}
+```
+
+push가 tool 호출보다 5초 이상 앞섰는데도 이벤트가 도달하지 않았다. 구현 방식은 원인이 아니다.
+
+### 9.5.2 남은 단일 가설
+
+**development bypass가 대화형 확인을 요구한다.** 문서 원문: "The development flag bypasses the allowlist for specific entries **after a confirmation prompt**." `-p` 비대화형 세션에는 이 프롬프트를 표시하고 응답받을 경로가 없으므로 bypass가 성립하지 않고, 채널은 등록되지 않으며, notification은 문서가 명시한 대로 조용히 drop된다. 관측된 모든 증상(연결 성공, tool 등록 성공, channel 등록 흔적 없음, 경고 없음)과 일치한다.
+
+이 가설은 **대화형 터미널에서 1회 실행**해야 확인된다. 비-TTY 도구 환경에서는 검증할 수 없다.
 
 ### 9.6 결론
 
