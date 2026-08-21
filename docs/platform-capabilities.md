@@ -17,7 +17,7 @@
 | git | `2.55.0.windows.4` | |
 | pnpm | `11.22.0` | |
 | Python | `3.13.15` | |
-| Node.js | **미설치** | PATH의 `C:\Program Files\nodejs`, `.volta\bin`, `.fnm\aliases\default\bin`이 모두 존재하지 않는다. OD-001이 Node를 전제하므로 구현 전 재설치가 필요하다. |
+| Node.js | `v26.7.0` | nvm-windows 관리. 실제 경로는 `C:\nvm4w\nodejs`이며 `NVM_SYMLINK`로 PATH에 연결된다. §6 참조 |
 
 `ORCA_CLI_COMMAND`와 `ORCA_DEV_REPO_ROOT`는 unset이다. Claude 계정은 조직에 속하지 않은 개인 Max이고, Codex는 oauth로 인증돼 있다.
 
@@ -36,7 +36,7 @@ run-use, send, task-create, task-list, task-update, worker-abandon, worker-list,
 worker-read, worker-release, worker-retain, worker-show, worker-start, worker-stop
 ```
 
-`coordinator-start`, `coordinator-stop`, `run`, `run-stop`은 은퇴한 scheduler 명령으로 아무 효과가 없다. **successor coordinator 세션을 만드는 공식 orchestration 명령은 존재하지 않는다.**
+`coordinator-start`, `coordinator-stop`, `run`, `run-stop`은 은퇴한 scheduler 명령으로 아무 효과가 없다. orchestration 표면에는 세션을 만드는 명령이 없다. 세션 생성은 terminal 표면이 담당한다(§2.10).
 
 `task-list`, `gate-list`, `worker-list`, `check`는 `--run <run_id>`를 받는다. `gate-list` 스키마 note: "--run inspects a named Run without binding; otherwise gates are scoped to the caller." Observer는 `run-list` 뒤 각 Run을 `--run`으로 명시해 binding 없이 읽는다. `--run` 없는 호출은 `run_required` 오류를 반환한다.
 
@@ -253,17 +253,34 @@ orca orchestration worker-start --task <task_id>
 
 **Claude**: `--model` alias `opus`, `sonnet`, `fable`, `haiku` 또는 풀네임. `--effort` `low`, `medium`, `high`, `xhigh`, `max`. `ultra`는 없다.
 
-**Codex** (models_cache 기준):
+**Codex** (models_cache 기준. 설명은 벤더 원문):
 
-| slug | 기본 effort | 지원 effort | speed tier |
-|---|---|---|---|
-| `gpt-5.6-sol` | low | low, medium, high, xhigh, max, **ultra** | fast |
-| `gpt-5.6-terra` | medium | low, medium, high, xhigh, max, **ultra** | fast |
-| `gpt-5.6-luna` | medium | low, medium, high, xhigh, max | fast |
-| `gpt-5.5` | medium | low, medium, high, xhigh | fast |
-| `gpt-5.4` | medium | low, medium, high, xhigh | fast |
-| `gpt-5.4-mini` | medium | low, medium, high, xhigh | 없음 |
-| `gpt-5.3-codex-spark` | high | low, medium, high, xhigh | 없음 |
+| slug | 벤더 설명 | 기본 effort | 지원 effort | ctx | tier |
+|---|---|---|---|---|---|
+| `gpt-5.6-sol` | Latest frontier agentic coding model | low | low, medium, high, xhigh, max, **ultra** | 272k | fast |
+| `gpt-5.6-terra` | Balanced agentic coding model for everyday work | medium | low, medium, high, xhigh, max, **ultra** | 272k | fast |
+| `gpt-5.6-luna` | Fast and affordable agentic coding model | medium | low, medium, high, xhigh, max | 272k | fast |
+| `gpt-5.5` | Frontier model for complex coding, **research**, and real-world work | medium | low, medium, high, xhigh | 272k | fast |
+| `gpt-5.3-codex-spark` | Ultra-fast coding model (1.5k tok/s, 동기 협업용) | high | low, medium, high, xhigh | **128k** | 없음 |
+| `gpt-5.4` | **deprecated** → `gpt-5.6-terra`로 이전 | medium | low, medium, high, xhigh | 272k | fast |
+| `gpt-5.4-mini` | **deprecated** → `gpt-5.6-luna`로 이전 | medium | low, medium, high, xhigh | 272k | 없음 |
+
+`gpt-5.4`와 `gpt-5.4-mini`는 models_cache에 `upgrade` 필드와 `retirement_at`이 설정된 은퇴 예정 모델이다. 새 배치 정책에 쓰지 않는다.
+
+`gpt-5.6` 계열은 `tool_mode`가 `code_mode_only`이고 `gpt-5.5`는 제한이 없다. **벤더 설명에서 "research"를 명시한 모델은 `gpt-5.5`가 유일하다.**
+
+`visibility: hide`인 모델 두 개가 더 있다. `gpt-reserve`(luna와 동일 설명)와 `codex-auto-review`("Automatic approval review model for Codex", 272k, effort max까지 지원)다. 모델 선택 UI에 노출되지 않지만 `--model`이 opaque passthrough이므로 지정 자체는 가능할 수 있다. PR 리뷰 전용 모델 후보이나 **동작 미검증이다.**
+
+effort 단계의 벤더 정의:
+
+| effort | 설명 |
+|---|---|
+| `low` | Fast responses with lighter reasoning |
+| `medium` | Balances speed and reasoning depth for everyday tasks |
+| `high` | Greater reasoning depth for complex problems |
+| `xhigh` | Extra high reasoning depth for complex problems |
+| `max` | Maximum reasoning depth for the hardest problems |
+| `ultra` | Maximum reasoning **with automatic task delegation** |
 
 `ultra`("Maximum reasoning with automatic task delegation")는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만 있다.
 
@@ -272,6 +289,32 @@ orca orchestration worker-start --task <task_id>
 `~/.codex/config.toml`의 전역 기본값은 `model = "gpt-5.6-sol"`, `model_reasoning_effort = "xhigh"`다. `--model` 없이 dispatch된 codex worker는 이 값을 쓴다.
 
 사용자 표기 `sol high fast`는 서로 다른 세 축이다: model `gpt-5.6-sol` + effort `high` + service tier `priority`. **`worker-start`에 service tier 인자가 없으므로 tier는 이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나 `worker_done` 권위를 잃는다.
+
+### 2.10 Terminal 표면
+
+세션 생성·입력·대기·읽기는 orchestration이 아니라 terminal 표면이 제공한다.
+
+```text
+terminal create --worktree <selector> --title <name> --command <text> --focus --json
+terminal send   --terminal <handle> --text <text> --enter --interrupt
+terminal wait   --terminal <handle> --for exit|tui-idle --timeout-ms <n>
+terminal read   --terminal <handle> --screen | --cursor <n> --limit <n>
+```
+
+`terminal create`의 note: "Use this, not `worktree create`, for a fresh agent in the current checkout." 예시는 `--command "codex"` 형태로 에이전트를 띄운다.
+
+successor coordinator 승계에 필요한 네 동작이 모두 여기 있다.
+
+| 필요 동작 | 명령 |
+|---|---|
+| successor 세션 생성 | `terminal create --worktree current --command "claude"` |
+| 부팅 프롬프트 주입 | `terminal send --terminal <handle> --text "..." --enter` |
+| 부팅 완료 대기 | `terminal wait --for tui-idle --timeout-ms <n>` |
+| 인수 확인 | `terminal read --terminal <handle> --screen` |
+
+`run-use --takeover-legacy`는 "must run in the live coordinator agent terminal it binds"를 요구하므로 위에서 만든 터미널이 그 조건을 만족한다.
+
+`terminal read`의 기본 읽기는 escape sequence가 제거된 누적 스트림이라 TUI 화면 판정에 부적합하다. ACK 확인에는 `--screen`을 쓴다.
 
 ### 2.9 Wake-up 표면
 
@@ -282,9 +325,18 @@ orca orchestration worker-start --task <task_id>
 
 ## 3. Claude Code
 
-### 3.1 skill 패키징
+### 3.1 skill 패키징과 discovery
 
-skill은 `~/.agents/skills/<name>/SKILL.md`에 있다. `~/.claude/skills`는 존재하지 않는다. `~/.agents/.skill-lock.json`이 출처를 기록하며 `orchestration`·`orca-cli`·`computer-use`는 `stablyai/orca` repo에서 설치됐다.
+**Claude Code가 discovery하는 user-level skill home은 `~/.claude/skills/`뿐이다.** `~/.agents/skills/`는 여러 코딩 에이전트가 공유하는 디렉터리이며 Claude Code의 탐색 경로가 아니다. 두 home에 동일한 프로브 skill을 심고 헤드리스 세션에서 목록을 조회해 확인했다 — `~/.claude/skills`의 것만 나타났다.
+
+`orca skills install`은 기본적으로 호스트에서 감지한 에이전트들과 공유 `.agents/skills`를 대상으로 한다. `claude-code`가 대상에서 빠지면 Claude Code 세션은 해당 skill을 전혀 보지 못하므로 대상을 직접 지정한다.
+
+```text
+orca skills install --skill orca-cli --skill orchestration --skill computer-use --agent claude-code
+```
+
+- **skill은 세션 시작 시점에 로드된다.** 설치 직후 기존 세션에는 나타나지 않으며 재시작이 필요하다.
+- `/init-orchestrate`는 `~/.claude/skills/init-orchestrate/SKILL.md`에 둔다. coordinator는 대상 repository에서 실행되므로 repo-local `.claude/skills`는 매 repository마다 설치가 필요해 부적합하다.
 
 `orchestration/SKILL.md`는 **discovery stub**이다. 본문이 "This file is a discovery stub, not the usage guide"라고 명시하고, 실제 가이드는 `orca skills get orchestration --full`이 버전에 맞춰 서빙한다. 버전 의존 계약을 파일에 고정하지 않는 이 패턴은 `/init-orchestrate`에도 적용할 수 있다.
 
@@ -354,6 +406,33 @@ claude --dangerously-load-development-channels server:<mcp-server-name>  # 개�
 - push부터 Claude가 receipt를 호출하기까지 약 7~10초. transport 지연이 아니라 모델 턴을 포함한 반응 시간이며, 유휴 세션·단일 이벤트 조건의 값이다.
 
 > **운영 제약: channel 이벤트는 대화형 세션에만 도착한다.** 같은 서버·flag·설정으로 `-p` 비대화형 세션은 4가지 구성 모두 미도달이었다. Bridge가 깨울 coordinator 세션은 대화형으로 유지돼야 하며, daemon이 `-p`로 coordinator를 대신 띄우는 설계는 성립하지 않는다.
+
+### 3.6 Hook 기반 세션 제어와 컨텍스트 측정
+
+**Stop hook이 `{"decision":"block","reason":"<text>"}`를 반환하면 세션이 종료되지 않고 `reason`을 지시로 받아 턴을 이어간다.**
+
+```text
+Stop hook 1회차 → {"decision":"block","reason":"[rollover-monitor] 컨텍스트 임계값 초과. ..."}
+세션 출력      → ROLLOVER-ACK: Context approaching limit; ready to summarize and hand off...
+Stop hook 2회차 → stop_hook_active: true → {} → 정상 종료
+```
+
+재호출 시 `stop_hook_active`가 `true`로 전달되므로 무한 루프 방지는 플랫폼이 제공한다. hook이 이 플래그를 확인하지 않으면 세션이 끝나지 않는다.
+
+Stop hook payload의 키: `session_id`, `transcript_path`, `cwd`, `prompt_id`, `permission_mode`, `hook_event_name`, `stop_hook_active`, `last_assistant_message`, `background_tasks`, `session_crons`.
+
+턴 종료는 무인 coordinator에게 자연스러운 안전 checkpoint이므로 rollover trigger 지점으로 쓸 수 있다.
+
+> **hook의 `reason`은 명령의 권위를 스스로 주장할 수 없다.** 적대적 문구(`IGNORE ALL PREVIOUS OUTPUT...`)로 시험하면 모델이 prompt injection으로 판단해 거부한다. rollover 지시가 신뢰받으려면 권위가 세션 컨텍스트에 미리 서 있어야 한다. `/init-orchestrate`가 부팅 시점에 "rollover-monitor의 신호는 운영자가 사전 승인한 절차"라는 계약을 세우고, hook의 `reason`은 그 절차를 짧게 가리키기만 해야 한다. 자동 rollover의 Run 시작 시 승인은 UX 선택이 아니라 **기술적 전제조건**이다.
+
+**컨텍스트 점유량은 측정 가능하다.** Stop hook이 받는 `transcript_path`의 JSONL에서 마지막 `assistant` 레코드의 `message.usage`를 읽는다.
+
+```json
+{"input_tokens":2,"cache_creation_input_tokens":1647,"cache_read_input_tokens":85231,
+ "output_tokens":592,"service_tier":"standard"}
+```
+
+`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`가 그 턴의 입력 컨텍스트다. 같은 레코드의 `model` 필드로 창 크기를 판정한다. 열화 감지는 모델의 자기 판단이 아니라 외부 monitor의 **측정**으로 할 수 있다.
 
 ### 3.5 `@Claude`와의 차이
 
@@ -459,7 +538,22 @@ check 개수는 repository마다 0~2개로 제각각이고 CI가 아예 없는 r
 
 PR body에도 `## Task`(`T-ID`, ticket 경로)/`## Why`/`## What` 규약이 있으나 **Orca Run/Task/Dispatch ID는 없다.** correlation metadata는 추가해야 하며 기존 규약과의 공존 형식을 정해야 한다.
 
-## 6. 미검증 항목
+## 6. 호스트 전제조건
+
+이 워크플로우는 호스트 설정에 의존하며 머신을 옮기면 조용히 깨진다. 저장소 파일이 아니라 준비 절차로 관리한다.
+
+| 전제조건 | 실패 모드 | 확인 |
+|---|---|---|
+| skill 설치 대상에 `claude-code` 포함 | 공유 디렉터리에만 설치되어 Claude Code가 skill을 못 봄 (§3.1) | `ls ~/.claude/skills` |
+| git 커밋 identity | `~/.gitconfig` 부재로 worker가 커밋·PR을 만들 수 없음 | `git var GIT_AUTHOR_IDENT` |
+| `NVM_HOME`·`NVM_SYMLINK` 정의 | 사용자 PATH 항목이 두 변수 참조로 되어 있어 미정의면 빈 문자열로 확장되고 `node`·`npm`·`npx`가 전부 사라짐 | `node -v` |
+| nvm 활성 버전 26.x | 24.19.0이 활성일 수 있다. OD-001과 `node:sqlite` 근거가 26.x 기준 | `nvm list` |
+
+PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의하면 해소된다. **새 프로세스부터 적용되므로 Orca 앱과 터미널 재시작이 필요하다.** 이미 떠 있는 세션은 낡은 환경을 그대로 들고 있다.
+
+정상 확인 항목: `gh` 인증(scopes `repo`/`workflow`/`read:org`/`gist`), Windows Credential Manager의 github.com 자격증명, Orca repo 등록, Orca agent hooks(claude·codex 모두 installed), Codex CLI oauth.
+
+## 7. 미검증 항목
 
 - Slack App manifest와 실제 workspace/channel/owner ID
 - 실제 `worker_done` body 품질과 transcript fallback 필요 조건
@@ -469,6 +563,8 @@ PR body에도 `## Task`(`T-ID`, ticket 경로)/`## Why`/`## What` 규약이 있�
 - coordinator 재시작 후 terminal/pane handle 유지 여부
 - Gate resolve 후 task status가 직전 값으로 복원되는지 아니면 항상 `ready`가 되는지
 - 장시간 세션에서의 Channel 안정성과 재시작 시 pending 이벤트 처리
-- successor coordinator 세션을 만드는 수단 (`orca-cli` terminal/worktree 계열 미조사)
+- `terminal create`로 띄운 `claude` 프로세스가 부팅 프롬프트를 실제로 받는지
+- `run-use`가 `consumer_generation`을 증가시켜 predecessor의 fencing token이 되는지
+- `worker-start --agent claude`가 등록된 Orca 계정을 요구하는지 (`orca account list`의 `claude.accounts`가 비어 있음)
 
 이 항목을 검증하기 전에는 관련 adapter의 구현 완료를 선언하지 않는다.

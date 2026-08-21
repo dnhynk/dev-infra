@@ -114,18 +114,36 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 
 coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·model·effort를 선택한다. 모든 worker를 같은 기본 agent로 배치하지 않는다.
 
-배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §12](../platform-capabilities.md#12-agent-배치-표면-2026-08-22)를 따른다.
+배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §12](../platform-capabilities.md#28-agent-배치-표면)를 따른다.
 
-초기 배치 정책:
+배치 정책:
 
-| 작업 종류 | agent | model | effort |
-|---|---|---|---|
-| 깊은 추론이 필요한 설계·아키텍처 판단 | `claude` | `opus` | `max` |
-| 기본 코드 구현 | `claude` | `opus` | `high` |
-| 병렬 리서치·조사 | `codex` | `gpt-5.6-sol` | `ultra` |
-| PR 리뷰 | `codex` | `gpt-5.6-sol` | `high` |
+| # | 작업 종류 | 판정 기준 | agent | model | effort |
+|---|---|---|---|---|---|
+| 1 | 아키텍처·스키마·계약 설계 | 되돌리기 비싼 구조 결정, 여러 대안의 trade-off 비교가 필요 | `claude` | `opus` | `max` |
+| 2 | 어려운 구현 | 동시성·상태기계·성능 등 정확성 논증이 필요하고 테스트로 전부 잡히지 않음 | `claude` | `opus` | `xhigh` |
+| 3 | 기본 코드 구현과 테스트 작성 | 스펙이 정해진 기능 구현, 새 테스트 설계 | `claude` | `opus` | `high` |
+| 4 | 버그 재현·디버깅 | 원인 가설 → 반증 관측 절차가 필요 | `claude` | `opus` | `xhigh` |
+| 5 | 단순 반복·기계적 작업 | 판단 없이 확정된 규칙만 적용 (rename, import 정리, 정형 케이스 추가, 규칙이 확정된 대량 마이그레이션) | `codex` | `gpt-5.6-luna` | `medium` |
+| 6 | 병렬 리서치·조사 | 여러 소스를 넓게 훑어 사실을 수집 | `codex` | `gpt-5.6-sol` | `ultra` |
+| 7 | PR 리뷰 | | `codex` | `gpt-5.6-sol` | `xhigh` |
+| 8 | 추론이 필요한 문서·스펙 집필 | 설계 판단이 문서 내용에 들어감 | `codex` | `gpt-5.6-sol` | `high` ~ `xhigh` |
+| 9 | 사실 정리형 문서 | 확정된 사실을 구조화 (레퍼런스, README, 변경 요약) | `codex` | `gpt-5.6-terra` | `medium` |
+| 10 | 리뷰 지적 반영 수정 | | 원 Dispatch와 동일 배치 | | |
 
-이 표는 시작점이며 Run별 추가 지시로 덮어쓸 수 있다. 새 작업 종류가 생기면 임의 배치하지 않고 정책에 추가한다.
+배치 근거:
+
+- 1~4행의 Claude 우선, 5행의 `gpt-5.6-luna` `medium`, 7행의 `xhigh`, 8~9행의 문서 작업 Codex 우선은 **사용자 판단**이다.
+- 6행 `ultra`는 벤더가 이 단계를 "Maximum reasoning with **automatic task delegation**"으로 정의하므로 병렬 조사에 대응한다. `ultra`는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만 있다.
+- 5행 `gpt-5.6-luna`의 벤더 설명은 "Fast and affordable agentic coding model"이다.
+- 9행 `gpt-5.6-terra`의 벤더 설명은 "Balanced agentic coding model for everyday work"로, 판단이 적은 정리 작업에 대응한다.
+- 10행은 [Coordinator 운영 계약](#4-coordinator-운영-계약)의 "수정 요청은 가능한 한 원 worker에게 돌린다"를 따른다. terminal을 재사용하면 배치가 유지되므로 별도 지정이 필요 없다.
+
+이 표는 Run별 추가 지시로 덮어쓸 수 있다. 어느 행에도 명확히 해당하지 않는 작업은 임의로 배치하지 않고 3행을 기본값으로 쓰되 그 사실을 기록하고, 반복되면 정책에 새 행을 추가한다.
+
+`gpt-5.4`와 `gpt-5.4-mini`는 은퇴 예정 모델이므로 쓰지 않는다.
+
+`codex-auto-review`("Automatic approval review model for Codex")는 7행의 대안 후보이나 모델 선택 UI에 노출되지 않고 동작을 검증하지 않았다. 검증 전에는 채택하지 않는다.
 
 배치 시 지켜야 할 계약:
 
