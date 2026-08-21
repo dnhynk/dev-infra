@@ -167,3 +167,15 @@
 - 실측한 스키마 구조는 그대로 유지하되 값은 지어낸다.
 - 근거: 저장소가 public이므로 실데이터 fixture는 redaction 규칙(OD-018/036/064)을 먼저 닫아야 하는데, S0 검증에는 구조만 있으면 충분하다.
 - rollover-monitor Stop hook을 `~/.claude/settings.json`에 **추가 항목**으로 등록한다. Orca가 같은 이벤트에 등록한 hook을 지우지 않는다. 명령은 nvm symlink 절대경로를 쓴다. Claude Code 세션 PATH에 `node`가 없을 수 있다.
+
+### DL-024 · S0 출구 조건 충족
+
+로드맵의 [Slice S0](roadmap.md#4-bridge-slice-s0--관찰상관관계-기반) 출구 조건을 다음 근거로 충족했다.
+
+- **같은 입력을 반복해도 같은 entity로 인식됨** — key를 관측 입력에서 결정적으로 파생시킨다. 실제 Orca·GitHub에 대해 snapshot을 두 번 실행했고 기존 9개 entity가 동일하게 재파생됐다. 두 실행 사이에 새로 생긴 Run 1건만 증가했다.
+- **누락된 correlation을 추측하지 않고 오류로 식별함** — `vertical-live` PR 5건이 모두 `uncorrelated:no_metadata`로 보고됐다. branch 이름과 제목에 단서가 있어도 확정하지 않는다.
+- **실제 sample schema가 문서와 fixture에 반영됨** — 테스트가 실측 응답 형태(`run_required` 오류 payload, gate `options` JSON 문자열, task `created_by_process_incarnation`, `statusCheckRollup`)를 그대로 쓴다.
+
+외부 write는 없다. `check`와 `--ack`는 클라이언트에 넣지 않았다.
+
+S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요한 C1에서, ingestion 정책(OD-023)은 상태를 갱신해야 하는 C1/C2에서 정한다.
