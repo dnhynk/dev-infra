@@ -335,3 +335,121 @@ task-list  --run run_legacy_local → tasks: [], count: 0, legacyReadOnly: true
 ### 7.5 Claude Code channel flag 재확인
 
 `claude 2.1.238 --help`에도 `--channels`와 `--dangerously-load-development-channels`가 노출되지 않는다(2.1.237 관측과 동일). `--mcp-config`, `--plugin-dir`, `--plugin-url`, `mcp`, `plugin` 서브커맨드는 존재한다. D3의 선행 smoke test 사유가 유지된다.
+
+## 8. Gate 계약 실측 (2026-08-21)
+
+throwaway Run `run_a48566be983b`("THROWAWAY fixture capture ... safe to delete")에서 실제로 생성·조회·resolve하며 관측했다. 이전 기록의 "Gate가 0개여서 실제 JSON sample을 확보하지 못했다"를 대체한다.
+
+### 8.1 실제 Gate schema
+
+```json
+{
+  "id": "gate_ac624dad74b5",
+  "run_id": "run_a48566be983b",
+  "task_id": "task_cd1991c049a8",
+  "question": "구독 취소 시 서비스 이용 권한을 언제 종료할까?",
+  "options": "[\"A: 취소 즉시 종료\",\"B: 결제 기간 종료 시 종료\"]",
+  "status": "pending",
+  "resolution": null,
+  "created_at": "2026-08-21 14:33:10",
+  "resolved_at": null
+}
+```
+
+관측된 `status` 값: `pending`, `resolved`. `gate-list --status pending`은 정상 동작한다.
+
+`options`는 배열이 아니라 **JSON 문자열**이고, 원소는 **설명 없는 평문 문자열**이다. **선택지에 안정적인 ID가 없다.** `resolution`도 구조가 없는 자유 텍스트이며 어떤 option을 골랐는지와 기계적으로 연결되지 않는다.
+
+### 8.2 Slack Gate 카드 요구 대비 부족분
+
+[Slack UX](ux/slack-surfaces.md#32-gate-결정-카드)와 [Bridge 스펙 6.2](specs/orca-slack-bridge.md#62-gate-표시)가 요구하는 의미를 Orca Gate가 직접 제공하는지 대조한 결과다.
+
+| 카드에 필요한 의미 | Orca Gate 제공 여부 |
+|---|---|
+| 질문 | ✅ `question` |
+| 선택지 | ⚠️ `options` (평문 문자열, 설명 없음) |
+| 선택지의 안정적 ID | ❌ 없음 |
+| 각 선택지의 의미 설명 | ❌ 없음 |
+| coordinator 권장안 | ❌ 없음 |
+| 권장 이유 | ❌ 없음 |
+| 결정 영향 | ❌ 없음 |
+| 대기 중인 Task 목록 | ⚠️ `task_id` 1건만. 나머지는 `deps`에서 파생해야 함 |
+| 계속 가능한 독립 Task | ❌ 없음 |
+| 임의 metadata 필드 | ❌ 없음 |
+
+즉 **Orca Gate schema만으로는 스펙이 요구하는 Gate 카드를 만들 수 없다.** OD-050은 "확인 후 결정"이 아니라 "반드시 Bridge 또는 coordinator 측에서 해결해야 하는 설계 과제"로 확정됐다. 남은 선택지는 `question`/`options` 문자열에 구조를 인코딩하거나, Bridge durable store에 sidecar metadata를 두거나, 카드를 축소하는 것이다. 확장 가능한 Gate 필드는 존재하지 않는다.
+
+### 8.3 Gate와 Task status의 자동 연동
+
+같은 task에 gate를 만들고 status를 추적한 직접 관측 결과다.
+
+```text
+gate 생성 전   → task status = ready
+gate-create 후 → task status = blocked
+gate-resolve 후 → task status = ready
+```
+
+플랫폼이 자동으로 전이시킨다. Bridge가 blocked 상태를 따로 계산할 필요가 없다는 뜻이며 OD-067 taxonomy의 `blocked Task` 항목에 쓸 수 있다. 다만 resolve 후 항상 직전 status로 복원되는지, 아니면 항상 `ready`가 되는지는 이번 관측만으로 구분하지 못했다.
+
+### 8.4 ⚠️ Gate 중복 resolve를 플랫폼이 막지 않는다
+
+가장 중요한 발견이다. 다음을 순서대로 실행했다.
+
+| # | 호출 | 결과 |
+|---|---|---|
+| 1 | `gate-resolve --retry-request slack-action-TEST1 --resolution "B: ..."` | `ok:true`, `status: resolved`, `resolved_at: 14:33:34`, `mutation.replayed: false` |
+| 2 | 같은 `--retry-request slack-action-TEST1`로 재호출 | `ok:true`, **`mutation.replayed: true`**, `resolved_at` 14:33:34 그대로, resolution 변화 없음 |
+| 3 | **다른** 키 `slack-action-TEST2` + 다른 resolution으로 재호출 | **`ok:true`**, `resolution`이 `"A: 취소 즉시 종료 (덮어쓰기 시도)"`로 **조용히 덮어써짐**, `resolved_at` 14:33:46으로 갱신 |
+
+결론:
+
+- `--retry-request`는 **같은 요청의 재시도**만 멱등화한다. 응답의 `mutation.replayed`로 재생 여부를 판정할 수 있다.
+- **이미 `resolved`인 Gate에 다른 요청이 오면 Orca는 거부하지 않고 덮어쓴다.** 오류도, 경고도 없다.
+
+따라서 [Bridge 스펙 §7.2](specs/orca-slack-bridge.md#72-처리-순서)의 "Orca에서 Gate가 아직 open인지 읽는다"와 [보안 경계](specs/orca-slack-bridge.md#10-보안-경계)의 "stale·resolved Gate action 거부"는 **방어적 권장이 아니라 필수**다. 플랫폼이 대신 막아주지 않는다.
+
+추가로 남는 위험: status 확인과 `gate-resolve` 사이에 TOCTOU 창이 있다. 서로 다른 Slack action 두 개가 동시에 `pending`을 읽으면 둘 다 통과하고 마지막 호출이 이긴다. `--retry-request`로는 이 경합을 막을 수 없으므로 Bridge durable store에서 Gate 단위 직렬화가 필요하다. OD-051에 이 조건을 반영한다.
+
+### 8.5 Gate 해결이 coordinator에게 자동 통지되지 않는다
+
+`gate-create`와 `gate-resolve` 이후 `orchestration inbox`는 계속 `messages: [], count: 0`이었다. Orca는 Gate 상태 변화를 coordinator 메일박스로 push하지 않는다. 즉 coordinator를 깨우는 경로(Channel 또는 polling/재조회)는 Bridge가 반드시 제공해야 하며, "Channel은 초인종"이라는 설계 전제가 관측으로 뒷받침됐다.
+
+### 8.6 mutation envelope
+
+모든 mutation 응답에 다음이 포함된다.
+
+```json
+"mutation": { "requestId": "<--retry-request 값 또는 자동 생성 uuid>", "replayed": false }
+```
+
+`--retry-request`는 호출자가 정한 임의 문자열을 그대로 받는다(`slack-action-TEST1`이 그대로 echo됐다). Slack action ID를 그대로 키로 쓸 수 있다는 뜻이다.
+
+### 8.7 Task row가 repository 경로를 나른다
+
+```json
+{
+  "id": "task_cd1991c049a8",
+  "run_id": "run_a48566be983b",
+  "parent_id": null,
+  "created_by_terminal_handle": "term_720b6c26-...",
+  "created_by_pane_key": "f39db44b-...:8c71884b-...",
+  "created_by_process_incarnation": "ccb3c8ee-...::D:/dev-infra@@8c25bfec:f126ab2a-...",
+  "created_by_run_generation": 1,
+  "task_title": "...", "display_name": "...", "spec": "...",
+  "status": "ready", "deps": "[]", "result": null,
+  "created_at": "2026-08-21 14:32:57", "completed_at": null
+}
+```
+
+`created_by_process_incarnation`에 **작업 디렉터리(`D:/dev-infra`)가 포함**된다. `run-list` row에는 repository identity가 없다는 기존 기록은 유효하지만, Task row에는 경로 후보가 있다. OD-020(Run↔repository 연결)의 새 후보 경로다. 다만 문자열 안에 인코딩된 값이라 안정적 파싱 형식인지, worktree와 repository root를 구분할 수 있는지는 미검증이다.
+
+`run-create` 응답에서는 `coordinator_handle`과 `coordinator_pane_key`가 **자동으로 채워졌다**. Run을 만든 terminal을 Orca가 식별한다는 뜻이며 이것도 OD-020 후보다.
+
+### 8.8 adapter가 처리해야 할 형식 비일관성
+
+- 타임스탬프 형식이 섞여 있다. Run은 ISO8601 UTC(`2026-08-21T14:32:45Z`), Task와 Gate는 타임존 없는 `2026-08-21 14:33:10`이다.
+- `deps`와 `options`는 배열이 아니라 **JSON 문자열**이다(`"[]"`, `"[\"A\",\"B\"]"`).
+
+### 8.9 정리하지 못한 상태
+
+`run-delete`에 해당하는 명령이 orchestration 29개 명령에 없다. throwaway Run `run_a48566be983b`과 그 task/gate는 로컬 Orca DB에 남아 있다. 제거하려면 범위가 넓은 `orchestration reset --all|--tasks`를 써야 하므로 실행하지 않았다. Bridge가 Run을 발견할 때 이 Run을 만나게 되므로, objective 문자열로 식별 가능하도록 `THROWAWAY`를 명시해 두었다.

@@ -168,3 +168,13 @@ ID: OD-003
 검증 방법: 첫 slice에서 실제 pnpm test 실행 명령과 출력을 남긴다. 현재 미실행.
 결정일: 2026-08-21
 ```
+
+## 2026-08-21 관측이 바꾼 항목
+
+아직 닫지 않았지만 제약이 좁혀졌다. 근거는 [플랫폼 검증 §8](platform-capabilities.md#8-gate-계약-실측-2026-08-21).
+
+- **OD-050** (Gate option/recommendation/impact metadata): 실측 결과 Orca Gate schema에 권장안·이유·영향·선택지 설명·선택지 ID·임의 metadata 필드가 **전혀 없다**. "제공되는지 확인"이 아니라 "Bridge 또는 coordinator가 반드시 만들어야 한다"로 성격이 바뀌었다. 남은 선택지는 `question`/`options` 문자열 인코딩, Bridge sidecar store, 카드 축소 셋 중 하나다.
+- **OD-051** (crash window와 outbox atomicity): `--retry-request`가 같은 요청의 재시도를 멱등화하고 `mutation.replayed`로 재생을 판정할 수 있다. 그러나 **이미 resolved된 Gate를 다른 요청이 조용히 덮어쓴다.** 따라서 (1) resolve 직전 status 재확인은 필수이고, (2) status 확인과 resolve 사이 TOCTOU를 막을 Gate 단위 직렬화가 Bridge 측에 필요하다.
+- **OD-067** (blocker taxonomy): `gate-create`가 task를 `blocked`로, `gate-resolve`가 `ready`로 자동 전이시키는 것을 관측했다. `blocked Task`는 Bridge가 계산하지 않고 Orca status를 그대로 쓸 수 있다. `permission pause`는 `worker-show`의 `observation.agentWait`가 source 후보다.
+- **OD-023** (ingestion 방식): Gate 생성·해결이 `inbox`에 메시지를 만들지 않는다. Gate 변화는 push로 오지 않으므로 polling 또는 재조회가 필요하다. 또한 Observer는 `check --ack`를 호출하면 coordinator의 배치를 소비하므로 `inbox` 또는 `check --peek/--all`로 제한해야 한다.
+- **OD-020** (Run↔repository↔coordinator identity): Task row의 `created_by_process_incarnation`에 작업 디렉터리(`D:/dev-infra`)가 포함되고, `run-create` 시 `coordinator_handle`·`coordinator_pane_key`가 자동으로 채워진다. 두 경로 모두 후보이며 파싱 안정성은 미검증이다.
