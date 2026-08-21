@@ -14,8 +14,8 @@
 | review 전담 Codex `sol high fast` | 확정 의도, 실행 mapping TBD | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약), [OD-017](open-decisions.md#bootstrap--continuity) |
 | coordinator가 review를 확인하고 merge·다음 작업까지 무인 진행 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
 | A: 장문 부팅 prompt 복사·붙여넣기 제거 | 확정 | [A 문제](product-vision.md#a-반복되는-부팅-프롬프트), [통합 스펙](specs/orchestration-bootstrap-and-continuity.md) |
-| `/orchestration` + `/init-orchestrate 데모까지만 구현` UX | 확정 목표 | [목적](specs/orchestration-bootstrap-and-continuity.md#1-목적) |
-| B: context 열화 감지·handoff·새 session 부팅 자동화 | 확정 목표, mechanism TBD | [B 문제](product-vision.md#b-수동-컨텍스트-승계), [승계 lifecycle](specs/orchestration-bootstrap-and-continuity.md#6-컨텍스트-승계-lifecycle) |
+| `/orchestration` + `/init-orchestrate 데모까지만 구현` UX | 확정 목표, 패키징 확정 (OD-010) | [목적](specs/orchestration-bootstrap-and-continuity.md#1-목적) |
+| B: context 열화 감지·handoff·새 session 부팅 자동화 | 확정 목표, 감지·승계 수단 확정 (OD-014, OD-015, DL-017) | [B 문제](product-vision.md#b-수동-컨텍스트-승계), [승계 lifecycle](specs/orchestration-bootstrap-and-continuity.md#6-컨텍스트-승계-lifecycle) |
 | A와 B를 하나의 workstream으로 처리 | 사용자 확정 | [로드맵 AB](roadmap.md#2-workstream-ab--bootstrap--continuity) |
 | C: Agent 대화가 아니라 상태 변화를 요약 | 확정 | [설계 철학](product-vision.md#상태-변화가-중심이다), [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
 | worker 완료→PR, review→수정/승인, CI→ready, merge→완료 lifecycle | 확정 방향, 세부 상태 TBD | [PR Digest lifecycle](specs/orca-slack-bridge.md#51-관심-lifecycle), [상관관계 계약](contracts/observation-and-correlation.md#6-pr-canonical-state) |

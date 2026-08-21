@@ -25,12 +25,12 @@
 
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
-| OD-010 | `/init-orchestrate` 패키징과 `/orchestration` 호출 계약 | AB 구현 전 | OPEN |
+| OD-010 | `/init-orchestrate` 패키징과 `/orchestration` 호출 계약 | AB 구현 전 | DECIDED |
 | OD-011 | authoritative spec 발견·우선순위 규칙 | AB 구현 전 | OPEN |
-| OD-012 | fresh/resume 자동 판별 또는 명시 옵션 | AB 구현 전 | OPEN |
+| OD-012 | fresh/resume 자동 판별 또는 명시 옵션 | AB 구현 전 | DECIDED |
 | OD-013 | `HANDOFF.md` 위치·schema·archive·atomic write | AB-1 전 | OPEN |
-| OD-014 | context 열화 신호와 threshold | AB-2 전 | OPEN |
-| OD-015 | successor 세션 생성·부팅·ACK 공식 수단 | AB-2 전 | OPEN |
+| OD-014 | context 열화 신호와 threshold | AB-2 전 | DECIDED |
+| OD-015 | successor 세션 생성·부팅·ACK 공식 수단 | AB-2 전 | DECIDED |
 | OD-016 | coordinator single-writer와 권한 이관 | AB-2 전 | OPEN |
 | OD-017 | `sol high fast`의 실제 model/effort/tier mapping | reviewer dispatch 전 | OPEN |
 | OD-018 | handoff redaction과 transcript 포함 범위 | AB-1 전 | OPEN |
@@ -229,3 +229,110 @@ ID: OD-028
 - **OD-010** (`/init-orchestrate` 패키징과 호출 계약): 이 환경의 skill은 `~/.agents/skills/<name>/SKILL.md`에 있고 `~/.claude/skills`는 존재하지 않는다. `orchestration` skill은 discovery stub이고 실제 가이드는 `orca skills get orchestration --full`이 서빙한다. 같은 stub+런타임조회 패턴이 `/init-orchestrate`의 후보다. 실제 배치 위치는 coordinator 세션이 발견하는지 실측한 뒤 확정한다.
 - **OD-015** (successor 세션 생성 공식 수단): `orchestration coordinator-start`가 은퇴해 Orca orchestration 표면에는 없다(§7.2). 남은 후보는 `orca-cli`의 terminal/worktree 생성 계열이며 아직 조사하지 않았다.
 - **OD-016** (coordinator single-writer와 권한 이관): `run-use --takeover-legacy`가 "live coordinator agent terminal에서 실행, 기존 worker 배정 보존"이라는 실제 메커니즘으로 존재한다(§7.2). pane/terminal handle이 세션 identity와 연결되므로 fencing 판정의 재료도 있다. 절차 설계는 미결이다.
+
+## 2026-08-22 AB-0 부팅·롤오버 실측이 바꾼 항목
+
+근거는 [플랫폼 검증 §12](platform-capabilities.md#12-ab-0-부팅롤오버-메커니즘-실측-2026-08-22).
+
+- **OD-016** (single-writer와 권한 이관): 승계 절차의 골격이 정해졌다. predecessor가 임계값에서 스스로 신규 dispatch·merge를 멈추고(self-fence) → handoff를 확정한 뒤 → `terminal create`로 successor를 만들고 → successor가 그 터미널에서 `run-use --takeover-legacy`를 실행한다. predecessor가 successor 생성 **이전에** 자기 fence를 걸므로 두 coordinator의 mutation 구간이 시간적으로 겹치지 않는다. 남은 미결은 (1) `run-use`가 `consumer_generation`을 증가시켜 predecessor가 자신이 밀려났음을 **감지**할 fencing token이 되는지, (2) predecessor가 successor 생성 직후·인수 확인 전에 죽었을 때의 복구 주체다. 사용자는 자가증식 방식을 택했고 이 실패 구간은 (D)에서 도입될 daemon으로 나중에 덮기로 했다(DL-017).
+- **OD-013** (`HANDOFF.md` 위치·schema): OD-012의 fresh/resume 자동 판별이 `HANDOFF.md`에서 `run_id`를 읽는 것을 전제하므로, schema에 Orca Run ID가 기계적으로 읽히는 필드로 포함돼야 한다는 제약이 추가됐다.
+- **OD-004** (지원 버전): 이번 검증은 Claude Code `2.1.238`, Orca `1.4.187`에서 수행했다. Stop hook의 `decision: "block"`·`stop_hook_active` 의미론과 transcript `message.usage` 필드는 버전 의존 사실이므로 지원 버전 범위를 정할 때 재확인 대상이다.
+- **OD-005** (설정과 주입 방식): 호스트 전제조건(§12.6)이 설정 항목으로 드러났다. skill 설치 대상, git 커밋 identity, `NVM_HOME`/`NVM_SYMLINK`는 저장소가 아니라 호스트 준비 절차로 다뤄야 한다.
+
+```text
+ID: OD-010
+상태: DECIDED
+결정: `/init-orchestrate`는 `~/.claude/skills/init-orchestrate/SKILL.md`에 user-level skill로 배치한다.
+      skill 본문에는 repository 무관하게 불변인 운영 계약만 담고, repository별 계약은 대상 repository의
+      authoritative spec을 읽으라는 지시로 위임한다(`orchestration` skill의 discovery stub 패턴).
+      `/orchestration`의 선행 입력을 필수 전제로 삼지 않는다. 필요한 Orca 사용법은
+      `orca skills get orchestration --full`로 직접 조회한다.
+근거:
+  - 프로브 실측 결과 Claude Code가 discovery하는 user-level skill home은 `~/.claude/skills/`뿐이고
+    `~/.agents/skills/`는 읽지 않는다(§12.1).
+  - coordinator는 임의의 대상 repository에서 실행되므로 repo-local 설치는 repository마다 반복이 필요하다.
+  - 실측 과정에서 `orchestration` skill이 이 호스트의 Claude Code 세션에 로드된 적이 없음이 드러났다.
+    부팅 계약이 다른 skill의 선행 로드에 의존하면 같은 무증상 실패가 반복된다.
+  - `orchestration` skill 자체가 stub + 런타임 조회 패턴을 쓰므로 버전 의존 계약을 파일에 고정하지 않는다.
+대안과 기각 이유:
+  - `~/.agents/skills/` 배치: 여러 에이전트가 공유하는 디렉터리지만 Claude Code가 읽지 않는다. 실측으로 기각.
+  - repo-local `.claude/skills/`: 대상 repository마다 설치가 필요해 A의 목표와 충돌. 기각.
+  - plugin marketplace 패키징: 배포 경로가 늘고 preview 제약이 있다. 단일 개인 호스트에는 이점이 없어 보류.
+영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §3, 향후 ~/.claude/skills/init-orchestrate/SKILL.md
+검증 방법: 두 skill home에 프로브 skill을 심고 헤드리스 세션에서 목록 조회(2026-08-22).
+          실제 `/init-orchestrate` 발견과 동작은 배치 후 새 세션에서 검증한다. 현재 미배치.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-012
+상태: DECIDED
+결정: fresh/resume는 자동 판별한다. `HANDOFF.md`가 존재하고 그 안에 기록된 `run_id`가
+      `orca orchestration run-list`에 살아 있으면 Resume, 아니면 Fresh다.
+      `--fresh` / `--resume <run_id>` 명시 override를 두고, 판별 결과는 mutation 전에 사용자에게 제시한다.
+근거:
+  - 사용자 진입점이 Fresh와 Resume에서 동일한 한 줄이어야 B가 해결된 것으로 본다(스펙 §6).
+  - 두 신호 모두 live source(파일 시스템과 Orca)에서 읽으므로 세션 기억에 의존하지 않는다.
+  - `HANDOFF.md` 존재만으로 판별하면 이미 종료된 Run의 잔재가 잘못된 Resume을 유발한다.
+대안과 기각 이유:
+  - 명시 옵션 필수: 사용자가 매번 Run 상태를 기억해야 하므로 A의 목표와 충돌. 기각.
+  - `run-current` 바인딩으로 판별: 바인딩되지 않은 새 터미널에서 `run_required`를 반환한다(§7.2). 단독 신호로 부적합.
+영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §3.2/§3.3, OD-013(schema에 run_id 요구)
+검증 방법: 미실행. 배치 후 Fresh·Resume 두 경로를 실제 Run으로 검증한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-014
+상태: DECIDED
+결정: 열화 감지 주체는 Claude Code Stop hook이다. 신호는 transcript의 마지막 assistant 레코드
+      `message.usage`의 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`다.
+      임계 정책은 점유율(%)이 아니라 **남은 여유 토큰 절대값**으로 표현한다.
+      모델별 창 크기는 같은 레코드의 `model`로 판정하고, 모르는 모델이면 발동하지 않는다(fail-safe).
+      초기 임계값은 미검증 값으로 두고 1차 실제 rollover 관측에서 재보정한다.
+근거:
+  - `message.usage` 필드가 transcript에 실재하고 hook이 `transcript_path`를 받는 것을 실측했다(§12.4).
+  - Stop hook의 `{"decision":"block","reason":...}` 주입이 실제로 동작하고 `stop_hook_active`가
+    무한 루프를 막는 것을 실측했다(§12.2). 턴 종료는 무인 coordinator의 자연스러운 안전 checkpoint다.
+  - rollover 절차 자체(handoff 확정·successor 생성·인수 확인)는 거의 고정 비용이므로,
+    창 크기가 달라져도 필요한 여유분은 비슷하다. 따라서 비율이 아니라 절대값이 맞다.
+  - fail-safe를 "발동하지 않음"으로 두는 이유: 잘못된 rollover는 진행 중 작업을 끊지만,
+    발동하지 않으면 최악의 경우 기존 수동 절차로 되돌아갈 뿐이다.
+대안과 기각 이유:
+  - PreCompact hook: 컨텍스트가 이미 찬 뒤라 늦고, 압축 자체가 열화다. 가장 못 믿을 상태의 coordinator에게
+    handoff 작성을 맡기게 되므로 기각.
+  - 모델의 자기 판단: 토큰 점유에 대한 자기 관측이 부정확하고, 하필 열화 시점에 가장 신뢰도가 낮다.
+    보조 신호로만 둔다.
+영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §8, 향후 rollover-monitor hook과 ~/.claude/settings.json
+검증 방법: 격리 프로젝트에서 Stop hook block/reason 왕복과 usage 필드 존재를 실측(2026-08-22).
+          임계값 숫자와 handoff 절차의 실제 토큰 비용은 미측정.
+결정일: 2026-08-22
+후속: 초기 임계값 확정과 재보정은 첫 실제 rollover 관측에서 수행한다.
+```
+
+```text
+ID: OD-015
+상태: DECIDED
+결정: successor 세션은 predecessor가 Orca terminal 표면으로 만든다.
+      생성 `terminal create --worktree current --command "claude"` →
+      부팅 `terminal send --terminal <handle> --text <부팅 프롬프트> --enter` →
+      대기 `terminal wait --for tui-idle --timeout-ms <n>` →
+      ACK  `terminal read --terminal <handle> --screen`.
+근거:
+  - `coordinator-start` 은퇴는 기능 제거가 아니라 표면 이동이었다. `terminal create`의 스키마 note가
+    "Use this, not `worktree create`, for a fresh agent in the current checkout"라고 명시한다(§12.5).
+  - `run-use --takeover-legacy`가 "live coordinator agent terminal에서 실행"을 요구하는데,
+    이 경로로 만든 터미널이 정확히 그 조건을 만족한다.
+  - ACK 확인에 `--screen`이 필요하다. 기본 읽기는 escape sequence가 제거된 누적 스트림이라
+    TUI 화면 판정에 부적합하다는 note가 있다.
+대안과 기각 이유:
+  - `worktree create`: 현재 checkout에 fresh agent를 띄우는 용도가 아니라고 note가 명시. 기각.
+  - `orchestration send`/`inbox`: durable inbox이지 세션 생성 수단이 아니다. 기각.
+  - 외부 프로세스로 `claude` 직접 spawn: Orca가 관리하지 않는 터미널이므로 `takeover-legacy`의
+    "live coordinator agent terminal" 전제를 만족한다는 증거가 없다. 기각.
+영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §6, OD-016(권한 이관 절차)
+검증 방법: `orca agent-context --json`에서 명령 스키마와 note 확인(2026-08-22).
+          실제 세션 생성·부팅 프롬프트 주입·ACK 왕복은 미실행.
+결정일: 2026-08-22
+후속: `run-use`가 `consumer_generation`을 증가시켜 fencing token이 되는지는 OD-016에서 확인한다.
+```
