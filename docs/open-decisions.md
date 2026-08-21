@@ -219,3 +219,13 @@ ID: OD-028
 결정일: 2026-08-22
 후속: 기록 형식·필드·enum·작성 주체와 task status 전이 규칙은 OD-073에서 AB workstream과 함께 확정한다.
 ```
+
+## 2026-08-22 AB-0 환경 관측이 바꾼 항목
+
+근거는 [플랫폼 검증 §11](platform-capabilities.md#11-ab-0-환경identity-관측-2026-08-22).
+
+- **OD-020** (Run↔repo↔coordinator session identity): 실측 경로가 확보됐다. coordinator 세션의 `ORCA_TERMINAL_HANDLE`/`ORCA_PANE_KEY`가 Run row의 `coordinator_handle`/`coordinator_pane_key`와 동일 값이고, `ORCA_WORKTREE_ID`가 로컬 경로를 담아 Git remote를 거쳐 GitHub repository로 이어진다. 남은 미결은 (1) 환경변수를 어느 신뢰 수준으로 취급할지, (2) `<uuid>::<path>` 형식의 안정성, (3) coordinator 재시작 시 handle 유지 여부다.
+- **OD-053** (Run↔현재 coordinator Channel routing): Channel Adapter가 MCP 서브프로세스로서 위 identity를 그대로 상속하고 `CLAUDE_CODE_SESSION_ID`는 자기 세션 값으로 받는 것을 실측했다. Adapter 자기소개 payload의 재료가 확정 가능하다. 단 coordinator pane 안의 자식 세션도 같은 `ORCA_*`를 상속하므로 세션 구분에는 `CLAUDE_CODE_SESSION_ID`가 필요하다. `CLAUDE_PID`는 조상 값이 상속되므로 사용 금지.
+- **OD-010** (`/init-orchestrate` 패키징과 호출 계약): 이 환경의 skill은 `~/.agents/skills/<name>/SKILL.md`에 있고 `~/.claude/skills`는 존재하지 않는다. `orchestration` skill은 discovery stub이고 실제 가이드는 `orca skills get orchestration --full`이 서빙한다. 같은 stub+런타임조회 패턴이 `/init-orchestrate`의 후보다. 실제 배치 위치는 coordinator 세션이 발견하는지 실측한 뒤 확정한다.
+- **OD-015** (successor 세션 생성 공식 수단): `orchestration coordinator-start`가 은퇴해 Orca orchestration 표면에는 없다(§7.2). 남은 후보는 `orca-cli`의 terminal/worktree 생성 계열이며 아직 조사하지 않았다.
+- **OD-016** (coordinator single-writer와 권한 이관): `run-use --takeover-legacy`가 "live coordinator agent terminal에서 실행, 기존 worker 배정 보존"이라는 실제 메커니즘으로 존재한다(§7.2). pane/terminal handle이 세션 identity와 연결되므로 fencing 판정의 재료도 있다. 절차 설계는 미결이다.

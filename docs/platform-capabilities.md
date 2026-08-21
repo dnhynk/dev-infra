@@ -702,3 +702,91 @@ result 타입 : string          ← deps, options와 같이 JSON 문자열로 �
 - `task-update`는 `--status`를 요구하므로 결과 기록과 상태 전이가 한 호출에 묶인다. reviewer 결과를 남기면서 task를 어떤 status로 둘지 함께 정해야 한다.
 - `--result`는 스키마 검증을 하지 않는다. 형식 계약은 Bridge와 AB workstream이 정의하고 읽는 쪽에서 검증해야 한다.
 - 이 실측은 저장 가능성만 확인한 것이고, 실제 필드·enum·작성 주체는 확정하지 않았다.
+
+## 11. AB-0 환경·identity 관측 (2026-08-22)
+
+### 11.1 skill 패키징 실태
+
+- 설치된 skill은 `~/.agents/skills/<name>/SKILL.md`에 있다. `orchestration`, `orca-cli`, `computer-use`, `find-skills` 4개가 `home`(Agent skills home)에, 나머지는 plugin/bundled로 총 47개다.
+- `~/.agents/.skill-lock.json`이 출처를 기록한다. `orchestration`·`orca-cli`·`computer-use`는 `stablyai/orca` GitHub repo의 `skills/<name>/SKILL.md`에서 설치됐다.
+- **`orchestration/SKILL.md`는 discovery stub이다.** 본문이 "This file is a discovery stub, not the usage guide"라고 명시하며, 실제 사용 가이드는 `orca` 바이너리가 버전에 맞춰 서빙한다(`orca skills get orchestration --full`).
+- 이 패턴은 `/init-orchestrate` 설계에 그대로 참고할 수 있다. 버전 의존 계약을 skill 파일에 고정하지 않고 stub + 런타임 조회로 분리하는 방식이다.
+- `~/.claude/skills`는 존재하지 않는다. 이 환경의 skill 노출 경로가 Claude Code 기본 경로와 다르므로, `/init-orchestrate`를 어디에 두어야 coordinator 세션이 실제로 발견하는지는 배치 시점에 실측으로 확인해야 한다(OD-010).
+
+### 11.2 Orca가 모든 Claude 세션을 계측한다
+
+`~/.claude/settings.json`에 Orca가 설치한 hook이 등록돼 있다: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `SubagentStart`, `SubagentStop`, `TeammateIdle`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`.
+
+모두 `~/.orca/agent-hooks/claude-hook.cmd`를 호출하고, 이 스크립트는 localhost로 POST한다.
+
+```text
+POST http://127.0.0.1:%ORCA_AGENT_HOOK_PORT%/hook/claude
+  X-Orca-Agent-Hook-Token: %ORCA_AGENT_HOOK_TOKEN%
+  paneKey=%ORCA_PANE_KEY%   tabId=%ORCA_TAB_ID%
+  launchToken=%ORCA_AGENT_LAUNCH_TOKEN%   worktreeId=%ORCA_WORKTREE_ID%
+  payload@-   ← Claude Code hook payload를 stdin에서
+```
+
+`PermissionRequest` hook이 이미 등록돼 있다는 점은 후속 범위인 permission relay와 관련이 있으나 현재 범위는 아니다.
+
+### 11.3 ⭐ Run↔coordinator session↔repository 연결 (OD-020)
+
+Orca가 실행한 Claude 세션의 환경변수에 identity가 주입돼 있다.
+
+```text
+ORCA_TERMINAL_HANDLE = term_720b6c26-eb04-4a16-ab79-b226ac50c04f
+ORCA_PANE_KEY        = f39db44b-299d-4b10-930f-26bfda80d535:8c71884b-2c92-44ee-b010-17bbc3828abc
+ORCA_TAB_ID          = f39db44b-299d-4b10-930f-26bfda80d535
+ORCA_WORKTREE_ID     = ccb3c8ee-6d9e-42af-af36-9fdac6566fcc::D:/dev-infra
+ORCA_WORKSPACE_ID    = ccb3c8ee-6d9e-42af-af36-9fdac6566fcc::D:/dev-infra
+ORCA_AGENT_HOOK_PORT = 51594
+CLAUDE_CODE_SESSION_ID = 572e44ec-aa3c-4564-abbd-d83221dfd353
+```
+
+이 값들이 §8.7에서 관측한 Orca row 필드와 **정확히 일치한다.**
+
+| 환경변수 | 대응 Orca 필드 |
+|---|---|
+| `ORCA_TERMINAL_HANDLE` | Run row의 `coordinator_handle` |
+| `ORCA_PANE_KEY` | Run row의 `coordinator_pane_key`, Task row의 `created_by_pane_key` |
+| `ORCA_WORKTREE_ID` | Task row `created_by_process_incarnation`의 접두부 |
+
+따라서 연결 고리가 구체화된다.
+
+```text
+Orca Run.coordinator_handle / coordinator_pane_key
+   ↕ (동일 값)
+coordinator 세션의 ORCA_TERMINAL_HANDLE / ORCA_PANE_KEY
+   ↓
+ORCA_WORKTREE_ID = <workspaceUuid>::<로컬 경로>
+   ↓ Git remote
+GitHub repository
+```
+
+이는 [correlation 계약 §5](contracts/observation-and-correlation.md#5-run-repository-coordinator-연결)가 "TBD"로 둔 `live terminal 판정`과 `Run↔repository` 문제에 실측 근거를 제공한다. 다만 다음은 여전히 미해결이다.
+
+- 환경변수는 **주장이지 증명이 아니다.** 프로세스가 값을 위조할 수 있다. 신뢰 경계에서 어느 수준으로 취급할지 정해야 한다.
+- `ORCA_WORKTREE_ID`의 `<uuid>::<path>` 형식이 안정적 계약인지, worktree와 repository root를 구분할 수 있는지 미검증이다.
+- coordinator가 재시작하면 pane/terminal handle이 유지되는지 미검증이다.
+
+### 11.4 ⭐ MCP 서브프로세스가 identity를 상속한다 (OD-053)
+
+Channel Adapter는 Claude Code가 stdio로 spawn하는 MCP 서버다. 이 서브프로세스가 세션 identity를 볼 수 있는지 직접 시험했다. 서버 시작 시 환경변수를 로그에 남기고 `-p` 세션으로 실행한 결과다.
+
+```text
+ORCA_TERMINAL_HANDLE   = term_720b6c26-eb04-4a16-ab79-b226ac50c04f
+ORCA_PANE_KEY          = f39db44b-...:8c71884b-...
+ORCA_WORKTREE_ID       = ccb3c8ee-...::D:/dev-infra
+ORCA_TAB_ID            = f39db44b-...
+ORCA_AGENT_HOOK_PORT   = 51594
+CLAUDE_CODE_SESSION_ID = 61c1372d-2f33-48d1-96f4-c85388466519
+```
+
+**Adapter가 자신이 어느 Orca terminal/pane/worktree와 어느 Claude Code session에 속하는지 추가 배관 없이 알 수 있다.** [시스템 구조](architecture/orca-slack-bridge.md#channel-adapter)가 요구한 "각 Adapter는 daemon에 자신이 어느 Run/coordinator session에 binding됐는지 증명해야 한다"에 실현 경로가 생겼다.
+
+주의할 점 두 가지를 관측했다.
+
+1. **`CLAUDE_CODE_SESSION_ID`는 자기 세션 값으로 새로 설정된다.** 서브프로세스가 본 값(`61c1372d-...`)은 그것을 spawn한 `-p` 세션의 ID이며, 부모 세션(`572e44ec-...`)과 다르다. 세션 구분에 쓸 수 있다.
+2. **⚠️ `CLAUDE_PID`는 신뢰할 수 없다.** 서브프로세스가 본 값은 `23412`로, spawn한 세션이 아니라 **조상 세션의 PID**였다. 상속된 낡은 값이므로 session identity 판정에 쓰면 안 된다.
+
+또한 `ORCA_*` 값은 pane 단위이므로, coordinator pane 안에서 실행된 **자식 Claude 세션도 같은 `ORCA_PANE_KEY`를 상속한다.** Adapter가 "나는 coordinator 세션이다"와 "나는 coordinator pane 안의 자식 세션이다"를 `ORCA_*`만으로 구분할 수 없다. 구분에는 `CLAUDE_CODE_SESSION_ID`가 필요하며, 그 값과 Run의 매핑은 별도로 확립해야 한다.
