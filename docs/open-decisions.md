@@ -26,7 +26,7 @@
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
 | OD-010 | `/init-orchestrate` 패키징과 `/orchestration` 호출 계약 | AB 구현 전 | DECIDED |
-| OD-011 | authoritative spec 발견·우선순위 규칙 | AB 구현 전 | OPEN |
+| OD-011 | authoritative spec 발견·우선순위 규칙 | AB 구현 전 | DECIDED |
 | OD-012 | fresh/resume 자동 판별 또는 명시 옵션 | AB 구현 전 | DECIDED |
 | OD-013 | `HANDOFF.md` 위치·schema·archive·atomic write | AB-1 전 | OPEN |
 | OD-014 | context 열화 신호와 threshold | AB-2 전 | DECIDED |
@@ -260,7 +260,8 @@ ID: OD-010
   - plugin marketplace 패키징: 배포 경로가 늘고 preview 제약이 있다. 단일 개인 호스트에는 이점이 없어 보류.
 영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §3, 향후 ~/.claude/skills/init-orchestrate/SKILL.md
 검증 방법: 두 skill home에 프로브 skill을 심고 헤드리스 세션에서 목록 조회(2026-08-22).
-          실제 `/init-orchestrate` 발견과 동작은 배치 후 새 세션에서 검증한다. 현재 미배치.
+          `~/.claude/skills/init-orchestrate/` 배치 후 새 세션 목록에서 발견됨을 확인(2026-08-22).
+          실제 부팅 동작은 첫 Run에서 검증한다.
 결정일: 2026-08-22
 ```
 
@@ -335,4 +336,28 @@ ID: OD-015
           실제 세션 생성·부팅 프롬프트 주입·ACK 왕복은 미실행.
 결정일: 2026-08-22
 후속: `run-use`가 `consumer_generation`을 증가시켜 fencing token이 되는지는 OD-016에서 확인한다.
+```
+
+```text
+ID: OD-011
+상태: DECIDED
+결정: `/init-orchestrate`는 repository별 문서 구조를 알지 못한다. 대상 repository의
+      **권위 선언 문서**(충돌 시 무엇이 우선하는지 스스로 밝힌 문서)를 찾아 그 선언을 그대로 따른다.
+      흔한 위치는 `docs/README.md`, `AGENTS.md`, `CONTRIBUTING.md`다.
+      권위 선언이 없으면 스펙을 추측해 고르지 않고 후보 목록을 제시해 사용자에게 묻는다.
+      적용한 스펙 경로와 작업 규약은 부팅 시 사용자에게 명시한다.
+근거:
+  - OD-010이 skill 본문에 repository 무관한 계약만 담기로 했으므로 발견 규칙도 특정 구조에 의존할 수 없다.
+  - 이 repository는 이미 `docs/README.md`의 문서 권위 절로 우선순위를 선언한다.
+    규칙이 그 선언을 읽게 하면 문서 구조가 바뀌어도 skill을 고칠 필요가 없다.
+  - 선언이 없는 repository에서 skill이 스펙을 고르면 그것이 곧 근거 없는 추측이며 작업 규약 위반이다.
+  - 부팅 시 적용 문서를 명시하면 이후 모든 판단의 근거를 사용자가 검증할 수 있다.
+대안과 기각 이유:
+  - 고정 경로 규약(`docs/specs/**` 등) 강제: repository마다 구조가 달라 유지 비용이 skill로 넘어온다. 기각.
+  - 파일명 휴리스틱으로 스펙 추정: 근거 없는 추측이며 조용히 틀린다. 기각.
+  - 매번 사용자에게 질의: 선언이 있는 repository에서 불필요한 왕복이다. 선언 부재 시 fallback으로만 둔다.
+영향 문서/파일: skills/init-orchestrate/SKILL.md §2, specs/orchestration-bootstrap-and-continuity.md §3.1
+검증 방법: skill 배치 후 새 세션 목록에서 발견 확인(2026-08-22).
+          실제 발견 규칙의 동작은 첫 Run에서 검증한다.
+결정일: 2026-08-22
 ```

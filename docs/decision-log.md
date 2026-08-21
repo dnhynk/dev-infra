@@ -127,4 +127,5 @@
 - 이 워크플로우는 호스트 설정에 의존하며, 머신을 옮기면 조용히 깨진다. 실제로 새 머신에서 세 항목이 깨져 있었다: Claude Code용 skill 미설치, git 커밋 identity 부재, `NVM_HOME`/`NVM_SYMLINK` 미정의로 인한 node 소실.
 - 이 항목들은 저장소 파일이 아니라 호스트 준비 절차로 다룬다(DL-015의 public 저장소 방침과 OD-005).
 - 확인 방법과 실패 모드는 [플랫폼 검증 §12.6](platform-capabilities.md#126-호스트-전제조건-머신-이전-시-재현-필요)에 기록했다.
+- `/init-orchestrate` skill 원본은 `skills/init-orchestrate/SKILL.md`에 두고 `~/.claude/skills/`로 설치한다. 홈 디렉터리에만 두면 다음 머신에서 같은 방식으로 사라진다.
 - node는 DL-014/OD-001대로 **26.x를 유지**한다. 관측 시점 호스트의 nvm 활성 버전이 24.19.0이었으나 26.7.0으로 되돌렸고, OD-001의 근거였던 `node:sqlite` 동작을 이 호스트에서 재확인했다(2026-08-22).
