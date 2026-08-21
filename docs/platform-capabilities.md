@@ -245,3 +245,93 @@ node -e "const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(
 ```
 
 의미: durable store 후보로 SQLite를 쓸 때 Windows에서 네이티브 모듈 컴파일 없이 런타임 내장 API를 쓸 수 있다. 다만 파일 기반 동작, WAL, 동시성, migration, locking은 아직 확인하지 않았으며 OD-043에서 확정한다.
+
+## 7. AB-0 / Size Gate 1차 관측 (2026-08-21)
+
+### 7.1 권위 있는 스키마 원본
+
+`orca agent-context --json`이 231개 명령의 machine-readable 스키마(`schemaVersion` v1)를 반환한다. 명령·flag를 기억이나 예시로 추측하지 말고 이 출력을 adapter 계약의 1차 자료로 쓴다. orchestration 하위에 29개 명령이 있다.
+
+```text
+ask, check, coordinator-start, dispatch, dispatch-show, gate-create, gate-list,
+gate-resolve, inbox, reply, reset, run-create, run-current, run-list, run-show,
+run-use, send, task-create, task-list, task-update, worker-abandon, worker-list,
+worker-read, worker-release, worker-retain, worker-show, worker-start, worker-stop
+```
+
+### 7.2 이전 기록에 없던 확인된 사실
+
+**Run을 binding하지 않고 조회하는 경로가 있다.**
+`task-list`, `gate-list`, `worker-list`, `check`가 `--run <run_id>`를 받는다. `gate-list`의 스키마 note는 "`--run` inspects a named Run without binding; otherwise gates are scoped to the caller"라고 명시한다. `--run` 없는 `gate-list`는 `run_required`를 반환하고 `data.effectsApplied: false`를 함께 준다. 즉 Observer는 `run-list` → 각 Run에 `--run` 명시 경로로 binding 없이 읽을 수 있다.
+
+**`--retry-request <id>` 멱등성 키가 CLI 표면에 존재한다.**
+`gate-create`, `gate-resolve`, `run-use`, `send`, `check`가 이 flag를 받는다. Bridge가 Slack action ID에서 파생한 안정적인 키를 넘기면 crash window에서의 중복 resolve를 플랫폼 수준에서 막을 수 있는 후보다. OD-051과 "같은 action이 Gate를 두 번 resolve하지 않는다" 불변조건에 직접 관련된다. 실제 중복 호출 동작은 아직 검증하지 않았다.
+
+**메시지 전달에 명시적 delivery/ack 의미가 있다.**
+`check`는 `--wait`(도착까지 block, 15초마다 stderr에 `_keepalive` JSON), `--peek`(읽음 표시 없이 미읽음만), `--all`(읽음 표시 없이 전체), `--ack <delivery_id>`를 가진다. 스키마 note: "A bound Run replays the same Delivery until `--ack`; process every message before acknowledging."
+
+> **설계 위험**: Bridge가 `--ack`를 호출하면 coordinator가 받아야 할 배치를 소비해 버린다. Observer는 `inbox` 또는 `check --peek/--all`만 쓰고 `--ack`를 절대 호출하지 않아야 한다. OD-023(ingestion 방식)은 이 제약 위에서 결정한다.
+
+**사람 대기 상태에 증거 기반 관측 필드가 있다.**
+`worker-show`의 `observation.agentWait`는 사람만 답할 수 있는 프롬프트에 멈춘 worker를 hook/prompt-text/title 중 무엇으로 판정했는지와 함께 보고한다. `null`은 "찾아봤고 없음", 필드 부재는 "보지 않았음"이며 부재를 "대기 아님"으로 해석하면 안 된다. OD-067 blocker taxonomy의 `permission pause` 항목에 쓸 수 있는 실제 source다.
+
+**terminal 상태와 Task 상태는 별개 축이다.**
+`worker-list --terminal-state`의 값은 `active|reclaimable|retained|release_pending|release_unknown|released`이며, note는 "process accounting"이고 "완료된 Task도 live terminal을 소유할 수 있다"고 명시한다. liveness 판정에 Task status를 대신 쓰면 안 된다.
+
+**`worker-read`는 source가 전환될 수 있다.**
+`--source auto|transcript|terminal`이고 cursor는 특정 source에 고정된다. Orca가 `source_changed`를 보고하면 새로 읽어야 한다. OD-025의 fallback 규칙은 이 전환을 포함해야 한다.
+
+**`coordinator-start`는 은퇴했다.**
+스키마 note가 "This command performs no effects"라고 명시한다. 즉 Orca CLI에는 successor coordinator 세션을 만드는 공식 명령이 없다. OD-015의 후보 하나가 제거됐고, 세션 생성 수단은 `orca-cli` 계열 terminal/worktree 표면에서 따로 확인해야 한다.
+
+**`run-use --takeover-legacy`가 인수 경로 후보다.**
+note: "must run in the live coordinator agent terminal it binds; it preserves existing worker assignments." OD-016(single-writer·권한 이관)에 직접 관련된 실제 메커니즘이다. 다만 "live coordinator terminal에서 실행"이 전제라 predecessor fencing과 어떻게 결합되는지는 미검증이다.
+
+**`worker_done`은 3문장 body만 나르지 않는다.**
+`send`는 `--outcome succeeded|failed`를 `worker_done`에 요구하고 `--task-id`, `--dispatch-id`, `--files-modified <csv>`, `--report-path <path>`, `--phase`, `--payload <json>`을 지원한다. OD-029(PR identity를 어디에 실을지)의 후보 carrier가 body 텍스트 말고도 존재한다는 뜻이다.
+
+**응답 envelope 형태.**
+
+```text
+성공: { "id": <uuid>, "ok": true,  "result": {...}, "_meta": { "runtimeId": <uuid> } }
+실패: { "id": <uuid>, "ok": false, "error": { "code", "message",
+        "data": { "effectsApplied": false, "nextCommandArgs": [...], "nextSteps": [...] } } }
+```
+
+`effectsApplied`는 실패 시 mutation 여부를 판정할 수 있게 해준다.
+
+### 7.3 `run-list` row의 실제 필드
+
+```json
+{
+  "id": "run_legacy_local",
+  "objective": "Legacy orchestration state (inspect only)",
+  "home_database": "this_database",
+  "coordinator_handle": null,
+  "coordinator_pane_key": null,
+  "consumer_generation": 0,
+  "legacy": 1,
+  "created_at": "2026-08-21T11:34:41Z",
+  "updated_at": "2026-08-21T11:34:41Z"
+}
+```
+
+repository/worktree identity가 없다는 기존 기록이 확인됐다. 다만 `coordinator_handle`과 `coordinator_pane_key` 필드는 존재하므로, 값이 채워진 실제 Run에서 이 둘이 live terminal 판정에 쓸 수 있는지 다시 확인해야 한다(OD-020).
+
+### 7.4 현재 환경에 실데이터가 없다
+
+관측 시점 상태:
+
+```text
+run-list      → run_legacy_local 1건 (legacy: 1, "inspect only")
+worker-list   → workers: [], counts: {}
+inbox         → messages: [], count: 0
+gate-list  --run run_legacy_local → gates: [], count: 0
+task-list  --run run_legacy_local → tasks: [], count: 0, legacyReadOnly: true
+```
+
+즉 **Size Gate가 요구하는 실제 Run/Task/Worker/Gate/`worker_done` fixture는 관측만으로 확보할 수 없다.** 실제 orchestration Run을 한 번 돌려야 한다. Gate JSON schema가 여전히 미확보라는 기존 기록도 그대로 유효하다.
+
+### 7.5 Claude Code channel flag 재확인
+
+`claude 2.1.238 --help`에도 `--channels`와 `--dangerously-load-development-channels`가 노출되지 않는다(2.1.237 관측과 동일). `--mcp-config`, `--plugin-dir`, `--plugin-url`, `mcp`, `plugin` 서브커맨드는 존재한다. D3의 선행 smoke test 사유가 유지된다.
