@@ -48,10 +48,11 @@
 | OD-025 | `worker-read` fallback 조건과 최대 범위 | C1 전 | OPEN |
 | OD-026 | repository canonicalization, rename/fork/multiple remote | S0 전 | OPEN |
 | OD-027 | Project↔Repository cardinality, 등록 주체, 설정/DB mapping과 routing | S0 전 | OPEN |
-| OD-028 | reviewer verdict를 GitHub formal review와 Orca 중 어디에 durable하게 남길지 | C1/C2 전 | OPEN |
+| OD-028 | reviewer verdict를 GitHub formal review와 Orca 중 어디에 durable하게 남길지 | C1/C2 전 | DECIDED |
 | OD-029 | PR 생성과 `worker_done` 전송의 ordering 및 PR identity 포함 방식 | AB-1/S0 전 | OPEN |
 | OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
 | OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | OPEN |
+| OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | OPEN |
 
 ## PR state와 요약
 
@@ -199,3 +200,22 @@ ID: OD-003
 - **OD-037** (risk 산정 근거): `[blocker]`/`[major]`/`[minor]` 개수를 집계하면 risk를 LLM 추정이 아니라 사실로 산정할 수 있다. 규약이 전역화되는 것이 전제다.
 - **OD-032** (required/optional check와 merge-ready 정책): repository별 check 개수가 0~2개로 제각각이고 CI가 아예 없는 repo도 있다. merge-ready 판정에 CI 통과를 무조건 전제할 수 없다.
 - **OD-021** (PR correlation metadata): `vertical-live` PR body에 `## Task`/`T-ID` 규약이 이미 있으나 Orca Run/Task/Dispatch ID는 없다. 새 metadata를 기존 규약과 공존시키는 형식을 정해야 한다.
+
+```text
+ID: OD-028
+상태: DECIDED
+결정: reviewer verdict의 durable source는 Orca다. reviewer가 coordinator에게 반환한 결과를 Orca에 구조화해 기록하고, Bridge는 GitHub review 본문이 아니라 Orca를 읽는다.
+근거:
+  - 사용자 repository 4곳 전부에서 GitHub `reviewDecision`이 null이다.
+  - PR author와 review author가 같은 계정이라 GitHub이 self-approve를 막으므로 현재 workflow에서 formal verdict는 원리적으로 불가능하다.
+  - `orca orchestration task-update --result <json>`이 중첩 객체·배열을 손실 없이 보존함을 실측으로 확인했다.
+  - Gate도 이미 Orca에서 읽으므로 orchestration 사실의 source가 하나로 모인다.
+  - GitHub review 본문은 신뢰 경계상 untrusted content이며, 이를 상태 source로 삼으면 형식이 깨질 때 fallback이 필요하다.
+대안과 기각 이유:
+  - reviewer용 별도 GitHub 계정/PAT: `reviewDecision`이 살아나고 GitHub 의미론과 정확히 일치하지만, 계정·토큰 관리가 늘고 모든 repository 설정을 바꿔야 한다. 기각.
+  - review 본문 규약(`## Verdict:`) 전역화 후 파싱: 기존 자산을 쓸 수 있으나 untrusted 본문을 상태 source로 삼는 문제가 남는다. 표시용 보조 사실로만 활용한다.
+영향 문서/파일: contracts/observation-and-correlation.md §6, specs/orca-slack-bridge.md §5, specs/orchestration-bootstrap-and-continuity.md §4, architecture/orca-slack-bridge.md
+검증 방법: throwaway Run에서 task-update --result 왕복 실측(2026-08-22). 실제 reviewer 경로 통합은 AB-1/C1에서 검증한다.
+결정일: 2026-08-22
+후속: 기록 형식·필드·enum·작성 주체와 task status 전이 규칙은 OD-073에서 AB workstream과 함께 확정한다.
+```

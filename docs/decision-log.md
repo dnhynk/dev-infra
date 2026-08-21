@@ -100,3 +100,13 @@
   - Size Gate에서 수집하는 Orca/GitHub/Slack fixture는 커밋 전에 redaction 규칙을 먼저 확정한다 (OD-018, OD-036, OD-064).
   - Slack workspace/channel/owner user ID와 Project↔Repository mapping은 공개 저장소 파일이 아니라 로컬 설정으로 다룬다 (OD-027, OD-042).
 - 근거: 사용자가 public을 명시적으로 선택했다. 비공개 정보는 저장소가 아니라 주입 경로로 분리해 해결한다.
+
+## 2026-08-22 · reviewer verdict source
+
+### DL-016 · reviewer verdict는 Orca에 기록한다
+
+- Bridge가 읽을 reviewer verdict의 durable source는 GitHub formal review가 아니라 Orca다.
+- 근거: 사용자 repository 4곳 전부 `reviewDecision`이 null이고, PR author와 review author가 같은 계정이라 GitHub이 self-approve를 막는다. 현재 workflow에서 formal verdict는 원리적으로 남길 수 없다.
+- `task-update --result`가 중첩 JSON을 손실 없이 보존함을 실측으로 확인했다.
+- GitHub review 본문의 `## Verdict` / `## Gates` / `## Findings` 규약은 표시용 보조 사실로만 쓰고 상태 source로 삼지 않는다.
+- 기록 형식과 작성 주체는 AB workstream에서 `/init-orchestrate`의 reviewer 계약과 함께 확정한다 (OD-073).

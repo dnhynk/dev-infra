@@ -670,3 +670,35 @@ push가 tool 호출보다 5초 이상 앞섰는데도 이벤트가 도달하지 
 check 개수는 repo마다 0~2개로 제각각이고 `toss_trade`는 CI가 아예 없다. 따라서 [merge-ready 정책](contracts/observation-and-correlation.md#6-pr-canonical-state)은 "required check 통과"를 전제할 수 없고 repository별 설정을 읽거나 정책을 명시해야 한다(OD-032).
 
 merged PR에서 `mergeable`과 `mergeStateStatus`는 `UNKNOWN`으로 반환됐고 `mergedAt`, `mergeCommit.oid`는 정상이었다. terminal state 판정은 `state`/`mergedAt`을 쓰고 `mergeable` 계열은 open PR에서만 의미를 갖는 것으로 보인다. 이 항목은 open PR 표본으로 재확인이 필요하다.
+
+### 10.5 Orca `task-update --result`가 구조화 결과를 보존한다 (실측)
+
+OD-028을 "Orca에 구조화 기록"으로 정하기 전에 실제 저장 가능 여부를 확인했다. throwaway Run의 task에 중첩 JSON을 넣고 다시 읽었다.
+
+```text
+orca orchestration task-update --run run_a48566be983b --id task_cd1991c049a8 \
+  --status completed --result '{"kind":"reviewer_result","verdict":"request_changes",
+  "pr":{"repo":"dnhynk/vertical-live","number":31},
+  "findings":[{"severity":"blocker","file":"...","line":750},{"severity":"minor",...}],
+  "gates":{"lint":"pass","test":"pass"}}' --json
+```
+
+읽기 결과:
+
+```text
+status      : completed
+result 타입 : string          ← deps, options와 같이 JSON 문자열로 저장된다
+파싱 성공   : verdict = request_changes
+중첩 보존   : pr = {"repo":"dnhynk/vertical-live","number":31}
+배열 보존   : findings = 2건, blocker/minor
+객체 보존   : gates = {"lint":"pass","test":"pass"}
+```
+
+임의 중첩 객체와 배열이 손실 없이 왕복된다. **reviewer verdict를 Orca에 durable하게 남길 자리가 실제로 존재한다.**
+
+주의할 점:
+
+- `result`는 파싱된 객체가 아니라 **JSON 문자열**로 반환된다. adapter가 `deps`, `options`와 동일하게 처리해야 한다.
+- `task-update`는 `--status`를 요구하므로 결과 기록과 상태 전이가 한 호출에 묶인다. reviewer 결과를 남기면서 task를 어떤 status로 둘지 함께 정해야 한다.
+- `--result`는 스키마 검증을 하지 않는다. 형식 계약은 Bridge와 AB workstream이 정의하고 읽는 쪽에서 검증해야 한다.
+- 이 실측은 저장 가능성만 확인한 것이고, 실제 필드·enum·작성 주체는 확정하지 않았다.
