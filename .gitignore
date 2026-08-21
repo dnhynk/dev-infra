@@ -1,0 +1,25 @@
+# 런타임/도구 미확정 상태의 공통 최소 무시 규칙 (OD-001~003 확정 시 갱신)
+node_modules/
+dist/
+build/
+.venv/
+__pycache__/
+
+# secret과 로컬 설정
+.env
+.env.*
+!.env.example
+*.local.json
+
+# 로컬 durable store (OD-043 확정 전 임시)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# OS/편집기
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

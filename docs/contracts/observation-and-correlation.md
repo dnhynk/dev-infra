@@ -1,0 +1,228 @@
+# Orchestration 관찰·상관관계 계약
+
+상태: **Draft · 일부 형식 TBD**
+
+이 문서는 `/init-orchestrate`, worker, coordinator, Orca, GitHub, Bridge 사이에서 관찰 가능해야 하는 의미를 정의한다. 구현자가 ID 연결을 추측하지 않게 하는 것이 목적이다.
+
+## 1. Entity identity
+
+Bridge가 구분해야 하는 기본 entity:
+
+- Project: 사람이 인식하는 제품/프로젝트 이름
+- Repository: GitHub의 canonical owner/name
+- Orca Run
+- Orca Task
+- Orca Dispatch
+- Orca Worker
+- Orca Gate
+- GitHub Pull Request
+- coordinator session/terminal
+- Slack PR root message
+- Slack Run root message
+
+같은 이름, 여러 Git remote, fork, repository rename, 여러 Run이 같은 repository에서 동작하는 경우의 canonicalization은 TBD다.
+
+Project↔Repository 관계도 아직 확정하지 않았다. 최소한 설정 또는 durable store가 사람이 보는 Project identity와 GitHub repository identity를 연결하고 Slack routing에 제공해야 한다. cardinality, 자동 발견 시 생성 규칙, rename 처리, 수동 등록 주체는 TBD다.
+
+## 2. PR correlation metadata
+
+사용자가 제시한 최소 후보는 PR body의 HTML comment다.
+
+```html
+<!-- orca-run: run_abc -->
+<!-- orca-task: task_xyz -->
+<!-- orca-dispatch: dispatch_123 -->
+```
+
+목표 연결:
+
+```text
+canonical repository + PR number
+  → Orca Run
+  → Task
+  → Dispatch/Worker
+  → worker_done
+  → 필요 시 제한된 transcript
+```
+
+이 형식은 화면에 거의 영향을 주지 않는 correlation ID라는 방향만 확정됐다. 다음은 구현 전에 결정한다.
+
+- 최종 key 이름과 문법
+- 필수/선택 필드
+- PR 하나와 Task/Dispatch의 cardinality
+- metadata를 작성하는 주체
+- `/init-orchestrate`가 worker PR 규칙을 주입하는 방법
+- metadata 누락 시 숨김·uncorrelated 표시·수동 연결 중 어떤 동작을 할지
+- metadata 불일치 또는 변조를 검증할지와 검증 강도
+- 수정된 PR body와 최초 correlation 사이의 우선순위
+
+Bridge는 metadata가 없거나 모순될 때 branch 이름이나 PR 제목만으로 조용히 확정하지 않는다. 신뢰·검증·fallback 정책은 미결정 장부에서 확정한다.
+
+## 3. Worker 완료 계약
+
+- worker는 배정된 Dispatch 완료 시 `worker_done`을 정확히 한 번 보낸다.
+- body는 장문 transcript가 아니라 정확히 세 문장이다.
+  - 첫 문장: 무엇을 했는가
+  - 둘째 문장: 무엇을 발견했는가
+  - 셋째 문장: 무엇이 남았는가
+- PR URL 또는 PR identity를 body에 포함할지, metadata만으로 연결할지는 TBD다.
+- PR 생성과 `worker_done` 전송의 strict ordering은 TBD이며, Bridge는 확정 전까지 event arrival order를 가정하지 않는다.
+- `worker_done`이 누락·중복·불완전할 때의 상태와 recovery는 `OD-070`에서 확정한다.
+- worker가 release된 뒤에도 필요하면 `worker-read`로 결과를 확인할 수 있다는 Orca capability를 활용할 수 있다.
+
+`worker-read`는 기본 요약 pipeline이 아니다. fallback을 허용하는 최소 부족 조건, 읽을 최대 범위, secret redaction, 외부 LLM 전송 허용 여부를 먼저 정해야 한다.
+
+## 4. Gate 생성 계약
+
+질문의 승격 경계:
+
+```text
+Worker ask/escalation
+  → Coordinator가 spec/code/live state/공인 자료로 판단 가능
+      → Worker reply
+  → Coordinator도 owner 판단 없이는 결정 불가
+      → 해당 Task에 연결된 Orca Gate 생성
+```
+
+- worker의 모든 질문이 Gate가 되는 것은 아니다.
+- 사람에게 올릴 Gate는 coordinator가 생성한다.
+- Bridge는 일반 ask/reply를 Slack에 표시하지 않고 open Gate만 관찰한다.
+- ask/escalation과 Gate의 correlation, Gate 생성 command/payload는 실제 Orca sample을 확인한 뒤 확정한다.
+
+Slack Gate 카드에는 다음 의미가 필요하다.
+
+- 질문
+- 선택지와 각 선택지 설명
+- coordinator 권장안
+- 권장 이유
+- 결정 영향
+- 이 Gate에 의존해 대기하는 Task
+- 독립적으로 계속할 수 있는 Task
+
+현재 Orca Gate schema가 이 의미를 모두 직접 제공하는지는 검증되지 않았다. 부족한 정보가 있다면 다음 중 어떤 방식으로 표현할지 빌드 중 확정한다.
+
+- Gate 필드 확장
+- 구조화된 Gate metadata
+- Task/Run 상태에서 파생
+- Bridge가 표시 가능한 축소 UI
+
+Bridge가 coordinator의 장문 reasoning을 수집해 임의로 권장안이나 영향을 만들어내서는 안 된다.
+
+## 5. Run↔repository↔coordinator 연결
+
+자동 발견에는 최소한 다음 연결이 필요하다.
+
+```text
+Orca Run
+  → coordinator handle/session
+  → live terminal 또는 Run에 속한 Worker resource
+  → worktree/folder/repository
+  → Git remote
+  → GitHub repository
+```
+
+Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator inbox다. Bridge가 Run 하나를 repository 하나에 제한할지, 여러 repository를 허용할지는 지원 정책으로 정해야 한다. 로컬 Orca 1.4.179 관측상 `run-list` row만으로 repository/worktree와 실제 coordinator liveness를 판정할 수 없다. global `worker-list`의 `runId`와 `resource.worktreeId`를 통해 일부 Run의 repository 후보를 복구할 수 있지만 historical/released worker도 포함되므로 liveness 증거는 아니며 worker가 없는 Run에는 적용되지 않는다. 따라서 다음이 TBD다.
+
+- live terminal을 authoritative하게 판정하는 방법
+- coordinator 재시작 후 같은 Run과 새 session을 연결하는 방법
+- 여러 live Run이 같은 repository를 사용할 때 routing
+- stale run/coordinator handle 처리
+- 자동 발견 실패 시 수동 등록 형식
+
+## 6. PR canonical state
+
+review verdict의 durable source도 먼저 정해야 한다. reviewer가 coordinator에게만 결과를 반환하고 GitHub formal review를 남기지 않으면 GitHub만 관찰하는 Bridge는 approval/changes-requested를 볼 수 없다. GitHub formal review를 의무화할지, 구조화된 Orca reviewer 결과를 추가 source로 삼을지는 TBD다.
+
+다음은 사용자에게 보여줄 의미 상태 후보이며 최종 enum이 아니다.
+
+| 의미 | 필요한 source fact 후보 |
+|---|---|
+| 구현 완료·리뷰 진행 중 | PR 존재 + worker 완료 + review 미완료 |
+| 리뷰에서 수정 필요 | 유효한 changes-requested verdict |
+| 수정 후 재검토 중 | changes requested 이후 새 head + 재검토 상태 |
+| 리뷰 통과 | 현재 head에 대해 요구되는 review 조건 충족 |
+| CI 통과 | 현재 head의 required checks 충족 |
+| 병합 준비 완료 | draft 아님 + review/CI/merge 조건 충족 |
+| 병합 완료 | GitHub merged fact |
+
+정식 상태 전이 전에 다음을 결정한다.
+
+- 여러 reviewer의 상충 verdict
+- 새 commit 이후 이전 approval 유효성
+- required/optional check
+- failed, cancelled, skipped, neutral, pending 처리
+- draft PR과 ready-for-review
+- merge conflict와 merge queue
+- reopened와 closed-without-merge
+- force-push로 사라진 head의 transition
+
+`Merge Ready`는 GitHub 단일 필드가 아니라 명시적으로 정의할 derived state다.
+
+## 7. Run progress
+
+Run 카드의 `완료/전체` 진행률에 포함할 Task 집합이 필요하다.
+
+미결정 항목:
+
+- 동적으로 추가된 Task
+- cancelled/failed Task
+- retry된 Task
+- 한 Task의 여러 Dispatch
+- Gate에 blocked된 Task와 dependency waiting Task
+- 완료 뒤 다시 열린 Task
+
+숫자가 Orca source와 어떤 규칙으로 일치하는지 `OD-069`에서 확정하기 전에는 진행률을 “정확하다”고 주장하지 않는다.
+
+### Blocker taxonomy
+
+`blocker`, `open Gate`, `blocked Task`, `waiting dependency`, `worker ask`, `CI failure`, `permission pause`는 같은 개념이 아니다. `#agent-runs`의 blocker 수에 무엇을 포함하고 각각을 어떻게 표시할지는 TBD다. 최소한 사람 결정용 open Gate와 그 Gate 때문에 대기하는 Task 수를 서로 다른 값으로 구분할 수 있어야 한다.
+
+## 8. 중요한 transition과 중복 제거
+
+thread에는 raw event가 아니라 semantic transition을 기록한다.
+
+PR 후보:
+
+- PR 생성
+- review에서 문제 발견
+- 수정 완료 및 재검토
+- review 통과
+- CI 핵심 실패 또는 통과
+- merge 완료
+
+Run/Gate 후보:
+
+- Run 시작
+- Gate 생성
+- owner 결정이 Orca에 기록됨
+- coordinator notification pending/attempted
+- dependent Task 재개 관찰
+- Run 완료
+
+같은 snapshot을 반복 관찰해도 동일 transition을 다시 만들지 않아야 한다. event key, state version, source timestamp, out-of-order 우선순위는 TBD다.
+
+## 9. Source conflict 규칙
+
+확정된 우선순위:
+
+- Gate 상태·resolution: Orca
+- PR/review/check/merge: GitHub
+- Slack message identity와 delivery bookkeeping: Bridge durable store
+- 제품 의미와 운영 규약: accepted spec
+
+PR metadata가 Orca live state와 모순되면 자동으로 어느 한쪽을 덮어쓰지 않는다. 모순을 명시적 correlation error로 취급하고 해결 정책을 적용한다.
+
+## 10. 계약 확정 전 검증 자료
+
+구현 전에 실제 대상 버전에서 다음 fixture 또는 snapshot이 필요하다.
+
+- 최소 한 개 Run의 run/task/worker JSON
+- `worker_done`이 있는 worker와 release된 worker 사례
+- open/resolved Gate JSON
+- 여러 reviewer와 새 commit이 있는 PR
+- required/optional check 조합
+- merge conflict, draft, merged PR
+- live coordinator와 stale coordinator handle
+- correlation metadata 정상·누락·불일치 사례
+
+민감 정보는 redaction하고, 실제 schema를 확인하기 전에는 기억이나 예시 필드로 adapter를 구현하지 않는다.
