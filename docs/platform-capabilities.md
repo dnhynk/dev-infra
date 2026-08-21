@@ -590,3 +590,83 @@ push가 tool 호출보다 5초 이상 앞섰는데도 이벤트가 도달하지 
 
 - 이 결과는 preview 기능에 대한 특정 버전 관측이다. release 전 재확인 대상이다.
 - 장시간 세션에서의 안정성, 세션 재시작 시 pending 이벤트 처리, 여러 coordinator 세션에 대한 라우팅은 D3 구현 중에 검증한다.
+
+## 10. GitHub PR 실측 (2026-08-22)
+
+사용자의 실제 repository 4곳(`vertical-live` public, `ToneAndMove`, `toss_trade`, `PostFeel` private)의 PR을 read-only로 조사했다. 지금까지 문서가 "TBD"로 두었던 review verdict source 문제에 측정된 답이 나왔다.
+
+### 10.1 ⚠️ `reviewDecision`은 모든 repository에서 null이다
+
+| repository | PR 수 | GitHub review | `reviewDecision` | CI check |
+|---|---|---|---|---|
+| `vertical-live` | 31 | 있음 (전부 `COMMENTED`) | **null** | 1 |
+| `ToneAndMove` | 36 | **0건** | null | 2 |
+| `toss_trade` | 49 | **0건** | null | 0 |
+| `PostFeel` | 22 | **0건** | null | 1 |
+
+`vertical-live`의 31개 PR을 표본 조사한 결과 review state는 예외 없이 `COMMENTED`였고 `APPROVED`나 `CHANGES_REQUESTED`는 한 건도 없었다. GitHub은 이 두 state에서만 `reviewDecision`을 설정하므로 값이 항상 비어 있다.
+
+원인은 구조적이다. **PR author와 review author가 같은 계정(`dnhynk`)이다.** GitHub은 자기 PR을 스스로 approve할 수 없게 막으므로, 단일 계정으로 운영하는 현재 workflow에서는 formal verdict를 남기는 것이 애초에 불가능하다.
+
+**결론: 현재 workflow에서 GitHub만 관찰하는 Bridge는 approve/changes-requested를 볼 수 없다.** [Bridge 스펙 5.1](specs/orca-slack-bridge.md#51-관심-lifecycle)의 `리뷰에서 수정 필요`, `리뷰 통과`와 [PR canonical state](contracts/observation-and-correlation.md#6-pr-canonical-state)의 해당 상태들은 지금 관찰 가능한 source가 없다. OD-028은 "어느 쪽을 계약으로 삼을지"가 아니라 "workflow를 바꿔야 한다"는 문제다.
+
+### 10.2 review 본문에 구조화된 verdict 규약이 이미 존재한다 (단, repo 국소)
+
+`vertical-live`의 review 본문은 다음 형태를 따른다.
+
+```text
+## Verdict: request_changes        ← 또는 approve
+
+## Gates (executed by reviewer)
+| gate | result | evidence |
+|---|---|---|
+| format:check | pass | `npm.cmd run format:check` exit 0 — ... |
+| lint         | pass | eslint 0, ... |
+| typecheck    | pass | tsc --build ... |
+| test         | pass | 146 files passed, 2,091 passed / 1 skipped / 0 failed |
+| build        | pass | ... |
+
+## Acceptance criteria
+...
+
+## Findings
+- [blocker] apps/server/src/engine/engine.ts:750 — ...
+- [major]   apps/server/src/engine/engine.ts:693 — ...
+- [minor]   docs/tasks/TASK-T8e-clock-jump-flaky.md:157 — ...
+```
+
+`vertical-live` 표본에서 `## Verdict: request_changes` 12건, `## Verdict: approve` 4건이 확인됐다. **그러나 나머지 세 repository에는 GitHub review 자체가 없으므로 이 규약은 전역 계약이 아니라 해당 repo의 국소 관행이다.**
+
+이 형식이 Bridge 설계에 주는 것:
+
+- **verdict**: `## Verdict:` 라인이 `approve`/`request_changes`를 명시한다.
+- **severity taxonomy**: `[blocker]`/`[major]`/`[minor]`가 이미 존재한다. OD-037의 risk를 LLM 추정이 아니라 **집계된 사실**로 산정할 수 있는 근거다.
+- **핵심 comment 선택 규칙(OD-033)**: `## Findings`의 `[blocker]` 항목이 자연스러운 추출 대상이다. 본문 전체(3~7KB)를 요약 입력으로 넣을 필요가 없다.
+- **검증 사실**: `## Gates` 표가 실행 명령과 출력 근거를 담고 있어, Slack 카드의 `검증` 필드를 "source fact가 있을 때만 표시한다"는 원칙대로 채울 수 있다.
+
+단 이 본문은 [신뢰 경계](architecture/orca-slack-bridge.md#8-신뢰-경계)상 untrusted content다. 파싱해 표시할 수는 있어도 instruction으로 신뢰하면 안 되며, 형식이 깨졌을 때의 fallback이 필요하다.
+
+### 10.3 PR body에도 구조화된 규약이 있으나 Orca correlation ID는 없다
+
+`vertical-live` PR body(약 15KB)는 `## Task`(`T-ID`, ticket 경로), `## Why`, `## What` 구조를 따른다. 즉 사람이 정한 task 식별자는 이미 있지만 **Orca Run/Task/Dispatch ID는 없다.** [correlation 계약 §2](contracts/observation-and-correlation.md#2-pr-correlation-metadata)가 제안한 HTML comment metadata는 여전히 추가해야 하며, 기존 `## Task` 규약과 어떻게 공존시킬지 함께 정해야 한다(OD-021).
+
+### 10.4 CI와 merge 상태
+
+`statusCheckRollup` 원소 형태:
+
+```json
+{
+  "__typename": "CheckRun",
+  "name": "ci",
+  "workflowName": "CI",
+  "status": "COMPLETED",
+  "conclusion": "SUCCESS",
+  "startedAt": "2026-08-19T21:44:32Z",
+  "completedAt": "2026-08-19T21:46:37Z",
+  "detailsUrl": "https://github.com/.../actions/runs/.../job/..."
+}
+```
+
+check 개수는 repo마다 0~2개로 제각각이고 `toss_trade`는 CI가 아예 없다. 따라서 [merge-ready 정책](contracts/observation-and-correlation.md#6-pr-canonical-state)은 "required check 통과"를 전제할 수 없고 repository별 설정을 읽거나 정책을 명시해야 한다(OD-032).
+
+merged PR에서 `mergeable`과 `mergeStateStatus`는 `UNKNOWN`으로 반환됐고 `mergedAt`, `mergeCommit.oid`는 정상이었다. terminal state 판정은 `state`/`mergedAt`을 쓰고 `mergeable` 계열은 open PR에서만 의미를 갖는 것으로 보인다. 이 항목은 open PR 표본으로 재확인이 필요하다.
