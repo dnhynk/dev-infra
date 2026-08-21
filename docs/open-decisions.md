@@ -31,7 +31,7 @@
 | OD-013 | `HANDOFF.md` 위치·schema·archive·atomic write | AB-1 전 | OPEN |
 | OD-014 | context 열화 신호와 threshold | AB-2 전 | DECIDED |
 | OD-015 | successor 세션 생성·부팅·ACK 공식 수단 | AB-2 전 | DECIDED |
-| OD-016 | coordinator single-writer와 권한 이관 | AB-2 전 | OPEN |
+| OD-016 | coordinator single-writer와 권한 이관 | AB-2 전 | DECIDED |
 | OD-017 | `sol high fast`의 실제 model/effort/tier mapping | reviewer dispatch 전 | DECIDED |
 | OD-074 | supervised worker 경로에서 service tier를 지정할 수단 | reviewer dispatch 전 | OPEN |
 | OD-018 | handoff redaction과 transcript 포함 범위 | AB-1 전 | OPEN |
@@ -341,10 +341,11 @@ ID: OD-015
   - 외부 프로세스로 `claude` 직접 spawn: Orca가 관리하지 않는 터미널이므로 `takeover-legacy`의
     "live coordinator agent terminal" 전제를 만족한다는 증거가 없다. 기각.
 영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §6, OD-016(권한 이관 절차)
-검증 방법: `orca agent-context --json`에서 명령 스키마와 note 확인(2026-08-22).
-          실제 세션 생성·부팅 프롬프트 주입·ACK 왕복은 미실행.
+검증 방법: throwaway Run `run_ebd0bb4592d2`에서 생성→준비 확인→주입→제출 확인→인수까지
+          실제로 완주(2026-08-22). `--worktree current` 셀렉터가 유효함을 확인했다.
+          제출 확인이 셸 경로 변환으로 `/init-orchestrate`가 치환된 것을 잡아냈다.
 결정일: 2026-08-22
-후속: `run-use`가 `consumer_generation`을 증가시켜 fencing token이 되는지는 OD-016에서 확인한다.
+후속: fencing 판정은 OD-016에서 닫았다.
 ```
 
 ```text
@@ -431,4 +432,36 @@ ID: OD-027
 영향 문서/파일: apps/orca-slack-bridge의 project 모듈, config 예시 파일
 검증 방법: S0 snapshot이 설정에 없는 repository를 `repo_unmapped`로 보고하는지 확인한다.
 결정일: 2026-08-22
+```
+
+```text
+ID: OD-016
+상태: DECIDED
+결정: 승계는 predecessor의 자기 fence가 successor 생성보다 먼저 일어나는 순서로 보장한다.
+      successor는 자기 terminal에서 `orca orchestration run-use --id <run_id>`를 실행해 인수한다.
+      `--takeover-legacy`는 플랫폼이 자동 채택한 legacy Run 전용이며 일반 Run에는 거부된다.
+      인수 여부의 판정 근거는 Run row의 `consumer_generation`이다. 값이 올라가면 이전 coordinator는
+      밀려난 것이다.
+근거:
+  - throwaway Run `run_ebd0bb4592d2`로 실제 승계를 완주하며 관측했다(2026-08-22).
+      coordinator_handle   term_ea1ab528... → term_e9b76901...
+      coordinator_pane_key d6bf920b:579f6115 → 4b2cc0a8:bcb81716
+      consumer_generation  1 → 2
+  - `--takeover-legacy`는 같은 Run에서 거부됐다.
+      `{"ok":false,"error":{"code":"invalid_argument",
+        "message":"Legacy takeover is only available for the automatically adopted Run."}}`
+    successor가 "bash 서브셸이 terminal identity를 못 가진다"는 가설을 먼저 세웠다가
+    환경에 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`가 정상 존재함을 확인해 반증했고,
+    실제 원인이 Run의 `legacy: 0`임을 밝혔다.
+  - 시간적 배제로 single-writer를 보장한다. predecessor가 successor를 만들기 전에 스스로
+    신규 dispatch·merge를 멈추므로 두 coordinator의 mutation 구간이 겹치지 않는다.
+대안과 기각 이유:
+  - 잠금 파일이나 별도 lease: Orca가 이미 generation으로 소유권을 표현하므로 두 번째 진실이 생긴다. 기각.
+  - predecessor가 successor 인수를 기다렸다가 종료: 인수 확인까지 살아 있어야 하므로 열화가
+    더 진행된다. 자기 fence가 먼저이면 기다릴 이유가 없다.
+영향 문서/파일: skills/init-orchestrate/SKILL.md §5·§11, specs/orchestration-bootstrap-and-continuity.md §6.2
+검증 방법: 위 실측(2026-08-22). predecessor가 generation 변화를 실제로 감지해 행동을 바꾸는
+          경로는 미구현이며 미검증이다.
+결정일: 2026-08-22
+후속: predecessor가 successor 생성과 인수 확인 사이에 죽는 구간은 DL-017대로 (D)의 daemon이 덮는다.
 ```

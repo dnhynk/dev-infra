@@ -90,7 +90,9 @@ handoff 문서만 읽고 바로 mutation하지 않는다.
 4. handoff snapshot과 live 상태의 차이를 식별한다.
 5. 차이는 live system을 기준으로 reconcile하고 그 사실을 기록한다.
 6. predecessor의 ownership 반납이 확인된 뒤에만 mutation 권한을 얻는다
-   (`orca orchestration run-use --id <run_id> --takeover-legacy`, 이 터미널에서 실행).
+   (`orca orchestration run-use --id <run_id>`, 이 터미널에서 실행). 인수되면 Run의
+   coordinator handle과 pane key가 이 터미널 값으로 바뀌고 consumer generation이 올라간다.
+   `--takeover-legacy`는 플랫폼이 자동 채택한 legacy Run 전용이며 일반 Run에는 거부된다.
 7. §7의 Run 마커를 이 세션 값으로 갱신한다. 갱신하지 않으면 monitor가 이 세션을 coordinator로 인식하지 못한다.
 8. 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은 PR을 중복 merge하지 않는다.
 9. 두 번 실패한 디버깅 접근을 다시 시도하지 않는다. handoff의 기각 기록을 확인한다.
@@ -232,7 +234,10 @@ rollover-monitor의 지시를 받거나 스스로 열화를 감지하면 다음 
    프롬프트가 보일 때까지 반복한다. 첫 실행 확인 대화(디렉터리 신뢰 여부 등)가 보이면 답하고
    다시 확인한다. **준비를 관측하기 전에는 부팅 프롬프트를 보내지 않는다.**
 5. **부팅 주입.** `orca terminal send --terminal <handle> --text "/init-orchestrate --resume <run_id>" --enter`
-   `--text`와 `--enter`를 한 호출로 보낸다.
+   `--text`와 `--enter`를 한 호출로 보낸다. **`/`로 시작하는 텍스트는 셸이 경로로 바꿔버릴 수
+   있다.** 실측에서 Git Bash가 `/init-orchestrate`를 `C:/Program Files/Git/init-orchestrate`로
+   치환했다. 경로 변환이 없는 셸에서 호출하거나 변환을 끄고, 6번에서 화면에 찍힌 문자열이 보낸
+   문자열과 같은지 확인한다.
 6. **제출 확인.** `terminal wait --for tui-idle` 뒤 `terminal read --screen`. 보낸 텍스트가 입력
    상자에 그대로 남아 있으면 제출되지 않은 것이다. `terminal send --enter`만 다시 보낸다.
    `--text`를 다시 보내면 중복 입력된다.
@@ -251,6 +256,7 @@ TUI 판정에 쓸 수 없다.
 - 같은 Run에 dispatch·merge 권한을 행사하는 coordinator가 동시에 둘이 되지 않는다.
   1번의 자기 fence가 3번보다 **먼저** 일어나야 이것이 보장된다.
 - successor는 reconciliation 전에 mutation하지 않는다.
+- predecessor는 Run의 consumer generation이 올라간 것으로 자신이 밀려났음을 확인할 수 있다.
 - 승계 도중 실패해도 handoff와 실제 Orca/Git 상태는 보존한다.
 - **자동 전환을 실제로 확인하지 못했으면 "자동 재개됨"이라고 보고하지 않는다.**
 

@@ -319,9 +319,23 @@ successor coordinator 승계에 필요한 네 동작이 모두 여기 있다.
 | 부팅 완료 대기 | `terminal wait --for tui-idle --timeout-ms <n>` |
 | 인수 확인 | `terminal read --terminal <handle> --screen` |
 
-`run-use --takeover-legacy`는 "must run in the live coordinator agent terminal it binds"를 요구하므로 위에서 만든 터미널이 그 조건을 만족한다.
-
 `terminal read`의 기본 읽기는 escape sequence가 제거된 누적 스트림이라 TUI 화면 판정에 부적합하다. ACK 확인에는 `--screen`을 쓴다.
+
+throwaway Run `run_ebd0bb4592d2`으로 승계를 완주하며 확인한 사실이다(2026-08-22).
+
+- `--worktree current`는 유효한 셀렉터다.
+- 응답 본문은 `result.terminal.tail[]`(줄 배열)과 `status`다. `--screen`이면 `source: screen`이 함께 온다.
+- `terminal send`는 `accepted`와 `bytesWritten`을 돌려준다. **둘 다 "무엇이 입력됐는지"를 보증하지 않는다.**
+- **인수 명령은 `run-use --id <run_id>`이며 `--takeover-legacy`가 아니다.** 후자는 플랫폼이 자동
+  채택한 legacy Run 전용이고 일반 Run(`legacy: 0`)에는 `invalid_argument`로 거부된다.
+  `"Legacy takeover is only available for the automatically adopted Run."`
+- 인수에 성공하면 Run row의 `coordinator_handle`·`coordinator_pane_key`가 새 터미널 값으로 바뀌고
+  **`consumer_generation`이 1 증가한다.** 이전 coordinator가 자신이 밀려났음을 판정할 수 있는 값이다.
+
+> ⚠️ **`--text`가 `/`로 시작하면 셸이 경로로 치환할 수 있다.** Git Bash에서 호출했을 때
+> `/init-orchestrate --resume <run>`이 터미널에 `C:/Program Files/Git/init-orchestrate --resume <run>`으로
+> 입력됐다. MSYS 경로 변환이다. `send`의 `accepted: true`와 `bytesWritten`은 이 손상을 알려주지 않으므로,
+> 보낸 뒤 `--screen`으로 화면에 찍힌 문자열을 대조하는 것이 유일한 탐지 수단이다.
 
 ## 3. Claude Code
 
