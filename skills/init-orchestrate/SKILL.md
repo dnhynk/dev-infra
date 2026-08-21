@@ -228,11 +228,23 @@ rollover-monitor의 지시를 받거나 스스로 열화를 감지하면 다음 
 2. **checkpoint.** handoff를 확정한다. 진행 중이던 외부 효과와 비멱등 작업, 미커밋 변경,
    두 번 실패한 접근, 다음 행동과 전제조건을 포함한다.
 3. **successor 생성.** `orca terminal create --worktree current --command "claude" --json`
-4. **부팅 주입.** `orca terminal send --terminal <handle> --text "/init-orchestrate --resume <run_id>" --enter`
-5. **부팅 대기.** `orca terminal wait --terminal <handle> --for tui-idle --timeout-ms <n>`
-6. **확인.** `orca terminal read --terminal <handle> --screen`
-   기본 읽기는 escape sequence가 제거된 누적 스트림이라 TUI 판정에 쓸 수 없다. `--screen`을 쓴다.
-7. **종료.** 이후 이 세션은 mutation하지 않는다.
+4. **준비 확인.** `terminal wait --for tui-idle` 뒤 `terminal read --screen`. 에이전트 입력
+   프롬프트가 보일 때까지 반복한다. 첫 실행 확인 대화(디렉터리 신뢰 여부 등)가 보이면 답하고
+   다시 확인한다. **준비를 관측하기 전에는 부팅 프롬프트를 보내지 않는다.**
+5. **부팅 주입.** `orca terminal send --terminal <handle> --text "/init-orchestrate --resume <run_id>" --enter`
+   `--text`와 `--enter`를 한 호출로 보낸다.
+6. **제출 확인.** `terminal wait --for tui-idle` 뒤 `terminal read --screen`. 보낸 텍스트가 입력
+   상자에 그대로 남아 있으면 제출되지 않은 것이다. `terminal send --enter`만 다시 보낸다.
+   `--text`를 다시 보내면 중복 입력된다.
+7. **인수 확인.** successor가 부팅해 Run을 인수했는지 화면으로 확인한다.
+8. **종료.** 이후 이 세션은 mutation하지 않는다.
+
+읽기는 항상 `--screen`을 쓴다. 기본 읽기는 escape sequence가 제거된 누적 스트림이라
+TUI 판정에 쓸 수 없다.
+
+4번과 6번은 coordinator가 직접 모는 모든 agent terminal에 적용한다. 각각 3회 안에 원하는
+상태를 관측하지 못하면 화면 내용을 그대로 붙여 사용자에게 올린다. 추측으로 키를 더 보내지
+않는다. 무인 운용에서 이 두 확인을 건너뛰면 상대 세션이 프롬프트 앞에 멈춘 채 영구 대기한다.
 
 불변조건:
 
