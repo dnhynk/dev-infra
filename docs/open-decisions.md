@@ -45,10 +45,10 @@
 | OD-021 | PR HTML metadata 최종 형식과 작성 주체 | AB-1/S0 전 | OPEN |
 | OD-022 | metadata 누락·불일치·변조 정책 | S0 전 | OPEN |
 | OD-023 | Orca polling/event/reconciliation 방식과 주기 | S0 전 | OPEN |
-| OD-024 | GitHub API와 `gh` adapter, 인증, 갱신 방식 | S0 전 | OPEN |
+| OD-024 | GitHub API와 `gh` adapter, 인증, 갱신 방식 | S0 전 | DECIDED |
 | OD-025 | `worker-read` fallback 조건과 최대 범위 | C1 전 | OPEN |
-| OD-026 | repository canonicalization, rename/fork/multiple remote | S0 전 | OPEN |
-| OD-027 | Project↔Repository cardinality, 등록 주체, 설정/DB mapping과 routing | S0 전 | OPEN |
+| OD-026 | repository canonicalization, rename/fork/multiple remote | S0 전 | DECIDED |
+| OD-027 | Project↔Repository cardinality, 등록 주체, 설정/DB mapping과 routing | S0 전 | DECIDED |
 | OD-028 | reviewer verdict를 GitHub formal review와 Orca 중 어디에 durable하게 남길지 | C1/C2 전 | DECIDED |
 | OD-029 | PR 생성과 `worker_done` 전송의 ordering 및 PR identity 포함 방식 | AB-1/S0 전 | OPEN |
 | OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
@@ -75,7 +75,7 @@
 | OD-040 | Slack App manifest, scopes, 채널 ID 설정 | C1/D2 전 | OPEN |
 | OD-041 | Socket Mode 최종 채택과 reconnect 정책 | 실제 Slack 통합 전 | OPEN |
 | OD-042 | owner/workspace allowlist 관리 | D2 전 | OPEN |
-| OD-043 | durable store 기술·경로·migration·locking | C1/D2 전 | OPEN |
+| OD-043 | durable store 기술·경로·migration·locking | C1 전 | OPEN |
 | OD-044 | event idempotency와 out-of-order 우선순위 | C2 전 | OPEN |
 | OD-045 | retention, backup, corruption recovery | 운영 자동화 전 | OPEN |
 | OD-046 | Slack message 삭제·archive·channel 변경 복구 | C2/D1 전 | OPEN |
@@ -376,4 +376,49 @@ ID: OD-017
 검증 방법: codex 설정과 models_cache 직접 조회(2026-08-22). 실제 dispatch 시 receipt의 launch.effective로 재확인한다.
 결정일: 2026-08-22
 후속: service tier는 worker-start로 표현할 수 없다. OD-074에서 다룬다.
+```
+
+```text
+ID: OD-024
+상태: DECIDED
+결정: GitHub 사실 조회는 `gh` CLI를 `--json`으로 호출한다. REST API와 토큰 직접 관리는 쓰지 않는다.
+근거:
+  - `gh`가 이미 인증돼 있고(scopes repo/workflow/read:org/gist) 자격증명이 Windows Credential Manager에 있다.
+  - 저장소가 public이므로 토큰을 저장소나 설정 파일에 두지 않는 편이 DL-015의 전제와 맞는다.
+  - `--json`이 필요한 필드만 선택해 반환하므로 응답 파싱이 좁아진다.
+대안과 기각 이유:
+  - REST + 토큰: 프로세스 spawn이 없어 빠르고 rate limit 제어가 쉬우나 토큰 주입·보관 경로(OD-005)를 먼저 닫아야 한다. 필요해지면 어댑터 경계에서 교체한다.
+영향 문서/파일: apps/orca-slack-bridge의 github 어댑터
+검증 방법: S0 live snapshot 실행으로 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-026
+상태: DECIDED
+결정: Repository의 canonical key는 GitHub의 숫자 `id`다. `owner/name`은 표시용이며 key로 쓰지 않는다.
+근거:
+  - repository rename과 owner 이전에도 숫자 id는 유지되므로 같은 repository를 같은 entity로 인식한다는 S0 출구 조건을 만족한다.
+  - fork는 별도 id를 가지므로 자동으로 구분된다.
+대안과 기각 이유:
+  - `owner/name` 문자열 key: rename 시 같은 repository가 새 entity로 갈라진다. 기각.
+  - Git remote URL: 여러 remote와 SSH/HTTPS 표기 차이로 정규화 부담이 크다. remote는 로컬 worktree에서 repository를 **찾는** 입력으로만 쓰고 key로 쓰지 않는다.
+영향 문서/파일: contracts/observation-and-correlation.md §1, identity 모듈
+검증 방법: fixture 테스트에서 rename 전후 동일 id가 동일 entity로 축약되는지 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-027
+상태: DECIDED (배치와 주체만. cardinality 세부는 S0 구현 중 확정)
+결정: Project↔Repository mapping은 저장소 밖 설정 파일에 둔다. 저장소에는 예시 파일만 커밋한다.
+근거:
+  - 저장소가 public이므로 Slack workspace/channel/owner ID와 project mapping을 저장소 파일로 두지 않는다(DL-015).
+  - 수동 등록이 D1 범위이고 자동 발견은 O1이므로, 설정 파일이 두 단계를 모두 수용한다.
+대안과 기각 이유:
+  - 저장소 내 파일 + secret만 분리: mapping 자체는 민감하지 않으나 channel/owner ID와 한 파일에 모이게 되어 경계가 흐려진다.
+  - Git remote에서 자동 파생: 사람이 보는 Project 이름을 표현할 수 없다. O1의 자동 발견 입력으로는 유효하다.
+영향 문서/파일: apps/orca-slack-bridge의 project 모듈, config 예시 파일
+검증 방법: S0 snapshot이 설정에 없는 repository를 `repo_unmapped`로 보고하는지 확인한다.
+결정일: 2026-08-22
 ```

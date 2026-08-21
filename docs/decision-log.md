@@ -140,3 +140,29 @@
 - 적용 여부는 요청값이 아니라 receipt의 `launch.effective`로 검증한다.
 - 배치가 다른 후속 Task에는 terminal을 재사용하지 않는다. `--model`/`--effort`가 `--terminal`과 결합 불가하기 때문이다.
 - 상세 정책은 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다.
+
+## 2026-08-22 · S0 설계 방향
+
+### DL-020 · S0는 durable store 없이 만든다
+
+- entity key를 전부 결정적으로 파생시킨다: Repository는 GitHub 숫자 `id`, Run/Task/Dispatch/Gate는 Orca 발행 id, PR은 `repoId + number`.
+- 따라서 "같은 입력을 반복해도 같은 entity로 인식됨"이라는 S0 출구 조건이 저장소 없이 성립한다.
+- durable store(OD-043)는 Slack message identity를 보관해야 하는 C1에서 도입한다.
+- 근거: 필요해지기 전에 저장소 기술·migration·locking을 정하지 않는다. 조기 일반화 금지.
+
+### DL-021 · correlation 결과는 합타입이고 uncorrelated는 정상 출력이다
+
+- 결과는 `correlated` / `uncorrelated(reason)` / `conflict(details)` 셋 중 하나다.
+- branch 이름이나 PR 제목으로 추측해 확정하지 않는다([관찰·상관관계 계약 §2](contracts/observation-and-correlation.md#2-pr-correlation-metadata)).
+- PR metadata 형식(OD-021)은 AB workstream이 소유하므로 S0에는 **설정으로 주입**한다. S0는 파서와 판정만 갖는다.
+- 결과적으로 S0의 correlation 동작은 연결된 PR이 하나도 없는 상태에서도 검증할 수 있다.
+
+### DL-022 · S0는 polling하지 않는다
+
+- 호출 1회 = read-only snapshot 1회다. polling·webhook·reconciliation 조합(OD-023)은 상태를 갱신해야 하는 C1/C2에서 정한다.
+- `orchestration check --ack`는 어떤 경우에도 호출하지 않는다. coordinator가 받아야 할 배치를 소비하기 때문이다.
+
+### DL-023 · fixture는 합성으로 만든다
+
+- 실측한 스키마 구조는 그대로 유지하되 값은 지어낸다.
+- 근거: 저장소가 public이므로 실데이터 fixture는 redaction 규칙(OD-018/036/064)을 먼저 닫아야 하는데, S0 검증에는 구조만 있으면 충분하다.
