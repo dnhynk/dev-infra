@@ -1,0 +1,11 @@
+{
+  "projects": [
+    { "name": "Tone & Move", "repositories": ["dnhynk/ToneAndMove"] },
+    { "name": "Vertical Live", "repositories": ["dnhynk/vertical-live"] }
+  ],
+  "correlationKeys": {
+    "run": "orca-run",
+    "task": "orca-task",
+    "dispatch": "orca-dispatch"
+  }
+}

@@ -4,6 +4,10 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "bin": {
+    "orca-slack-bridge": "./dist/cli.js"
   }
 }
