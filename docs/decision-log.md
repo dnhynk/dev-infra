@@ -166,3 +166,4 @@
 
 - 실측한 스키마 구조는 그대로 유지하되 값은 지어낸다.
 - 근거: 저장소가 public이므로 실데이터 fixture는 redaction 규칙(OD-018/036/064)을 먼저 닫아야 하는데, S0 검증에는 구조만 있으면 충분하다.
+- rollover-monitor Stop hook을 `~/.claude/settings.json`에 **추가 항목**으로 등록한다. Orca가 같은 이벤트에 등록한 hook을 지우지 않는다. 명령은 nvm symlink 절대경로를 쓴다. Claude Code 세션 PATH에 `node`가 없을 수 있다.

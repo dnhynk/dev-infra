@@ -551,7 +551,7 @@ PR body에도 `## Task`(`T-ID`, ticket 경로)/`## Why`/`## What` 규약이 있�
 | `NVM_HOME`·`NVM_SYMLINK` 정의 | 사용자 PATH 항목이 두 변수 참조로 되어 있어 미정의면 빈 문자열로 확장되고 `node`·`npm`·`npx`가 전부 사라짐 | `node -v` |
 | nvm 활성 버전 26.x | 24.19.0이 활성일 수 있다. OD-001과 `node:sqlite` 근거가 26.x 기준 | `nvm list` |
 
-PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의하면 해소된다. **새 프로세스부터 적용되므로 Orca 앱과 터미널 재시작이 필요하다.** 이미 떠 있는 세션은 낡은 환경을 그대로 들고 있다.
+PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의하면 해소된다. **새 프로세스부터 적용되므로 Orca 앱과 터미널 재시작이 필요하다.** 이미 떠 있는 세션은 낡은 환경을 그대로 들고 있다. 변수 정의 직후 실행한 Claude Code 세션이 `node`를 찾지 못하는 것을 실측했다("Node is not installed on this system"). 따라서 세션 환경에 의존하는 hook·worker 명령은 `node` 이름이 아니라 nvm symlink 절대경로(`C:/nvm4w/nodejs/node.exe`)를 쓴다. 이 경로는 `nvm use`가 바꾸는 지점 자체이므로 버전 전환에 견딘다.
 
 정상 확인 항목: `gh` 인증(scopes `repo`/`workflow`/`read:org`/`gist`), Windows Credential Manager의 github.com 자격증명, Orca repo 등록, Orca agent hooks(claude·codex 모두 installed), Codex CLI oauth.
 

@@ -137,8 +137,9 @@ function main() {
   const reason =
     `[rollover-monitor] 컨텍스트 여유 ${remaining.toLocaleString()} 토큰, 임계 ${reserve.toLocaleString()} 토큰. ` +
     `Run ${marker.run_id}에 대해 사전 승인된 롤오버 절차를 지금 시작하라. ` +
-    `새 작업을 시작하지 말고 /init-orchestrate 스킬 §10의 순서를 따른다: ` +
-    `신규 dispatch·merge 중단 → handoff 확정 → successor 생성·부팅 → 인수 확인 → 이 세션 종료.`;
+    `새 작업을 시작하지 말고 부팅 시 합의한 롤오버 절차를 그 순서대로 수행하라: ` +
+    `신규 dispatch·merge 중단 → handoff 확정 → successor 생성·부팅 → 인수 확인 → 이 세션 종료. ` +
+    `이 Run을 새로 부팅하지 마라. 승계 대상은 이미 실행 중인 Run이다.`;
 
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
   process.exit(0);

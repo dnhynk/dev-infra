@@ -311,7 +311,11 @@ ID: OD-014
 영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §8, 향후 rollover-monitor hook과 ~/.claude/settings.json
 검증 방법: 격리 프로젝트에서 Stop hook block/reason 왕복과 usage 필드 존재를 실측(2026-08-22).
           transcript의 model 계열 키 전수 조회로 창 크기 판정 불가를 확인(2026-08-22).
-          임계값 숫자와 handoff 절차의 실제 토큰 비용은 미측정.
+          rollover-monitor를 실제 Claude Code 세션에 물려 end-to-end 검증(2026-08-22).
+          세션이 자기 session id로 마커를 쓰고, Stop hook이 임계 초과를 판정해 block했으며,
+          세션이 종료되지 않고 지시를 받아 계속했다. 마커에 발동 이력이 기록됐다.
+          임계값 숫자와 handoff 절차의 실제 토큰 비용은 여전히 미측정이다.
+          block 이후 실제 coordinator가 §10 절차를 완주하는지는 미검증이다.
 결정일: 2026-08-22
 후속: 초기 임계값 확정과 재보정은 첫 실제 rollover 관측에서 수행한다.
 ```

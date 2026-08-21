@@ -130,14 +130,23 @@ rollover-monitor는 마커가 없으면 아무것도 하지 않는다.
 ~/.claude/orchestration/<worktree 경로를 파일명으로 치환>.json
 ```
 
-보존해야 하는 의미는 다음과 같다. 정확한 필드명은 rollover-monitor 구현과 함께 확정한다.
+파일명은 worktree 절대 경로의 영숫자가 아닌 문자를 각각 `-`로 바꾼 것이다
+(`D:\dev-infra` → `D--dev-infra.json`). Claude Code가 `~/.claude/projects/`에 쓰는 규칙과 같다.
 
-- Orca run_id
-- worktree 절대 경로
-- 이 coordinator의 Claude Code session id
-- **이 세션의 컨텍스트 창 크기**
-- 롤오버 사전 승인 여부
-- handoff 문서 경로
+```json
+{
+  "run_id": "run_...",
+  "worktree_path": "D:/dev-infra",
+  "coordinator_session_id": "<이 세션의 CLAUDE_CODE_SESSION_ID>",
+  "context_window": 1000000,
+  "rollover_approved": true,
+  "handoff_path": "D:/dev-infra/HANDOFF.md",
+  "reserve_tokens": 120000
+}
+```
+
+`reserve_tokens`는 선택이다. 없으면 monitor가 창 크기에서 파생한다.
+`rollover` 키는 monitor가 발동 이력을 기록하는 자리이므로 coordinator가 쓰지 않는다.
 
 창 크기를 세션이 직접 기록해야 하는 이유는 transcript가 그것을 알려주지 않기 때문이다. transcript의 `model` 필드는 같은 모델의 컨텍스트 창 변형을 구분하지 않는다. 자기 창 크기를 아는 주체는 세션 자신뿐이다.
 
