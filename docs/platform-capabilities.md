@@ -935,3 +935,67 @@ NVM 항목은 PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변
 정상으로 확인한 항목: `gh` 인증(scopes `repo`/`workflow`/`read:org`/`gist`), Windows Credential Manager의 github.com 자격증명, Orca repo 등록 6건(`D:/dev-infra` 포함), Orca agent hooks(claude·codex 모두 `installed`), Codex CLI `0.149.0` oauth.
 
 미확인으로 남는 항목: `orca account list`의 `claude.accounts`가 비어 있다(codex는 `systemDefault.hasAuth: true`). 시스템 `claude` 로그인 자체는 헤드리스 실행 성공으로 확인했으나, `worker-start --agent claude`가 등록된 Orca 계정을 요구하는지는 실제 worker를 띄워야 판정할 수 있다.
+
+## 12. Agent 배치 표면 (2026-08-22)
+
+worker의 brand·model·effort를 작업별로 지정하는 데 필요한 실제 인터페이스와 유효 값이다.
+
+### 12.1 `worker-start`의 배치 인자
+
+```text
+orca orchestration worker-start --task <task_id>
+  [--worktree <current|selector|new-child|new-top-level>]
+  (--agent <agent> | --terminal <handle>)
+  [--model <id>] [--effort <level>]
+  [--repo <selector>] [--base-branch <ref>] [--name <name>] [--setup <run|skip|inherit>]
+```
+
+`--agent` 값: `claude`, `codex`, `cursor`, `opencode`, `gemini`, `grok`, `droid`, `omp`, `pi`. 메시지 group address(`@claude`, `@codex`, …)와 같은 이름 공간이다.
+
+제약:
+
+- **`--effort`는 `--model`을 요구한다.**
+- **`--model`/`--effort`는 `--terminal`과 결합할 수 없다.** 따라서 기존 terminal을 재사용하는 후속 Dispatch(`worker-start --terminal <handle>`)는 배치를 바꿀 수 없다. 후속 작업에 다른 배치가 필요하면 terminal을 재사용하지 않고 새 agent terminal을 만들어야 한다.
+- `--model`/`--effort`는 **fresh agent terminal에만** 적용되며 agent 기본 인자를 덮어쓴다.
+- 연결된 worker server가 launch-preference 지원을 advertise해야 Orca가 두 옵션을 전달한다.
+- 실제 적용 결과는 receipt의 `launch.requested`와 `launch.effective`에 보고된다. **요청값이 아니라 이 필드로 검증해야 한다.**
+
+`--model`은 Orca가 검증하지 않는 opaque provider id다. 유효 값은 각 provider CLI가 정한다.
+
+### 12.2 Claude (Claude Code 2.1.238)
+
+- `--model`: alias `opus`, `sonnet`, `fable`, `haiku` 또는 풀네임(`claude-fable-5` 등)
+- `--effort`: `low`, `medium`, `high`, `xhigh`, `max`
+- `ultra` effort는 없다.
+
+### 12.3 Codex (codex-cli 0.149.0)
+
+모델과 각 모델이 지원하는 reasoning effort:
+
+| slug | 기본 effort | 지원 effort | speed tier |
+|---|---|---|---|
+| `gpt-5.6-sol` | low | low, medium, high, xhigh, max, **ultra** | fast |
+| `gpt-5.6-terra` | medium | low, medium, high, xhigh, max, **ultra** | fast |
+| `gpt-5.6-luna` | medium | low, medium, high, xhigh, max | fast |
+| `gpt-5.5` | medium | low, medium, high, xhigh | fast |
+| `gpt-5.4` | medium | low, medium, high, xhigh | fast |
+| `gpt-5.4-mini` | medium | low, medium, high, xhigh | 없음 |
+| `gpt-5.3-codex-spark` | high | low, medium, high, xhigh | 없음 |
+
+`ultra`("Maximum reasoning with automatic task delegation")는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만 있다. 다른 모델에 지정하면 유효하지 않다.
+
+`service_tiers`는 모든 상위 모델이 `{"id": "priority", "name": "Fast", "1.5x speed, increased usage"}` 하나이며 `additional_speed_tiers`는 `["fast"]`다.
+
+현재 전역 기본값은 `~/.codex/config.toml`의 `model = "gpt-5.6-sol"`, `model_reasoning_effort = "xhigh"`다. `--model` 없이 dispatch된 codex worker는 이 값을 쓴다.
+
+### 12.4 `sol high fast` 표기의 분해
+
+사용자 표기는 서로 다른 세 축을 하나로 붙인 것이다.
+
+| 표기 조각 | 축 | 값 |
+|---|---|---|
+| `sol` | model slug | `gpt-5.6-sol` |
+| `high` | reasoning effort | `high` |
+| `fast` | service tier | `priority` (표시명 `Fast`) |
+
+**`worker-start`에는 service tier 인자가 없다.** `--model`과 `--effort`만 있으므로 `fast`는 이 경로로 표현할 수 없다. tier를 지정하려면 codex 설정 기본값을 쓰거나, `terminal create --command 'codex --model … -c …'`로 argv를 직접 구성하는 경로가 필요하다. 후자는 supervised worker lifecycle 밖이므로 `worker_done` 권위를 잃는다.

@@ -32,7 +32,8 @@
 | OD-014 | context 열화 신호와 threshold | AB-2 전 | DECIDED |
 | OD-015 | successor 세션 생성·부팅·ACK 공식 수단 | AB-2 전 | DECIDED |
 | OD-016 | coordinator single-writer와 권한 이관 | AB-2 전 | OPEN |
-| OD-017 | `sol high fast`의 실제 model/effort/tier mapping | reviewer dispatch 전 | OPEN |
+| OD-017 | `sol high fast`의 실제 model/effort/tier mapping | reviewer dispatch 전 | DECIDED |
+| OD-074 | supervised worker 경로에서 service tier를 지정할 수단 | reviewer dispatch 전 | OPEN |
 | OD-018 | handoff redaction과 transcript 포함 범위 | AB-1 전 | OPEN |
 | OD-019 | worker ask/escalation↔coordinator reply↔사람용 Gate correlation | AB-1/D1 전 | OPEN |
 
@@ -360,4 +361,19 @@ ID: OD-011
 검증 방법: skill 배치 후 새 세션 목록에서 발견 확인(2026-08-22).
           실제 발견 규칙의 동작은 첫 Run에서 검증한다.
 결정일: 2026-08-22
+```
+
+```text
+ID: OD-017
+상태: DECIDED
+결정: `sol high fast`는 model `gpt-5.6-sol` + reasoning effort `high` + service tier `priority`(표시명 Fast)의 세 축 조합이다.
+      supervised worker 배치는 worker-start --agent codex --model gpt-5.6-sol --effort high 로 표현한다.
+근거:
+  - `~/.codex/config.toml`의 `model = "gpt-5.6-sol"`이 `sol`의 실제 slug다.
+  - codex-cli 0.149.0의 models_cache.json이 모델별 `supported_reasoning_levels`와 `service_tiers`를 정의한다.
+  - `gpt-5.6-sol`의 service_tiers는 `{"id":"priority","name":"Fast"}` 하나이고 additional_speed_tiers는 `["fast"]`다.
+영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §4.2, platform-capabilities.md §12
+검증 방법: codex 설정과 models_cache 직접 조회(2026-08-22). 실제 dispatch 시 receipt의 launch.effective로 재확인한다.
+결정일: 2026-08-22
+후속: service tier는 worker-start로 표현할 수 없다. OD-074에서 다룬다.
 ```

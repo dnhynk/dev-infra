@@ -129,3 +129,14 @@
 - 확인 방법과 실패 모드는 [플랫폼 검증 §12.6](platform-capabilities.md#126-호스트-전제조건-머신-이전-시-재현-필요)에 기록했다.
 - `/init-orchestrate` skill 원본은 `skills/init-orchestrate/SKILL.md`에 두고 `~/.claude/skills/`로 설치한다. 홈 디렉터리에만 두면 다음 머신에서 같은 방식으로 사라진다.
 - node는 DL-014/OD-001대로 **26.x를 유지**한다. 관측 시점 호스트의 nvm 활성 버전이 24.19.0이었으나 26.7.0으로 되돌렸고, OD-001의 근거였던 `node:sqlite` 동작을 이 호스트에서 재확인했다(2026-08-22).
+
+## 2026-08-22 · Agent 배치
+
+### DL-017 · 작업 종류별 agent 배치를 동적으로 한다
+
+- coordinator는 모든 worker를 같은 기본 agent로 배치하지 않는다. 작업 종류와 난이도에 따라 brand·model·effort를 선택한다.
+- 초기 정책: 깊은 추론 `claude/opus/max`, 기본 코드 작업 `claude/opus/high`, 병렬 리서치 `codex/gpt-5.6-sol/ultra`, PR 리뷰 `codex/gpt-5.6-sol/high`.
+- `worker-start`의 `--agent`/`--model`/`--effort`로 표현한다. 새 메커니즘이 필요하지 않다.
+- 적용 여부는 요청값이 아니라 receipt의 `launch.effective`로 검증한다.
+- 배치가 다른 후속 Task에는 terminal을 재사용하지 않는다. `--model`/`--effort`가 `--terminal`과 결합 불가하기 때문이다.
+- 상세 정책은 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다.

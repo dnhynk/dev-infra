@@ -91,8 +91,7 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 - Task DAG를 만들고 독립 작업을 병렬화한다.
 - coding worker는 각 branch가 checkout된 별도 worktree에 배정한다.
 - worker는 PR을 만들며 최종 merge를 직접 수행하지 않는다.
-- PR review 전담 Codex agent는 사용자가 표현한 `sol high fast` 프로파일을 사용한다.
-- `sol high fast`를 실제 model·reasoning effort·service tier에 매핑하는 방법은 구현 전 확인한다.
+- PR review는 전담 Codex agent가 맡는다. 배치는 [Agent 배치 정책](#42-agent-배치-정책)을 따른다.
 - reviewer는 승인 또는 수정 요청과 근거를 coordinator에게 반환한다.
 - Bridge가 review 상태를 관찰하려면 같은 verdict가 GitHub formal review 또는 별도로 확정한 Orca reviewer-result source에 durable하게 남아야 한다. 어느 source를 계약으로 삼을지는 TBD다.
 - coordinator는 review 결과를 간단히 최종 확인한 뒤 merge한다.
@@ -110,6 +109,30 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 - Gate가 열린 뒤에는 그 결정에 의존하는 Task만 blocked/waiting 상태가 되고 독립 Task는 계속된다.
 - Bridge는 worker↔coordinator의 일반 ask/reply를 Slack에 중계하지 않고 사람용 open Gate만 `#agent-runs`에 투영한다.
 - ask/escalation과 생성된 Gate의 correlation 형식은 구현 전에 확정한다.
+
+### 4.2 Agent 배치 정책
+
+coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·model·effort를 선택한다. 모든 worker를 같은 기본 agent로 배치하지 않는다.
+
+배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §12](../platform-capabilities.md#12-agent-배치-표면-2026-08-22)를 따른다.
+
+초기 배치 정책:
+
+| 작업 종류 | agent | model | effort |
+|---|---|---|---|
+| 깊은 추론이 필요한 설계·아키텍처 판단 | `claude` | `opus` | `max` |
+| 기본 코드 구현 | `claude` | `opus` | `high` |
+| 병렬 리서치·조사 | `codex` | `gpt-5.6-sol` | `ultra` |
+| PR 리뷰 | `codex` | `gpt-5.6-sol` | `high` |
+
+이 표는 시작점이며 Run별 추가 지시로 덮어쓸 수 있다. 새 작업 종류가 생기면 임의 배치하지 않고 정책에 추가한다.
+
+배치 시 지켜야 할 계약:
+
+- **적용 결과를 요청값으로 가정하지 않는다.** `worker-start` receipt의 `launch.effective`를 읽어 실제 적용된 model/effort를 확인하고, `launch.requested`와 다르면 그 사실을 기록한다. worker server가 launch-preference를 지원하지 않으면 옵션이 전달되지 않는다.
+- **배치가 다른 후속 Task에 terminal을 재사용하지 않는다.** `--model`/`--effort`는 `--terminal`과 결합할 수 없으므로, terminal 재사용 경로는 이전 배치를 그대로 유지한다. 다른 배치가 필요하면 `worker-release` 후 새 agent terminal을 만든다.
+- **모델이 지원하지 않는 effort를 지정하지 않는다.** `ultra`는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만 있고 Claude에는 없다.
+- service tier(`fast`)는 `worker-start`로 표현할 수 없다. tier가 필요하다고 판단되면 임의로 supervised 경로를 벗어나지 말고 사용자에게 올린다.
 
 ## 5. Worker와 PR 관찰 계약
 
@@ -278,7 +301,7 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - active worker가 있는 동안 권한을 이관하는 절차
 - 여러 Run이 같은 repository에 있을 때 선택 규칙
 - Run↔repository↔coordinator session identity
-- `sol high fast`의 실제 실행 설정
+- service tier를 supervised worker 경로에서 지정할 수단
 - reviewer verdict의 durable 관찰 source
 - ask/escalation↔Gate correlation
 - PR correlation metadata 형식
