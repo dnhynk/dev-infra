@@ -23,17 +23,29 @@ import type { PullRequestKey } from '../identity/keys.js';
  *
  * 보장하지 않는다.
  *
- * - **Slack 루트가 PR당 하나라는 것.** `chat.postMessage`가 성공한 뒤 `insertPrMessage`
- *   전에 죽으면 매핑 행이 없으므로 다음 실행이 루트를 하나 더 만든다. PRIMARY KEY는 매핑
- *   행의 유일성만 강제하고 이미 게시된 Slack 메시지를 되돌리지 못한다.
+ * - **Slack 루트가 PR당 하나라는 것.** PRIMARY KEY는 매핑 행의 유일성만 강제하고 이미
+ *   게시된 Slack 메시지를 되돌리지 못한다. 루트가 하나 더 생길 수 있는 창이 둘이다.
  *
- * 이 창을 C1에서 닫지 않는다. 스펙 §9가 crash 경계별 atomicity와 outbox를 TBD로 두었고
- * 같은 성격의 미결정 항목이 OD-051이다. 지금 outbox나 2단계 commit을 설계하면 미결정
- * 항목을 구현자가 조용히 닫는 것이 된다.
+ * 창 1 — crash. `chat.postMessage`가 성공한 뒤 `insertPrMessage` 전에 프로세스가 죽으면
+ * 매핑 행이 없으므로 다음 실행이 루트를 하나 더 만든다.
  *
- * C1 출구 조건은 "재관찰로 루트가 중복되지 않음"이다(로드맵 §5). 이는 crash 없는 재실행을
- * 뜻하고, 그 범위에서는 현재 스키마로 충분하다. 재실행은 `findPrMessage`가 기존 행을 찾아
- * `chat.update`로 가기 때문이다.
+ * 창 2 — delivery unknown. 프로세스가 죽지 않아도, 요청은 Slack에 닿았는데 응답을 받지
+ * 못하면 메시지가 만들어졌는지 알 수 없다. 호출자에게는 실패로 보이므로 매핑 행이 남지
+ * 않고, 같은 실행의 재시도나 다음 관찰이 루트를 하나 더 만들 수 있다. 요청을 두 번 보내도
+ * 같은 요청임을 Slack이 알아볼 안정적인 identity가 없으면 이 창은 닫히지 않는다.
+ *
+ * 두 창을 C1에서 닫지 않는다. 스펙 §9가 crash 경계별 atomicity와 outbox를 TBD로 두었고
+ * 같은 성격의 미결정 항목이 OD-051이다. 지금 outbox나 2단계 commit이나 요청 idempotency
+ * key를 설계하면 미결정 항목을 구현자가 조용히 닫는 것이 된다.
+ *
+ * **구현자에게**: 이 성질이 보장된 것처럼 쓰지 마라. `SlackPoster.post`가 던진 실패는
+ * "메시지가 만들어지지 않았다"는 뜻이 아니다. 결과를 모르는 실패를 자동 재시도로 덮으면
+ * 루트가 늘어난다.
+ *
+ * C1 출구 조건 "재관찰로 루트가 중복되지 않음"(로드맵 §5)이 검증하는 것은 하나다. 매핑
+ * 행이 남은 뒤의 재관찰이 `findPrMessage`로 기존 행을 찾아 `chat.update`로 간다는 것.
+ * 검증하지 않는 것은 위의 두 창이다. 그 둘에서는 매핑 행이 아예 없으므로 재관찰이 루트를
+ * 새로 만든다.
  *
  * 담지 않는 것: thread transition 기록, Gate↔action correlation, coordinator notification
  * pending, 관찰 cursor. 각각 C2/D2/D3의 사실이고, 지금 만들면 쓰이지 않는 스키마가 된다.
@@ -123,8 +135,9 @@ export type NewPrMessage = {
  * ```
  *
  * `chat.postMessage` 성공과 `insertPrMessage` 사이에서 죽으면 다음 실행이 카드를 하나 더
- * 만든다. outbox와 crash 경계 atomicity는 스펙 §9에서 TBD이며 C1 범위 밖이다. C1은 이
- * 창을 없앴다고 주장하지 않는다.
+ * 만든다. 게시 결과를 모른 채 끝난 호출도 결과가 같다. 두 창의 설명은 파일 머리에 있고,
+ * outbox와 crash 경계 atomicity는 스펙 §9에서 TBD이며 C1 범위 밖이다. C1은 두 창을
+ * 없앴다고 주장하지 않는다.
  *
  * 지문은 카드에 실제로 표시하는 값에서만 계산한다. 관찰 시각을 넣으면 사실이 바뀌지 않아도
  * 매 실행이 `chat.update`를 만든다.

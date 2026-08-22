@@ -48,7 +48,13 @@ export type PostedMessage = {
  * `message_not_found` 등)를 잃지 않는다. 호출자가 "메시지가 지워져 다시 연결이 필요함"과
  * "채널 접근 권한이 없음"을 구분해야 하기 때문이다(UX §6).
  *
- * 429와 재시도는 구현이 감춘다. 이 인터페이스는 재시도가 끝난 뒤의 결과만 반환한다.
+ * Slack이 응답을 준 실패(429, 5xx 등)의 재시도는 구현이 감춘다. 이 인터페이스는 재시도가
+ * 끝난 뒤의 결과만 반환한다.
+ *
+ * **`post`에서 응답을 받지 못한 실패는 다르다.** 메시지가 만들어졌는지 알 수 없으므로
+ * 자동 재시도가 루트를 하나 더 만들 수 있다. 그런 실패는 감추지 말고 호출자에게 던진다.
+ * 같은 요청임을 Slack이 알아볼 identity를 만들지 않는다 — 스펙 §9와 OD-051이 열어 둔
+ * 항목이고 C1에서 닫지 않는다. `update`는 channel과 ts가 이미 정해져 있어 같은 위험이 없다.
  */
 export interface SlackPoster {
   post(input: PostMessageInput): Promise<PostedMessage>;

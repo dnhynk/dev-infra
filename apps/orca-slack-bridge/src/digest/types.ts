@@ -153,6 +153,50 @@ export type DigestStatus =
   | 'awaiting_review';
 
 /**
+ * 관측이 잘린 지점. 원인별로 따로 싣는다.
+ *
+ * 카드는 부분만 보고 말한 경우 그 사실을 숨기지 않는다(UX §6). 두 절단은 원인도 의미도
+ * 다르므로 하나의 boolean으로 합치지 않는다.
+ *
+ * **이 사실을 `SummaryResult`에서 읽지 않는다.** 이유가 둘이다.
+ *
+ * - `SummaryResult`의 `truncated`는 `ok` 변형에만 있다. 요약이 실패하면 축소 카드를
+ *   그려야 하는데 바로 그때 값이 없다.
+ * - `SummaryFacts.truncated`는 단일 boolean이고 프롬프트 문구가 "PR 본문이 상한 때문에
+ *   잘렸다"로 본문 전용이다(`summarize/contract.ts`). 파일 목록 절단을 그 플래그로 켜면
+ *   모델에게 거짓 설명을 주게 된다.
+ *
+ * 그래서 절단은 관측 사실로서 `ProjectedPr`이 싣고, renderer는 요약 성공·실패 어느 쪽에서도
+ * 여기서 읽는다.
+ *
+ * summarizer 쪽을 고치려 하지 마라. `CAPS.changedPaths`가 프롬프트용 목록을 이미 40개로
+ * 자르므로 summarizer는 애초에 전체 목록을 보지 않는 설계다. 절단을 알아야 하는 것은
+ * summarizer가 아니라 카드다. 게다가 `SummaryFacts`를 바꾸면 `factsFingerprint`가 바뀌어
+ * OD-035의 캐시 계약이 흔들리고, OD-034는 실제 API 호출로 검증된 계약이다.
+ */
+export type ObservationTruncation = {
+  /**
+   * PR 본문이 summarizer 입력 상한(`CAPS.prBody`)에서 잘렸다.
+   *
+   * 카드 본문에는 영향이 없고, 요약이 본문 전체를 보지 못했다는 뜻이다.
+   * `SummaryFacts.truncated`와 같은 조건에서 켜진다. 두 값을 다르게 계산하지 않는다.
+   * 여기에도 두는 이유는 요약이 실패하면 `SummaryResult`에서 그 사실이 사라지기 때문이다.
+   */
+  readonly prBody: boolean;
+  /**
+   * 변경 파일 목록이 잘렸다.
+   *
+   * `PullRequestFacts.changedFilesTotal > changedPaths.length`에서 파생한다. 관측된 원인은
+   * `gh pr list --json files`의 100건 상한이다(실측: `nodejs/node` PR #65461이
+   * `changedFiles` 1971에 `files` 100). Bridge는 읽을 때 목록을 자르지 않으므로 길이가
+   * 전체보다 짧다는 것은 조회 쪽에서 잘렸다는 뜻이다.
+   *
+   * 몇 개가 잘렸는지는 싣지 않는다. C1 카드는 "일부만 관측했다"는 사실만 표시한다.
+   */
+  readonly changedFiles: boolean;
+};
+
+/**
  * 카드 하나를 그리는 데 필요한 관찰 사실 전부.
  *
  * 여기 없는 값은 카드에 나타나지 않는다. 렌더러는 이 타입 밖에서 사실을 가져오지 않는다.
@@ -187,6 +231,8 @@ export type ProjectedPr = {
   readonly checks: readonly CheckFact[];
   /** 없으면 null(OD-070). */
   readonly workerReport: WorkerReport | null;
+  /** 관측이 잘린 지점. 카드가 부분 관측을 숨기지 않게 한다. */
+  readonly truncation: ObservationTruncation;
 };
 
 /**
@@ -230,6 +276,9 @@ export type PrProjection =
  *
  * `DigestStatus`는 여기 싣지 않는다. `pr`에서 결정적으로 파생되므로 두 곳에 두면
  * 서로 어긋날 수 있다.
+ *
+ * 절단 사실도 `summary`에서 읽지 않는다. `pr.truncation`이 유일한 source다. 이유는
+ * `ObservationTruncation`에 적었다.
  */
 export type RenderInput = {
   readonly pr: ProjectedPr;
