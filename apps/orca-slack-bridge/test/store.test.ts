@@ -54,10 +54,27 @@ describe('resolveStatePath', () => {
     );
   });
 
-  it('win32에 APPDATA가 없으면 추측하지 않고 XDG 규칙으로 내려간다', () => {
-    expect(resolveStatePath(null, { XDG_DATA_HOME: '/data' }, 'win32')).toBe(
-      join('/data', 'orca-slack-bridge', 'state.db'),
+  // XDG 명세: 상대경로는 invalid이므로 무시하고 기본값으로 간다. 던지지 않는다.
+  // http://specifications.freedesktop.org/basedir/latest/
+  it('상대 XDG_DATA_HOME은 무효로 보고 무시한다. cwd에 state.db를 만들지 않는다', () => {
+    const fallback = join(homedir(), '.local', 'share', 'orca-slack-bridge', 'state.db');
+    expect(resolveStatePath(null, { XDG_DATA_HOME: 'relative/data' }, 'linux')).toBe(fallback);
+    expect(resolveStatePath(null, { XDG_DATA_HOME: '.' }, 'linux')).toBe(fallback);
+  });
+
+  // 설정 파일과 달리 DB 경로가 어긋나면 오류 없이 다른 파일이 열려 기존 카드를 잃는다.
+  // 그래서 defaultConfigPath와 달리 XDG로 내려가지 않고 던진다.
+  it('win32에 APPDATA가 없으면 XDG로 내려가지 않고 던진다', () => {
+    expect(() => resolveStatePath(null, { XDG_DATA_HOME: '/data' }, 'win32')).toThrow(
+      /APPDATA가 없어/,
     );
+    // 해결책을 메시지에 담는다.
+    expect(() => resolveStatePath(null, {}, 'win32')).toThrow(new RegExp(STATE_PATH_VAR));
+  });
+
+  it('win32에 APPDATA가 없어도 명시 경로나 환경변수가 있으면 던지지 않는다', () => {
+    expect(resolveStatePath('D:\\explicit.db', {}, 'win32')).toBe('D:\\explicit.db');
+    expect(resolveStatePath(null, { [STATE_PATH_VAR]: 'D:\\env.db' }, 'win32')).toBe('D:\\env.db');
   });
 
   it('빈 문자열은 지정하지 않은 것으로 본다', () => {
@@ -79,6 +96,13 @@ describe('SqliteDigestStore', () => {
     raw.close();
     expect(mode.journal_mode).toBe('wal');
     expect(version).toEqual({ version: SCHEMA_VERSION });
+  });
+
+  it('WAL로 전환되지 않으면 실제 mode를 담아 던진다', () => {
+    // :memory:는 원리적으로 WAL이 될 수 없고 sqlite는 예외 대신 memory를 돌려준다.
+    // 결과를 확인하지 않으면 WAL이 아닌 채로 스키마 준비까지 성공한다. 특례를 두지 않는다.
+    expect(() => new SqliteDigestStore(':memory:')).toThrow(/WAL로 열지 못했다/);
+    expect(() => new SqliteDigestStore(':memory:')).toThrow(/journal mode는 memory이다/);
   });
 
   it('기록이 없으면 null이다. 이것이 루트를 새로 만들라는 신호다', () => {
