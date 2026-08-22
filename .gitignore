@@ -26,3 +26,6 @@ Thumbs.db
 
 # pnpm
 .pnpm-store/
+
+# coordinator 승계 상태 (OD-013). 세션 로컬이며 커밋하지 않는다
+HANDOFF.md

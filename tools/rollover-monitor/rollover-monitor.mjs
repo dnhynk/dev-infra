@@ -73,10 +73,20 @@ function usedTokens(transcriptPath) {
   return null;
 }
 
-/** 임계값. 마커가 명시하지 않으면 창 크기에서 파생한다. 이 기본값은 미검증이며 1차 롤오버에서 재보정한다. */
+/**
+ * 임계값. 마커가 명시하지 않으면 창 크기에서 파생한다.
+ *
+ * 하한 80k는 실측한 롤오버 절차 비용 18.5k의 4배 이상이다(작업 없는 Run 1회 관측).
+ * 실제 Run은 handoff에 담을 상태가 많아 절차 비용이 커지므로 배수가 필요하다.
+ * 비율 15%는 "창이 크면 세션이 다루는 상태도 크고 handoff도 커진다"는 가정이며 미검증이다.
+ *
+ * auto-compact와의 경쟁은 이 값으로 회피한다. 발동 이후 coordinator는 새 작업을 받지 않으므로
+ * 컨텍스트 증가가 절차 비용으로 묶인다. 따라서 reserve가 절차 비용보다 충분히 크면
+ * 압축 임계값을 몰라도 세션이 창 끝에 닿지 않는다.
+ */
 function reserveFor(marker) {
   if (Number.isFinite(marker.reserve_tokens)) return marker.reserve_tokens;
-  return Math.max(60_000, Math.round(marker.context_window * 0.12));
+  return Math.max(80_000, Math.round(marker.context_window * 0.15));
 }
 
 function main() {

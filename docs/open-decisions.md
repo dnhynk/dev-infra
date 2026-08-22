@@ -28,7 +28,7 @@
 | OD-010 | `/init-orchestrate` 패키징과 `/orchestration` 호출 계약 | AB 구현 전 | DECIDED |
 | OD-011 | authoritative spec 발견·우선순위 규칙 | AB 구현 전 | DECIDED |
 | OD-012 | fresh/resume 자동 판별 또는 명시 옵션 | AB 구현 전 | DECIDED |
-| OD-013 | `HANDOFF.md` 위치·schema·archive·atomic write | AB-1 전 | OPEN |
+| OD-013 | `HANDOFF.md` 위치·schema·archive·atomic write | AB-1 전 | DECIDED |
 | OD-014 | context 열화 신호와 threshold | AB-2 전 | DECIDED |
 | OD-015 | successor 세션 생성·부팅·ACK 공식 수단 | AB-2 전 | DECIDED |
 | OD-016 | coordinator single-writer와 권한 이관 | AB-2 전 | DECIDED |
@@ -315,8 +315,15 @@ ID: OD-014
           coordinator가 사람 지시 없이 successor를 만들고 물러났고 generation이 3 → 4로 올랐다.
           monitor가 마커에 남긴 `rollover` 기록(`last_remaining_tokens: 924950`)이 발동 주체의
           증거가 되어, successor가 "누가 주입했는가"를 스스로 판정할 수 있었다.
-          부팅 직후 coordinator의 컨텍스트 점유량은 약 75k였다(1M 창 기준 관측치 1건).
-          handoff 확정과 승계 절차 자체의 토큰 비용은 여전히 미측정이므로 임계값은 미보정이다.
+          두 세션의 transcript에서 실제 비용을 측정했다(1M 창, 작업 없는 Run, 관측치 1건).
+              부팅 완료      50,480   (skill 로드 + 스펙 읽기)
+              발동 시점      76,627
+              종료 시점      95,155
+              롤오버 절차    18,528 (46턴)
+          auto-compact 임계값은 측정하지 못했다. 이 호스트의 31개 transcript·1,879턴에
+          압축 이력이 0건이고 관측된 최대 점유량은 571,283이다.
+          다만 발동 이후 coordinator는 새 작업을 받지 않아 컨텍스트 증가가 절차 비용으로
+          묶이므로, reserve가 절차 비용보다 충분히 크면 압축 임계값을 몰라도 창 끝에 닿지 않는다.
 결정일: 2026-08-22
 후속: 초기 임계값 확정과 재보정은 첫 실제 rollover 관측에서 수행한다.
 ```
@@ -465,4 +472,50 @@ ID: OD-016
           경로는 미구현이며 미검증이다.
 결정일: 2026-08-22
 후속: predecessor가 successor 생성과 인수 확인 사이에 죽는 구간은 DL-017대로 (D)의 daemon이 덮는다.
+```
+
+```text
+ID: OD-013
+상태: DECIDED
+결정: orchestration handoff는 `handoff` 스킬의 템플릿과 증거 규율을 상속하고 orchestration
+      필수 필드를 더한 것이다. 별도 형식을 새로 정의하지 않는다.
+
+      위치: 대상 repository의 계약을 따르고, 없으면 repository 루트 `HANDOFF.md`.
+      커밋하지 않는다(`.gitignore`). 세션 로컬 운영 상태이며 successor는 같은 호스트에서 돈다.
+
+      상속하는 절: 목표(검증 가능한 완료 기준 포함) / 현재 상태 / 변경 사항 /
+      검증(`통과`·`실패`·`보고됨(미검증)`·`미실행` 4분류, 명령과 핵심 결과 동반) /
+      결정과 근거 / 남은 위험(`[확인 필요]`·`[추론]` 표기) / 다음 작업(첫 작업은 완료 기준 동반).
+
+      추가하는 orchestration 필수 필드:
+      - `run_id` (기계적으로 읽히는 형태). OD-012의 fresh/resume 판별이 이 값에 의존한다.
+      - repository 경로, predecessor session id, rollover 사유
+      - Task DAG 상태와 의존, worker/dispatch 상태, worktree·branch·PR·review·CI 상태
+      - open Gate와 사용자 응답 대기 사항, 독립적으로 계속할 수 있는 Task
+      - 진행 중이던 외부 효과 또는 비멱등 작업
+
+      archive: 승계마다 덮어쓴다. 이전 handoff를 보존하지 않으며 Run 종료 시 삭제한다.
+      atomic write: 임시 파일에 쓰고 rename한다.
+근거:
+  - `handoff` 스킬은 `disable-model-invocation: true`라 coordinator가 호출할 수 없고,
+    allowed-tools가 읽기 전용이며 경로를 받지 않으면 파일을 만들지 않는다. 무인 롤오버 경로에서
+    실행할 수 없으므로 호출이 아니라 규칙 상속으로 재사용한다.
+  - 그 템플릿에는 `run_id`가 없다. 그대로 쓰면 fresh/resume 판별이 끊긴다.
+  - 4분류 검증 표기와 `[확인 필요]`/`[추론]`은 작업 규약의 "실행하지 않았으면 그렇게 적는다"를
+    문서 형식으로 구현한 것이다. 두 경로가 같은 규율을 쓰면 사람이 만든 handoff와 coordinator가
+    만든 handoff를 같은 기준으로 읽을 수 있다.
+  - "관련 없는 기존 워킹트리 변경을 이번 세션 작업으로 귀속하지 않는다"는 이 저장소처럼 여러
+    세션이 동시에 같은 워킹트리를 만지는 환경에서 오귀속을 막는다.
+  - 커밋하지 않는 이유: successor가 같은 호스트에서 돌므로 로컬 파일로 충분하고, public
+    저장소에 세션 운영 상태를 남길 이유가 없으며, 동시 세션이 서로의 handoff를 커밋하는 충돌이 생긴다.
+  - atomic write가 필요한 이유: 승계 도중 predecessor가 죽으면 반쯤 쓰인 handoff가 남고
+    successor가 그것을 완전한 상태로 신뢰한다.
+대안과 기각 이유:
+  - 롤오버 경로에서 `/handoff` 호출: 모델이 호출할 수 없고 파일도 쓰지 않는다. 불가능해서 기각.
+  - 독자 형식 신규 정의: 같은 목적의 형식이 둘이 되어 갈라진다. 기각.
+  - handoff를 커밋: 이력이 남지만 동시 세션 충돌과 public 저장소 오염이 크다. 기각.
+영향 문서/파일: skills/init-orchestrate/SKILL.md §10, .gitignore
+검증 방법: `handoff` 스킬의 frontmatter와 template.md를 직접 읽어 상속 가능 범위와 결손 필드를
+          확인(2026-08-22). 실제 Run에서 이 형식으로 승계가 성립하는지는 다음 실 Run에서 검증한다.
+결정일: 2026-08-22
 ```

@@ -215,12 +215,38 @@ Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·mo
 
 ## 10. Handoff 유지
 
-- 위치와 schema는 대상 repository의 계약을 따른다. 계약이 없으면 repository 루트의
-  `HANDOFF.md`를 쓰고, schema 확정이 필요하다는 사실을 사용자에게 올린다.
-- 계약이 무엇이든 **Orca run_id가 기계적으로 읽히는 형태로 포함돼야 한다.** §3의 판별이 이에 의존한다.
+위치는 대상 repository의 계약을 따르고, 없으면 repository 루트 `HANDOFF.md`를 쓴다.
+세션 로컬 운영 상태이므로 커밋하지 않는다. 승계마다 덮어쓰고 Run이 끝나면 지운다.
+임시 파일에 쓰고 rename한다. 반쯤 쓰인 handoff를 successor가 완전한 상태로 신뢰하면 안 된다.
+
+`handoff` 스킬이 설치돼 있으면 그 `template.md`의 절 구성과 증거 규율을 따른다. 없으면 아래를 쓴다.
+
+```text
+목표          검증 가능한 완료 기준을 포함한다
+현재 상태     근거가 있는 상태만 쓴다
+변경 사항     경로 또는 커밋 단위로, 무엇이 왜 달라졌는지
+검증          통과 / 실패 / 보고됨(미검증) / 미실행 을 구분하고 명령과 핵심 결과를 함께 쓴다
+결정과 근거   대화나 저장소 근거가 있을 때만
+남은 위험     [확인 필요]와 [추론]을 표기한다
+다음 작업     첫 작업은 바로 실행 가능하게, 완료 판정 기준과 함께
+```
+
+여기에 orchestration 상태를 더한다.
+
+- **`run_id`를 기계적으로 읽히는 형태로 넣는다.** §3의 fresh/resume 판별이 이 값에 의존한다.
+- repository 경로, predecessor session id, rollover 사유
+- Task DAG 상태와 의존, worker·dispatch 상태, worktree·branch·PR·review·CI 상태
+- open Gate와 사용자 응답 대기 사항, 독립적으로 계속할 수 있는 Task
+- 진행 중이던 외부 효과 또는 비멱등 작업
+
+지키는 규칙:
+
 - 안전한 checkpoint마다 갱신한다. 열화 시점에 몰아서 쓰지 않는다. 열화된 상태의 coordinator가
   가장 정확한 기록을 남길 것이라고 기대하지 않는다.
-- secret과 장문 transcript는 복사하지 않는다.
+- 커밋된 변경과 미커밋 변경을 구분한다.
+- **관련 없는 기존 워킹트리 변경을 이 Run의 산출물로 귀속하지 않는다.** 같은 워킹트리에서 다른
+  세션이 동시에 작업하고 있을 수 있다.
+- secret, 원시 로그, 전체 diff, 시간순 일지는 넣지 않는다.
 
 ## 11. 롤오버 절차
 
