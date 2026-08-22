@@ -93,10 +93,17 @@ async function main(): Promise<number> {
   return 0;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (e: unknown) => {
-    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
-    process.exit(1);
-  },
-);
+/**
+ * 이 모듈이 프로세스의 진입점일 때만 CLI를 실행한다.
+ * 진입점 판정을 Node에 맡겨 경로 문자열 비교 없이 처리하므로,
+ * test가 `parseArgs`를 import해도 `main()`과 `process.exit`이 실행되지 않는다.
+ */
+if (import.meta.main) {
+  main().then(
+    (code) => process.exit(code),
+    (e: unknown) => {
+      process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+      process.exit(1);
+    },
+  );
+}
