@@ -43,7 +43,7 @@ worker는 PR body **맨 끝**에 다음 블록을 붙인다. 사람이 읽는 �
 
 ```text
 canonical repository + PR number
-  → Orca Run → Task → Dispatch/Worker → worker_done → 필요 시 제한된 transcript
+  → Orca Run → Task → Dispatch/Worker → worker_done
 ```
 
 Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시점 body가 기준이다.
@@ -58,7 +58,7 @@ Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시�
 | 같은 key가 서로 다른 값으로 중복 | `conflict` |
 | metadata의 task가 다른 Run에 속함 | `conflict` |
 
-`uncorrelated`는 실패가 아니라 **정상 출력**이다. Bridge는 branch 이름이나 PR 제목으로 추측해 확정하지 않고, 모순을 자동으로 한쪽으로 덮지 않는다.
+`uncorrelated`는 실패가 아니라 **정상 출력**이다. Bridge는 branch 이름이나 PR 제목으로 추측해 확정하지 않고, 모순을 자동으로 한쪽으로 덮지 않는다. C1은 `uncorrelated` 또는 `conflict` PR에 Slack 카드를 만들지 않는다.
 
 ## 3. Worker 완료 계약
 
@@ -70,10 +70,8 @@ Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시�
 - **PR을 만든 뒤에 `worker_done`을 보낸다.** 완료 신호가 리뷰 대상보다 먼저 도착하지 않게 한다.
 - **PR identity를 `worker_done`에 싣지 않는다.** 연결 방향이 PR → task이고 PR body의 correlation metadata가 유일한 연결점이다. worker 명령에서 raw `--payload` JSON은 PowerShell이 따옴표를 깨뜨릴 수 있어 쓰지 않는다.
 - `--files-modified`는 사용한다.
-- `worker_done`이 누락·중복·불완전할 때의 상태와 recovery는 `OD-070`에서 확정한다.
-- worker가 release된 뒤에도 필요하면 `worker-read`로 결과를 확인할 수 있다는 Orca capability를 활용할 수 있다.
-
-`worker-read`는 기본 요약 pipeline이 아니다. fallback을 허용하는 최소 부족 조건, 읽을 최대 범위, secret redaction, 외부 LLM 전송 허용 여부를 먼저 정해야 한다.
+- C1에서 `worker_done`이 없으면 카드는 계속 만들고 `worker 보고 없음`을 표시한다. 중복·불완전 payload의 recovery는 C2에서 정한다.
+- C1은 `worker-read` fallback을 사용하지 않는다. 따라서 transcript는 summarizer 입력도 Slack 카드 입력도 아니다.
 
 ## 4. Gate 생성 계약
 

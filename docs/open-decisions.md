@@ -44,15 +44,15 @@
 | OD-020 | Run↔repo cardinality와 Run↔worktree↔coordinator session identity | S0 전 | OPEN |
 | OD-021 | PR HTML metadata 최종 형식과 작성 주체 | AB-1/S0 전 | DECIDED |
 | OD-022 | metadata 누락·불일치·변조 정책 | S0 전 | DECIDED |
-| OD-023 | Orca polling/event/reconciliation 방식과 주기 | S0 전 | OPEN |
+| OD-023 | Orca polling/event/reconciliation 방식과 주기 | S0 전 | DECIDED |
 | OD-024 | GitHub API와 `gh` adapter, 인증, 갱신 방식 | S0 전 | DECIDED |
-| OD-025 | `worker-read` fallback 조건과 최대 범위 | C1 전 | OPEN |
+| OD-025 | `worker-read` fallback 조건과 최대 범위 | C1 전 | DECIDED |
 | OD-026 | repository canonicalization, rename/fork/multiple remote | S0 전 | DECIDED |
 | OD-027 | Project↔Repository cardinality, 등록 주체, 설정/DB mapping과 routing | S0 전 | DECIDED |
 | OD-028 | reviewer verdict를 GitHub formal review와 Orca 중 어디에 durable하게 남길지 | C1/C2 전 | DECIDED |
 | OD-029 | PR 생성과 `worker_done` 전송의 ordering 및 PR identity 포함 방식 | AB-1/S0 전 | DECIDED |
 | OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
-| OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | OPEN |
+| OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | DECIDED |
 | OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | DECIDED |
 
 ## PR state와 요약
@@ -62,7 +62,7 @@
 | OD-030 | canonical PR state와 transition | C2 전 | OPEN |
 | OD-031 | review verdict 축약과 새 commit 후 approval | C2 전 | OPEN |
 | OD-032 | required/optional check와 merge-ready 정책 | C2 전 | OPEN |
-| OD-033 | review 핵심 comment 선택 규칙 | C1/C2 전 | OPEN |
+| OD-033 | review 핵심 comment 선택 규칙 | C1/C2 전 | DECIDED |
 | OD-034 | summarizer provider/model/schema/language | C1 전 | DECIDED |
 | OD-035 | summarizer 실패 fallback, cache, 호출 상한 | C1 전 | DECIDED |
 | OD-036 | code/review/transcript의 LLM·Slack 전송 경계 | C1 전 | DECIDED |
@@ -72,18 +72,18 @@
 
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
-| OD-040 | Slack App manifest, scopes, 채널 ID 설정 | C1/D2 전 | OPEN |
+| OD-040 | Slack App manifest, scopes, 채널 ID 설정 | C1/D2 전 | DECIDED |
 | OD-041 | Socket Mode 최종 채택과 reconnect 정책 | 실제 Slack 통합 전 | OPEN |
 | OD-042 | owner/workspace allowlist 관리 | D2 전 | OPEN |
-| OD-043 | durable store 기술·경로·migration·locking | C1 전 | OPEN |
+| OD-043 | durable store 기술·경로·migration·locking | C1 전 | DECIDED |
 | OD-044 | event idempotency와 out-of-order 우선순위 | C2 전 | OPEN |
 | OD-045 | retention, backup, corruption recovery | 운영 자동화 전 | OPEN |
 | OD-046 | Slack message 삭제·archive·channel 변경 복구 | C2/D1 전 | OPEN |
-| OD-047 | Slack identity 영역에서 Project와 Repository를 둘 다 표시할지와 fallback | C1/D1 전 | OPEN |
+| OD-047 | Slack identity 영역에서 Project와 Repository를 둘 다 표시할지와 fallback | C1/D1 전 | DECIDED |
 | OD-048 | 공통 channel topology의 최종 채택 여부 | 첫 Slack 설정 전 | OPEN |
 | OD-049 | GitHub 공식 Slack App 설치와 repo별 review/workflow 구독 범위 | 운영 환경 준비 전 | OPEN |
 | OD-071 | modal submission validation error를 modal에 유지·표시하는 UX | D2 전 | OPEN |
-| OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | OPEN |
+| OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED (C1 범위만. D1/D2 알림 정책은 계속 열려 있음) |
 
 ## Gate와 Channel
 
@@ -106,8 +106,8 @@
 
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
-| OD-060 | 실제 Slack/GitHub/Orca 통합 테스트 범위 | 첫 외부 write 전 | OPEN |
-| OD-061 | 테스트 workspace/repository/Run과 owner identity | 첫 외부 write 전 | OPEN |
+| OD-060 | 실제 Slack/GitHub/Orca 통합 테스트 범위 | 첫 외부 write 전 | DECIDED |
+| OD-061 | 테스트 workspace/repository/Run과 owner identity | 첫 외부 write 전 | DECIDED |
 | OD-062 | 허용 지연, polling/API/LLM 비용 한도 | 운영 전 | OPEN |
 | OD-063 | daemon 자동 시작 방식 | O1 전 | OPEN |
 | OD-064 | health/log/audit format과 secret 마스킹 | 실제 통합 전 | OPEN |
@@ -687,5 +687,117 @@ ID: OD-035
   - 어떤 실패도 Orca/GitHub 상태를 변경하지 않으며 실패를 성공처럼 숨기지 않는다.
 근거: UX 문서가 summarizer 실패를 드러내도록 요구하고, 스펙이 실패 시 상태 불변을 요구한다.
 영향 문서/파일: src/summarize/index.ts, renderer
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-040
+상태: DECIDED
+결정: Slack App manifest·scope·채널 설정은 docs/ops/slack-app-setup.md를 확정 계약으로 쓴다.
+근거: 2026-08-22에 verify-slack의 전 항목 통과를 기록했다.
+대안과 기각 이유: 별도 계약을 병행 — manifest·scope·설정의 기준이 갈라진다. 기각.
+영향 문서/파일: docs/ops/slack-app-setup.md, apps/orca-slack-bridge/src/slack/verify.ts
+검증 방법: verify-slack 전 항목 통과 기록(2026-08-22).
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-043
+상태: DECIDED
+결정: durable store는 node:sqlite를 쓴다. Windows 기본 경로는 %APPDATA%\orca-slack-bridge\state.db이며 override를 허용한다.
+      WAL과 schema_version 테이블을 쓰고, C1은 단일 프로세스이므로 파일 lock을 만들지 않는다.
+근거: DL-018에서 이 호스트의 node:sqlite 동작을 재확인했고 외부 의존성이 늘지 않는다. C1에는 daemon이 없어 동시 writer가 없다.
+대안과 기각 이유: 별도 DB 의존성 추가 — 조기 일반화다. 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §9, apps/orca-slack-bridge/src/store/schema.ts, src/store/sqlite.ts
+검증 방법: node:sqlite 파일 DB의 WAL, schema_version, 재시작 뒤 message identity 재사용을 테스트와 실제 DB로 확인했다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-023
+상태: DECIDED
+결정: C1에는 polling이 없다. digest 명령 1회 실행이 관찰 1회다. 주기 실행은 O1에서 정한다.
+근거: DL-022의 S0 방침을 잇고, 출구 조건의 재관찰은 명령 재실행으로 충족한다.
+대안과 기각 이유: C1 polling — daemon·주기·reconciliation 계약을 조기에 도입한다. 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §5, apps/orca-slack-bridge/src/cli.ts, src/digest/digest.ts
+검증 방법: T5가 digest를 두 번 명시적으로 실행해 최초 게시과 재관찰을 관측했다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-025
+상태: DECIDED
+결정: C1은 worker-read fallback을 쓰지 않고 worker_done만 쓴다.
+근거: 스펙 §5.3이 transcript를 기본 입력에서 배제하므로 redaction 경계(OD-018/064)를 열 필요가 없다.
+대안과 기각 이유: worker-read fallback — transcript의 읽기 범위·redaction·외부 전송 계약을 선결해야 한다. 기각.
+영향 문서/파일: docs/contracts/observation-and-correlation.md §3, apps/orca-slack-bridge/src/orca/client.ts, src/digest/project.ts
+검증 방법: T3의 Orca 조회 구현과 projection 테스트가 inbox의 worker_done만 사용함을 확인했다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-033
+상태: DECIDED
+결정: reviewer_result.findings는 severity 내림차순으로 최대 10건만 카드와 요약 입력에 쓴다.
+근거: OD-073이 findings를 구조화 사실로 만들었고 CAPS.findings = 10이 이미 구현돼 있다.
+대안과 기각 이유: 전체 findings 표시 — 카드와 입력의 상한이 없어져 C1의 짧은 digest 목적과 맞지 않는다. 기각.
+영향 문서/파일: apps/orca-slack-bridge/src/digest/project.ts, src/summarize/contract.ts
+검증 방법: project 테스트가 severity 정렬과 10건 상한을 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-070
+상태: DECIDED
+결정: C1에서 worker_done이 누락돼도 카드는 막지 않고 worker 보고 없음으로 표시한다. 중복·불완전 payload 정책은 C2로 넘긴다.
+근거: UX §6이 degraded 상태를 숨기지 말라고 요구한다.
+대안과 기각 이유: worker_done이 없으면 카드 생성 중단 — 관찰된 PR 사실까지 숨긴다. 기각.
+영향 문서/파일: docs/contracts/observation-and-correlation.md §3, docs/ux/slack-surfaces.md §6, apps/orca-slack-bridge/src/digest/types.ts
+검증 방법: project 테스트가 worker_done 부재를 ProjectedPr에 남기는 것을 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-047
+상태: DECIDED
+결정: identity 표시는 [Project] owner/repo #N이고, Project 미등록이면 owner/repo #N이다.
+근거: 사용자 확정.
+대안과 기각 이유: Project 또는 repository 하나만 표시 — 다중 repository 공용 surface에서 식별이 부족하다. 기각.
+영향 문서/파일: docs/ux/slack-surfaces.md §1, apps/orca-slack-bridge/src/digest/render.ts
+검증 방법: renderer 테스트가 Project 등록·미등록의 두 표현을 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-060
+상태: DECIDED
+결정: 첫 외부 write는 실제 #pr-digest에 한다. 통합 테스트 경계는 대역으로 하는 멱등성 테스트와 실제 게시 1회 및 재실행 관측이다.
+근거: 사용자 확정.
+대안과 기각 이유: 대역만으로 종료 — 실제 Slack write 경로를 검증하지 못한다. 기각.
+영향 문서/파일: docs/roadmap.md §5, apps/orca-slack-bridge/test/digest.test.ts
+검증 방법: T5가 실제 게시 1회와 동일 명령 재실행을 기록했고, 대역 통합 테스트를 통과했다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-061
+상태: DECIDED
+결정: 실제 대상 repository는 dnhynk/dev-infra이며, 대상 PR은 이 Run이 만든 correlated PR이다. 실제 channel ID·team ID·user ID는 문서에 기록하지 않는다.
+근거: 사용자 확정과 public repository 제약(DL-015).
+대안과 기각 이유: 실제 식별자를 문서화 — public 저장소에 비공개 운영 식별자를 남긴다. 기각.
+영향 문서/파일: docs/ops/slack-app-setup.md, docs/roadmap.md §5
+검증 방법: T5의 실제 게시 결과와 PR body의 correlation metadata를 확인했다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-072
+상태: DECIDED (C1 범위만. D1/D2 알림 정책은 계속 열려 있음)
+결정: C1은 summarizer 실패 시 축소 카드와 요약 실패, 입력 상한 초과 시 잘림, worker_done 없음 시 worker 보고 없음을 표시한다.
+      correlation 실패는 카드를 만들지 않으므로 Slack에 표시하지 않는다.
+근거: C1은 degraded 사실을 숨기지 않는 UX §6을 따른다.
+대안과 기각 이유: C1에서 owner 알림까지 정함 — D1/D2의 owner·Channel 정책을 선결한다. 기각.
+영향 문서/파일: docs/ux/slack-surfaces.md §6, apps/orca-slack-bridge/src/digest/render.ts
+검증 방법: renderer·project·digest 테스트가 각 C1 degraded 표현 또는 skip을 확인한다.
 결정일: 2026-08-22
 ```

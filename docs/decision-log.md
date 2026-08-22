@@ -203,3 +203,17 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - `status`는 PR·Orca 사실에서 결정적으로 파생하고, `risk`는 reviewer-result의 severity 집계로 파생한다. 링크·버튼·검증 주장은 스키마에 없다.
 - 근거: 스펙이 "상태별 layout과 action을 코드로 결정한다"와 "source fact에 없는 성공·안전성·검증을 주장하지 않는다"를 요구한다. 스키마에서 제거하면 잘못된 주장이 원천적으로 불가능해진다.
 - 실측 근거도 있다. 스키마에 필드 설명 없이 luna를 호출했을 때 review 입력이 없는데도 `reviewGist`를 채우고 `why`에 없던 보안 주장을 넣었다. 검증 계층은 모델과 무관하게 필요하다.
+
+## 2026-08-22 · C1 PR Digest
+
+### DL-028 · C1은 관찰 시점의 사실만 렌더한다
+
+- C1 카드는 reviewer verdict, findings 요약, risk, CI 결론, merged 여부처럼 관찰 시점에 존재하는 사실을 표시한다.
+- canonical state machine, transition 정의, merge-ready 판정, 새 commit 뒤 approval 유효성, transition thread는 C2다.
+- uncorrelated PR은 정상 관찰 결과지만 카드로 만들지 않는다. branch·제목으로 correlation을 추측하지 않는 DL-021의 결과다.
+
+### DL-029 · C1 durable store를 node:sqlite로 도입한다
+
+- DL-020이 C1에서 도입하겠다고 예고한 durable store를 `node:sqlite`로 실제 도입한다.
+- Windows 기본 경로는 `%APPDATA%\orca-slack-bridge\state.db`이고 override를 허용한다. WAL, `schema_version`, 단일 프로세스 가정을 사용하며 파일 lock은 만들지 않는다.
+- 외부 DB 의존성을 추가하지 않고, 재시작 뒤 repository+PR의 Slack message identity를 찾아 갱신할 수 있게 한다.

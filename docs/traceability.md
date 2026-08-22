@@ -21,18 +21,18 @@
 | C: Agent 대화가 아니라 상태 변화를 요약 | 확정 | [설계 철학](product-vision.md#상태-변화가-중심이다), [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
 | worker 완료→PR, review→수정/승인, CI→ready, merge→완료 lifecycle | 확정 방향, 세부 상태 TBD | [PR Digest lifecycle](specs/orca-slack-bridge.md#51-관심-lifecycle), [상관관계 계약](contracts/observation-and-correlation.md#6-pr-canonical-state) |
 | `worker_done`을 정확히 한 번, 3문장 의미 요약 | 확정 | [Worker 계약](specs/orchestration-bootstrap-and-continuity.md#5-worker와-pr-관찰-계약), [관찰 계약](contracts/observation-and-correlation.md#3-worker-완료-계약) |
-| 부족할 때만 released worker transcript까지 `worker-read` | 확정 방향, fallback 기준 TBD | [Worker 완료 계약](contracts/observation-and-correlation.md#3-worker-완료-계약) |
+| C1은 `worker_done`만 사용하고 released worker transcript까지 `worker-read`하지 않음 | 확정 | [Worker 완료 계약](contracts/observation-and-correlation.md#3-worker-완료-계약) |
 | PR 카드 하나를 상태마다 update | 확정 | [Slack projection](specs/orca-slack-bridge.md#54-slack-projection), [PR UX](ux/slack-surfaces.md#2-pr-digest) |
 | PR 카드의 what/why/current/impact/review/risk/validation | 확정 의미 | [PR UX](ux/slack-surfaces.md#2-pr-digest) |
 | `#github`과 `#pr-digest` 역할 분리 | 확정, `raw` 용어 정정 | [제품 철학](product-vision.md#운영-사실과-사람용-의미를-분리한다), [플랫폼 검증](platform-capabilities.md#5-github) |
 | coordinator에게 Slack 요약 책임을 추가하지 않고 별도 Observer 사용 | 확정 | [제품 역할](specs/orca-slack-bridge.md#1-제품-역할) |
-| Orca run/task/worker/gate read-only 관찰 | 확정 방향, schema/polling TBD | [Orca Collector](architecture/orca-slack-bridge.md#orca-collector), [플랫폼 검증](platform-capabilities.md#2-orca) |
+| Orca run/task/worker/gate read-only 관찰 | C1은 명령 1회 관찰, polling은 O1 | [Orca Collector](architecture/orca-slack-bridge.md#orca-collector), [OD-023](open-decisions.md#확정-기록) |
 | GitHub title/body/branch/commit/files/stats/review/comments/CI/merge 직접 조회 | 확정 방향 | [Bridge 입력](specs/orca-slack-bridge.md#52-입력-사실), [GitHub 검증](platform-capabilities.md#52-원본-상태-조회) |
 | GitHub Slack 메시지를 파싱하지 않음 | 확정 | [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
 | PR body의 Orca Run/Task/Dispatch HTML metadata | 확정 방향, 형식 TBD | [Correlation 계약](contracts/observation-and-correlation.md#2-pr-correlation-metadata) |
 | 최소 facts→LLM structured JSON→deterministic renderer | 확정 | [의미 압축](specs/orca-slack-bridge.md#53-의미-압축) |
 | transcript 50,000자를 기본 입력으로 보내지 않음 | 확정 | [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
-| repo+PR와 Slack message ts, Run/Task 상태를 durable store에 보관 | 확정 개념, DB TBD | [Durability](specs/orca-slack-bridge.md#9-durability와-멱등성), [최소 저장 개념](architecture/orca-slack-bridge.md#7-최소-저장-개념) |
+| repo+PR와 Slack message ts, Run/Task 상태를 durable store에 보관 | C1은 node:sqlite | [Durability](specs/orca-slack-bridge.md#9-durability와-멱등성), [OD-043](open-decisions.md#확정-기록) |
 | Root=current, thread=중요 상태 변화 이력 | 확정 | [공통 UX](ux/slack-surfaces.md#1-공통-원칙) |
 | D: Orca Run 하나=Slack root 하나 | 확정 | [Run Observer](specs/orca-slack-bridge.md#6-d--run-observer), [Run UX](ux/slack-surfaces.md#3-agent-runs) |
 | Task/PR/blocker 현재 상태와 사람 개입 필요 여부 표시 | 확정 의미, 집계 TBD | [Run Observer](specs/orca-slack-bridge.md#61-기본-단위), [Run progress 계약](contracts/observation-and-correlation.md#7-run-progress) |
@@ -64,7 +64,7 @@
 | 하드코딩 대신 설정/DB의 Project↔Repository mapping | 확정 방향, cardinality TBD | [Entity 계약](contracts/observation-and-correlation.md#1-entity-identity), [OD-027](open-decisions.md#orcagithub-관찰과-correlation) |
 | GitHub App workspace당 한 번 설치, 여러 repo 구독 | 공식 확인 | [GitHub Slack App](platform-capabilities.md#51-공식-slack-app) |
 | Orca Bridge Slack App 하나가 여러 채널 담당 | 목표 구조 | [다중 프로젝트 구조](specs/orca-slack-bridge.md#11-다중-프로젝트-정보-구조) |
-| 이 세션은 문서 작성만 하고 실제 빌드/외부 변경은 하지 않음 | 사용자 확정 | [문서 인덱스](README.md#현재-산출물-경계) |
+| C1에서 실제 빌드와 제한된 외부 write를 검증함 | 완료 | [문서 인덱스](README.md#현재-산출물-경계), [로드맵](roadmap.md#5-bridge-slice-c1--pr-digest-첫-수직-슬라이스) |
 | 실제 빌드에서는 대상 확정 후 Slack/GitHub/Orca 통합 write 허용 | 사용자 확정 | [DL-008](decision-log.md#dl-008--현재-세션-권한), [로드맵](roadmap.md#3-bridge-사전-size-gate) |
 | 나머지 Bridge 범위는 size 확인 후 분할 | 사용자 확정 | [로드맵](roadmap.md#3-bridge-사전-size-gate) |
 | 구체 기술·계약은 빌드 과정에서 확정 | 사용자 확정 | [미결정 장부](open-decisions.md) |

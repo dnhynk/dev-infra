@@ -53,15 +53,15 @@ Slack은 daemon과 Socket Mode WebSocket으로 연결하는 방향이다. 공개
 
 - Run·Task·Dispatch·Worker·Gate를 read-only로 읽는다.
 - `worker_done`을 우선 사용한다.
-- 정보가 부족하다는 확정 조건에서만 `worker-read`를 호출한다.
+- C1은 `worker-read`를 호출하지 않고 `worker_done`만 사용한다. fallback은 후속 범위다.
 - Gate resolution만 별도의 좁은 write adapter로 분리한다.
 
 ### GitHub Collector
 
 - GitHub 원본에서 PR·comment·check·merge 상태를 읽고, reviewer가 formal GitHub review를 남기는 계약이면 review verdict도 읽는다.
-- reviewer verdict가 Orca에만 남는 계약이면 별도의 Orca reviewer-result 입력 경계를 사용한다. 최종 source는 TBD다.
+- reviewer verdict는 Orca reviewer-result에서 읽는다(DL-016).
 - GitHub Slack 메시지를 입력으로 사용하지 않는다.
-- polling, webhook, 주기적 reconciliation 중 어떤 조합을 쓸지는 TBD다.
+- C1은 polling하지 않는다. `digest` 명령 1회가 관찰 1회이며, 주기 실행은 O1에서 정한다.
 
 ### Correlator
 

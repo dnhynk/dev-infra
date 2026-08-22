@@ -1,6 +1,6 @@
 # `orca-slack-bridge` Umbrella 스펙
 
-상태: **Draft · 구현 전**  
+상태: **Draft · C1 구현됨, 후속 slice 미구현**
 해결 대상: **C + D**  
 예정 위치: `dev-infra/apps/orca-slack-bridge`
 
@@ -64,7 +64,7 @@ Slack의 3초 acknowledgement 제한 때문에 네트워크 요청 ACK와 Gate r
 |---|---|---|
 | Run·Task·Dispatch·Worker 상태 | Orca orchestration | 읽고 projection |
 | worker 완료 요약 | Orca `worker_done` | 우선 요약 입력으로 사용 |
-| 상세 worker transcript | Orca `worker-read` | 부족할 때만 fallback |
+| 상세 worker transcript | Orca `worker-read` | C1에서는 읽지 않음; fallback은 후속 범위 |
 | Gate 질문·선택지·상태·결정 | Orca Gate | 표시하고 제한적으로 resolve |
 | PR·check·merge 상태 | GitHub API 또는 `gh` 원본 | 읽고 projection |
 | reviewer verdict | GitHub formal review 또는 확정할 Orca reviewer-result source | 읽고 projection |
@@ -87,7 +87,7 @@ Review + CI + merge 조건 → Merge Ready
 Coordinator merge → 완료
 ```
 
-PR 생성과 `worker_done`의 strict ordering은 아직 정하지 않는다. Bridge가 관찰할 후보 변화:
+worker는 PR을 만든 뒤 `worker_done`을 보낸다. C1의 관찰은 `digest` 명령 1회 실행당 1회이며 polling하지 않는다. Bridge가 관찰할 후보 변화:
 
 - PR opened/discovered
 - 연결된 `worker_done`
@@ -100,7 +100,7 @@ PR 생성과 `worker_done`의 strict ordering은 아직 정하지 않는다. Bri
 - merge-ready 조건 충족
 - merged
 
-정확한 canonical state, 여러 reviewer의 상충 verdict, 새 commit 후 approval 유효성, required check, draft, merge queue, merge conflict, closed-without-merge 처리는 TBD다.
+정확한 canonical state, 여러 reviewer의 상충 verdict, 새 commit 후 approval 유효성, required check, draft, merge queue, merge conflict, closed-without-merge 처리는 C2에서 정한다.
 
 ### 5.2 입력 사실
 
@@ -109,7 +109,7 @@ Orca에서:
 - Task 목적
 - Run/Task/Dispatch/Worker identity
 - `worker_done`
-- 필요할 때만 제한된 transcript
+- C1에서는 transcript를 읽지 않는다
 
 GitHub에서:
 
@@ -152,11 +152,12 @@ Renderer는 다음을 보장해야 한다.
 
 ### 5.4 Slack projection
 
-- 모든 repository의 semantic PR digest를 하나의 `#pr-digest`에 모을 수 있다.
-- 모든 카드 상단에 project/repository/PR identity를 표시한다.
+- C1의 대상은 correlated PR뿐이다. uncorrelated 또는 conflict PR에는 카드를 만들지 않는다.
+- C1의 첫 외부 write는 실제 `#pr-digest`에 한다.
+- 모든 카드 상단은 Project가 등록됐으면 `[Project] owner/repo #N`, 아니면 `owner/repo #N`으로 표시한다.
 - PR 하나당 루트 메시지 하나를 만든다.
 - 상태가 바뀌면 Bridge 자신이 작성한 같은 메시지를 `chat.update`로 갱신한다.
-- 중요한 상태 변화만 thread에 한 번 남긴다.
+- C1은 thread transition을 만들지 않는다. 중요한 상태 변화의 thread는 C2다.
 - 모바일에서 무엇을, 왜, 현재 어떤 상태로 바꾸는지와 위험·검증·PR 링크를 짧게 파악할 수 있어야 한다.
 
 구체적인 문구와 layout은 [Slack 메시지 UX](../ux/slack-surfaces.md)를 따른다.
@@ -288,7 +289,7 @@ Channel reply tool 또는 localhost IPC를 통해 coordinator가 application rec
 - coordinator notification pending/attempt 상태
 - 마지막 성공 관찰 cursor 또는 snapshot
 
-SQLite는 제시된 후보일 뿐 아직 확정 기술이 아니다.
+C1 durable store는 `node:sqlite`다. 기본 경로는 Windows에서 `%APPDATA%\\orca-slack-bridge\\state.db`이며 명시적 경로 또는 환경변수로 override할 수 있다. WAL과 `schema_version` 테이블을 사용하고, C1은 daemon이나 동시 writer가 없다는 단일 프로세스 가정으로 파일 lock을 만들지 않는다.
 
 필수 성질:
 
@@ -385,7 +386,7 @@ S0, C1, C2, D1, D2, D3를 구현한 core C/D 상태는 다음 end-to-end 증거�
 11. raw Agent transcript와 GitHub Slack 메시지를 기본 데이터 pipeline에 포함하지 않는다.
 12. 독립 Task는 한 Gate 때문에 Bridge에 의해 중단되지 않는다.
 
-실제 Slack·GitHub·Orca 통합 테스트와 fixture 테스트의 경계는 빌드 시작 시 확정한다. 실행 명령과 출력 없이 완료를 선언하지 않는다.
+C1의 통합 테스트 경계는 대역 멱등성 테스트와 실제 `#pr-digest` 게시 1회 및 재실행 관측으로 확정했다(OD-060/061). 후속 slice는 실행 명령과 출력 없이 완료를 선언하지 않는다.
 
 PC 자동 시작, 새 Run/repository 자동 발견과 자동 routing까지 검증해야 [전체 제품의 최종 운영 UX](#12-전체-제품의-최종-운영-ux) 완료를 선언할 수 있다.
 

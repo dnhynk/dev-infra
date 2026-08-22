@@ -135,7 +135,7 @@ coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 work
   - 첫 문장: 무엇을 했는가
   - 둘째 문장: 무엇을 발견했는가
   - 셋째 문장: 무엇이 남았는가
-- PR 생성과 `worker_done` 전송의 strict ordering, PR identity를 body에 포함할지는 구현 전에 확정한다. Observer는 이 결정 전까지 두 event가 항상 특정 순서로 도착한다고 가정하지 않는다.
+- worker는 PR을 만든 뒤 `worker_done`을 보낸다. PR identity는 body에 넣지 않고 PR body 맨 끝의 correlation metadata를 유일한 연결점으로 쓴다(OD-021/029).
 - worker가 만드는 PR에는 Bridge가 Run·Task·Dispatch를 정확히 연결할 correlation metadata가 필요하다.
 - metadata의 최종 형식과 생성 주체는 [관찰·상관관계 계약](../contracts/observation-and-correlation.md)에서 확정한다.
 - coordinator는 metadata가 포함되도록 worker에게 규칙을 전달하되, 형식이 확정되기 전에는 임의 문법을 영구 계약으로 만들지 않는다.

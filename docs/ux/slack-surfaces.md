@@ -15,7 +15,7 @@
 - 상태 표현은 한국어 중심으로 하되 product/repository/Run/PR identity는 원본 식별자를 보존한다.
 - 접근성을 위해 emoji나 색상만으로 상태를 구분하지 않는다.
 
-예시의 `[toneandmove]`는 identity 영역을 축약한 표현이다. Project와 Repository를 둘 다 표시할지, 같을 때 하나만 표시할지, Project가 미등록이면 어떤 fallback을 쓸지는 TBD다.
+카드 identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되지 않았으면 `owner/repo #N`이다. 예시의 `[toneandmove] PR #184`는 이 표현을 축약한 것이다.
 
 ## 2. `#pr-digest`
 
@@ -284,7 +284,16 @@ repository마다 채널을 새로 만들지 않고 identity와 thread로 구분�
 - coordinator 세션이 닫혀 있음
 - Channel delivery는 시도했지만 처리 여부를 모름
 
-구체적인 오류 문구와 owner notification 정책은 `OD-072`에서 확정한다.
+구체적인 오류 문구와 D1/D2 owner notification 정책은 `OD-072`의 후속 범위에서 확정한다.
+
+C1 카드에서만 확정한 degraded 표시:
+
+- summarizer가 실패하면 축소 카드에 `요약 실패`를 표시한다.
+- 입력 상한을 넘겨 일부만 관측했으면 잘림을 표시한다.
+- 연결된 `worker_done`이 없으면 `worker 보고 없음`을 표시한다.
+- correlation 실패 PR은 카드를 만들지 않으므로 Slack에 degraded 표시도 없다.
+
+D1/D2의 owner 알림 정책은 계속 미정이다.
 
 ## 7. 초기 비허용 UI
 

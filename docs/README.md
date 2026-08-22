@@ -1,7 +1,7 @@
 # dev-infra 문서 인덱스
 
-상태: **구현 전 명세 초안**  
-기준일: **2026-08-21**
+상태: **C1 구현·검증 반영, 후속 slice 명세 초안**
+기준일: **2026-08-22**
 
 이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 기준 문서다. 현재 문서 루트는 `D:\dev-infra\docs`다. 현재 세션은 문서 작성 세션이며, 애플리케이션 코드·Slack 설정·GitHub 설정·Orca 상태는 변경하지 않았다.
 
@@ -69,4 +69,4 @@
 
 ## 현재 산출물 경계
 
-이 문서 세트는 다음 빌드 세션이 무엇을 조사하고 어떤 결정을 받아야 하는지를 명확히 하는 데까지 책임진다. 실제 구현 완료를 의미하지 않는다. 테스트, 실제 Slack 메시지, GitHub API 호출, Orca `gate-resolve`, Channel notification은 실행하지 않았다.
+이 문서 세트는 C1 PR Digest의 구현·검증 결과와 후속 slice의 현재 계약을 함께 보존한다. C1에서는 테스트, GitHub API 조회, 실제 `#pr-digest` 게시 1회와 재실행 관측을 완료했다. Gate resolve와 Channel notification은 실행하지 않았다.
