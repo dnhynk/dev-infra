@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { openDigestStore, formatDigestError } from '../src/cli.js';
-import { SqliteDigestStore } from '../src/store/sqlite.js';
+import { SqliteDigestStore, SchemaVersionError } from '../src/store/sqlite.js';
+import { SCHEMA_VERSION } from '../src/store/schema.js';
 import { pullRequestKey } from '../src/identity/keys.js';
 import type { DigestStore, NewPrMessage } from '../src/store/schema.js';
 
@@ -108,6 +110,19 @@ describe('dry-run store', () => {
       // 단언이 실패해도 handle을 남기지 않는다. 남기면 win32에서 afterEach의 rmSync가 EPERM이다.
       live.close();
     }
+  });
+
+  it('모르는 스키마 버전이면 실제 실행과 똑같이 던진다', () => {
+    openDigestStore(dbPath, false).close();
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`UPDATE schema_version SET version = ${SCHEMA_VERSION + 1} WHERE id = 1`);
+    raw.close();
+    const before = fileprint(dbPath);
+
+    // dry-run이 실제 실행과 다른 판정을 내리면 dry-run으로 확인한 의미가 없다.
+    expect(() => openDigestStore(dbPath, true)).toThrow(SchemaVersionError);
+    // 던지는 경로에서도 원본을 바꾸지 않는다.
+    expect(fileprint(dbPath)).toEqual(before);
   });
 
   it('write를 던진다. 게시하지 않은 카드의 매핑을 남기지 않는다', () => {
