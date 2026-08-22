@@ -15,8 +15,14 @@ describe('명령 분기', () => {
     if (p.kind === 'run') expect(p.command).toBe('verify-slack');
   });
 
+  it('digest를 인식한다', () => {
+    const p = parseArgs(['digest']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') expect(p.command).toBe('digest');
+  });
+
   it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack']) {
+    for (const c of ['snapshot', 'verify-slack', 'digest']) {
       expect(parseArgs([c]).kind).toBe('run');
     }
   });
@@ -60,6 +66,50 @@ describe('명령 분기', () => {
     expect(parseArgs(['snapshot', '--pr-limit', '0']).kind).toBe('error');
     expect(parseArgs(['snapshot', '--pr-limit', 'x']).kind).toBe('error');
     expect(parseArgs(['snapshot', '--pr-limit', '-3']).kind).toBe('error');
+  });
+});
+
+describe('digest 옵션', () => {
+  it('기본값은 실제 게시이며 대상을 좁히지 않는다', () => {
+    const p = parseArgs(['digest']);
+    if (p.kind === 'run') {
+      expect(p.dryRun).toBe(false);
+      expect(p.pr).toBeNull();
+      expect(p.statePath).toBeNull();
+    }
+  });
+
+  it('--dry-run, --pr, --state를 읽는다', () => {
+    const p = parseArgs(['digest', '--dry-run', '--pr', '5', '--state', 'D:/state.db']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.dryRun).toBe(true);
+      expect(p.pr).toBe(5);
+      expect(p.statePath).toBe('D:/state.db');
+    }
+  });
+
+  it('잘못된 --pr은 오류', () => {
+    expect(parseArgs(['digest', '--pr', '0']).kind).toBe('error');
+    expect(parseArgs(['digest', '--pr', 'x']).kind).toBe('error');
+    expect(parseArgs(['digest', '--pr', '-1']).kind).toBe('error');
+  });
+
+  // digest만 외부 write를 한다. --dry-run 오타를 무시하면 확인 없이 실제 채널에 게시된다.
+  it('digest는 모르는 플래그를 무시하지 않고 오류로 만든다', () => {
+    const p = parseArgs(['digest', '--dry-runn']);
+    expect(p.kind).toBe('error');
+    if (p.kind === 'error') expect(p.message).toContain('--dry-runn');
+  });
+
+  it('값 자리에 온 값은 플래그로 오인하지 않는다', () => {
+    const p = parseArgs(['digest', '--state', '--weird-path']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') expect(p.statePath).toBe('--weird-path');
+  });
+
+  it('write하지 않는 명령의 기존 동작은 바꾸지 않는다', () => {
+    expect(parseArgs(['snapshot', '--dry-runn']).kind).toBe('run');
   });
 });
 
