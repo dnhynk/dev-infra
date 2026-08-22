@@ -6,7 +6,12 @@ import {
   identityLine,
   type RenderedCard,
 } from '../src/digest/render.js';
-import type { ProjectedPr, RenderInput } from '../src/digest/types.js';
+import type {
+  DigestStatus,
+  ProjectedPr,
+  RenderInput,
+  ReviewedHeadMatch,
+} from '../src/digest/types.js';
 import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 import { repositoryIdentity } from '../src/identity/repository.js';
 import type { SummaryDraft, SummaryResult } from '../src/summarize/index.js';
@@ -80,6 +85,47 @@ function plain(card: RenderedCard): string {
 function contains(card: RenderedCard, needle: string): boolean {
   return JSON.stringify(card.blocks).includes(needle);
 }
+
+/** section block들의 text. Slack의 3000자 상한이 걸리는 자리다. */
+function sectionTexts(card: RenderedCard): readonly string[] {
+  return card.blocks
+    .map((b) => b as Record<string, unknown>)
+    .filter((o) => o['type'] === 'section')
+    .map((o) => String((o['text'] as Record<string, unknown>)['text']));
+}
+
+/** emoji를 지운다. 색·emoji 없이도 상태를 알 수 있는지 보기 위해서다. */
+function withoutEmoji(value: string): string {
+  return value.replace(/\p{Extended_Pictographic}|\uFE0F/gu, '');
+}
+
+function withReview(
+  verdict: 'approve' | 'request_changes',
+  headMatch: ReviewedHeadMatch,
+  reviewedHeadSha: string | null,
+): ProjectedPr {
+  return {
+    ...basePr,
+    review: { verdict, reviewedHeadSha, headMatch, findings: [], findingsTotal: 0 },
+  };
+}
+
+/** 다섯 `DigestStatus`를 각각 한 번씩 내는 입력. 아래 여러 테스트가 공유한다. */
+const ALL_STATES: readonly ProjectedPr[] = [
+  basePr,
+  withReview('approve', 'same', 'abc1234'),
+  withReview('request_changes', 'same', 'abc1234'),
+  { ...basePr, state: 'closed' },
+  { ...basePr, state: 'merged' },
+];
+
+const STATUS_TEXT_LABEL: Readonly<Record<DigestStatus, string>> = {
+  merged: '병합 완료',
+  closed: '병합 없이 닫힘',
+  changes_requested: '리뷰에서 수정 요청',
+  review_approved: '리뷰 통과',
+  awaiting_review: '리뷰 결과 없음',
+};
 
 const cases: Readonly<Record<string, RenderInput>> = {
   '요약 성공 · review 없음': { pr: basePr, summary: okSummary },
@@ -216,6 +262,243 @@ describe('renderCard', () => {
     });
     expect(contains(card, '&lt;script&gt; &amp;')).toBe(true);
     expect(contains(card, '<script>')).toBe(false);
+  });
+});
+
+/**
+ * snapshot 밖의 의미 요구.
+ *
+ * 아래 단언은 snapshot을 갱신해도 깨진다. snapshot만으로 고정하면 두 truncation flag를 하나로
+ * 합치거나 경고 문구를 지운 뒤 snapshot을 다시 찍는 것으로 통과해 버린다.
+ */
+describe('renderCard · 의미 요구', () => {
+  it('두 절단 flag는 각각 단독으로 서로 다른 표시를 낸다', () => {
+    const bodyOnly = renderCard({
+      pr: { ...basePr, truncation: { prBody: true, changedFiles: false } },
+      summary: okSummary,
+    });
+    const filesOnly = renderCard({
+      pr: { ...basePr, truncation: { prBody: false, changedFiles: true } },
+      summary: okSummary,
+    });
+
+    expect(contains(bodyOnly, 'PR 본문이 상한에서 잘려')).toBe(true);
+    expect(contains(bodyOnly, '변경 파일 목록을 일부만 관측했다')).toBe(false);
+    expect(contains(filesOnly, '변경 파일 목록을 일부만 관측했다')).toBe(true);
+    expect(contains(filesOnly, 'PR 본문이 상한에서 잘려')).toBe(false);
+    // 두 flag를 하나로 합치면 두 카드가 같아지고 이 단언이 깨진다.
+    expect(renderFingerprint(bodyOnly)).not.toBe(renderFingerprint(filesOnly));
+  });
+
+  it('review가 null이면 리뷰 판정이 없다는 것이 드러난다', () => {
+    expect(basePr.review).toBeNull();
+    const card = renderCard({ pr: basePr, summary: okSummary });
+    expect(contains(card, 'reviewer_result가 관찰되지 않았다')).toBe(true);
+    // 판정이 있는 것처럼 보이는 줄을 만들지 않는다.
+    expect(contains(card, '판정:')).toBe(false);
+    expect(contains(card, '보고된 finding 없음')).toBe(false);
+    expect(deriveStatus(basePr)).toBe('awaiting_review');
+    expect(contains(card, STATUS_TEXT_LABEL.awaiting_review)).toBe(true);
+  });
+
+  it('headMatch unknown과 different가 서로 다른 문장을 낸다', () => {
+    const card = (pr: ProjectedPr): RenderedCard => renderCard({ pr, summary: okSummary });
+    const different = card(withReview('approve', 'different', 'old9999'));
+    const unknown = card(withReview('approve', 'unknown', null));
+    const same = card(withReview('approve', 'same', basePr.headSha));
+
+    expect(contains(different, 'reviewer가 본 commit이 현재 head와 다르다')).toBe(true);
+    expect(contains(different, '알 수 없어')).toBe(false);
+
+    expect(contains(unknown, 'reviewer가 본 commit을 알 수 없어')).toBe(true);
+    expect(contains(unknown, 'reviewer가 본 commit이 현재 head와 다르다')).toBe(false);
+
+    // same은 어느 쪽 문장도 만들지 않는다.
+    expect(contains(same, 'reviewer가 본 commit')).toBe(false);
+
+    // 세 값이 서로 다른 카드를 만든다. 하나로 뭉뚱그리면 깨진다.
+    expect(new Set([different, unknown, same].map((c) => renderFingerprint(c))).size).toBe(3);
+
+    // 사실 진술이지 approval 무효 판정이 아니다(OD-031, C2).
+    for (const c of [different, unknown]) {
+      expect(contains(c, '판정: approve')).toBe(true);
+      for (const claim of ['무효', '만료', '다시 리뷰']) {
+        expect(contains(c, claim)).toBe(false);
+      }
+    }
+  });
+
+  it('모든 상태에서 identity와 PR 링크가 blocks와 fallback 양쪽에 있다', () => {
+    const seen = new Set<DigestStatus>();
+    for (const pr of ALL_STATES) {
+      for (const summary of [okSummary, failedSummary]) {
+        const card = renderCard({ pr, summary });
+        seen.add(deriveStatus(pr));
+        expect(contains(card, '[dev-infra] dnhynk/dev-infra #7')).toBe(true);
+        expect(card.text).toContain('[dev-infra] dnhynk/dev-infra #7');
+        expect(contains(card, PR_URL)).toBe(true);
+        expect(card.text).toContain(PR_URL);
+      }
+    }
+    // 다섯 상태를 전부 덮었다. 상태가 늘면 이 단언이 먼저 깨진다.
+    expect(seen.size).toBe(5);
+  });
+
+  it('emoji와 색을 지워도 상태를 알 수 있다', () => {
+    for (const pr of ALL_STATES) {
+      const card = renderCard({ pr, summary: okSummary });
+      const label = STATUS_TEXT_LABEL[deriveStatus(pr)];
+      expect(withoutEmoji(JSON.stringify(card.blocks))).toContain(label);
+      expect(withoutEmoji(card.text)).toContain(label);
+    }
+  });
+
+  it('closed 카드도 라벨·identity·링크를 모두 남긴다', () => {
+    const card = renderCard({ pr: { ...basePr, state: 'closed' }, summary: failedSummary });
+    expect(contains(card, STATUS_TEXT_LABEL.closed)).toBe(true);
+    expect(withoutEmoji(card.text)).toContain(STATUS_TEXT_LABEL.closed);
+    expect(contains(card, '[dev-infra] dnhynk/dev-infra #7')).toBe(true);
+    expect(contains(card, PR_URL)).toBe(true);
+  });
+
+  it('review_approved가 병합 준비 완료를 주장하지 않는다', () => {
+    const approved = withReview('approve', 'same', basePr.headSha);
+    expect(deriveStatus(approved)).toBe('review_approved');
+
+    // CI가 실패해도 상태 라벨은 review verdict만 옮긴다. 둘을 결합한 판정은 C2다(OD-032).
+    for (const pr of [
+      approved,
+      { ...approved, checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] },
+      { ...approved, isDraft: true },
+    ]) {
+      const card = renderCard({ pr, summary: okSummary });
+      const all = [card.text, JSON.stringify(card.blocks)].join('\n');
+      expect(all).toContain(STATUS_TEXT_LABEL.review_approved);
+      for (const claim of ['병합 준비', 'merge_ready', 'merge-ready', '병합 가능', '병합해도']) {
+        expect(all).not.toContain(claim);
+      }
+    }
+  });
+});
+
+describe('renderCard · fallback text 이스케이프', () => {
+  /**
+   * PR 제목과 모델 title은 untrusted input이다(스펙 §10). blocks만 이스케이프하면 fallback
+   * text에서 `<!channel>` 하나가 카드 한 번에 workspace 전체를 깨운다.
+   */
+  const HOSTILE = 'fix: <@U012ABC> <!channel> & <https://evil.example|GitHub>';
+
+  it('요약 실패 시 PR 원문 제목이 fallback에서도 이스케이프된다', () => {
+    const card = renderCard({ pr: { ...basePr, title: HOSTILE }, summary: failedSummary });
+    expect(card.text).toContain('&lt;@U012ABC&gt;');
+    expect(card.text).toContain('&lt;!channel&gt;');
+    expect(card.text).toContain('&amp;');
+    expect(card.text).not.toContain('<!channel>');
+    expect(card.text).not.toContain('<@U012ABC>');
+    expect(card.text).not.toContain('<https://evil.example|GitHub>');
+  });
+
+  it('요약 성공 시 모델이 만든 title도 fallback에서 이스케이프된다', () => {
+    const card = renderCard({
+      pr: basePr,
+      summary: { ...okSummary, draft: { ...okDraft, title: HOSTILE } },
+    });
+    expect(card.text).toContain('&lt;!channel&gt;');
+    expect(card.text).not.toContain('<!channel>');
+  });
+
+  it('identity에 들어온 예약 문자도 fallback에서 이스케이프된다', () => {
+    const card = renderCard({ pr: { ...basePr, project: '<!here>' }, summary: okSummary });
+    expect(card.text).toContain('[&lt;!here&gt;]');
+    expect(card.text).not.toContain('<!here>');
+  });
+
+  it('fallback과 blocks가 같은 이스케이프 결과를 쓴다', () => {
+    const card = renderCard({ pr: { ...basePr, title: HOSTILE }, summary: failedSummary });
+    const escaped =
+      'fix: &lt;@U012ABC&gt; &lt;!channel&gt; &amp; &lt;https://evil.example|GitHub&gt;';
+    expect(card.text).toContain(escaped);
+    expect(contains(card, escaped)).toBe(true);
+    // URL을 뺀 나머지에는 예약 문자가 남지 않는다.
+    expect(card.text.replace(PR_URL, '')).not.toMatch(/[<>]/);
+  });
+});
+
+describe('renderCard · section text 3000자 상한', () => {
+  /**
+   * Slack section text는 최대 3000자다. 넘기면 `invalid_blocks`로 카드 **전체**가 거절돼
+   * identity와 PR 링크까지 사라진다. `WorkerReport.body`도 `ProjectedPr.title`도 계약에
+   * 상한이 없으므로 렌더 경계에서 막는다.
+   */
+  const LONG = 'ㄱ'.repeat(5000);
+  const MARK = '표시 한도 3000자를 넘어 잘림';
+
+  const overflowing: Readonly<Record<string, RenderInput>> = {
+    'worker 보고 본문': {
+      pr: { ...basePr, workerReport: { outcome: 'succeeded', body: LONG } },
+      summary: failedSummary,
+    },
+    'PR 제목': { pr: { ...basePr, title: LONG }, summary: failedSummary },
+    '모델 title': { pr: basePr, summary: { ...okSummary, draft: { ...okDraft, title: LONG } } },
+    '요약 what': { pr: basePr, summary: { ...okSummary, draft: { ...okDraft, what: LONG } } },
+    'check 이름': {
+      pr: { ...basePr, checks: [{ name: LONG, status: 'COMPLETED', conclusion: 'SUCCESS' }] },
+      summary: okSummary,
+    },
+  };
+
+  for (const [name, input] of Object.entries(overflowing)) {
+    it(`${name}이 길어도 어떤 section도 3000자를 넘지 않는다`, () => {
+      const texts = sectionTexts(renderCard(input));
+      expect(texts.length).toBeGreaterThan(0);
+      for (const t of texts) expect(t.length).toBeLessThanOrEqual(3000);
+      // 하나는 실제로 상한에 닿았다. 입력이 짧아서 통과한 것이 아니다.
+      expect(Math.max(...texts.map((t) => t.length))).toBe(3000);
+    });
+
+    it(`${name}을 자를 때 잘렸다는 것이 카드에 보인다`, () => {
+      expect(contains(renderCard(input), MARK)).toBe(true);
+    });
+  }
+
+  it('상한 안이면 자르지도 표시를 붙이지도 않는다', () => {
+    for (const input of Object.values(cases)) {
+      const card = renderCard(input);
+      expect(contains(card, MARK)).toBe(false);
+      for (const t of sectionTexts(card)) expect(t.length).toBeLessThan(3000);
+    }
+  });
+
+  it('상한을 넘겨도 identity와 PR 링크는 남는다', () => {
+    const card = renderCard(overflowing['PR 제목']!);
+    expect(contains(card, 'dnhynk/dev-infra #7')).toBe(true);
+    expect(contains(card, PR_URL)).toBe(true);
+  });
+
+  it('이스케이프 뒤의 길이로 센다', () => {
+    // `&`는 이스케이프하면 5자가 된다. 원문 2000자가 escape 뒤 10000자다.
+    const card = renderCard({
+      pr: { ...basePr, workerReport: { outcome: 'succeeded', body: '&'.repeat(2000) } },
+      summary: failedSummary,
+    });
+    for (const t of sectionTexts(card)) expect(t.length).toBeLessThanOrEqual(3000);
+  });
+
+  it('지문은 자른 결과를 해싱한다', () => {
+    const fp = (body: string): string =>
+      renderFingerprint(
+        renderCard({
+          pr: { ...basePr, workerReport: { outcome: 'succeeded', body } },
+          summary: failedSummary,
+        }),
+      );
+    const head = 'ㄱ'.repeat(4000);
+    // 잘려 나가 카드에 없는 자리가 다르면 카드가 같으므로 지문도 같다. 없는 차이로 update하지 않는다.
+    expect(fp(`${head}A`)).toBe(fp(`${head}B`));
+    // 카드에 남는 자리가 다르면 지문이 바뀐다.
+    expect(fp(`A${head}`)).not.toBe(fp(`B${head}`));
+    // 자른 카드와 자르지 않은 카드는 다르다.
+    expect(fp(head)).not.toBe(fp('짧다'));
   });
 });
 

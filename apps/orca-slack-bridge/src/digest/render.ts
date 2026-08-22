@@ -22,7 +22,11 @@ import type { DigestStatus, ProjectedPr, RenderInput } from './types.js';
 
 /** 게시할 카드 한 장. `SlackPoster`의 `text`/`blocks`에 그대로 넘긴다. */
 export type RenderedCard = {
-  /** blocks를 그리지 못하는 자리(알림, 검색 결과)용 대체 텍스트. 비지 않는다. */
+  /**
+   * blocks를 그리지 못하는 자리(알림, 검색 결과)용 대체 텍스트. 비지 않는다.
+   *
+   * blocks와 **같은** 이스케이프를 거친 값으로 만든다. 이 자리도 mrkdwn으로 해석된다.
+   */
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
 };
@@ -64,6 +68,29 @@ const FINDING_SUMMARY_CAP = 200;
 const FAILURE_REASON_CAP = 300;
 
 /**
+ * section block `text`의 문자 수 상한.
+ *
+ * Slack이 고정한 값이다. "Minimum length for the `text` in this field is 1 and maximum length
+ * is 3000 characters."(`https://docs.slack.dev/reference/block-kit/composition-objects/text-object`)
+ * 넘기면 `chat.postMessage`가 `invalid_blocks`로 거절하고 **카드 전체가 게시되지 않는다.**
+ * identity와 PR 링크가 항상 표시돼야 한다는 C1 출구 조건이 입력 하나로 깨진다.
+ *
+ * 줄 단위 상한(`FINDING_SUMMARY_CAP` 등)으로는 막을 수 없다. 상한이 없는 입력이 여럿이고
+ * (`WorkerReport.body`, `ProjectedPr.title`, findings 10줄의 합) 한 절이 그 합으로 넘친다.
+ * 그래서 renderer가 section을 만드는 **한 지점**에서 일반적으로 적용한다.
+ */
+const SECTION_TEXT_CAP = 3000;
+
+/**
+ * 상한에서 잘렸음을 카드에 남기는 표시.
+ *
+ * 조용히 자르지 않는다. 부분만 보여 주고 전부인 척하지 않는 것은 `ObservationTruncation`과
+ * 같은 규칙이다(UX §6). 다만 이것은 **관측 절단이 아니라 표시 한도**이므로 `ProjectedPr`에
+ * 싣지 않는다. 관측은 전부 했고 Slack이 그만큼만 그릴 수 있을 뿐이다.
+ */
+const SECTION_TRUNCATION_MARK = '\n…(표시 한도 3000자를 넘어 잘림)';
+
+/**
  * Slack mrkdwn 예약 문자를 이스케이프한다.
  *
  * PR 제목, 모델 출력, 파일 경로에 `<`나 `&`가 들어오면 Slack이 링크나 entity로 해석해
@@ -78,8 +105,19 @@ function cut(value: string, cap: number): string {
   return v.length <= cap ? v : `${v.slice(0, cap)}…`;
 }
 
+/**
+ * section text를 Slack 상한 안으로 맞춘다.
+ *
+ * 이스케이프 뒤의 길이로 센다. Slack이 보는 것은 전송된 문자열이고 `&amp;`는 5자다.
+ * 자른 결과가 그대로 카드에 실리므로 `renderFingerprint`도 자른 결과를 해싱한다.
+ */
+function capSectionText(text: string): string {
+  if (text.length <= SECTION_TEXT_CAP) return text;
+  return `${text.slice(0, SECTION_TEXT_CAP - SECTION_TRUNCATION_MARK.length)}${SECTION_TRUNCATION_MARK}`;
+}
+
 function section(text: string): SlackBlock {
-  return { type: 'section', text: { type: 'mrkdwn', text } };
+  return { type: 'section', text: { type: 'mrkdwn', text: capSectionText(text) } };
 }
 
 function labelled(label: string, lines: readonly string[]): SlackBlock {
@@ -136,8 +174,14 @@ export function renderCard(input: RenderInput): RenderedCard {
   // 요약이 실패하면 PR 원문 제목이 카드 제목의 fallback이다(OD-035).
   const title = summary.kind === 'ok' ? summary.draft.title : pr.title;
 
+  // blocks와 fallback text가 **같은** 이스케이프 결과를 쓴다. 두 경로가 각자 이스케이프하면
+  // 한쪽만 고쳐지고, 그때 새는 쪽은 항상 fallback이다. PR 제목은 untrusted input이고(스펙 §10)
+  // 이스케이프하지 않은 `<!channel>` 하나가 카드 한 번에 workspace 전체를 깨운다.
+  const escapedIdentity = esc(identity);
+  const escapedTitle = esc(title);
+
   const blocks: SlackBlock[] = [];
-  blocks.push(section(`${emoji} *${esc(identity)}* · ${esc(title)}`));
+  blocks.push(section(`${emoji} *${escapedIdentity}* · ${escapedTitle}`));
 
   if (summary.kind === 'ok') {
     blocks.push(labelled('무엇이 바뀌나', [esc(summary.draft.what)]));
@@ -224,8 +268,9 @@ export function renderCard(input: RenderInput): RenderedCard {
     ],
   });
 
-  // blocks를 그리지 못하는 자리에서도 identity·상태·링크가 남아야 한다.
-  const text = `${emoji} ${identity} · ${title} — ${label} — ${pr.url}`;
+  // blocks를 그리지 못하는 자리에서도 identity·상태·링크가 남아야 한다. 그 자리도 mrkdwn으로
+  // 해석되므로 blocks와 같은 이스케이프를 거친 값을 쓴다.
+  const text = `${emoji} ${escapedIdentity} · ${escapedTitle} — ${label} — ${pr.url}`;
 
   return { text, blocks };
 }
