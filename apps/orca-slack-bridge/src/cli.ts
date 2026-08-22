@@ -3,10 +3,11 @@ import { loadConfig, defaultConfigPath, type BridgeConfig } from './project/conf
 import { GhCli } from './github/runner.js';
 import { OrcaCli } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
-import { verifySlack, formatVerify } from './slack/verify.js';
+import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import { SlackWebApiPoster, botToken } from './slack/post.js';
-import { SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
+import { ReadOnlyDigestStore, SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
+import type { DigestStore } from './store/schema.js';
 import {
   MemorySummaryCache,
   OpenAiSummaryProvider,
@@ -37,6 +38,13 @@ export type ParsedArgs =
 
 type RunArgs = Extract<ParsedArgs, { readonly kind: 'run' }>;
 
+/**
+ * 값 플래그의 값을 읽는다. 플래그가 없으면 undefined.
+ *
+ * `argv[i + 1]`을 그대로 값으로 쓴다. 그 자리에 값이 실제로 있는지는 `missingFlagValue`가 먼저
+ * 판정하므로 여기서 다시 보지 않는다. **새 값 플래그를 만들면 반드시 `VALUE_FLAGS`에 넣는다.**
+ * 넣지 않으면 그 플래그만 검사를 통과하지 못한 채 값 없이 흐른다.
+ */
 function arg(argv: readonly string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
@@ -48,9 +56,39 @@ function isCommand(v: string | undefined): v is Command {
   return v !== undefined && (COMMANDS as readonly string[]).includes(v);
 }
 
-/** 값을 받는 플래그와 받지 않는 플래그. `digest`의 오타 검사에 쓴다. */
+/** 값을 받는 플래그와 받지 않는 플래그. 값 검사와 `digest`의 오타 검사에 쓴다. */
 const VALUE_FLAGS: readonly string[] = ['--config', '--orca', '--pr-limit', '--pr', '--state'];
 const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
+
+/**
+ * 값 플래그가 값을 실제로 받았는지 본다. 위반이 없으면 null.
+ *
+ * `arg()`는 `argv[i + 1]`을 무조건 값으로 쓰므로, 이 검사가 없으면 값이 없거나 값 자리에 다른
+ * 플래그가 온 호출이 오류 없이 `run`으로 내려간다. 그때 잃는 것이 크다.
+ *
+ * - `digest --pr`은 `pr = null`이 되어 좁히려던 의도와 반대로 **모든 PR에 게시**한다.
+ * - `digest --state`는 기본 DB로 간다. 다른 store를 쓰려던 의도가 조용히 뒤집힌다.
+ * - `digest --state --dry-runn`은 `--dry-run` 오타가 `--state`의 값으로 먹혀 `dryRun`이 false가
+ *   된다. 실제 채널에 게시하면서 없던 이름의 DB를 열어 기존 매핑을 못 찾으므로 **루트를 하나 더
+ *   만든다.** 로드맵 §5의 "재관찰로 루트가 중복되지 않음"이 오타 하나로 깨진다.
+ *
+ * 값이 `--`로 시작하면 오류로 본다. 값을 요구하는 자리에 플래그가 온 것이므로 오타이거나 값
+ * 누락이다. `--config`·`--orca`·`--state`의 값이 `--`로 시작하는 정상적인 호출은 없다.
+ *
+ * `unknownDigestFlag`와 달리 이 검사는 **모든 명령**에 건다. 모르는 플래그를 무시하는 것은
+ * `snapshot`에서 무해하지만, 값 없는 값 플래그는 어느 명령에서도 유효한 호출이 아니어서 뺏을
+ * 정상 동작이 없다. 원인도 명령별이 아니라 `arg()` 한 곳에 있으므로 명령별 특례를 두지 않는다.
+ */
+function missingFlagValue(argv: readonly string[]): string | null {
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined || !VALUE_FLAGS.includes(token)) continue;
+    const value = argv[i + 1];
+    if (value === undefined) return `${token}은 값을 요구하는데 값이 없다`;
+    if (value.startsWith('--')) return `${token}은 값을 요구하는데 플래그가 왔다: ${value}`;
+  }
+  return null;
+}
 
 /**
  * `digest`가 모르는 플래그를 찾는다. 없으면 null.
@@ -59,16 +97,15 @@ const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
  * `verify-slack`에서는 무시가 무해하지만 `digest`는 되돌릴 수 없는 외부 write를 한다.
  * `--dry-run`을 한 글자 틀리면 확인 없이 실제 채널에 게시된다. 그래서 write하는 명령에만
  * 검사를 건다. 다른 명령의 기존 동작은 바꾸지 않는다.
+ *
+ * 값 자리를 따로 건너뛰지 않는다. `missingFlagValue`가 먼저 돌아 `--`로 시작하는 값을 이미
+ * 거부하므로, `--`로 시작하는 토큰은 값일 수 없다. 건너뛰던 예전 코드가 `--state --dry-runn`의
+ * 오타를 값으로 보아 통과시켰다.
  */
 function unknownDigestFlag(argv: readonly string[]): string | null {
-  const valuePositions = new Set<number>();
-  for (const flag of VALUE_FLAGS) {
-    const i = argv.indexOf(flag);
-    if (i >= 0) valuePositions.add(i + 1);
-  }
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
-    if (token === undefined || !token.startsWith('--') || valuePositions.has(i)) continue;
+    if (token === undefined || !token.startsWith('--')) continue;
     if (!VALUE_FLAGS.includes(token) && !BOOL_FLAGS.includes(token)) return token;
   }
   return null;
@@ -81,6 +118,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if (!isCommand(command)) {
     return { kind: 'error', message: `알 수 없는 명령: ${String(command)}` };
   }
+  const missing = missingFlagValue(argv);
+  if (missing !== null) return { kind: 'error', message: missing };
   if (command === 'digest') {
     const unknown = unknownDigestFlag(argv);
     if (unknown !== null) {
@@ -148,17 +187,54 @@ function summaryProvider(env: NodeJS.ProcessEnv): SummaryProvider {
   return new OpenAiSummaryProvider({ apiKey: key });
 }
 
+/**
+ * digest가 쓸 store를 연다.
+ *
+ * dry-run은 읽기 전용 store를 쓴다. `SqliteDigestStore`는 여는 것만으로 부모 디렉터리와 DB
+ * 파일을 만들고 WAL과 스키마를 쓰며 닫을 때 checkpoint하므로, 도움말이 말하는 "store에 쓰지
+ * 않는다"가 거짓이 된다. 쓰지 않는 수단과 그 근거는 `ReadOnlyDigestStore`에 있다.
+ */
+export function openDigestStore(statePath: string, dryRun: boolean): DigestStore {
+  return dryRun ? new ReadOnlyDigestStore(statePath) : new SqliteDigestStore(statePath);
+}
+
+/**
+ * digest 실패를 사람이 읽는 한 줄로 만든다. 대상 채널 ID를 지운다.
+ *
+ * `store/sqlite.ts`의 `insertPrMessage`는 실패 원인을 좁히려고 오류 message에 `channelId`와
+ * `messageTs`를 싣는다. disk full이나 제약 위반이면 그 message가 그대로 stderr로 나가, 설정에서만
+ * 와야 할 실제 채널 ID가 로그에 남는다(스펙 §10의 로그 마스킹).
+ *
+ * store의 오류 형식을 바꾸지 않고 **CLI 경계에서** 지운다. store 오류가 사람에게 나가는 경로가
+ * 여기 하나뿐이라 diff가 작고, 같은 오류를 쓰는 다른 경로(test, 예외 chain)의 진단 정보는 그대로
+ * 남기 때문이다. 마스킹은 `slack/verify.ts`의 `maskToken`을 그대로 쓴다. `slack/post.ts`가 토큰에
+ * 하는 것과 같은 방식이고, 형식을 새로 만들면 둘이 갈라져 한쪽만 고쳐진다.
+ *
+ * `maskToken`은 길이에 따라 결과가 다르다. 12자 이하는 통째로 `***`가 되고 그보다 길면 앞뒤
+ * 일부가 남는다. 통상 Slack 채널 ID는 12자 이하라 `***`가 된다. `config.ts`는 채널 ID의 길이를
+ * 제한하지 않으므로, 더 긴 ID에서는 값 전체가 아니라 앞 9자가 남는다는 것을 알고 쓴다.
+ *
+ * **구현자에게**: store 오류를 사람에게 내보내는 경로를 새로 만들면 여기서 하는 것을 함께 한다.
+ */
+export function formatDigestError(e: unknown, channel: string): string {
+  const message = e instanceof Error ? e.message : String(e);
+  // 빈 문자열로 replaceAll하면 문자 사이마다 끼워 넣는다. 지울 것도 없다.
+  if (channel === '') return message;
+  return message.replaceAll(channel, maskToken(channel));
+}
+
 async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<number> {
   if (config.slack === null) {
     process.stderr.write('digest는 설정의 slack 섹션이 필요하다. 게시 채널은 설정에서만 읽는다\n');
     return 2;
   }
+  const channel = config.slack.channels.prDigest;
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
-  const store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
+  const store = openDigestStore(resolveStatePath(parsed.statePath), parsed.dryRun);
   try {
     const report = await runDigest(new OrcaCli(orcaBin), new GhCli(), {
       config,
-      channel: config.slack.channels.prDigest,
+      channel,
       store,
       // dry-run은 poster를 아예 만들지 않는다. 토큰도 읽지 않으므로 write 경로가 없다.
       slack: parsed.dryRun ? null : new SlackWebApiPoster({ token: botToken(process.env) }),
@@ -172,6 +248,10 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
       (parsed.json ? JSON.stringify(report, null, 2) : formatReport(report)) + '\n',
     );
     return 0;
+  } catch (e) {
+    // main의 최상위 handler로 올리지 않는다. 그쪽은 채널 ID를 지울 근거를 갖고 있지 않다.
+    process.stderr.write(formatDigestError(e, channel) + '\n');
+    return 1;
   } finally {
     store.close();
   }
