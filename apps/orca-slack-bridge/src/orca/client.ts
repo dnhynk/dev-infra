@@ -179,54 +179,100 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** OD-073이 정의한 유일한 `reviewer_result` 버전. */
+export const REVIEWER_RESULT_SCHEMA_VERSION = 1;
+
+/** 비어 있지 않은 문자열을 **강제하지 않고 요구한다**. 어긋나면 던진다. */
+function requireText(raw: unknown, at: string): string {
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    throw new TypeError(`${at}이(가) 비어 있지 않은 문자열이 아니다: ${String(raw)}`);
+  }
+  return raw.trim();
+}
+
 function finding(raw: unknown, at: string): FindingFacts {
   if (!isRecord(raw)) throw new TypeError(`${at}이(가) 객체가 아니다`);
   const severity = raw['severity'];
   if (severity !== 'blocker' && severity !== 'major' && severity !== 'minor') {
     throw new TypeError(`${at}.severity가 blocker/major/minor가 아니다: ${String(severity)}`);
   }
-  const line = raw['line'];
+  // `line`은 없어도 된다. `FindingFacts.line`이 `number | null`이므로 파일 단위 finding을
+  // 표현할 수 있다. 없는 것과 값이 깨진 것은 다르므로 후자만 던진다.
+  const rawLine = raw['line'];
+  let line: number | null = null;
+  if (rawLine !== undefined && rawLine !== null) {
+    if (typeof rawLine !== 'number' || !Number.isSafeInteger(rawLine) || rawLine <= 0) {
+      throw new TypeError(`${at}.line이 양의 정수가 아니다: ${String(rawLine)}`);
+    }
+    line = rawLine;
+  }
   return {
     severity,
-    file: str(raw['file']),
-    line: typeof line === 'number' && Number.isFinite(line) ? line : null,
-    summary: str(raw['summary']),
+    file: requireText(raw['file'], `${at}.file`),
+    line,
+    summary: requireText(raw['summary'], `${at}.summary`),
   };
 }
 
 /**
- * task result가 `reviewer_result`면 읽고, 아니면 null.
+ * task result가 `reviewer_result`면 **OD-073 v1 shape를 엄격히 검증해** 읽고, 아니면 null.
  *
- * null은 "이 task는 review task가 아니다"라는 정상 출력이다. 반대로 `kind`가
- * `reviewer_result`인데 모양이 다르면 던진다. 계약이 깨진 것을 조용히 "리뷰 없음"으로
- * 덮으면 카드가 리뷰 결과를 통째로 빠뜨린 채 그려진다.
+ * "없음"과 "malformed"를 가른다. `result`가 null이거나 `kind`가 `reviewer_result`가 아니면
+ * (실측: worker_done으로 끝난 task의 result에는 `provenance: "worker_report"` JSON이 들어 있다)
+ * 이 task는 review task가 아니라는 정상 출력이므로 null이다. `kind`가 맞는데 shape가 어긋나면
+ * 던진다.
+ *
+ * **관대한 강제를 하지 않는다.** 부재를 빈 배열로, 잘못된 값을 빈 문자열이나 null로 바꿔
+ * 받으면 malformed한 result도 verdict가 카드에 그려진다. 카드가 리뷰 상태를 조용히 잘못
+ * 말하게 된다. `summarize/validate.ts`가 LLM 출력에 같은 자세를 취하는 이유와 같다.
+ *
+ * `schemaVersion`이 1이 아니면 높은 쪽도 던진다. 근거는 `store/schema.ts`의 `SCHEMA_DDL`과
+ * 같다. C1은 reviewer_result migration을 만들지 않으므로, 모르는 버전을 아는 버전처럼
+ * 추측해 읽지 않는 것이 migration이 생기기 전까지의 계약이다.
+ *
+ * `reviewedHeadSha`는 없어도 된다. merge된 `ReviewedHeadMatch`에 "없어서 대조하지 못했다"는
+ * `unknown` 값이 있으므로 부재는 표현 가능한 v1 상태다. 타입이 어긋나는 것만 던진다.
+ * `gates`는 읽지 않으므로 검증하지도 않는다.
+ *
+ * @param taskId 오류 메시지에 실어 어느 task의 result가 깨졌는지 즉시 알게 한다.
  */
-export function parseReviewerResult(result: unknown): OrcaReviewerResult | null {
+export function parseReviewerResult(result: unknown, taskId: string): OrcaReviewerResult | null {
   if (!isRecord(result) || result['kind'] !== 'reviewer_result') return null;
+  const at = `${taskId}의 reviewer_result`;
+
+  const schemaVersion = result['schemaVersion'];
+  if (typeof schemaVersion !== 'number' || !Number.isSafeInteger(schemaVersion)) {
+    throw new TypeError(`${at}.schemaVersion이 정수가 아니다: ${String(schemaVersion)}`);
+  }
+  if (schemaVersion !== REVIEWER_RESULT_SCHEMA_VERSION) {
+    throw new TypeError(
+      `${at}.schemaVersion ${schemaVersion}을(를) 이 Bridge가 읽을 수 없다. ` +
+        `아는 버전은 ${REVIEWER_RESULT_SCHEMA_VERSION}뿐이고 모르는 버전을 추측해 읽지 않는다`,
+    );
+  }
+
   const verdict = result['verdict'];
   if (verdict !== 'approve' && verdict !== 'request_changes') {
-    throw new TypeError(`reviewer_result.verdict가 approve/request_changes가 아니다: ${String(verdict)}`);
+    throw new TypeError(`${at}.verdict가 approve/request_changes가 아니다: ${String(verdict)}`);
   }
   const pr = result['pr'];
-  if (!isRecord(pr)) throw new TypeError('reviewer_result.pr이 객체가 아니다');
-  const repo = pr['repo'];
+  if (!isRecord(pr)) throw new TypeError(`${at}.pr이 객체가 아니다: ${String(pr)}`);
   const number = pr['number'];
-  if (typeof repo !== 'string' || repo.trim() === '') {
-    throw new TypeError('reviewer_result.pr.repo가 비어 있다');
+  if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) {
+    throw new TypeError(`${at}.pr.number가 양의 정수가 아니다: ${String(number)}`);
   }
-  if (typeof number !== 'number' || !Number.isSafeInteger(number)) {
-    throw new TypeError(`reviewer_result.pr.number가 정수가 아니다: ${String(number)}`);
-  }
+  const sha = result['reviewedHeadSha'];
   const findings = result['findings'];
-  if (findings !== undefined && findings !== null && !Array.isArray(findings)) {
-    throw new TypeError('reviewer_result.findings가 배열이 아니다');
+  if (!Array.isArray(findings)) {
+    throw new TypeError(`${at}.findings가 배열이 아니다: ${String(findings)}`);
   }
   return {
     verdict,
-    repo: repo.trim(),
+    repo: requireText(pr['repo'], `${at}.pr.repo`),
     prNumber: number,
-    reviewedHeadSha: strOrNull(result['reviewedHeadSha']),
-    findings: (findings ?? []).map((f, i) => finding(f, `reviewer_result.findings[${i}]`)),
+    reviewedHeadSha:
+      sha === undefined || sha === null ? null : requireText(sha, `${at}.reviewedHeadSha`),
+    findings: findings.map((f, i) => finding(f, `${at}.findings[${i}]`)),
   };
 }
 
@@ -252,6 +298,37 @@ export type WorkerDoneMessage = {
 };
 
 /**
+ * `inbox` 한 번의 결과.
+ *
+ * 메시지와 **부재를 증명할 수 있는지**를 한 값으로 묶어 넘긴다. 둘을 따로 넘기면 호출자가
+ * 포화 사실을 빠뜨린 채 "worker_done 없음"으로 판정할 수 있다.
+ */
+export type WorkerDoneInbox = {
+  /** 상한 안에서 관찰된 `worker_done` 전부. 모든 Run이 섞여 있다. */
+  readonly messages: readonly WorkerDoneMessage[];
+  /**
+   * 반환 행 수가 요청 상한과 같았다. 더 오래된 행이 잘렸을 수 있다는 뜻이다.
+   *
+   * 참이면 **부재를 증명할 수 없다.** 찾은 것은 여전히 사실이지만, 못 찾은 것은 "없다"가
+   * 아니라 "판정 불가"다. 판정은 `digest/project.ts`의 `pickWorkerReport`가 한다.
+   */
+  readonly saturated: boolean;
+  /** 요청한 `--limit`. 포화 오류가 손잡이로 싣는다. */
+  readonly limit: number;
+};
+
+/**
+ * `inbox --limit`의 기본값.
+ *
+ * 실측(2026-08-22, 이 호스트의 전체 inbox): 55행 99,446바이트로 행당 평균 1.8KB다.
+ * 5000행이면 약 9MB로 `OrcaCli.run`의 `maxBuffer` 32MB 안에 든다. 같은 실측에서
+ * `--limit 100000`까지 CLI가 요청을 잘라내지 않고 그대로 55행을 돌려줬다.
+ *
+ * 이 값이 부족해도 카드가 거짓을 말하지는 않는다. 포화를 감지해 판정 불가를 던진다.
+ */
+export const INBOX_LIMIT = 5000;
+
+/**
  * `worker_done`을 **소비하지 않고** 읽는다.
  *
  * `orca orchestration check`는 기본 동작이 배치를 읽음 처리하고 `--ack`가 그것을 확정하므로
@@ -259,17 +336,37 @@ export type WorkerDoneMessage = {
  * 조회 명령이다. 실측으로 확인했다: 같은 인자로 세 번 연속 호출해 33 row의
  * `read`/`delivered_at`/`sequence`/`body` 길이가 하나도 바뀌지 않았다.
  *
- * `inbox`에는 `--run` 필터가 없어 모든 Run의 메시지가 온다. Run 구분은 호출자가 `runId`로 한다.
- * `--limit`이 필요한 이유도 같다. heartbeat까지 섞여 오므로 Run의 worker_done 수보다 넉넉히 잡는다.
+ * `inbox`에는 `--run` 필터가 없어 모든 Run의 메시지가 온다. Run 구분은 호출자가 한다.
+ * heartbeat·question·status도 같은 목록에 섞여 온다(실측 55행 중 worker_done은 19행).
  *
  * `--full`은 쓰지 않는다. 실측에서 `--full` 유무로 `body` 길이가 달라진 row가 0건이었다.
+ *
+ * ## 남는 한계 — C1이 닫지 않는다
+ *
+ * CLI 표면이 `orca orchestration inbox [--limit <n>] [--terminal <handle>] [--full] [--json]`
+ * 뿐이라 `--run` 필터도 cursor도 pagination도 없다. **`--limit`이 유일한 손잡이다.** 그래서
+ * "누적 메시지가 상한을 넘으면 오래된 `worker_done`을 못 본다"는 성질 자체는 남는다. 여기서
+ * 하는 것은 그 상태를 **감지해서 거짓말을 막는 것**이지 없애는 것이 아니다.
+ *
+ * 감지 방법도 완전하지 않다. 판정은 `반환 행 수 >= 요청 상한`인데, CLI가 요청보다 낮은 값으로
+ * 조용히 clamp하면 반환 행 수가 상한에 닿지 않아 포화를 놓친다. 위 실측은 전체가 55행인
+ * 상태에서 한 것이라 clamp의 부재를 증명하지 못한다.
+ *
+ * 이 한계를 닫으려면 관찰 방식 자체가 정해져야 한다. `OD-023`(ingestion 방식)이 C1을
+ * "`digest` 1회 실행 = 관찰 1회"로 두었고, 얼마나 오래된 메시지까지 봐야 하는지는
+ * `OD-062`(허용 지연·비용 한도)와 `OD-065`(초기 동시 repository/Run 규모)가 정해지기 전에는
+ * 근거 없이 고를 수 없다. 세 항목이 닫히기 전까지 C1은 상한을 올리고 포화를 드러낸다.
  */
-export async function listWorkerDone(runner: OrcaRunner, limit = 200): Promise<WorkerDoneMessage[]> {
+export async function listWorkerDone(
+  runner: OrcaRunner,
+  limit = INBOX_LIMIT,
+): Promise<WorkerDoneInbox> {
   const r = await call<{ messages?: unknown[] }>(runner, [
     'orchestration', 'inbox', '--limit', String(limit), '--json',
   ]);
+  const rows = r.messages ?? [];
   const out: WorkerDoneMessage[] = [];
-  for (const row of r.messages ?? []) {
+  for (const row of rows) {
     const o = row as Record<string, unknown>;
     if (o['type'] !== 'worker_done') continue;
     const payload = parseJsonField<unknown>(o['payload'], null);
@@ -291,5 +388,7 @@ export async function listWorkerDone(runner: OrcaRunner, limit = 200): Promise<W
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
     });
   }
-  return out;
+  // 포화 판정은 worker_done 수가 아니라 **반환된 전체 행 수**로 한다. 잘린 것은 목록이지
+  // 목록에서 걸러낸 결과가 아니다.
+  return { messages: out, saturated: rows.length >= limit, limit };
 }

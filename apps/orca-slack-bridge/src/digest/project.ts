@@ -1,12 +1,12 @@
 import type { Correlation } from '../correlate/resolve.js';
 import type { PullRequestFacts } from '../github/pull-request.js';
-import { taskKey } from '../identity/keys.js';
+import { runKey, taskKey } from '../identity/keys.js';
 import type { RepositoryIdentity } from '../identity/repository.js';
 import {
   parseReviewerResult,
   type OrcaReviewerResult,
   type OrcaTask,
-  type WorkerDoneMessage,
+  type WorkerDoneInbox,
 } from '../orca/client.js';
 import { projectForRepository, type BridgeConfig } from '../project/config.js';
 import { CAPS, type FindingFacts } from '../summarize/contract.js';
@@ -34,12 +34,16 @@ export type OrcaFacts = {
   /** correlation이 가리키는 Run의 task 전부. reviewer_result와 Task 목적의 source다. */
   readonly tasks: readonly OrcaTask[];
   /**
-   * 관찰 시점에 남아 있는 `worker_done` 전부.
+   * `inbox` 한 번의 결과 전체.
    *
-   * `listWorkerDone`이 모든 Run의 메시지를 주므로 Run 필터는 여기서 건다.
+   * 메시지 배열이 아니라 `WorkerDoneInbox`를 받는다. 포화 사실이 함께 와야 "worker_done이
+   * 없다"와 "충분히 멀리 보지 못했다"를 가를 수 있다. 배열만 받으면 호출자가 그 사실을
+   * 떨어뜨린 채 부재로 판정할 수 있다.
+   *
+   * `listWorkerDone`이 모든 Run의 메시지를 주므로 Run 필터는 `pickWorkerReport`가 건다.
    * `worker-read` fallback은 쓰지 않는다(OD-025).
    */
-  readonly workerDone: readonly WorkerDoneMessage[];
+  readonly workerDone: WorkerDoneInbox;
 };
 
 /**
@@ -122,7 +126,7 @@ export function pickReviewerResult(
   const needle = repository.nameWithOwner.trim().toLowerCase();
   const matches: { task: OrcaTask; result: OrcaReviewerResult }[] = [];
   for (const task of tasks) {
-    const result = parseReviewerResult(task.result);
+    const result = parseReviewerResult(task.result, task.id);
     if (result === null) continue;
     if (result.prNumber !== prNumber) continue;
     if (result.repo.toLowerCase() !== needle) continue;
@@ -140,17 +144,39 @@ export function pickReviewerResult(
 /**
  * correlation의 Task가 보낸 `worker_done`을 찾는다.
  *
+ * Run 필터도 여기서 건다. `inbox`에는 `--run`이 없어 다른 Run의 메시지가 섞여 오고, task id는
+ * Run 사이에서 유일하다고 보장되지 않는다.
+ *
  * 계약상 Dispatch마다 정확히 한 번이지만 재dispatch가 있으면 같은 Task에 여러 건이 남는다.
- * 그때는 가장 최근 것을 쓴다. 없으면 null이고 카드가 "worker 보고 없음"을 표시한다(OD-070).
+ * 그때는 가장 최근 것을 쓴다.
+ *
+ * 결과가 세 가지다.
+ *
+ * - **찾음** → 그 보고. inbox가 포화됐어도 찾은 것은 사실이므로 정상이다.
+ * - **못 찾음 + 포화 아님** → null. 상한 안에 전부 있었는데 없었으므로 정말 없다.
+ *   카드는 "worker 보고 없음"을 표시한다(OD-070).
+ * - **못 찾음 + 포화** → 던진다. OD-070의 "없음"은 정말로 없을 때의 규칙이고, 충분히 멀리
+ *   보지 못한 것을 없음으로 표시하면 카드가 거짓을 말한다. 판정 불가는 `workerReport: null`로
+ *   내려보내지 않는다.
  */
 export function pickWorkerReport(
-  messages: readonly WorkerDoneMessage[],
+  inbox: WorkerDoneInbox,
   origin: CorrelatedOrigin,
 ): WorkerReport | null {
-  const matches = messages.filter(
-    (m) => m.taskId !== null && taskKey(m.taskId) === origin.task,
+  const matches = inbox.messages.filter(
+    (m) => runKey(m.runId) === origin.run && m.taskId !== null && taskKey(m.taskId) === origin.task,
   );
-  if (matches.length === 0) return null;
+  if (matches.length === 0) {
+    if (inbox.saturated) {
+      throw new Error(
+        `${origin.task}의 worker_done 부재를 증명할 수 없다: ` +
+          `inbox가 요청 상한 ${inbox.limit}행에 닿아 더 오래된 메시지가 잘렸을 수 있는데 ` +
+          `그 안에서 이 Task의 worker_done을 찾지 못했다. ` +
+          `inbox에는 --run 필터도 pagination도 없으므로 --limit을 올려 다시 관찰해라`,
+      );
+    }
+    return null;
+  }
   matches.sort((a, b) => {
     const d = a.createdAt.getTime() - b.createdAt.getTime();
     return d === 0 ? a.messageId.localeCompare(b.messageId) : d;
@@ -190,11 +216,7 @@ export function projectPullRequest(
           findingsTotal: reviewer.findings.length,
         };
 
-  const runId = correlation.run.slice('run:'.length);
-  const workerReport = pickWorkerReport(
-    orca.workerDone.filter((m) => m.runId === runId),
-    correlation,
-  );
+  const workerReport = pickWorkerReport(orca.workerDone, correlation);
 
   return {
     kind: 'card',

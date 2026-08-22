@@ -9,7 +9,15 @@ import {
   type OrcaFacts,
 } from '../src/digest/project.js';
 import type { ProjectedPr } from '../src/digest/types.js';
-import { listWorkerDone, listTasks, parseReviewerResult, type OrcaRunner } from '../src/orca/client.js';
+import {
+  INBOX_LIMIT,
+  listWorkerDone,
+  listTasks,
+  parseReviewerResult,
+  type OrcaRunner,
+  type WorkerDoneInbox,
+  type WorkerDoneMessage,
+} from '../src/orca/client.js';
 import { repositoryIdentity } from '../src/identity/repository.js';
 import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { PullRequestFacts } from '../src/github/pull-request.js';
@@ -154,12 +162,49 @@ async function facts(): Promise<OrcaFacts> {
   };
 }
 
+/** 포화되지 않은 inbox. 여기서 못 찾은 것은 정말 없는 것이다. */
+function inbox(messages: readonly WorkerDoneMessage[], saturated = false): WorkerDoneInbox {
+  return { messages, saturated, limit: INBOX_LIMIT };
+}
+
+/**
+ * 상한보다 많은 행을 들고 `--limit`만큼만 돌려주는 대역.
+ *
+ * 실제 `orca orchestration inbox`와 같은 성질을 만든다. 오래된 행이 먼저 잘리고, 호출자는
+ * 잘렸다는 사실을 반환 행 수로만 알 수 있다.
+ */
+class SaturatingInbox implements OrcaRunner {
+  constructor(private readonly rows: readonly unknown[]) {}
+  async run(args: readonly string[]): Promise<string> {
+    const i = args.indexOf('--limit');
+    const limit = Number.parseInt(String(args[i + 1]), 10);
+    return JSON.stringify({
+      id: 'x',
+      ok: true,
+      result: { count: Math.min(limit, this.rows.length), messages: this.rows.slice(0, limit) },
+    });
+  }
+}
+
+/** `inbox` 응답의 worker_done row 하나. */
+function row(id: string, taskId: string): unknown {
+  return {
+    id, run_id: 'run_7804be5a654f', type: 'worker_done',
+    subject: '완료', body: '했다. 봤다. 남았다.',
+    payload: JSON.stringify({ taskId, dispatchId: 'ctx_1', outcome: 'succeeded' }),
+    created_at: '2026-08-22T10:30:36Z',
+  };
+}
+
 describe('Orca 사실 수집', () => {
   it('worker_done을 소비하지 않는 inbox로 읽는다', async () => {
     const orca = new FakeOrca();
-    const msgs = await listWorkerDone(orca);
+    const inbox = await listWorkerDone(orca);
     // check와 --ack는 coordinator의 배치를 삼키므로 인자에 나타나면 안 된다.
-    expect(orca.calls).toEqual([['orchestration', 'inbox', '--limit', '200', '--json']]);
+    expect(orca.calls).toEqual([
+      ['orchestration', 'inbox', '--limit', String(INBOX_LIMIT), '--json'],
+    ]);
+    const msgs = inbox.messages;
     expect(msgs.map((m) => m.messageId)).toEqual(['msg_d7dd7cf9e9e2', 'msg_ffff00001111']);
     expect(msgs[0]).toMatchObject({
       runId: 'run_7804be5a654f',
@@ -190,8 +235,8 @@ describe('Orca 사실 수집', () => {
   it('task result에서 reviewer_result만 읽고 나머지는 null이다', async () => {
     const tasks = await listTasks(new FakeOrca(), 'run_7804be5a654f');
     // worker_report provenance는 리뷰 결과가 아니다.
-    expect(parseReviewerResult(tasks[0]?.result)).toBeNull();
-    expect(parseReviewerResult(tasks[1]?.result)).toEqual({
+    expect(parseReviewerResult(tasks[0]?.result, 'task_56972eaff901')).toBeNull();
+    expect(parseReviewerResult(tasks[1]?.result, 'task_8bf3d72f262a')).toEqual({
       verdict: 'request_changes',
       repo: 'dnhynk/dev-infra',
       prNumber: 1,
@@ -200,17 +245,113 @@ describe('Orca 사실 수집', () => {
     });
   });
 
-  it('kind는 맞는데 모양이 깨졌으면 던진다', () => {
-    expect(() => parseReviewerResult({ kind: 'reviewer_result', verdict: 'lgtm' })).toThrow(/verdict/);
-    expect(() =>
-      parseReviewerResult({ kind: 'reviewer_result', verdict: 'approve', pr: { repo: 'a/b' } }),
-    ).toThrow(/number/);
-  });
-
   it('completed_at의 두 형식을 모두 읽는다', async () => {
     const tasks = await listTasks(new FakeOrca(), 'run_7804be5a654f');
     expect(tasks[0]?.completedAt?.toISOString()).toBe('2026-08-22T10:30:36.000Z');
     expect(tasks[1]?.completedAt?.toISOString()).toBe('2026-08-22T10:57:33.666Z');
+  });
+});
+
+/**
+ * OD-073 v1 shape 검증.
+ *
+ * 세 경우를 가른다. 정상 부재는 null, malformed는 throw, 미지원 버전도 throw.
+ * 관대한 강제를 하면 malformed한 result의 verdict가 카드에 그려진다.
+ */
+describe('reviewer_result 엄격 검증', () => {
+  const V1 = {
+    kind: 'reviewer_result',
+    schemaVersion: 1,
+    verdict: 'approve',
+    pr: { repo: 'dnhynk/dev-infra', number: 1 },
+    reviewedHeadSha: '7e9479ebdebe35fc9956b65c0f851ff096c56130',
+    findings: [{ severity: 'major', file: 'a.ts', line: 3, summary: '요지' }],
+    gates: { typecheck: 'pass' },
+  } as const;
+
+  const parse = (over: Record<string, unknown>): unknown =>
+    parseReviewerResult({ ...V1, ...over }, 'task_8bf3d72f262a');
+
+  it('v1 shape를 만족하면 읽는다', () => {
+    expect(parse({})).toEqual({
+      verdict: 'approve',
+      repo: 'dnhynk/dev-infra',
+      prNumber: 1,
+      reviewedHeadSha: '7e9479ebdebe35fc9956b65c0f851ff096c56130',
+      findings: [{ severity: 'major', file: 'a.ts', line: 3, summary: '요지' }],
+    });
+  });
+
+  // 경우 1 — 정상 부재. reviewer_result가 아예 없는 것은 실패가 아니다.
+  it('reviewer_result가 아니면 null이다', () => {
+    expect(parseReviewerResult(null, 'task_1')).toBeNull();
+    expect(parseReviewerResult(undefined, 'task_1')).toBeNull();
+    expect(parseReviewerResult('completed', 'task_1')).toBeNull();
+    // worker_done으로 끝난 task의 result. malformed가 아니라 다른 종류의 사실이다.
+    expect(
+      parseReviewerResult(
+        { provenance: 'worker_report', outcome: 'succeeded', body: '...' },
+        'task_56972eaff901',
+      ),
+    ).toBeNull();
+  });
+
+  // 경우 2 — 미지원 버전. 모르는 버전을 아는 버전처럼 추측해 읽지 않는다.
+  it('schemaVersion이 1이 아니면 던진다', () => {
+    expect(() => parse({ schemaVersion: 2 })).toThrow(/schemaVersion 2/);
+    expect(() => parse({ schemaVersion: 2 })).toThrow(/추측해 읽지 않는다/);
+    expect(() => parse({ schemaVersion: 0 })).toThrow(/schemaVersion/);
+    expect(() => parse({ schemaVersion: '1' })).toThrow(/정수가 아니다/);
+    expect(() => parse({ schemaVersion: undefined })).toThrow(/정수가 아니다/);
+  });
+
+  // 경우 3 — malformed. 빈 값이나 null로 강제하지 않는다.
+  it('v1 shape를 어기면 던진다', () => {
+    expect(() => parse({ verdict: 'lgtm' })).toThrow(/verdict/);
+    expect(() => parse({ pr: { repo: 'a/b' } })).toThrow(/pr\.number/);
+    expect(() => parse({ pr: { repo: '  ', number: 1 } })).toThrow(/pr\.repo/);
+    expect(() => parse({ pr: 'dnhynk/dev-infra#1' })).toThrow(/pr이 객체가 아니다/);
+    // 부재를 빈 배열로 강제하지 않는다.
+    expect(() => parse({ findings: undefined })).toThrow(/findings가 배열이 아니다/);
+    expect(() => parse({ findings: null })).toThrow(/findings가 배열이 아니다/);
+    // 잘못된 값을 빈 문자열이나 null로 강제하지 않는다.
+    expect(() => parse({ findings: [{ severity: 'major', line: 3, summary: '요지' }] })).toThrow(
+      /findings\[0\]\.file/,
+    );
+    expect(() => parse({ findings: [{ severity: 'major', file: 'a.ts', summary: 42 }] })).toThrow(
+      /findings\[0\]\.summary/,
+    );
+    expect(() =>
+      parse({ findings: [{ severity: 'major', file: 'a.ts', line: 'ㄱ', summary: '요지' }] }),
+    ).toThrow(/findings\[0\]\.line/);
+    expect(() => parse({ findings: [{ severity: 'nit', file: 'a.ts', summary: '요지' }] })).toThrow(
+      /severity/,
+    );
+    expect(() => parse({ reviewedHeadSha: 12345 })).toThrow(/reviewedHeadSha/);
+  });
+
+  it('없어도 되는 값은 없어도 읽는다', () => {
+    // ReviewedHeadMatch에 unknown이 있으므로 reviewedHeadSha 부재는 표현 가능한 v1 상태다.
+    expect(parse({ reviewedHeadSha: undefined })).toMatchObject({ reviewedHeadSha: null });
+    // 파일 단위 finding. FindingFacts.line이 number | null이다.
+    expect(parse({ findings: [{ severity: 'minor', file: 'a.ts', summary: '요지' }] })).toMatchObject({
+      findings: [{ severity: 'minor', file: 'a.ts', line: null, summary: '요지' }],
+    });
+    expect(parse({ findings: [] })).toMatchObject({ findings: [] });
+  });
+
+  it('어느 task의 result가 깨졌는지 메시지에 싣는다', () => {
+    expect(() => parse({ verdict: 'lgtm' })).toThrow(/task_8bf3d72f262a/);
+  });
+
+  it('malformed reviewer_result는 projection까지 조용히 통과하지 않는다', async () => {
+    const f = await facts();
+    const base = f.tasks[1];
+    if (base === undefined) throw new Error('fixture가 깨졌다');
+    const broken = [{ ...base, result: { ...(base.result as object), schemaVersion: 2 } }];
+    expect(() => projectPullRequest(REPO, pr(), CORRELATED, { ...f, tasks: broken }, CONFIG)).toThrow(
+      /schemaVersion 2/,
+    );
   });
 });
 
@@ -270,16 +411,16 @@ describe('ProjectedPr 조립', () => {
 
   it('worker_done이 없으면 그 사실이 ProjectedPr에 남는다 (OD-070)', async () => {
     const f = await facts();
-    const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: [] }, CONFIG);
+    const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: inbox([]) }, CONFIG);
     expect(p.kind).toBe('card');
     expect(p.kind === 'card' && p.pr.workerReport).toBeNull();
   });
 
   it('다른 Run의 worker_done은 taskId가 같아도 쓰지 않는다', async () => {
     const f = await facts();
-    const other = f.workerDone.filter((m) => m.runId !== 'run_7804be5a654f');
+    const other = f.workerDone.messages.filter((m) => m.runId !== 'run_7804be5a654f');
     expect(other).toHaveLength(1);
-    const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: other }, CONFIG);
+    const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: inbox(other) }, CONFIG);
     expect(p.kind === 'card' && p.pr.workerReport).toBeNull();
   });
 
@@ -439,7 +580,7 @@ describe('DigestStatus 파생', () => {
   it('worker_done 유무는 status를 바꾸지 않는다', async () => {
     const f = await facts();
     const withReport = projectPullRequest(REPO, pr(), CORRELATED, f, CONFIG);
-    const without = projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: [] }, CONFIG);
+    const without = projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: inbox([]) }, CONFIG);
     if (withReport.kind !== 'card' || without.kind !== 'card') throw new Error('카드가 아니다');
     expect(deriveDigestStatus(withReport.pr)).toBe(deriveDigestStatus(without.pr));
   });
@@ -456,7 +597,98 @@ describe('worker_done 선택', () => {
     const newer = msg('msg_b', '2026-08-22T11:00:00Z', '재dispatch 보고');
     if (CORRELATED.kind !== 'correlated' || CORRELATED.task === null) throw new Error('fixture가 깨졌다');
     const origin = { ...CORRELATED, task: CORRELATED.task };
-    expect(pickWorkerReport([older, newer], origin)?.body).toBe('재dispatch 보고');
-    expect(pickWorkerReport([newer, older], origin)?.body).toBe('재dispatch 보고');
+    expect(pickWorkerReport(inbox([older, newer]), origin)?.body).toBe('재dispatch 보고');
+    expect(pickWorkerReport(inbox([newer, older]), origin)?.body).toBe('재dispatch 보고');
+  });
+});
+
+/**
+ * inbox 포화와 "부재를 증명할 수 없음".
+ *
+ * `inbox`에는 `--run` 필터도 pagination도 없고 `--limit`이 유일한 손잡이다. 상한을 넘긴
+ * 상태에서 worker_done을 못 찾은 것은 "없다"가 아니라 "판정 불가"다. OD-070의 "없음"
+ * 규칙을 판정 불가에 적용하면 카드가 거짓을 말한다.
+ */
+describe('inbox 포화', () => {
+  const origin = (() => {
+    if (CORRELATED.kind !== 'correlated' || CORRELATED.task === null) throw new Error('fixture가 깨졌다');
+    return { ...CORRELATED, task: CORRELATED.task };
+  })();
+
+  it('반환 행 수가 요청 상한과 같으면 포화로 본다', async () => {
+    // 상한보다 많은 행을 들고 있는 대역. 상한만큼만 돌아온다.
+    const rows = Array.from({ length: 7 }, (_, i) => row(`msg_${i}`, `task_${i}`));
+    const saturated = await listWorkerDone(new SaturatingInbox(rows), 5);
+    expect(saturated).toMatchObject({ saturated: true, limit: 5 });
+    expect(saturated.messages).toHaveLength(5);
+
+    const room = await listWorkerDone(new SaturatingInbox(rows), 50);
+    expect(room).toMatchObject({ saturated: false, limit: 50 });
+    expect(room.messages).toHaveLength(7);
+  });
+
+  it('포화 판정은 worker_done 수가 아니라 전체 행 수로 한다', async () => {
+    // heartbeat가 상한을 채웠다. 걸러낸 worker_done은 1건뿐이지만 목록은 잘렸다.
+    const noise = Array.from({ length: 4 }, (_, i) => ({
+      id: `msg_h${i}`, run_id: 'run_7804be5a654f', type: 'heartbeat', subject: 'alive', body: '',
+      payload: '{"phase":"implementing"}', created_at: '2026-08-22T11:48:41Z',
+    }));
+    const got = await listWorkerDone(
+      new SaturatingInbox([row('msg_w', 'task_56972eaff901'), ...noise]),
+      5,
+    );
+    expect(got.messages).toHaveLength(1);
+    expect(got.saturated).toBe(true);
+  });
+
+  it('포화여도 찾았으면 정상이다', async () => {
+    const found = await listWorkerDone(
+      new SaturatingInbox([row('msg_w', 'task_56972eaff901'), row('msg_x', 'task_other')]),
+      2,
+    );
+    expect(found.saturated).toBe(true);
+    expect(pickWorkerReport(found, origin)).toEqual({
+      outcome: 'succeeded',
+      body: '했다. 봤다. 남았다.',
+    });
+  });
+
+  it('포화 상태에서 못 찾으면 workerReport: null이 아니라 던진다', async () => {
+    const missed = await listWorkerDone(
+      new SaturatingInbox([row('msg_x', 'task_other'), row('msg_y', 'task_another')]),
+      2,
+    );
+    expect(missed.saturated).toBe(true);
+    // 원인과 손잡이가 메시지에 있어야 한다.
+    expect(() => pickWorkerReport(missed, origin)).toThrow(/부재를 증명할 수 없다/);
+    expect(() => pickWorkerReport(missed, origin)).toThrow(/--limit/);
+    expect(() => pickWorkerReport(missed, origin)).toThrow(/task:task_56972eaff901/);
+  });
+
+  it('포화가 아니면 못 찾은 것이 부재다 (OD-070)', async () => {
+    const complete = await listWorkerDone(
+      new SaturatingInbox([row('msg_x', 'task_other')]),
+      50,
+    );
+    expect(complete.saturated).toBe(false);
+    expect(pickWorkerReport(complete, origin)).toBeNull();
+  });
+
+  it('포화 판정이 projection까지 전달된다', async () => {
+    const f = await facts();
+    const missed = await listWorkerDone(new SaturatingInbox([row('msg_x', 'task_other')]), 1);
+    expect(() =>
+      projectPullRequest(REPO, pr(), CORRELATED, { ...f, workerDone: missed }, CONFIG),
+    ).toThrow(/부재를 증명할 수 없다/);
+  });
+
+  it('다른 Run의 같은 task id는 찾은 것으로 치지 않는다', async () => {
+    const otherRun = {
+      ...(row('msg_z', 'task_56972eaff901') as Record<string, unknown>),
+      run_id: 'run_other000000',
+    };
+    const got = await listWorkerDone(new SaturatingInbox([otherRun]), 1);
+    expect(got.saturated).toBe(true);
+    expect(() => pickWorkerReport(got, origin)).toThrow(/부재를 증명할 수 없다/);
   });
 });
