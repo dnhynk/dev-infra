@@ -13,10 +13,27 @@ import type { PullRequestKey } from '../identity/keys.js';
  *
  * 단일 프로세스 가정이므로 파일 lock을 만들지 않는다. WAL만 켠다.
  *
- * C1이 보장하는 스펙 §9 성질은 둘이다.
+ * 스키마가 보장하는 것과 보장하지 않는 것을 구분한다.
  *
- * - 같은 repository+PR에 루트 메시지가 중복 생성되지 않는다 → `pr_message.pr_key`가 PRIMARY KEY다.
- * - 재시작 후 기존 메시지를 찾아 update할 수 있다 → channel/ts를 그 row에 함께 남긴다.
+ * 보장한다.
+ *
+ * - PR당 매핑 행이 하나다 → `pr_message.pr_key`가 PRIMARY KEY다.
+ * - 두 PR이 한 Slack 메시지를 가리키지 않는다 → `UNIQUE(channel_id, message_ts)`다.
+ * - 재시작 후 기존 메시지를 찾아 update할 수 있다 → channel/ts를 그 행에 함께 남긴다.
+ *
+ * 보장하지 않는다.
+ *
+ * - **Slack 루트가 PR당 하나라는 것.** `chat.postMessage`가 성공한 뒤 `insertPrMessage`
+ *   전에 죽으면 매핑 행이 없으므로 다음 실행이 루트를 하나 더 만든다. PRIMARY KEY는 매핑
+ *   행의 유일성만 강제하고 이미 게시된 Slack 메시지를 되돌리지 못한다.
+ *
+ * 이 창을 C1에서 닫지 않는다. 스펙 §9가 crash 경계별 atomicity와 outbox를 TBD로 두었고
+ * 같은 성격의 미결정 항목이 OD-051이다. 지금 outbox나 2단계 commit을 설계하면 미결정
+ * 항목을 구현자가 조용히 닫는 것이 된다.
+ *
+ * C1 출구 조건은 "재관찰로 루트가 중복되지 않음"이다(로드맵 §5). 이는 crash 없는 재실행을
+ * 뜻하고, 그 범위에서는 현재 스키마로 충분하다. 재실행은 `findPrMessage`가 기존 행을 찾아
+ * `chat.update`로 가기 때문이다.
  *
  * 담지 않는 것: thread transition 기록, Gate↔action correlation, coordinator notification
  * pending, 관찰 cursor. 각각 C2/D2/D3의 사실이고, 지금 만들면 쓰이지 않는 스키마가 된다.
@@ -49,7 +66,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 CREATE TABLE IF NOT EXISTS pr_message (
   -- identity/keys.ts의 PullRequestKey. 형식은 pr:<repo databaseId>#<number>다.
   -- repository rename과 owner 이전에도 같은 key가 나오므로 카드가 갈라지지 않는다.
-  -- PRIMARY KEY가 "PR 하나당 루트 메시지 하나"를 강제한다.
+  -- PRIMARY KEY는 "PR당 매핑 행 하나"만 강제한다. Slack 루트가 하나라는 보장은 아니다.
   pr_key             TEXT PRIMARY KEY,
   -- chat.update는 channel과 ts를 함께 요구한다. 또한 대상 채널 설정이 바뀌었을 때
   -- 예전 채널의 ts로 update를 시도하는 대신 불일치를 판정할 수 있다.

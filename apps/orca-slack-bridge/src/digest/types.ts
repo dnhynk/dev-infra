@@ -1,4 +1,4 @@
-import type { PullRequestKey } from '../identity/keys.js';
+import type { PullRequestKey, TaskKey } from '../identity/keys.js';
 import type { RepositoryIdentity } from '../identity/repository.js';
 import type { Correlation } from '../correlate/resolve.js';
 import type { CheckFact } from '../github/pull-request.js';
@@ -23,12 +23,31 @@ import type { SummaryResult } from '../summarize/index.js';
  */
 
 /**
- * correlated로 판정된 correlation.
+ * correlated로 판정됐고 Task까지 확정된 correlation.
  *
  * C1은 uncorrelated PR에 카드를 만들지 않으므로 타입 수준에서 그 불변식을 고정한다.
  * `uncorrelated`·`conflict`를 들고 여기까지 오면 컴파일이 막는다.
+ *
+ * `task`를 non-null로 좁힌다. `resolveCorrelation`은 `orca-run`만 있고 `orca-task`가 없는
+ * PR body도 `correlated` + `task: null`로 보고한다. 그런 PR은 `worker_done`도 Task 목적도
+ * 찾을 수 없어 카드 입력을 구성할 수 없다. 좁히는 지점은 projection이며
+ * `correlate/resolve.ts`의 출력은 바꾸지 않는다. 그 출력은 S0에서 검증된 계약이고,
+ * "run은 있고 task가 없다"를 어느 kind로 볼지는 OD-022의 누락 정책 표에 아직 행이 없다.
+ *
+ * 좁히기에서 탈락한 PR은 버리지 않는다. `PrProjection`의 `skipped`가 이유와 함께 남긴다.
+ *
+ * 좁히는 방법: `c.task !== null` 검사만으로는 `c` 자체가 좁혀지지 않는다. TypeScript는
+ * 속성 참조만 좁히고 객체 타입은 그대로 둔다. 타입 술어를 쓴다.
+ *
+ * ```ts
+ * function isCorrelatedOrigin(c: Correlation): c is CorrelatedOrigin {
+ *   return c.kind === 'correlated' && c.task !== null;
+ * }
+ * ```
  */
-export type CorrelatedOrigin = Extract<Correlation, { readonly kind: 'correlated' }>;
+export type CorrelatedOrigin = Extract<Correlation, { readonly kind: 'correlated' }> & {
+  readonly task: TaskKey;
+};
 
 /**
  * GitHub이 보고한 PR 상태.
@@ -39,7 +58,22 @@ export type CorrelatedOrigin = Extract<Correlation, { readonly kind: 'correlated
 export type PrState = 'open' | 'closed' | 'merged';
 
 /**
- * Orca reviewer task의 result에서 읽은 사실.
+ * reviewer가 본 commit과 현재 head의 관계.
+ *
+ * **사실 진술이지 유효성 판정이 아니다.** 이 값으로 "이전 approval이 아직 유효한가"를
+ * 판정하지 않는다. 그 판정은 OD-031이고 C2다. C1 카드는 두 값이 다르다는 관찰 사실만
+ * 표시한다.
+ */
+export type ReviewedHeadMatch =
+  /** `reviewedHeadSha`가 `ProjectedPr.headSha`와 같다. */
+  | 'same'
+  /** 두 값이 다르다. reviewer가 본 뒤 head가 움직였다는 사실만 뜻한다. */
+  | 'different'
+  /** `reviewedHeadSha`가 없어 대조하지 못했다. 같다는 뜻도 다르다는 뜻도 아니다. */
+  | 'unknown';
+
+/**
+ * Orca reviewer task의 result에서 읽은 사실과, 그것을 현재 head와 대조한 결과.
  *
  * review verdict의 durable source는 Orca다(DL-016). GitHub review 본문은 신뢰 경계상
  * untrusted content이므로 상태 source로 쓰지 않는다.
@@ -47,11 +81,26 @@ export type PrState = 'open' | 'closed' | 'merged';
 export type ReviewerResult = {
   /** `request_changes`여도 review task 자체는 completed다. 두 값 외에는 없다. */
   readonly verdict: 'approve' | 'request_changes';
-  /** reviewer가 본 commit. 현재 head와 다른지의 판정(approval 유효성)은 C2다. */
+  /** reviewer가 본 commit. 현재 head와의 관계는 `headMatch`가 사실로 싣는다. */
   readonly reviewedHeadSha: string | null;
+  /**
+   * `reviewedHeadSha`를 `ProjectedPr.headSha`와 대조한 결과. projection이 계산한다.
+   *
+   * 이 필드가 타입에 있으므로 renderer는 "reviewer가 다른 commit을 봤다"는 사실을 보지
+   * 못한 채 verdict만 그릴 수 없다. 두 값을 결합해 approval 유효성을 판정하는 것은
+   * OD-031이며 C1이 하지 않는다.
+   */
+  readonly headMatch: ReviewedHeadMatch;
   /** severity 내림차순 상한 10건(OD-033). 카드가 findings를 전부 나열하지 않는다. */
   readonly findings: readonly FindingFacts[];
-  /** 상한 적용 전 전체 개수. 잘렸다는 사실을 카드가 숨기지 않게 한다(UX §6). */
+  /**
+   * 상한 적용 전 전체 개수. 잘렸다는 사실을 카드가 숨기지 않게 한다(UX §6).
+   *
+   * 파생 경로: Orca task result의 `findings` 배열 길이다. reviewer는 상한 없이 전부
+   * 기록하고(OD-073에 상한이 없다), 상한 10은 Bridge가 카드와 프롬프트를 만들 때만
+   * 적용한다(`summarize/contract.ts`의 `CAPS.findings`). 그래서 읽은 배열의 길이가
+   * 상한 적용 전 전체 수다.
+   */
   readonly findingsTotal: number;
 };
 
@@ -86,6 +135,9 @@ export type WorkerReport = {
  * - `worker_done` 유무: 리뷰와 다른 축의 사실이다. `workerReport`가 null인지로 표시한다(OD-070).
  * - draft 여부: `isDraft`로 따로 표시한다.
  * - risk: `SummaryResult.risk`가 싣는다(OD-037).
+ * - reviewer가 본 commit이 현재 head와 다르다는 사실: verdict는 그대로 보고하고 그 사실은
+ *   `ReviewerResult.headMatch`가 싣는다. 둘을 결합해 approval이 아직 유효한지 판정하는 것은
+ *   OD-031이며 C2다.
  * - `merge_ready`: review·CI·merge 조건의 결합 판정이므로 C2다.
  */
 export type DigestStatus =
@@ -120,7 +172,11 @@ export type ProjectedPr = {
   readonly title: string;
   /** GitHub 원문 링크. C1 카드의 유일한 action이다. */
   readonly url: string;
-  /** 현재 head commit sha. 관찰한 check 결론과 reviewer_result가 어느 commit의 사실인지 고정한다. */
+  /**
+   * 현재 head commit sha. `PullRequestFacts.headRefOid`에서 온다.
+   *
+   * 관찰한 check 결론과 reviewer_result가 어느 commit의 사실인지 고정한다.
+   */
   readonly headSha: string;
   readonly state: PrState;
   /** draft PR에 리뷰 결과가 없는 것은 정상이므로 카드가 그 이유를 표시할 수 있어야 한다. */
@@ -132,6 +188,38 @@ export type ProjectedPr = {
   /** 없으면 null(OD-070). */
   readonly workerReport: WorkerReport | null;
 };
+
+/**
+ * projection이 카드를 만들지 않은 이유.
+ *
+ * 카드가 없다는 것도 관찰 결과다. 조용히 버리지 않고 이유를 남긴다(UX §6).
+ */
+export type PrSkipReason =
+  /** correlation이 `uncorrelated`다. 실패가 아니라 정상 출력이다(OD-022). */
+  | 'uncorrelated'
+  /** correlation이 `conflict`다. 모순을 자동으로 한쪽으로 덮지 않는다(OD-022). */
+  | 'conflict'
+  /**
+   * `correlated`지만 `orca-task`가 없다.
+   *
+   * Task를 찾을 수 없으므로 Task 목적도 `worker_done`도 붙일 수 없고 카드 입력이 서지
+   * 않는다. `CorrelatedOrigin`이 컴파일로 막는 경우가 런타임에서 여기로 온다.
+   */
+  | 'task_missing';
+
+/**
+ * PR 하나에 대한 projection 결과.
+ *
+ * 합타입으로 두어 "카드를 만들지 않았다"를 반환값에서 빠뜨릴 수 없게 한다. 호출자는
+ * `skipped`를 받으면 이유를 사람이 보는 출력에 남긴다.
+ */
+export type PrProjection =
+  | { readonly kind: 'card'; readonly pr: ProjectedPr }
+  | {
+      readonly kind: 'skipped';
+      readonly key: PullRequestKey;
+      readonly reason: PrSkipReason;
+    };
 
 /**
  * 렌더러 입력.

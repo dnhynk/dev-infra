@@ -99,8 +99,9 @@ describe('summarize', () => {
         project: null,
         pullRequests: [
           { pr: { key: 'pr:1#1', number: 1, title: 't', body: '', url: '', state: 'OPEN', isDraft: false,
-                  headRefName: 'h', baseRefName: 'b', mergedAt: null, reviewDecision: null,
-                  reviewCount: 0, checks: [] },
+                  headRefName: 'h', headRefOid: 'sha', baseRefName: 'b', mergedAt: null,
+                  reviewDecision: null, reviewCount: 0, checks: [],
+                  changedPaths: [], changedFilesTotal: 0 },
             correlation: { kind: 'uncorrelated', reason: 'no_metadata' } },
         ],
       }],
