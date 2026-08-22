@@ -397,6 +397,57 @@ function writeV1(path: string): void {
   raw.close();
 }
 
+/**
+ * 스키마 비교용 구조를 뽑는다.
+ *
+ * 컬럼 **이름만** 비교하면 type·notnull·default·PK가 갈라져도 통과하고 인덱스는 아예 보이지
+ * 않는다. 그래서 `table_info` 행을 그대로 담고 인덱스 메타데이터를 함께 담는다. `cid`를
+ * 지우지 않는 것이 의도다. `ALTER TABLE ADD COLUMN`은 맨 뒤에만 붙일 수 있으므로 컬럼
+ * 순서도 계약이다.
+ *
+ * `sqlite_master`의 SQL 문자열은 비교하지 않는다. 올린 파일에는 v1 `CREATE TABLE` 뒤에
+ * ALTER가 덧붙인 텍스트가 남고 새 파일에는 `SCHEMA_DDL` 원문이 남아, 스키마가 같아도
+ * 문자열은 다르다.
+ *
+ * 인덱스는 이름으로 정렬한다. 같아야 하는 것은 생성 순서가 아니라 집합이다.
+ */
+function readSchemaShape(path: string) {
+  const db = new DatabaseSync(path);
+  try {
+    const tables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as {
+        readonly name: string;
+      }[]
+    )
+      .map((t) => t.name)
+      // sqlite가 스스로 만드는 내부 테이블은 스키마 계약이 아니다.
+      .filter((name) => !name.startsWith('sqlite_'));
+
+    return tables.map((table) => ({
+      table,
+      columns: db.prepare(`PRAGMA table_info(${table})`).all(),
+      indexes: (
+        db.prepare(`PRAGMA index_list(${table})`).all() as {
+          readonly name: string;
+          readonly unique: number;
+          readonly origin: string;
+          readonly partial: number;
+        }[]
+      )
+        .map(({ name, unique, origin, partial }) => ({
+          name,
+          unique,
+          origin,
+          partial,
+          columns: db.prepare(`PRAGMA index_info(${name})`).all(),
+        }))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    }));
+  } finally {
+    db.close();
+  }
+}
+
 describe('v1 → v2 migration', () => {
   it('컬럼을 붙이고 버전을 올리며 기존 행을 그대로 둔다', () => {
     writeV1(dbPath);
@@ -428,16 +479,12 @@ describe('v1 → v2 migration', () => {
     expect(columns).toContain('facts_fingerprint');
     expect(columns).toContain('summary_json');
 
-    // 올린 파일과 새로 만든 파일의 스키마가 갈라지면 안 된다. ALTER TABLE ADD COLUMN은
-    // 맨 뒤에만 붙일 수 있으므로 DDL의 컬럼 순서도 그것을 따라야 한다.
+    // 올린 파일과 새로 만든 파일의 스키마가 갈라지면 안 된다. SCHEMA_DDL에만 있고
+    // MIGRATIONS에는 없는 컬럼(또는 그 반대)이 생기면 여기서 걸린다. 컬럼 이름뿐 아니라
+    // type·notnull·default·PK와 인덱스까지 비교한다.
     const freshPath = join(dir, 'fresh', 'state.db');
     new SqliteDigestStore(freshPath).close();
-    const fresh = new DatabaseSync(freshPath);
-    const freshColumns = (fresh.prepare('PRAGMA table_info(pr_message)').all() as {
-      name: string;
-    }[]).map((c) => c.name);
-    fresh.close();
-    expect(columns).toEqual(freshColumns);
+    expect(readSchemaShape(dbPath)).toEqual(readSchemaShape(freshPath));
   });
 
   it('올린 파일을 다시 열어도 같은 행을 찾는다. 두 번째 열기는 아무것도 바꾸지 않는다', () => {
@@ -456,13 +503,15 @@ describe('v1 → v2 migration', () => {
   // 그 파일에는 이미 게시된 카드의 매핑이 들어 있다.
   it('migration이 중간에 실패하면 파일이 v1 그대로 남는다', () => {
     writeV1(dbPath);
-    // 첫 문장이 이미 적용된 파일. 트랜잭션이 없던 구현이 중간에 죽으면 이 모양이 된다.
+    // **마지막** 문장만 미리 적용한다. 그래야 첫 ALTER가 성공한 뒤 둘째가 실패해, 되돌릴
+    // DDL이 트랜잭션 안에 실제로 남는다. 첫 문장을 미리 적용하면 아무것도 적용되기 전에
+    // 실패하므로 BEGIN/ROLLBACK을 지운 구현도 이 테스트를 통과한다.
     const seed = new DatabaseSync(dbPath);
-    seed.exec('ALTER TABLE pr_message ADD COLUMN facts_fingerprint TEXT');
+    seed.exec('ALTER TABLE pr_message ADD COLUMN summary_json TEXT');
     seed.close();
 
-    // 두 번째 ALTER는 성공하고 첫 번째가 duplicate column name으로 실패한다.
-    expect(() => new SqliteDigestStore(dbPath)).toThrow(/facts_fingerprint/);
+    // facts_fingerprint는 붙고 summary_json이 duplicate column name으로 실패한다.
+    expect(() => new SqliteDigestStore(dbPath)).toThrow(/summary_json/);
 
     const raw = new DatabaseSync(dbPath);
     const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
@@ -473,8 +522,11 @@ describe('v1 → v2 migration', () => {
     raw.close();
 
     expect(version).toEqual({ version: 1 });
-    // 같은 트랜잭션의 두 번째 문장이 되돌아갔다. 절반만 적용된 파일이 남지 않는다.
-    expect(columns).not.toContain('summary_json');
+    // 이 단언 하나가 ROLLBACK을 검증한다. 성공했던 첫 ALTER가 되돌아가지 않으면 컬럼은
+    // 붙었는데 버전은 v1인 파일이 남고 여기서 걸린다.
+    expect(columns).not.toContain('facts_fingerprint');
+    // 미리 심은 컬럼은 트랜잭션 밖에서 붙었으므로 그대로다.
+    expect(columns).toContain('summary_json');
     // 매핑 행은 그대로다.
     expect(rows).toEqual([{ pr_key: PR, message_ts: '1787403740.833329' }]);
   });
