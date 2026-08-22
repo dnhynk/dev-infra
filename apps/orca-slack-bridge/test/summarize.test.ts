@@ -35,6 +35,12 @@ const withReview: SummaryFacts = {
   },
 };
 
+/** 지적 없이 승인된 PR. verdict는 있고 findings는 0건이다. */
+const approvedNoFindings: SummaryFacts = {
+  ...base,
+  review: { verdict: 'approve', findings: [] },
+};
+
 class FakeProvider implements SummaryProvider {
   calls = 0;
   constructor(private readonly outputs: unknown[]) {}
@@ -157,6 +163,37 @@ describe('입력 경계', () => {
 
   it('잘렸으면 그 사실을 알린다', () => {
     expect(renderFactsPrompt({ ...base, truncated: true })).toContain('잘렸다');
+  });
+});
+
+describe('프롬프트와 검증의 기준이 같다 — 둘 다 findings를 본다', () => {
+  it('review가 null이면 review 절이 없고 reviewGist는 null이어야 한다', () => {
+    const p = renderFactsPrompt(base);
+    expect(p).not.toContain('## review 판정');
+    expect(p).not.toContain('## review findings');
+    expect(validateDraft({ ...good, reviewGist: '리뷰 핵심' }, base).ok).toBe(false);
+    expect(validateDraft({ ...good, reviewGist: null }, base).ok).toBe(true);
+  });
+
+  it('approve이고 findings가 0건이면 verdict도 넣지 않는다 — 검증이 reviewGist를 금지하므로', () => {
+    const p = renderFactsPrompt(approvedNoFindings);
+    expect(p).not.toContain('## review 판정');
+    expect(p).not.toContain('approve');
+    expect(validateDraft({ ...good, reviewGist: '지적 없이 승인됐다' }, approvedNoFindings).ok).toBe(
+      false,
+    );
+    expect(validateDraft({ ...good, reviewGist: null }, approvedNoFindings).ok).toBe(true);
+  });
+
+  it('findings가 있으면 verdict와 findings를 함께 넣고 reviewGist를 허용한다', () => {
+    const p = renderFactsPrompt(withReview);
+    expect(p).toContain('## review 판정');
+    expect(p).toContain('request_changes');
+    expect(p).toContain('## review findings');
+    expect(p).toContain('timeout 후 재시도 시 key 재생성');
+    expect(
+      validateDraft({ ...good, reviewGist: 'key 재생성 경로가 blocker로 지적됐다' }, withReview).ok,
+    ).toBe(true);
   });
 });
 
