@@ -217,3 +217,28 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - DL-020이 C1에서 도입하겠다고 예고한 durable store를 `node:sqlite`로 실제 도입한다.
 - Windows 기본 경로는 `%APPDATA%\orca-slack-bridge\state.db`이고 override를 허용한다. WAL, `schema_version`, 단일 프로세스 가정을 사용하며 파일 lock은 만들지 않는다.
 - 외부 DB 의존성을 추가하지 않고, 재시작 뒤 repository+PR의 Slack message identity를 찾아 갱신할 수 있게 한다.
+
+## 2026-08-23 · C1 실측 계약 보강
+
+### DL-030 · 사실은 노출하고 판정은 하지 않는다
+
+- C1은 source fact를 조합해 보여주되 C2에 남겨 둔 정책을 대신 판정하지 않는다.
+- `headMatch`는 reviewer가 본 commit과 현재 head가 같은지 여부를 사실로 싣는다. 이전 approval의 유효성은 OD-031의 미결정 범위이므로 C1이 판정하지 않는다.
+- 실제 게시 카드가 `병합 완료`, 리뷰 판정 `request_changes`, `reviewer가 본 commit이 현재 head와 다르다`를 함께 표시했다. 서로 다른 source fact를 불편하다는 이유로 숨기거나 하나의 결론으로 덮지 않는다.
+
+### DL-031 · 조용한 실패를 만들지 않는다
+
+- `import.meta.main` 부재, win32의 `APPDATA` 부재, WAL 전환 실패, 상대 store 환경변수, 접근 불가 store, inbox 포화는 모두 던진다.
+- 유일한 예외는 상대 `XDG_DATA_HOME`이다. XDG 명세가 상대경로를 invalid로 보고 무시하라고 규정하므로 기본값으로 돌아간다.
+- 오류를 빈 결과·기본 성공·`worker_done` 없음으로 바꾸지 않는다. 서로 다른 DB를 열거나 기존 카드 mapping을 잃는 실패는 즉시 드러내야 한다.
+
+### DL-032 · 다중 reviewer_result는 결정적으로 하나를 고른다
+
+- 여러 `reviewer_result`가 있으면 `completedAt`이 가장 최신인 1건을 사용한다.
+- `completedAt`이 동률이거나 없으면 task id 사전순으로 고른다. 관찰 순서나 inbox 반환 순서에 의존하지 않는다.
+
+### DL-033 · 요약 호출과 게시를 분리하고 migration은 덧붙인다
+
+- 게이트 A는 요약 입력의 사실 지문으로 summarizer 호출 여부를 정한다. 지문이 같으면 저장된 요약을 재사용하고, head sha처럼 요약 입력이 아닌 값만 움직였을 때는 호출하지 않는다(OD-035).
+- 게이트 B는 매번 렌더한 결과의 지문으로 Slack 게시 여부를 정한다. 사실 지문으로 게시까지 막으면 `SummaryFacts`에 없는 PR `state` 변화, 특히 merge가 카드에 반영되지 않는다.
+- durable store migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 DB를 열 수 없게 만드는 파괴적 변경은 message identity를 잃어 Slack 루트 중복을 만들 수 있으므로 이 방식으로 다루지 않는다(OD-043). 현재 `SCHEMA_VERSION`은 2다.

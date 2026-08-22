@@ -54,6 +54,9 @@
 | OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
 | OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | DECIDED |
 | OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | DECIDED |
+| OD-075 | `task.result`가 덮어쓴 `worker_report`의 durable 조회·pagination 계약 | C2 전 | OPEN |
+| OD-076 | PR 1 : Task N correlation metadata와 cardinality | AB-1/C2 전 | OPEN |
+| OD-077 | run만 있고 task가 없는 PR의 correlation kind와 처리 정책 | S0/C2 전 | OPEN |
 
 ## PR state와 요약
 
@@ -574,8 +577,7 @@ ID: OD-029
 ```text
 ID: OD-073
 상태: DECIDED
-결정: reviewer는 자기 review task에 결과를 구조화해 기록한다.
-      orca orchestration task-update --id <review_task> --status completed --result <json>
+결정: reviewer는 판정하고 자기 `worker_done` 본문에 다음 `reviewer_result` JSON을 싣는다.
       {
         "kind": "reviewer_result", "schemaVersion": 1,
         "verdict": "approve" | "request_changes",
@@ -584,16 +586,25 @@ ID: OD-073
         "findings": [{ "severity": "blocker"|"major"|"minor", "file": "<path>", "line": <n>, "summary": "<text>" }],
         "gates": { "<name>": "pass"|"fail" }
       }
+      reviewer Dispatch가 settle된 뒤 coordinator가
+      `orca orchestration task-update --id <review_task> --status completed --result <json>`으로 기록한다.
+      Dispatch가 살아 있을 때 기록하면 `task_not_startable`이므로 이 순서를 바꾸지 않는다.
       verdict가 request_changes여도 review task 자체는 completed다. 리뷰라는 작업은 끝났기 때문이다.
 근거:
-  - `task-update --result`가 중첩 객체·배열을 손실 없이 왕복 보존함을 실측했다.
+  - reviewer terminal은 Run에 바인딩되지 않아 직접 `task-update`할 권한이 없다.
+  - reviewer의 세 시도가 다음처럼 거부됐다. 이 거부가 coordinator single-writer를 보존하는 올바른 동작이다.
+    - `task-update --id <task> --status completed --result <json>` → `run_required`
+    - 위 명령 + `--run <run> --from <coordinator_handle>` → `consumer_fenced`
+    - 위 명령 + `--from <worker_handle>` → `consumer_fenced`
+  - worker가 `run-use`를 실행하면 Run의 coordinator 소유권을 가져가 기존 coordinator를 fence하므로 절대 실행하지 않는다.
+  - Windows에서 중첩 객체·배열·한글·백틱을 포함한 `reviewer_result`를 coordinator가 기록하고
+    `task-list --json`으로 읽어 무손실 왕복을 확인했다.
   - GitHub `reviewDecision`이 모든 대상 repository에서 null이므로 Orca가 유일한 durable source다(DL-016).
   - severity taxonomy는 `vertical-live` reviewer가 이미 쓰는 값을 그대로 쓴다.
-  - `reviewedHeadSha`는 새 commit 이후 이전 approval의 유효성(OD-031)을 판정할 근거다.
+  - `reviewedHeadSha`는 현재 head와 같은지를 드러내는 사실이다. 이전 approval의 유효성 판정은 OD-031에 남긴다.
 영향 문서/파일: contracts/observation-and-correlation.md §6, specs/orchestration-bootstrap-and-continuity.md §4
-검증 방법: 첫 Run의 review task에서 result를 읽어 스키마가 왕복되는지 확인한다.
-미검증: Windows에서 `--result` JSON 따옴표가 깨질 수 있다. 깨지면 파일 경유 수단을 찾는다.
-결정일: 2026-08-22
+검증 방법: 실제 reviewer terminal의 권한 거부 3건과 coordinator 기록, task-list JSON 왕복을 확인했다(2026-08-23).
+결정일: 2026-08-23
 ```
 
 ```text
@@ -679,15 +690,24 @@ ID: OD-036
 ID: OD-035
 상태: DECIDED
 결정:
-  - 호출 상한: 사실 지문(PR key + head sha + reviewer-result + CI 결론 + 입력 사실 해시)이
-    바뀔 때만 호출한다. 지문이 같으면 이전 결과를 재사용한다. 관찰 횟수가 아니라 의미 있는
-    전이 횟수에 비례한다.
+  - 게이트 A(요약 호출): PR key는 cache row를 식별하고, 실제 요약 입력인 Task 목적, `worker_done`,
+    PR 제목·본문, 변경 파일 경로, reviewer-result, CI 결론으로 사실 지문을 만든다. 지문이 같으면
+    저장된 요약을 재사용하고 입력이 바뀔 때만 호출한다. head sha 자체는 요약 입력이 아니므로
+    사실 지문에 넣지 않는다.
+  - 게이트 B(게시): 매 관찰마다 카드를 렌더하고 렌더 지문이 다를 때만 갱신한다.
+    사실 지문 하나로 게시 여부까지 판정하지 않는다. `SummaryFacts`에 PR `state`가 없어서
+    그렇게 하면 요약 입력은 그대로인 채 merge된 PR의 카드가 갱신되지 않음을 실행으로 확인했다.
   - 검증 실패 시: 1회 재시도한다. 재시도도 실패하면 요약 없이 사실만으로 축소 카드를 만들고
     "요약 실패"를 표시한다.
   - 어떤 실패도 Orca/GitHub 상태를 변경하지 않으며 실패를 성공처럼 숨기지 않는다.
-근거: UX 문서가 summarizer 실패를 드러내도록 요구하고, 스펙이 실패 시 상태 불변을 요구한다.
+근거:
+  - 제목·본문·변경 파일·review·CI가 그대로인 채 head만 움직이면 요약 문구가 달라질 이유가 없고,
+    이때 호출하는 것은 OD-035가 줄이려던 낭비다.
+  - 요약 호출과 카드 게시의 입력 집합은 다르므로 두 게이트가 필요하다.
+  - UX 문서가 summarizer 실패를 드러내도록 요구하고, 스펙이 실패 시 상태 불변을 요구한다.
 영향 문서/파일: src/summarize/index.ts, renderer
 결정일: 2026-08-22
+정정일: 2026-08-23
 ```
 
 ```text
@@ -704,13 +724,31 @@ ID: OD-040
 ```text
 ID: OD-043
 상태: DECIDED
-결정: durable store는 node:sqlite를 쓴다. Windows 기본 경로는 %APPDATA%\orca-slack-bridge\state.db이며 override를 허용한다.
-      WAL과 schema_version 테이블을 쓰고, C1은 단일 프로세스이므로 파일 lock을 만들지 않는다.
-근거: DL-018에서 이 호스트의 node:sqlite 동작을 재확인했고 외부 의존성이 늘지 않는다. C1에는 daemon이 없어 동시 writer가 없다.
-대안과 기각 이유: 별도 DB 의존성 추가 — 조기 일반화다. 기각.
+결정:
+  - durable store는 node:sqlite를 쓴다. 경로 우선순위는 `--state` → `ORCA_SLACK_BRIDGE_STATE` →
+    platform 기본값이다. DB 절대경로는 머신마다 의미가 달라지므로 `config.json`에 두지 않는다.
+  - win32 기본값은 `%APPDATA%\orca-slack-bridge\state.db`다. `APPDATA`가 없으면 던진다.
+  - 비win32 base는 절대경로인 `XDG_DATA_HOME`, 없거나 상대경로면 `~/.local/share`이며 그 아래
+    `orca-slack-bridge/state.db`를 쓴다. DB는 설정이 아니라 state이므로 `XDG_CONFIG_HOME`을 쓰지 않는다.
+  - 절대경로 여부는 실행 호스트가 아니라 대상 platform 규칙으로 판정한다. 상대 `XDG_DATA_HOME`은
+    XDG 명세대로 invalid로 보고 무시하지만, 상대 `ORCA_SLACK_BRIDGE_STATE`는 실행 cwd에 따라 서로 다른
+    DB를 조용히 열 수 있으므로 던진다. `--state`도 절대경로만 받는다.
+  - WAL과 `schema_version` 테이블을 쓰고, C1은 단일 프로세스이므로 파일 lock을 만들지 않는다.
+    WAL 전환 실패와 접근 불가 store는 던진다.
+  - schema migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 파일을 열지 못하게
+    하는 파괴적 변경은 살아 있는 카드 mapping을 잃고 루트 메시지를 중복시키므로 이 방식으로 다루지 않는다.
+    현재 `SCHEMA_VERSION`은 2다.
+근거:
+  - DL-018에서 이 호스트의 node:sqlite 동작을 재확인했고 외부 의존성이 늘지 않는다. C1에는 daemon이 없어 동시 writer가 없다.
+  - 설정 파일은 머신 간에 옮겨도 의미가 유지되는 값을 담지만 DB 절대경로는 그렇지 않다.
+대안과 기각 이유:
+  - 별도 DB 의존성 추가 — 조기 일반화다. 기각.
+  - `XDG_CONFIG_HOME` 사용 — state와 config의 XDG 의미를 섞으므로 기각.
+  - 파괴적 migration — 기존 message identity를 잃어 Slack 루트를 중복시킬 수 있으므로 기각.
 영향 문서/파일: docs/specs/orca-slack-bridge.md §9, apps/orca-slack-bridge/src/store/schema.ts, src/store/sqlite.ts
 검증 방법: node:sqlite 파일 DB의 WAL, schema_version, 재시작 뒤 message identity 재사용을 테스트와 실제 DB로 확인했다.
 결정일: 2026-08-22
+보강일: 2026-08-23
 ```
 
 ```text
@@ -749,12 +787,15 @@ ID: OD-033
 ```text
 ID: OD-070
 상태: DECIDED
-결정: C1에서 worker_done이 누락돼도 카드는 막지 않고 worker 보고 없음으로 표시한다. 중복·불완전 payload 정책은 C2로 넘긴다.
+결정: C1에서 `worker_done`이 정말 누락됐으면 카드는 막지 않고 worker 보고 없음으로 표시한다.
+      다만 inbox 반환 행 수가 요청 상한과 같아 전역 최신 N건 안에서 찾지 못한 경우는 누락이 아니라
+      판정 불가이므로 던진다. 중복·불완전 payload 정책은 C2로 넘긴다.
 근거: UX §6이 degraded 상태를 숨기지 말라고 요구한다.
 대안과 기각 이유: worker_done이 없으면 카드 생성 중단 — 관찰된 PR 사실까지 숨긴다. 기각.
 영향 문서/파일: docs/contracts/observation-and-correlation.md §3, docs/ux/slack-surfaces.md §6, apps/orca-slack-bridge/src/digest/types.ts
-검증 방법: project 테스트가 worker_done 부재를 ProjectedPr에 남기는 것을 확인한다.
+검증 방법: project 테스트가 worker_done 부재를 ProjectedPr에 남기고 inbox 포화는 예외로 중단하는 것을 확인한다.
 결정일: 2026-08-22
+보강일: 2026-08-23
 ```
 
 ```text
@@ -801,3 +842,18 @@ ID: OD-072
 검증 방법: renderer·project·digest 테스트가 각 C1 degraded 표현 또는 skip을 확인한다.
 결정일: 2026-08-22
 ```
+
+## 2026-08-23 C1 계약 실측이 연 신규 항목
+
+- **OD-075** (`task.result`와 `worker_done` 조회): coordinator가 OD-073에 따라
+  `task-update --result`로 `reviewer_result`를 기록하면 그 Task의 `worker_report`가 덮어써져
+  `task.result`에서 원래 `worker_done`을 읽을 수 없다. C1은 `inbox`로 우회하지만 inbox는 전역 최신
+  N건만 반환하고 `--run` 필터, cursor, pagination이 없어 durable 조회 계약이 아니다. 두 사실을 모두
+  보존하고 Run 범위에서 완전하게 조회할 source/API를 결정해야 한다.
+- **OD-076** (PR 1 : Task N cardinality): PR body는 `orca-task` id를 하나만 실을 수 있고 같은 key를
+  서로 다른 값으로 중복하면 `conflict`다. 여러 Task가 한 PR을 이어서 갱신하면 metadata는 마지막 Task만
+  가리킨다. OD-021은 반대 방향인 Task 1 : PR N만 규정하므로 다중 Task 이력의 표현·선택 규칙을 정해야 한다.
+- **OD-077** (run-only correlation kind): `orca-run`은 있지만 `orca-task`가 없는 PR은 parser 결과가
+  `correlated`인데 task가 null이다. OD-021은 `orca-task`를 필수로 규정하지만 OD-022의 누락 정책 표에는
+  이 행과 전용 kind가 없다. C1은 임시로 `PrProjection.skipped(task_missing)` 처리하며 `resolve.ts`의
+  correlation 합타입은 바꾸지 않았다. `uncorrelated` reason 또는 별도 kind와 downstream 정책을 정해야 한다.
