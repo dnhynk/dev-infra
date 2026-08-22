@@ -106,17 +106,19 @@ owner user ID는 Gate 결정 권한의 근거다. Bridge는 room이나 channel �
 PowerShell에서 한 번 실행한다. `setx`는 레지스트리에 영구 기록한다.
 
 ```powershell
-setx SLACK_BOT_TOKEN "xoxb-여기에-붙여넣기"
-setx SLACK_APP_TOKEN "xapp-여기에-붙여넣기"
+setx ORCA_SLACK_BRIDGE_BOT_TOKEN "xoxb-여기에-붙여넣기"
+setx ORCA_SLACK_BRIDGE_APP_TOKEN "xapp-여기에-붙여넣기"
 ```
+
+**변수 이름에 앱 이름을 붙이는 이유가 있다.** `SLACK_BOT_TOKEN`과 `SLACK_APP_TOKEN`은 Bolt for JavaScript가 쓰는 관례 이름이다. 사용자 환경변수는 같은 사용자의 모든 프로세스가 상속하므로, 관례 이름을 쓰면 나중에 만든 다른 Slack 앱이 이 Bridge의 토큰을 조용히 집어간다. Bridge는 관례 이름을 **읽지 않으며**, 관례 이름만 설정돼 있으면 `verify-slack`이 옮기라고 알려준다.
 
 **이미 떠 있는 프로세스에는 반영되지 않는다.** Orca 앱과 터미널을 재시작해야 새 프로세스가 값을 본다. `NVM_HOME` 때와 같은 성질이다([호스트 전제조건](../platform-capabilities.md#6-호스트-전제조건)).
 
 현재 세션에서 바로 쓰려면 그 세션에만 추가로 설정한다.
 
 ```powershell
-$env:SLACK_BOT_TOKEN = "xoxb-..."
-$env:SLACK_APP_TOKEN = "xapp-..."
+$env:ORCA_SLACK_BRIDGE_BOT_TOKEN = "xoxb-..."
+$env:ORCA_SLACK_BRIDGE_APP_TOKEN = "xapp-..."
 ```
 
 > **범위에 대한 정직한 설명**: 사용자 환경변수는 같은 사용자로 실행되는 모든 프로세스가 읽는다. Orca가 띄우는 worker agent도 포함된다. 단일 사용자 머신에서 파일과 환경변수 사이에 실질적인 격리 차이는 없다. 의미 있는 경계는 **저장소에 넣지 않는다**, **로그에 남기지 않는다**, **Slack 메시지에 싣지 않는다** 세 가지다. Bridge는 토큰을 출력할 때 항상 마스킹한다.
@@ -169,10 +171,10 @@ node dist/cli.js verify-slack
 
 ```text
   OK   config.slack       team=T01234567 owners=1 channels=2
-  OK   SLACK_BOT_TOKEN    xoxb-1234…abcd (56자)
+  OK   ORCA_SLACK_BRIDGE_BOT_TOKEN  xoxb-1234…abcd (56자)
   OK   auth.test          team=T01234567 bot_user=U0BOTID
   OK   team 일치          설정과 같다
-  OK   SLACK_APP_TOKEN    xapp-1234…wxyz (60자)
+  OK   ORCA_SLACK_BRIDGE_APP_TOKEN  xapp-1234…wxyz (60자)
   OK   connections:write  WebSocket URL 발급 성공 (연결하지 않음)
 
 모든 확인 통과
@@ -186,6 +188,7 @@ node dist/cli.js verify-slack
 | team 일치 | `auth.test`의 `team_id`와 설정 대조 | 다른 workspace의 토큰을 넣음 |
 | app token 유효성과 scope | `apps.connections.open` | `connections:write` 누락, bot token을 app token 자리에 넣음 |
 | 토큰 자리 바뀜 | 접두 검사 | `xoxb`/`xapp`를 서로 반대로 주입 |
+| 관례 이름 사용 | 변수 존재 확인 | 다른 Slack 앱과 토큰이 섞일 위험 |
 
 `apps.connections.open`은 만료되는 WebSocket URL을 발급받을 뿐 연결하지 않으며, URL은 출력하지 않는다.
 
@@ -195,7 +198,8 @@ node dist/cli.js verify-slack
 
 | 출력 | 원인 |
 |---|---|
-| `SLACK_BOT_TOKEN 환경변수가 비어 있다` | `setx` 후 터미널을 재시작하지 않았다 |
+| `환경변수가 비어 있다` | `setx` 후 터미널을 재시작하지 않았다 |
+| `SLACK_BOT_TOKEN가 설정돼 있으나 읽지 않는다` | 관례 이름에 넣었다. `ORCA_SLACK_BRIDGE_` 접두로 옮긴다 |
 | `xoxb-로 시작하지 않는다` | 두 토큰을 반대로 넣었다 |
 | `auth.test 실패: invalid_auth` | 토큰이 만료됐거나 앱을 재설치했다 |
 | `connections:write scope가 없다` | app-level token 생성 시 scope를 빠뜨렸다. 새로 발급해야 한다 |

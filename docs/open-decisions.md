@@ -19,7 +19,7 @@
 | OD-002 | package manager와 monorepo 도구 | monorepo scaffold 전 | DECIDED |
 | OD-003 | 테스트 framework와 CI | 첫 slice 구현 전 | DECIDED |
 | OD-004 | 지원 Windows/Orca/Claude Code/Slack/GitHub 버전 | adapter 계약 확정 전 | OPEN |
-| OD-005 | 설정 파일 형식과 secret 주입 방식 | 실제 통합 전 | OPEN |
+| OD-005 | 설정 파일 형식과 secret 주입 방식 | 실제 통합 전 | DECIDED |
 
 ## Bootstrap & Continuity
 
@@ -593,5 +593,28 @@ ID: OD-073
 영향 문서/파일: contracts/observation-and-correlation.md §6, specs/orchestration-bootstrap-and-continuity.md §4
 검증 방법: 첫 Run의 review task에서 result를 읽어 스키마가 왕복되는지 확인한다.
 미검증: Windows에서 `--result` JSON 따옴표가 깨질 수 있다. 깨지면 파일 경유 수단을 찾는다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-005
+상태: DECIDED
+결정: 설정은 저장소 밖 JSON 파일, secret은 앱 이름을 접두로 붙인 환경변수로 주입한다.
+      설정 파일: %APPDATA%\orca-slack-bridge\config.json (ORCA_SLACK_BRIDGE_CONFIG 또는 --config로 override)
+      secret: ORCA_SLACK_BRIDGE_BOT_TOKEN, ORCA_SLACK_BRIDGE_APP_TOKEN
+근거:
+  - 저장소가 public이므로 secret과 workspace/channel/owner ID를 저장소에 두지 않는다(DL-015).
+  - `SLACK_BOT_TOKEN`·`SLACK_APP_TOKEN`은 Bolt for JavaScript의 관례 이름이다. 사용자 환경변수는
+    같은 사용자의 모든 프로세스가 상속하므로, 관례 이름을 쓰면 나중에 만든 다른 Slack 앱이
+    이 Bridge의 토큰을 조용히 집어간다. 이름 충돌이 아니라 잘못된 토큰이 소리 없이 쓰이는 사고다.
+  - 설정 파서가 값 어디에서든 `xoxb-`/`xapp-` 문자열을 발견하면 거부해, secret을 설정 파일에
+    붙여넣는 사고를 막는다.
+대안과 기각 이유:
+  - 관례 이름 사용: 위 사고 때문에 기각. Bridge는 관례 이름을 읽지 않고, 설정돼 있으면 옮기라고 안내한다.
+  - 관례 이름을 fallback으로 허용: 같은 사고를 그대로 남긴다. 기각.
+  - Windows Credential Manager: 격리는 낫지만 단일 사용자 머신에서 agent도 같은 사용자로 실행되므로
+    실질적 격리 이득이 작고 코드가 늘어난다. 필요해지면 재검토한다.
+영향 문서/파일: docs/ops/slack-app-setup.md, apps/orca-slack-bridge/src/project/config.ts, src/slack/verify.ts
+검증 방법: verify-slack이 관례 이름만 설정된 경우를 실패로 보고하는지 테스트로 확인했다(2026-08-22).
 결정일: 2026-08-22
 ```

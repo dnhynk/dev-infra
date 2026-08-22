@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { maskToken, verifySlack, formatVerify } from '../src/slack/verify.js';
+import { maskToken, verifySlack, formatVerify, BOT_TOKEN_VAR, APP_TOKEN_VAR } from '../src/slack/verify.js';
 import { parseConfig } from '../src/project/config.js';
 
 const slack = {
@@ -69,17 +69,38 @@ describe('verifySlack — 네트워크 없이 판정되는 경로', () => {
     const r = await verifySlack(slack, {} as NodeJS.ProcessEnv);
     expect(r.ok).toBe(false);
     const names = r.checks.filter((c) => !c.ok).map((c) => c.name);
-    expect(names).toContain('SLACK_BOT_TOKEN');
-    expect(names).toContain('SLACK_APP_TOKEN');
+    expect(names).toContain(BOT_TOKEN_VAR);
+    expect(names).toContain(APP_TOKEN_VAR);
   });
 
   it('접두가 틀린 토큰은 호출 전에 잡고 값을 노출하지 않는다', async () => {
     const r = await verifySlack(slack, {
-      SLACK_BOT_TOKEN: fake('xapp', 'WRONGPLACEVALUE'),
-      SLACK_APP_TOKEN: fake('xoxb', 'WRONGPLACEVALUE'),
+      [BOT_TOKEN_VAR]: fake('xapp', 'WRONGPLACEVALUE'),
+      [APP_TOKEN_VAR]: fake('xoxb', 'WRONGPLACEVALUE'),
     } as NodeJS.ProcessEnv);
     expect(r.ok).toBe(false);
     const out = formatVerify(r);
     expect(out).not.toContain('WRONGPLACEVALUE');
+  });
+});
+
+describe('환경변수 이름 충돌 방지', () => {
+  it('앱 이름이 붙은 변수를 읽는다', () => {
+    expect(BOT_TOKEN_VAR).toBe('ORCA_SLACK_BRIDGE_BOT_TOKEN');
+    expect(APP_TOKEN_VAR).toBe('ORCA_SLACK_BRIDGE_APP_TOKEN');
+  });
+
+  it('Bolt 관례 이름을 값으로 쓰지 않는다', async () => {
+    const r = await verifySlack(slack, {
+      SLACK_BOT_TOKEN: fake('xoxb', 'GENERICVALUE'),
+      SLACK_APP_TOKEN: fake('xapp', 'GENERICVALUE'),
+    } as NodeJS.ProcessEnv);
+    expect(r.ok).toBe(false);
+    const out = formatVerify(r);
+    // 값을 집어가지 않았음을 확인한다.
+    expect(out).not.toContain('GENERICVALUE');
+    // 대신 옮기라고 안내한다.
+    expect(out).toContain('SLACK_BOT_TOKEN가 설정돼 있으나 읽지 않는다');
+    expect(out).toContain(BOT_TOKEN_VAR);
   });
 });
