@@ -43,7 +43,7 @@ worker는 PR body **맨 끝**에 다음 블록을 붙인다. 사람이 읽는 �
 
 ```text
 canonical repository + PR number
-  → Orca Run → Task → Dispatch/Worker → worker_done → 필요 시 제한된 transcript
+  → Orca Run → Task → Dispatch/Worker → worker_done
 ```
 
 Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시점 body가 기준이다.
@@ -58,22 +58,24 @@ Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시�
 | 같은 key가 서로 다른 값으로 중복 | `conflict` |
 | metadata의 task가 다른 Run에 속함 | `conflict` |
 
-`uncorrelated`는 실패가 아니라 **정상 출력**이다. Bridge는 branch 이름이나 PR 제목으로 추측해 확정하지 않고, 모순을 자동으로 한쪽으로 덮지 않는다.
+`uncorrelated`는 실패가 아니라 **정상 출력**이다. Bridge는 branch 이름이나 PR 제목으로 추측해 확정하지 않고, 모순을 자동으로 한쪽으로 덮지 않는다. C1은 `uncorrelated` 또는 `conflict` PR에 Slack 카드를 만들지 않는다.
 
 ## 3. Worker 완료 계약
 
 - worker는 배정된 Dispatch 완료 시 `worker_done`을 정확히 한 번 보낸다.
-- body는 장문 transcript가 아니라 정확히 세 문장이다.
+- body의 executive summary는 장문 transcript가 아니라 정확히 세 문장이다.
   - 첫 문장: 무엇을 했는가
   - 둘째 문장: 무엇을 발견했는가
   - 셋째 문장: 무엇이 남았는가
+- reviewer Dispatch는 같은 body에 §6의 `reviewer_result` JSON도 싣는다. reviewer가 판정을 전달하고
+  coordinator가 durable result를 기록한다.
 - **PR을 만든 뒤에 `worker_done`을 보낸다.** 완료 신호가 리뷰 대상보다 먼저 도착하지 않게 한다.
 - **PR identity를 `worker_done`에 싣지 않는다.** 연결 방향이 PR → task이고 PR body의 correlation metadata가 유일한 연결점이다. worker 명령에서 raw `--payload` JSON은 PowerShell이 따옴표를 깨뜨릴 수 있어 쓰지 않는다.
 - `--files-modified`는 사용한다.
-- `worker_done`이 누락·중복·불완전할 때의 상태와 recovery는 `OD-070`에서 확정한다.
-- worker가 release된 뒤에도 필요하면 `worker-read`로 결과를 확인할 수 있다는 Orca capability를 활용할 수 있다.
-
-`worker-read`는 기본 요약 pipeline이 아니다. fallback을 허용하는 최소 부족 조건, 읽을 최대 범위, secret redaction, 외부 LLM 전송 허용 여부를 먼저 정해야 한다.
+- C1에서 `worker_done`이 정말 없으면 카드는 계속 만들고 `worker 보고 없음`을 표시한다. 다만 inbox 반환
+  행 수가 요청 상한과 같아 최신 N건 안에서 못 찾은 경우는 없음이 아니라 판정 불가이므로 던진다.
+  inbox에는 `--run` 필터, cursor, pagination이 없다는 한계가 있다(OD-075). 중복·불완전 payload의 recovery는 C2에서 정한다.
+- C1은 `worker-read` fallback을 사용하지 않는다. 따라서 transcript는 summarizer 입력도 Slack 카드 입력도 아니다.
 
 ## 4. Gate 생성 계약
 
@@ -136,10 +138,13 @@ Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator i
 
 **review verdict의 durable source는 Orca다.** 대상 repository 전부에서 GitHub `reviewDecision`이 null이고, PR author와 review author가 같은 계정이라 GitHub이 self-approve를 막으므로 formal verdict가 원리적으로 불가능하다(DL-016).
 
-reviewer는 자기 review task에 결과를 기록한다.
+reviewer는 판정하고 자기 `worker_done` 본문에 결과를 싣는다. reviewer terminal은 Run에 바인딩되지 않아
+`task-update`를 직접 호출할 수 없다.
 
 ```text
-orca orchestration task-update --id <review_task> --status completed --result <json>
+reviewer 판정 + worker_done(reviewer_result JSON)
+  → reviewer Dispatch settle
+  → coordinator가 task-update --id <review_task> --status completed --result <json>
 ```
 
 ```json
@@ -155,7 +160,17 @@ orca orchestration task-update --id <review_task> --status completed --result <j
 
 `verdict`는 `approve` 또는 `request_changes`다. `request_changes`여도 review task 자체는 `completed`다. 리뷰라는 작업은 끝났기 때문이다.
 
-`reviewedHeadSha`는 새 commit 이후 이전 approval이 유효한지 판정할 근거다.
+순서를 바꾸지 않는다. reviewer Dispatch가 살아 있는 동안 coordinator가 기록하면 `task_not_startable`이므로
+settle된 뒤에만 기록한다. worker는 `run-use`를 실행하지 않는다. Run의 coordinator 소유권을 가져가 기존
+coordinator를 fence하기 때문이다. reviewer의 `task-update`가 `run_required` 또는 `consumer_fenced`로 거부되는
+것은 coordinator single-writer를 보존하는 올바른 동작이다.
+
+Windows에서도 중첩 객체·배열·한글·백틱을 포함한 `--result` JSON이 `task-list --json`까지 무손실로 왕복됨을
+확인했다. 여러 `reviewer_result`가 있으면 `completedAt` 최신 1건을 선택하고, 동률이거나 시각이 없으면 task id
+사전순으로 결정한다.
+
+`reviewedHeadSha`와 현재 head의 일치 여부(`headMatch`)는 사실로 노출한다. Bridge는 reviewer가 본 commit과
+현재 head가 다르다는 사실을 표시할 뿐, 이전 approval의 유효성은 판정하지 않는다(OD-031).
 
 GitHub review 본문의 `## Verdict` / `## Gates` / `## Findings` 규약은 표시용 보조 사실로만 쓰고 상태 source로 삼지 않는다. 신뢰 경계상 untrusted content다.
 

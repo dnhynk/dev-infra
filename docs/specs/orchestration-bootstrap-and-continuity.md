@@ -93,7 +93,7 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 - worker는 PR을 만들며 최종 merge를 직접 수행하지 않는다.
 - PR review는 전담 Codex agent가 맡는다. 배치는 [Agent 배치 정책](#42-agent-배치-정책)을 따른다.
 - reviewer는 승인 또는 수정 요청과 근거를 coordinator에게 반환한다.
-- Bridge가 review 상태를 관찰하려면 같은 verdict가 GitHub formal review 또는 별도로 확정한 Orca reviewer-result source에 durable하게 남아야 한다. 어느 source를 계약으로 삼을지는 TBD다.
+- reviewer verdict의 유일한 durable source는 correlated Orca Task의 `task.result`에 기록한 `reviewer_result`다. Bridge는 GitHub formal review를 verdict source로 사용하지 않고 `task.result`만 읽는다(DL-016, OD-028).
 - coordinator는 review 결과를 간단히 최종 확인한 뒤 merge한다.
 - 수정 요청은 가능한 한 원 worker에게 돌리고 재검토한다.
 - merge 뒤에는 다음 ready task를 자동으로 지시한다.
@@ -135,7 +135,7 @@ coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 work
   - 첫 문장: 무엇을 했는가
   - 둘째 문장: 무엇을 발견했는가
   - 셋째 문장: 무엇이 남았는가
-- PR 생성과 `worker_done` 전송의 strict ordering, PR identity를 body에 포함할지는 구현 전에 확정한다. Observer는 이 결정 전까지 두 event가 항상 특정 순서로 도착한다고 가정하지 않는다.
+- worker는 PR을 만든 뒤 `worker_done`을 보낸다. PR identity는 body에 넣지 않고 PR body 맨 끝의 correlation metadata를 유일한 연결점으로 쓴다(OD-021/029).
 - worker가 만드는 PR에는 Bridge가 Run·Task·Dispatch를 정확히 연결할 correlation metadata가 필요하다.
 - metadata의 최종 형식과 생성 주체는 [관찰·상관관계 계약](../contracts/observation-and-correlation.md)에서 확정한다.
 - coordinator는 metadata가 포함되도록 worker에게 규칙을 전달하되, 형식이 확정되기 전에는 임의 문법을 영구 계약으로 만들지 않는다.
@@ -245,8 +245,8 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 | 제품 요구사항과 작업 규약 | 확정 spec, `AGENTS.md` |
 | orchestration 상태 | Orca live Run/Task/Worker/Gate |
 | 코드·worktree 상태 | Git working tree/worktree |
-| PR·review·CI·merge 상태 | GitHub 원본 |
-| reviewer verdict가 GitHub에 기록되지 않는 경우 | 확정할 Orca reviewer-result source |
+| PR·CI·merge 상태 | GitHub 원본 |
+| reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` |
 | 연속성 snapshot | `HANDOFF.md` |
 | 세션 대화 기억 | source of truth로 사용하지 않음 |
 
@@ -296,7 +296,6 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - 여러 Run이 같은 repository에 있을 때 선택 규칙
 - Run↔repository↔coordinator session identity
 - service tier를 supervised worker 경로에서 지정할 수단
-- reviewer verdict의 durable 관찰 source
 - ask/escalation↔Gate correlation
 - PR correlation metadata 형식
 - Fresh/Resume 시 Channel Adapter 자동 등록·session opt-in 검증 책임

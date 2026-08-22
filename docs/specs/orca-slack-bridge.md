@@ -1,6 +1,6 @@
 # `orca-slack-bridge` Umbrella 스펙
 
-상태: **Draft · 구현 전**  
+상태: **Draft · C1 구현됨, 후속 slice 미구현**
 해결 대상: **C + D**  
 예정 위치: `dev-infra/apps/orca-slack-bridge`
 
@@ -64,10 +64,10 @@ Slack의 3초 acknowledgement 제한 때문에 네트워크 요청 ACK와 Gate r
 |---|---|---|
 | Run·Task·Dispatch·Worker 상태 | Orca orchestration | 읽고 projection |
 | worker 완료 요약 | Orca `worker_done` | 우선 요약 입력으로 사용 |
-| 상세 worker transcript | Orca `worker-read` | 부족할 때만 fallback |
+| 상세 worker transcript | Orca `worker-read` | C1에서는 읽지 않음; fallback은 후속 범위 |
 | Gate 질문·선택지·상태·결정 | Orca Gate | 표시하고 제한적으로 resolve |
 | PR·check·merge 상태 | GitHub API 또는 `gh` 원본 | 읽고 projection |
-| reviewer verdict | GitHub formal review 또는 확정할 Orca reviewer-result source | 읽고 projection |
+| reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` | 읽고 projection |
 | Slack 메시지 위치·표시 이력 | Bridge durable store | create/update/thread bookkeeping |
 | coordinator 통지 상태 | Bridge durable store | pending/attempt/확인 상태 관리 |
 | Slack 카드 문구 | derived view | authoritative 상태로 사용하지 않음 |
@@ -87,7 +87,7 @@ Review + CI + merge 조건 → Merge Ready
 Coordinator merge → 완료
 ```
 
-PR 생성과 `worker_done`의 strict ordering은 아직 정하지 않는다. Bridge가 관찰할 후보 변화:
+worker는 PR을 만든 뒤 `worker_done`을 보낸다. C1의 관찰은 `digest` 명령 1회 실행당 1회이며 polling하지 않는다. Bridge가 관찰할 후보 변화:
 
 - PR opened/discovered
 - 연결된 `worker_done`
@@ -100,7 +100,7 @@ PR 생성과 `worker_done`의 strict ordering은 아직 정하지 않는다. Bri
 - merge-ready 조건 충족
 - merged
 
-정확한 canonical state, 여러 reviewer의 상충 verdict, 새 commit 후 approval 유효성, required check, draft, merge queue, merge conflict, closed-without-merge 처리는 TBD다.
+정확한 canonical state, 여러 reviewer의 상충 verdict, 새 commit 후 approval 유효성, required check, draft, merge queue, merge conflict, closed-without-merge 처리는 C2에서 정한다.
 
 ### 5.2 입력 사실
 
@@ -109,38 +109,35 @@ Orca에서:
 - Task 목적
 - Run/Task/Dispatch/Worker identity
 - `worker_done`
-- 필요할 때만 제한된 transcript
+- correlated Task의 `task.result`에 기록된 `reviewer_result`
+- C1에서는 transcript를 읽지 않는다
 
 GitHub에서:
 
 - repository, PR number, title, body, URL
 - source/target branch와 head commit
 - changed files와 diff stats
-- GitHub formal review가 계약인 경우 review verdict와 review body/comment
-- 또는 별도로 확정한 Orca reviewer-result
 - CI/check 상태
 - mergeability와 merge 상태
 
-`review 핵심 comment`와 `Merge Ready`는 GitHub의 단일 필드가 아니라 Bridge가 명시적으로 정의해야 하는 derived 의미다.
+review 핵심 요약은 Orca `reviewer_result.findings`에서 만들며 GitHub review를 verdict source로 사용하지 않는다. `Merge Ready`는 GitHub의 단일 필드가 아니라 Bridge가 명시적으로 정의해야 하는 derived 의미다.
 
 ### 5.3 의미 압축
 
-Summarizer에는 처음부터 transcript 전체를 보내지 않는다. 기본 입력은 Task 목적, `worker_done`, PR title/body, 변경 파일 범주, review 결과와 핵심 comment, CI·merge 상태다.
+Summarizer 입력인 `SummaryFacts`는 Task 목적, `worker_done`, PR title, correlation metadata를 제거하고 상한을 적용한 PR body, 변경 파일 경로, `reviewer_result`의 findings, CI 결론, 입력 잘림 여부로 고정한다. PR state·merge 상태는 `SummaryFacts`에 없으며 worker transcript, diff 본문, GitHub review 원문 전체도 보내지 않는다.
 
-예상 structured output의 의미 예시:
+LLM structured output은 다음 네 필드뿐이다.
 
 ```json
 {
   "title": "결제 중복 처리 방지",
   "what": "같은 결제 요청이 여러 번 들어와도 한 번만 처리되도록 수정했습니다.",
   "why": "네트워크 재시도 시 동일 결제가 중복 처리될 가능성이 있었습니다.",
-  "status": "review_changes_requested",
-  "review": "응답 지연 후 재시도되는 예외 상황을 추가 보완해야 합니다.",
-  "risk": "low"
+  "reviewGist": "응답 지연 후 재시도되는 예외 상황을 추가 보완해야 합니다."
 }
 ```
 
-필드명·enum·risk 산정·provider·model·언어·fallback은 아직 계약이 아니다.
+`status`는 관찰한 PR·Orca 사실에서 코드가 파생하고, `risk`는 `reviewer_result.findings[].severity`를 코드가 집계해 파생한다. 모델에 두 판정을 맡기지 않는다. provider는 OpenAI API, 기본 모델은 설정으로 교체 가능한 `gpt-5.6-luna`, 출력 언어는 한국어다. 출력은 strict JSON Schema로 검증하며 검증 실패는 한 번 재시도하고, 재시도도 실패하면 요약 없이 사실만 담은 축소 카드를 만들고 "요약 실패"를 표시한다(OD-034~037, DL-026~027).
 
 Renderer는 다음을 보장해야 한다.
 
@@ -152,11 +149,12 @@ Renderer는 다음을 보장해야 한다.
 
 ### 5.4 Slack projection
 
-- 모든 repository의 semantic PR digest를 하나의 `#pr-digest`에 모을 수 있다.
-- 모든 카드 상단에 project/repository/PR identity를 표시한다.
+- C1의 대상은 correlated PR뿐이다. uncorrelated 또는 conflict PR에는 카드를 만들지 않는다.
+- C1의 첫 외부 write는 실제 `#pr-digest`에 한다.
+- 모든 카드 상단은 Project가 등록됐으면 `[Project] owner/repo #N`, 아니면 `owner/repo #N`으로 표시한다.
 - PR 하나당 루트 메시지 하나를 만든다.
 - 상태가 바뀌면 Bridge 자신이 작성한 같은 메시지를 `chat.update`로 갱신한다.
-- 중요한 상태 변화만 thread에 한 번 남긴다.
+- C1은 thread transition을 만들지 않는다. 중요한 상태 변화의 thread는 C2다.
 - 모바일에서 무엇을, 왜, 현재 어떤 상태로 바꾸는지와 위험·검증·PR 링크를 짧게 파악할 수 있어야 한다.
 
 구체적인 문구와 layout은 [Slack 메시지 UX](../ux/slack-surfaces.md)를 따른다.
@@ -288,11 +286,12 @@ Channel reply tool 또는 localhost IPC를 통해 coordinator가 application rec
 - coordinator notification pending/attempt 상태
 - 마지막 성공 관찰 cursor 또는 snapshot
 
-SQLite는 제시된 후보일 뿐 아직 확정 기술이 아니다.
+C1 durable store는 `node:sqlite`다. 기본 경로는 Windows에서 `%APPDATA%\\orca-slack-bridge\\state.db`이며 명시적 경로 또는 환경변수로 override할 수 있다. `--state`는 cwd 기준 상대경로를 허용하고, cwd가 다른 프로세스에 상속될 수 있는 `ORCA_SLACK_BRIDGE_STATE`만 대상 platform의 절대경로를 요구한다. WAL과 `schema_version` 테이블을 사용하고, C1은 daemon이나 동시 writer가 없다는 단일 프로세스 가정으로 파일 lock을 만들지 않는다.
 
-필수 성질:
+전체 Bridge가 지향하는 필수 성질과 C1에서 검증한 범위를 구분한다.
 
-- 같은 repository+PR에 루트 메시지가 중복 생성되지 않는다.
+- C1 store는 repository+PR마다 매핑 행을 하나만 보존하며 두 PR이 같은 Slack message identity를 가리키지 못하게 한다.
+- `chat.postMessage` 성공 뒤 매핑 행까지 남은 PR은 재관찰 시 기존 루트를 찾아 `chat.update`한다. T5가 검증한 중복 방지는 이 범위다.
 - 같은 Run에 루트 메시지가 중복 생성되지 않는다.
 - 같은 action이 Gate를 두 번 resolve하지 않는다.
 - 재시작 후 기존 메시지를 찾아 update할 수 있다.
@@ -300,7 +299,9 @@ SQLite는 제시된 후보일 뿐 아직 확정 기술이 아니다.
 - 오래된 event가 최신 카드를 과거 상태로 되돌리지 않는다.
 - 재전송이 coordinator의 후속 작업을 중복 실행하게 하지 않는다.
 
-crash 경계별 atomicity, outbox, DB migration, locking, retention, corruption recovery는 TBD다.
+그러나 C1은 Slack 루트가 PR당 절대 하나임을 보장하지 않는다. `chat.postMessage` 성공 뒤 `insertPrMessage` 전에 crash하면 매핑 행이 없고, 게시 성공 여부를 알 수 없는 delivery failure에서도 매핑 행을 남길 수 없어 다음 관찰이 새 루트를 만들 수 있다. 두 창의 atomicity·outbox·요청 idempotency 계약은 아직 열려 있다.
+
+OD-043이 확정한 범위는 `node:sqlite`, 경로 우선순위와 platform별 기본값, WAL, `schema_version`, 덧붙이기 migration, C1 단일 프로세스에서 파일 lock을 만들지 않는다는 계약이다. future multi-writer locking, retention, backup, corruption recovery와 위 두 게시 창은 후속 범위다.
 
 ## 10. 보안 경계
 
@@ -385,7 +386,7 @@ S0, C1, C2, D1, D2, D3를 구현한 core C/D 상태는 다음 end-to-end 증거�
 11. raw Agent transcript와 GitHub Slack 메시지를 기본 데이터 pipeline에 포함하지 않는다.
 12. 독립 Task는 한 Gate 때문에 Bridge에 의해 중단되지 않는다.
 
-실제 Slack·GitHub·Orca 통합 테스트와 fixture 테스트의 경계는 빌드 시작 시 확정한다. 실행 명령과 출력 없이 완료를 선언하지 않는다.
+C1의 통합 테스트 경계는 대역 멱등성 테스트와 실제 `#pr-digest` 게시 1회 및 재실행 관측으로 확정했다(OD-060/061). 후속 slice는 실행 명령과 출력 없이 완료를 선언하지 않는다.
 
 PC 자동 시작, 새 Run/repository 자동 발견과 자동 routing까지 검증해야 [전체 제품의 최종 운영 UX](#12-전체-제품의-최종-운영-ux) 완료를 선언할 수 있다.
 

@@ -36,7 +36,7 @@ TBD는 이 과정에서만 확정한다. 구현자가 편의상 먼저 채우지
 - context 열화 관측 가능성
 - handoff 저장·archive·redaction
 - coordinator single-writer 보장 가능성
-- reviewer verdict의 durable 관찰 위치
+- Orca `reviewer_result` 기록·관찰 계약 확인
 - worker ask/reply와 사람용 Gate 승격 계약
 
 출구 조건:
@@ -116,10 +116,10 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 
 출구 조건:
 
-- PR 카드가 정확히 하나 생성됨
-- 재관찰로 루트가 중복되지 않음
-- repository identity와 PR 링크가 항상 표시됨
-- LLM이 layout/action을 만들지 않음
+- **PR 카드가 정확히 하나 생성됨** — T5가 이 Run의 correlated PR에 실제 `#pr-digest` 카드 1회를 게시했고, durable store의 `pr_message` 행은 1건이었다.
+- **재관찰로 루트가 중복되지 않음** — T5가 같은 `digest` 명령을 재실행했을 때 `chat.postMessage`는 호출되지 않고 기존 message ts를 `chat.update`했으며 `pr_message` 행은 1건으로 남았다.
+- **repository identity와 PR 링크가 항상 표시됨** — T5의 실제 두 카드 blocks 비교에서 identity와 action button은 byte 단위로 같았고, renderer·digest 통합 테스트가 identity와 PR link를 고정한다.
+- **LLM이 layout/action을 만들지 않음** — T4 renderer 테스트와 T5 실제 재실행 비교에서 모델 문자열만 달랐고 identity·상태·리뷰·risk·CI·worker 보고·action은 deterministic renderer가 유지했다.
 
 ## 6. Bridge Slice C2 · Review·CI·Merge lifecycle
 

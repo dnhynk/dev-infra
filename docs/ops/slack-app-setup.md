@@ -161,7 +161,7 @@ notepad "$env:APPDATA\orca-slack-bridge\config.json"
 
 설정과 토큰이 실제로 유효한지 확인한다. **메시지를 게시하지 않는다.**
 
-> **2026-08-22 이 절차로 전 항목 통과를 확인했다.** bot·app token이 유효하고, `auth.test`의 `team_id`가 설정과 일치하며, `connections:write`로 WebSocket URL 발급에 성공했다. 실제 ID와 토큰은 저장소 밖 설정과 환경변수에 있으므로 여기 적지 않는다. 남은 것은 Socket Mode 실제 연결과 메시지 게시이며 D2에서 확인한다.
+> **2026-08-22 이 절차로 전 항목 통과를 확인했다.** bot·app token이 유효하고, `auth.test`의 `team_id`가 설정과 일치하며, `connections:write`로 WebSocket URL 발급에 성공했다. 실제 ID와 토큰은 저장소 밖 설정과 환경변수에 있으므로 여기 적지 않는다. C1의 실제 `#pr-digest` 메시지 게시도 별도로 확인했으며, 남은 것은 D2의 Socket Mode 실제 연결이다.
 
 ```powershell
 cd D:\dev-infra\apps\orca-slack-bridge
