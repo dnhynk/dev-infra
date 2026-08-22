@@ -115,7 +115,10 @@ function main() {
   const remaining = marker.context_window - used;
   if (remaining > reserve) return passthrough();
 
-  const state = marker.rollover ?? { triggered_count: 0 };
+  // 이전 발동이 다른 세션에서 났다면 그 롤오버는 성공한 것이다. 카운트를 리셋해
+  // 같은 Run의 다음 승계를 막지 않는다. 같은 세션에서의 반복만 누적해 멈춘 coordinator를 잡는다.
+  const prev = marker.rollover ?? { triggered_count: 0 };
+  const state = prev.last_session_id === hook.session_id ? prev : { triggered_count: 0 };
   if (state.triggered_count >= MAX_TRIGGERS) {
     return passthrough(
       `롤오버를 ${state.triggered_count}회 지시했으나 완료되지 않았다. 더 지시하지 않는다. 수동 개입이 필요하다.`
@@ -126,6 +129,7 @@ function main() {
     triggered_count: state.triggered_count + 1,
     last_triggered_at: new Date().toISOString(),
     last_remaining_tokens: remaining,
+    last_session_id: hook.session_id,
   };
   try {
     writeFileSync(markerPathFor(hook.cwd), JSON.stringify(marker, null, 2) + "\n");
