@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -275,6 +276,153 @@ describe('runDigest 멱등', () => {
   });
 });
 
+/**
+ * OD-035의 호출 상한. 게이트가 둘이고 각각 다른 것을 막는다(`digest/digest.ts`).
+ *
+ * 실측 배경: T5의 실제 E2E에서 같은 PR에 digest를 두 번 실행하면 사실이 그대로인데도
+ * `update`가 나왔다. 캐시가 프로세스 메모리에만 있어 매 실행이 summarizer를 다시 불렀고,
+ * 모델이 만든 문자열 셋이 흔들려 렌더 지문이 달라졌기 때문이다. 아래 테스트는 provider
+ * 호출 횟수를 직접 세어 그 회귀를 막는다. `StubProvider`가 결정적이라 호출을 세지 않고
+ * action만 보면 이 회귀가 드러나지 않는다.
+ */
+describe('runDigest 요약 재사용', () => {
+  it('사실이 그대로면 두 번째 실행은 summarizer를 부르지 않는다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+
+    await digestOnce({ slack, provider });
+    expect(provider.calls).toHaveLength(1);
+
+    const second = await digestOnce({ slack, provider });
+    expect(card(second).action).toBe('skip');
+    // 이것이 이 Task의 핵심이다. 호출 횟수가 관찰 횟수가 아니라 전이 횟수에 비례한다.
+    expect(provider.calls).toHaveLength(1);
+    expect(card(second).summaryReused).toBe(true);
+    expect(slack.posts).toHaveLength(1);
+    expect(slack.updates).toHaveLength(0);
+  });
+
+  it('요약 입력이 바뀌면 다시 부르고 update한다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+
+    await digestOnce({ slack, provider });
+    const changed = prRow({
+      statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    });
+    const second = await digestOnce({ slack, provider, prs: [changed] });
+
+    expect(provider.calls).toHaveLength(2);
+    expect(card(second).summaryReused).toBe(false);
+    expect(card(second).action).toBe('update');
+    expect(slack.updates).toHaveLength(1);
+  });
+
+  // 두 게이트는 서로 독립이다. 요약 입력이 바뀌었는데 카드가 그대로인 경우가 있고, 그때
+  // Slack을 부르지 않는 것이 맞다. 여기서는 PR 제목만 바꾼다. 제목은 SummaryFacts에 있지만
+  // 카드 제목은 모델이 만든 문자열에서 오므로(요약 성공 시) 대역의 출력이 같으면 카드도 같다.
+  it('요약을 다시 했어도 카드가 같으면 Slack을 부르지 않는다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+
+    await digestOnce({ slack, provider });
+    const second = await digestOnce({ slack, provider, prs: [prRow({ title: 'feat: 다른 제목' })] });
+
+    expect(provider.calls).toHaveLength(2);
+    expect(card(second).summaryReused).toBe(false);
+    expect(card(second).action).toBe('skip');
+    expect(slack.updates).toHaveLength(0);
+
+    // 새 요약과 새 사실 지문은 저장돼 있어야 한다. 저장하지 않으면 매 관찰이 다시 요약한다.
+    const third = await digestOnce({ slack, provider, prs: [prRow({ title: 'feat: 다른 제목' })] });
+    expect(provider.calls).toHaveLength(2);
+    expect(card(third).summaryReused).toBe(true);
+  });
+
+  // 회귀 방지: 사실 지문 하나로 게시까지 판정하면 이 전이에서 카드가 영영 갱신되지 않는다.
+  // SummaryFacts에 PR state가 없어 merge는 사실 지문을 전혀 움직이지 않기 때문이다.
+  // 게이트 B가 렌더 지문으로 잡는다. LLM은 안 부르고 카드는 갱신된다.
+  it('merge만 된 관찰은 summarizer를 부르지 않고 카드만 갱신한다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+
+    const open = await digestOnce({
+      slack,
+      provider,
+      prs: [prRow({ state: 'OPEN', mergedAt: null })],
+    });
+    expect(card(open).action).toBe('create');
+    // fixture의 reviewer_result가 approve라 열린 PR의 상태는 '리뷰 통과'다.
+    expect(card(open).card.text).toContain('리뷰 통과');
+    expect(provider.calls).toHaveLength(1);
+
+    const merged = await digestOnce({ slack, provider });
+    // 요약 입력은 byte 단위로 같다. 그래서 provider를 다시 부르지 않는다.
+    expect(provider.calls).toHaveLength(1);
+    expect(card(merged).summaryReused).toBe(true);
+    // 그런데 카드는 달라진다. 상태는 SummaryFacts가 아니라 ProjectedPr에서 온다.
+    expect(card(merged).action).toBe('update');
+    expect(card(merged).card.text).toContain('병합 완료');
+    expect(slack.posts).toHaveLength(1);
+    expect(slack.updates).toHaveLength(1);
+    expect(slack.updates[0]?.ts).toBe('1700000000.000001');
+  });
+
+  it('요약이 실패한 관찰은 저장하지 않아 다음 관찰이 다시 시도한다', async () => {
+    const slack = new FakeSlack();
+    await digestOnce({ slack, provider: new FailingProvider() });
+
+    // 실패를 durable하게 캐시하면 provider가 돌아와도 축소 카드가 사실이 바뀔 때까지 굳는다.
+    const provider = new StubProvider();
+    const second = await digestOnce({ slack, provider });
+    expect(provider.calls).toHaveLength(1);
+    expect(card(second).summaryReused).toBe(false);
+    expect(card(second).summary.kind).toBe('ok');
+  });
+
+  /** 저장된 값을 손으로 흔든다. store를 열지 않은 상태에서만 부른다. */
+  function patchRow(sql: string): void {
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(sql);
+    raw.close();
+  }
+
+  // v1 파일에서 올라온 행이 정확히 이 모양이다. 비어 있으면 "비교 불가"다.
+  it('사실 지문이 비어 있는 기존 행은 한 번 갱신된 뒤 채워진다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+    await digestOnce({ slack, provider });
+    patchRow('UPDATE pr_message SET facts_fingerprint = NULL, summary_json = NULL');
+
+    // 한 번은 요약한다. 비교할 값이 없으므로 재사용 판정이 miss다.
+    const healing = await digestOnce({ slack, provider });
+    expect(provider.calls).toHaveLength(2);
+    expect(card(healing).summaryReused).toBe(false);
+    // 카드 내용은 그대로이므로 Slack은 부르지 않는다. 그래도 지문은 남긴다.
+    expect(card(healing).action).toBe('skip');
+    expect(slack.updates).toHaveLength(0);
+
+    // 그 한 번의 갱신으로 자가 치유된다. 다음 관찰부터는 부르지 않는다.
+    const healed = await digestOnce({ slack, provider });
+    expect(provider.calls).toHaveLength(2);
+    expect(card(healed).summaryReused).toBe(true);
+    expect(card(healed).action).toBe('skip');
+  });
+
+  it('저장된 요약을 되살릴 수 없으면 던지지 않고 다시 부른다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+    await digestOnce({ slack, provider });
+    // 저장 형식이 바뀌었거나 행이 손상된 경우다. 카드가 멈추면 안 된다.
+    patchRow(`UPDATE pr_message SET summary_json = '{"title":42}'`);
+
+    const second = await digestOnce({ slack, provider });
+    expect(provider.calls).toHaveLength(2);
+    expect(card(second).summaryReused).toBe(false);
+    expect(card(second).action).toBe('skip');
+  });
+});
+
 describe('runDigest dry-run', () => {
   it('Slack에도 store에도 쓰지 않는다', async () => {
     const dry = await digestOnce({ slack: null });
@@ -288,6 +436,30 @@ describe('runDigest dry-run', () => {
     expect(card(live).action).toBe('create');
     expect(slack.posts).toHaveLength(1);
     expect(slack.updates).toHaveLength(0);
+  });
+
+  it('기존 카드에도 실제 실행과 같은 판정을 내리고 요약을 재사용한다', async () => {
+    const provider = new StubProvider();
+    const stillOpen = [prRow({ state: 'OPEN', mergedAt: null })];
+    await digestOnce({ slack: new FakeSlack(), provider, prs: stillOpen });
+    expect(provider.calls).toHaveLength(1);
+
+    // 사실이 그대로다. dry-run도 provider를 부르지 않고 skip으로 보고한다.
+    const unchanged = await digestOnce({ slack: null, provider, prs: stillOpen });
+    expect(card(unchanged).action).toBe('skip');
+    expect(card(unchanged).summaryReused).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+
+    // merge 전이는 요약을 재사용한 채 update로 보고한다. 여전히 아무것도 쓰지 않는다.
+    const merged = await digestOnce({ slack: null, provider });
+    expect(card(merged).action).toBe('update');
+    expect(card(merged).summaryReused).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+
+    // dry-run이 store에 썼다면 이 실행은 skip으로 떨어진다. 여전히 update여야 한다.
+    const live = await digestOnce({ slack: new FakeSlack(), provider });
+    expect(card(live).action).toBe('update');
+    expect(card(live).summaryReused).toBe(true);
   });
 
   it('게시할 blocks를 출력에 담는다', async () => {

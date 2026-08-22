@@ -10,6 +10,9 @@ import type { SlackPoster } from '../slack/post.js';
 import { buildCorrelationView, collectRuns } from '../snapshot/snapshot.js';
 import type { DigestStore } from '../store/schema.js';
 import {
+  factsFingerprint,
+  parseSummary,
+  serializeSummary,
   summarize,
   type SummaryCache,
   type SummaryProvider,
@@ -26,11 +29,35 @@ import type { PrSkipReason, ProjectedPr } from './types.js';
  * C1은 polling하지 않는다. 이 함수를 한 번 부르는 것이 관찰 한 번이다(OD-023).
  *
  * ```text
- * Orca/GitHub 관찰 → correlation → ProjectedPr → SummaryFacts → summarize → renderCard
- *   → store 조회 ─┬─ 매핑 없음      → chat.postMessage → insertPrMessage
- *                 ├─ 지문 다름      → chat.update      → updateRenderFingerprint
- *                 └─ 지문 같음      → 아무것도 하지 않음
+ * Orca/GitHub 관찰 → correlation → ProjectedPr → SummaryFacts → store 조회
+ *   → 게이트 A: 사실 지문이 같으면 저장된 요약 재사용, 다르면 summarize
+ *   → renderCard
+ *   → 게이트 B ─┬─ 매핑 없음        → chat.postMessage → insertPrMessage
+ *               ├─ 렌더 지문 다름   → chat.update      → updateObservation
+ *               └─ 렌더 지문 같음   → Slack 호출 없음
  * ```
+ *
+ * **게이트가 둘이고 각각 다른 것을 막는다.**
+ *
+ * 게이트 A는 **LLM 호출**을 막는다. 기준은 `factsFingerprint`, 즉 요약의 입력이다. 입력이
+ * 같으면 문구가 달라질 이유가 없으므로 저장된 문구를 그대로 쓴다(OD-035).
+ *
+ * 게이트 B는 **Slack 호출**을 막는다. 기준은 카드 자체의 지문이다. 요약을 재사용해도 카드가
+ * 달라질 수 있다. `ProjectedPr`이 카드에 그리는 사실 중 PR state, isDraft, headSha,
+ * `review.headMatch`, `workerReport.outcome`, `truncation`은 `SummaryFacts`에 없기 때문이다.
+ * PR이 merge되기만 한 관찰이 그 예다. 사실 지문은 그대로여서 LLM은 부르지 않고, 렌더 지문은
+ * 달라져서 카드는 `병합 완료`로 갱신된다.
+ *
+ * **게이트를 하나로 합치지 마라.** 사실 지문 하나로 게시까지 판정하면 위 전이에서 카드가
+ * 영영 갱신되지 않고, 렌더 지문 하나로 요약까지 판정하면 요약을 하기 전에는 렌더 지문을
+ * 알 수 없어 순환한다.
+ *
+ * OD-035 본문은 지문을 "PR key + head sha + reviewer-result + CI 결론 + 입력 사실 해시"로
+ * 열거하지만 그 열거는 계약이 스케치이던 시점의 근사다. 작동하는 원칙은 **요약의 입력이
+ * 바뀔 때만 호출한다**이고, 그래서 게이트 A에 head sha를 넣지 않는다. 제목·본문·변경
+ * 파일·review·CI가 그대로인 채 head만 움직이면 요약 문구가 달라질 이유가 없고, 그때 다시
+ * 부르는 것이 OD-035가 줄이려던 낭비다. head 이동이 카드에 반영돼야 하는 부분은 게이트 B가
+ * 렌더 지문으로 잡는다.
  *
  * 이 파일은 위 순서만 담는다. 사실 수집·파생·렌더는 각 모듈에 있고 여기서 다시 판정하지 않는다.
  */
@@ -41,7 +68,7 @@ export type DigestAction =
   | 'create'
   /** 매핑 행이 있고 렌더 지문이 달라 같은 메시지를 갱신한다. */
   | 'update'
-  /** 매핑 행이 있고 지문이 같다. Slack을 호출하지 않는다. */
+  /** 매핑 행이 있고 렌더 지문이 같다. Slack을 호출하지 않는다. */
   | 'skip'
   /**
    * 매핑 행의 채널이 설정의 대상 채널과 다르다. Slack에도 store에도 쓰지 않는다.
@@ -65,8 +92,16 @@ export type DigestResult =
       readonly url: string;
       readonly action: DigestAction;
       readonly card: RenderedCard;
+      /** 이 카드의 렌더 지문. 게시 여부를 정한 값이다. */
       readonly fingerprint: string;
       readonly summary: SummaryResult;
+      /**
+       * 이번 관찰이 summarizer를 부르지 않고 저장된 요약을 되살렸는지(게이트 A).
+       *
+       * 사람이 읽는 보고에 싣는다. OD-035가 줄이려는 것이 이 호출이므로, 줄었는지 아닌지가
+       * 출력에 보이지 않으면 확인할 방법이 없다.
+       */
+      readonly summaryReused: boolean;
       /**
        * 이 카드가 가리키는 Slack 메시지의 ts. 없으면 null.
        *
@@ -182,9 +217,24 @@ async function digestOne(
     taskPurpose(tasks, pr),
     options.config.correlationKeys,
   );
-  const summary = await summarize(facts, { provider: options.provider, cache: options.cache });
+  const factsFp = factsFingerprint(facts);
+  const existing = options.store.findPrMessage(pr.key);
+
+  // 게이트 A. 요약 입력이 그대로면 저장된 문구를 되살리고 provider를 부르지 않는다(OD-035).
+  const reused =
+    existing !== null && existing.factsFingerprint === factsFp
+      ? parseSummary(existing.summaryJson, factsFp)
+      : null;
+  const summary =
+    reused ?? (await summarize(facts, { provider: options.provider, cache: options.cache }));
+
   const card = renderCard({ pr, summary });
   const fingerprint = renderFingerprint(card);
+  const observation = {
+    renderFingerprint: fingerprint,
+    factsFingerprint: factsFp,
+    summaryJson: serializeSummary(summary),
+  } as const;
   const base = {
     kind: 'card',
     key: pr.key,
@@ -193,13 +243,21 @@ async function digestOne(
     card,
     fingerprint,
     summary,
+    summaryReused: reused !== null,
   } as const;
 
-  const existing = options.store.findPrMessage(pr.key);
   if (existing !== null && existing.channelId !== options.channel) {
     return { ...base, action: 'channel_mismatch', messageTs: existing.messageTs };
   }
+
+  // 게이트 B. 게시 여부는 렌더 지문이 정한다. 사실이 그대로여도 카드에만 있는 사실(PR state,
+  // headMatch 등)이 움직이면 여기서 잡히고, 요약을 재사용한 채 chat.update로 간다.
   if (existing !== null && existing.renderFingerprint === fingerprint) {
+    // 카드는 그대로다. Slack은 부르지 않는다. 다만 이번에 새로 요약했다면 그 결과는 남긴다.
+    // 남기지 않으면 이 사실 조합이 관찰마다 다시 요약된다. dry-run은 아무것도 쓰지 않는다.
+    if (options.slack !== null && reused === null) {
+      options.store.updateObservation(pr.key, observation, options.now().toISOString());
+    }
     return { ...base, action: 'skip', messageTs: existing.messageTs };
   }
 
@@ -223,7 +281,7 @@ async function digestOne(
       prKey: pr.key,
       channelId: posted.channel,
       messageTs: posted.ts,
-      renderFingerprint: fingerprint,
+      ...observation,
       at,
     });
     return { ...base, action: 'create', messageTs: posted.ts };
@@ -235,7 +293,7 @@ async function digestOne(
     text: card.text,
     blocks: card.blocks,
   });
-  options.store.updateRenderFingerprint(pr.key, fingerprint, at);
+  options.store.updateObservation(pr.key, observation, at);
   return { ...base, action: 'update', messageTs: updated.ts };
 }
 
@@ -263,7 +321,9 @@ export function formatReport(report: DigestReport): string {
     lines.push(
       `  summary ${
         r.summary.kind === 'ok'
-          ? 'ok'
+          ? r.summaryReused
+            ? 'ok (재사용, summarizer 호출 없음)'
+            : 'ok'
           : `failed: ${r.summary.reason.slice(0, REASON_CAP)}`
       }`,
     );

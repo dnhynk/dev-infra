@@ -5,11 +5,13 @@ import { dirname, join, posix, win32 } from 'node:path';
 import type { PullRequestKey } from '../identity/keys.js';
 import {
   ENABLE_WAL,
+  MIGRATIONS,
   SCHEMA_DDL,
   SCHEMA_VERSION,
   STATE_PATH_VAR,
   type DigestStore,
   type NewPrMessage,
+  type ObservationRecord,
   type PrMessageRecord,
 } from './schema.js';
 
@@ -132,10 +134,11 @@ function xdgDataBase(env: NodeJS.ProcessEnv): string {
 }
 
 /**
- * 파일의 스키마 버전이 이 코드가 아는 버전과 다를 때 던진다.
+ * 파일의 버전에서 `SCHEMA_VERSION`까지 올릴 문장이 없을 때 던진다.
  *
- * C1에는 migration이 없다. 다른 버전의 파일을 열면 읽는 컬럼이 실제와 어긋날 수 있으므로
- * 추측해서 열지 않는다. 버전이 늘어날 때 무엇을 할지는 그때 정한다.
+ * 두 경우다. 파일이 이 코드보다 **새로우면** 내려갈 문장이 없고, 파일이 `MIGRATIONS`가 아는
+ * 가장 낮은 버전보다 **낮으면** 올릴 문장이 없다. 어느 쪽이든 읽는 컬럼이 실제와 어긋날 수
+ * 있으므로 추측해서 열지 않는다.
  */
 export class SchemaVersionError extends Error {
   constructor(
@@ -144,24 +147,28 @@ export class SchemaVersionError extends Error {
     readonly expected: number,
   ) {
     super(
-      `store 파일의 스키마 버전이 ${found}인데 이 코드는 ${expected}만 안다: ${path}\n` +
-        'migration이 없으므로 열지 않는다.',
+      `store 파일의 스키마 버전이 ${found}인데 이 코드는 ${expected}까지 안다: ${path}\n` +
+        '그 버전에서 올릴 문장이 없으므로 열지 않는다.',
     );
     this.name = 'SchemaVersionError';
   }
 }
 
 const SELECT_ROW = `
-SELECT pr_key, channel_id, message_ts, render_fingerprint, created_at, updated_at
+SELECT pr_key, channel_id, message_ts, render_fingerprint, facts_fingerprint, summary_json,
+       created_at, updated_at
   FROM pr_message WHERE pr_key = ?`;
 
 const INSERT_ROW = `
 INSERT INTO pr_message
-  (pr_key, channel_id, message_ts, render_fingerprint, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)`;
+  (pr_key, channel_id, message_ts, render_fingerprint, facts_fingerprint, summary_json,
+   created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 
-const UPDATE_FINGERPRINT = `
-UPDATE pr_message SET render_fingerprint = ?, updated_at = ? WHERE pr_key = ?`;
+const UPDATE_OBSERVATION = `
+UPDATE pr_message
+   SET render_fingerprint = ?, facts_fingerprint = ?, summary_json = ?, updated_at = ?
+ WHERE pr_key = ?`;
 
 /** sqlite가 돌려주는 pr_message 한 행. 컬럼명 그대로다. */
 type PrMessageRow = {
@@ -169,6 +176,9 @@ type PrMessageRow = {
   readonly channel_id: string;
   readonly message_ts: string;
   readonly render_fingerprint: string;
+  /** v2 이전에 만들어진 행에는 값이 없다. */
+  readonly facts_fingerprint: string | null;
+  readonly summary_json: string | null;
   readonly created_at: string;
   readonly updated_at: string;
 };
@@ -179,6 +189,8 @@ function toRecord(row: PrMessageRow): PrMessageRecord {
     channelId: row.channel_id,
     messageTs: row.message_ts,
     renderFingerprint: row.render_fingerprint,
+    factsFingerprint: row.facts_fingerprint,
+    summaryJson: row.summary_json,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -215,6 +227,8 @@ export class SqliteDigestStore implements DigestStore {
           input.channelId,
           input.messageTs,
           input.renderFingerprint,
+          input.factsFingerprint,
+          input.summaryJson,
           input.at,
           input.at,
         );
@@ -229,11 +243,19 @@ export class SqliteDigestStore implements DigestStore {
     }
   }
 
-  updateRenderFingerprint(prKey: PullRequestKey, renderFingerprint: string, at: string): void {
-    const result = this.db.prepare(UPDATE_FINGERPRINT).run(renderFingerprint, at, prKey);
+  updateObservation(prKey: PullRequestKey, observation: ObservationRecord, at: string): void {
+    const result = this.db
+      .prepare(UPDATE_OBSERVATION)
+      .run(
+        observation.renderFingerprint,
+        observation.factsFingerprint,
+        observation.summaryJson,
+        at,
+        prKey,
+      );
     if (Number(result.changes) === 0) {
       // 갱신할 행이 없다는 것은 호출 순서가 깨졌다는 뜻이다. 새 행을 만들어 덮지 않는다.
-      throw new Error(`${prKey}의 매핑 행이 없어 지문을 갱신할 수 없다`);
+      throw new Error(`${prKey}의 매핑 행이 없어 관찰 결과를 갱신할 수 없다`);
     }
   }
 
@@ -277,6 +299,9 @@ type OpenedCopy = {
  *
  * write 메서드는 던진다. dry-run에서 `runDigest`는 Slack 호출 전에 돌아가므로 호출될 일이 없고,
  * 호출된다면 흐름이 깨졌다는 뜻이다. 조용히 무시하면 게시하지 않은 카드의 매핑이 남는다.
+ *
+ * 복사본에는 쓴다. 원본이 옛 버전이면 `openCopy`가 복사본에만 migration을 건다. 원본은
+ * 그대로이므로 "아무것도 쓰지 않는다"는 유지되고, dry-run은 실제 실행과 같은 컬럼을 읽는다.
  */
 export class ReadOnlyDigestStore implements DigestStore {
   private readonly opened: OpenedCopy;
@@ -296,8 +321,8 @@ export class ReadOnlyDigestStore implements DigestStore {
     throw new Error(`dry-run은 store에 쓰지 않는다. 루트 매핑을 기록하려 했다: ${this.path}`);
   }
 
-  updateRenderFingerprint(): void {
-    throw new Error(`dry-run은 store에 쓰지 않는다. 지문을 갱신하려 했다: ${this.path}`);
+  updateObservation(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. 관찰 결과를 갱신하려 했다: ${this.path}`);
   }
 
   close(): void {
@@ -351,11 +376,11 @@ function openCopy(path: string): OpenedCopy {
     copyFileSync(path, copy);
     if (pathExists(`${path}-wal`)) copyFileSync(`${path}-wal`, `${copy}-wal`);
     db = new DatabaseSync(copy);
-    // 버전 판정은 실제 실행과 같은 함수를 쓴다. 모르는 버전이면 여기서도 던진다.
+    // 버전 판정과 migration은 실제 실행과 같은 함수를 쓴다. 모르는 버전이면 여기서도 던진다.
+    // 올리는 대상은 **복사본**이다. 원본은 v1인 채로 남고, 다음 실제 실행이 원본을 올린다.
+    // 복사본을 올리지 않으면 dry-run이 v2 컬럼을 읽지 못해 실제 실행과 다른 판정을 낸다.
     const version = readSchemaVersion(db, path);
-    if (version !== null && version !== SCHEMA_VERSION) {
-      throw new SchemaVersionError(path, version, SCHEMA_VERSION);
-    }
+    if (version !== null) applyMigrations(db, path, version);
     return { db, scratch, schemaReady: version !== null };
   } catch (e) {
     db?.close();
@@ -386,7 +411,7 @@ function enableWal(db: DatabaseSync, path: string): void {
 }
 
 /**
- * 스키마 버전을 확인하고, 비어 있으면 DDL을 적용한다.
+ * 스키마 버전을 확인하고, 비어 있으면 DDL을 적용하고, 낮으면 올린다.
  *
  * 버전을 먼저 읽는 이유는 모르는 버전의 파일에 아무것도 쓰지 않기 위해서다. DDL이 전부
  * `IF NOT EXISTS`라 실행 자체는 무해하지만, 판정 전에 write를 시작하지 않는 편이 계약에 맞다.
@@ -413,8 +438,46 @@ function prepareSchema(db: DatabaseSync, path: string): void {
     return;
   }
 
-  if (version !== SCHEMA_VERSION) {
-    throw new SchemaVersionError(path, version, SCHEMA_VERSION);
+  applyMigrations(db, path, version);
+}
+
+/**
+ * 파일 버전 `from`에서 `SCHEMA_VERSION`까지 `MIGRATIONS`를 순서대로 적용한다.
+ *
+ * 이미 최신이면 아무것도 하지 않는다. 올릴 문장이 없는 버전이면 `SchemaVersionError`를
+ * 던진다. 파일이 코드보다 새로운 경우가 그렇고, `MIGRATIONS`가 시작하는 버전(1)보다 낮은
+ * 경우도 그렇다.
+ *
+ * **전체를 한 트랜잭션에 묶고 버전 기록까지 같은 트랜잭션에 넣는다.** 중간에 죽으면 컬럼은
+ * 붙었는데 버전은 옛것인 파일이 남고, 다음 실행이 같은 `ALTER TABLE`을 다시 걸어 실패한다.
+ * 이 파일에는 실제로 게시된 카드의 매핑이 들어 있어 열지 못하면 루트가 하나 더 생긴다.
+ *
+ * `ALTER TABLE`은 SQLite에서 트랜잭션 안에서 실행할 수 있고 ROLLBACK으로 되돌아간다.
+ * 되돌아간 파일은 적용 전과 같은 v1이므로 옛 코드로도 그대로 열린다. 이것이 `MIGRATIONS`를
+ * 덧붙이기로 제한한 이유이기도 하다(`schema.ts`).
+ */
+function applyMigrations(db: DatabaseSync, path: string, from: number): void {
+  if (from === SCHEMA_VERSION) return;
+  if (from > SCHEMA_VERSION || from < 1) {
+    throw new SchemaVersionError(path, from, SCHEMA_VERSION);
+  }
+
+  db.exec('BEGIN');
+  try {
+    for (let v = from; v < SCHEMA_VERSION; v += 1) {
+      const step = MIGRATIONS[v - 1];
+      // SCHEMA_VERSION과 MIGRATIONS.length가 어긋나면 여기서 드러난다. 건너뛰지 않는다.
+      if (step === undefined) throw new SchemaVersionError(path, from, SCHEMA_VERSION);
+      for (const statement of step) db.exec(statement);
+    }
+    db.prepare('UPDATE schema_version SET version = ?, applied_at = ? WHERE id = 1').run(
+      SCHEMA_VERSION,
+      new Date().toISOString(),
+    );
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
   }
 }
 

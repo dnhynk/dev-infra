@@ -124,6 +124,8 @@ describe('원본 store를 판정할 수 없을 때', () => {
       channelId: CHANNEL,
       messageTs: TS,
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       at: '2026-08-22T00:00:00Z',
     });
     live.close();
