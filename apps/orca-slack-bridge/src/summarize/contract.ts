@@ -114,12 +114,16 @@ export function renderFactsPrompt(facts: SummaryFacts): string {
   if (facts.changedPaths.length > 0) {
     add('변경 파일 경로', facts.changedPaths.slice(0, CAPS.changedPaths).join('\n'));
   }
-  if (facts.review) {
-    const lines = facts.review.findings
+  // 기준은 `hasReviewFindings`다. findings가 없으면 verdict도 넣지 않는다. verdict만 보여 주면
+  // 모델이 그것으로 reviewGist를 채우는데 검증은 findings 없는 reviewGist를 거부하므로
+  // 재시도까지 포함해 요약이 항상 실패한다. 카드의 리뷰 판정은 renderer가 사실에서 직접 그린다.
+  const review = hasReviewFindings(facts) ? facts.review : null;
+  if (review !== null) {
+    const lines = review.findings
       .slice(0, CAPS.findings)
       .map((f) => `- [${f.severity}] ${f.file}${f.line === null ? '' : `:${f.line}`} — ${f.summary}`);
-    add('review 판정', facts.review.verdict);
-    if (lines.length > 0) add('review findings', lines.join('\n'));
+    add('review 판정', review.verdict);
+    add('review findings', lines.join('\n'));
   }
   if (facts.checks.length > 0) {
     add('CI', facts.checks.map((c) => `${c.name}: ${c.conclusion ?? 'pending'}`).join('\n'));
@@ -130,7 +134,7 @@ export function renderFactsPrompt(facts: SummaryFacts): string {
   return parts.join('\n\n');
 }
 
-/** review 사실이 실제로 있었는지. reviewGist 검증의 기준이다. */
+/** review 사실이 실제로 있었는지. 프롬프트에 review 절을 넣는 기준이자 reviewGist 검증의 기준이다. */
 export function hasReviewFindings(facts: SummaryFacts): boolean {
   return facts.review !== null && facts.review.findings.length > 0;
 }
