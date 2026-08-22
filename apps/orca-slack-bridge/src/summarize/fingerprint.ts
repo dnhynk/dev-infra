@@ -1,0 +1,30 @@
+import { createHash } from 'node:crypto';
+import type { SummaryFacts } from './contract.js';
+
+/**
+ * 사실 지문.
+ *
+ * 관찰마다 호출하지 않고 지문이 바뀔 때만 호출한다. 비용이 polling 횟수가 아니라
+ * 의미 있는 전이 횟수에 비례한다(OD-035).
+ */
+export function factsFingerprint(facts: SummaryFacts): string {
+  // 키 순서에 의존하지 않도록 명시적으로 직렬화한다.
+  const canonical = JSON.stringify([
+    facts.taskPurpose,
+    facts.workerDone,
+    facts.prTitle,
+    facts.prBody,
+    [...facts.changedPaths].sort(),
+    facts.review === null
+      ? null
+      : [
+          facts.review.verdict,
+          [...facts.review.findings]
+            .map((f) => [f.severity, f.file, f.line, f.summary])
+            .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+        ],
+    [...facts.checks].map((c) => [c.name, c.conclusion]).sort((a, b) => String(a).localeCompare(String(b))),
+    facts.truncated,
+  ]);
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
