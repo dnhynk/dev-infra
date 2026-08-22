@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, join, posix, win32 } from 'node:path';
 import type { PullRequestKey } from '../identity/keys.js';
 import {
   ENABLE_WAL,
@@ -30,11 +30,22 @@ import {
  * 기본 경로의 base는 설정 파일과 다르다. DB는 설정이 아니라 state이므로 비win32에서
  * `XDG_CONFIG_HOME`이 아니라 `XDG_DATA_HOME`(없으면 `~/.local/share`) 아래에 둔다.
  *
- * `--state` 인자와 `ORCA_SLACK_BRIDGE_STATE`는 상대경로도 그대로 쓴다. 그 경우 실행
- * 디렉터리가 바뀌면 다른 파일이 열린다. 사용자가 직접 준 값이라 의도가 명시적이므로 지금은
- * 손대지 않는다. 아래 XDG 규칙은 XDG 변수에만 적용된다.
+ * 상대경로를 두 입력에서 다르게 다룬다. `--state`는 상대경로도 그대로 쓰고,
+ * `ORCA_SLACK_BRIDGE_STATE`가 상대경로면 던진다. 값의 수명이 다르기 때문이다. `--state`는
+ * 매 실행에서 호출자가 눈으로 보고 넘기는 인자이므로 cwd 기준 상대경로가 통상적인 CLI
+ * 의미이고, 어느 cwd에서 무엇을 여는지 그 자리에서 알 수 있다. 환경변수는 한 번 설정되면
+ * cwd가 다른 프로세스에 그대로 상속되므로 실행 위치마다 다른 파일이 조용히 열리고, 그러면
+ * 기존 `pr_message` 매핑을 잃어 Slack 루트가 중복된다. ambient 값에는 "호출자가 방금 보고
+ * 정했다"는 근거가 없다.
+ *
+ * 상대 `XDG_DATA_HOME`을 무시하는 것과도 다르다. 그쪽은 XDG 명세가 "ignore"로 규정하고
+ * 기본값을 정의해 둔 경우이고(`xdgDataBase` 참고), 이쪽은 사용자가 이 도구에만 주는 값이라
+ * 잘못됐으면 조용히 대체하지 않고 알린다.
+ *
+ * **구현자에게**: "일관성"을 이유로 두 입력의 판정을 통일하지 마라. 잃는 것이 다르다.
  *
  * `platform`을 인자로 받는 이유는 하나다. 한 OS에서만 실행해도 나머지 분기가 검증돼야 한다.
+ * 그래서 절대성 판정도 호스트가 아니라 `platform`을 따른다(`isAbsoluteOn` 참고).
  */
 export function resolveStatePath(
   explicit: string | null = null,
@@ -43,9 +54,31 @@ export function resolveStatePath(
 ): string {
   if (explicit !== null && explicit.trim() !== '') return explicit;
   const fromEnv = env[STATE_PATH_VAR];
-  if (fromEnv && fromEnv.trim() !== '') return fromEnv;
+  if (fromEnv && fromEnv.trim() !== '') {
+    if (!isAbsoluteOn(fromEnv, platform)) {
+      throw new Error(
+        `${STATE_PATH_VAR}가 상대경로다: ${fromEnv}\n` +
+          '이 값은 cwd가 다른 프로세스에도 그대로 상속되므로 실행 위치마다 다른 파일이 열린다. ' +
+          '그러면 기존 카드 매핑을 못 찾아 Slack 루트가 하나 더 생긴다. 절대경로를 지정하거나, ' +
+          '실행마다 다른 파일을 쓰려면 --state로 넘긴다.',
+      );
+    }
+    return fromEnv;
+  }
   if (platform === 'win32') return join(win32StateBase(env), 'orca-slack-bridge', 'state.db');
   return join(xdgDataBase(env), 'orca-slack-bridge', 'state.db');
+}
+
+/**
+ * 대상 `platform`의 경로 규칙으로 절대성을 판정한다.
+ *
+ * `node:path`의 최상위 `isAbsolute`는 인자로 받은 `platform`이 아니라 **실행 호스트**를
+ * 따른다. 그대로 쓰면 `resolveStatePath`가 `platform`을 받는 이유(한 OS에서 나머지 분기를
+ * 검증한다)가 무너진다. win32 호스트에서 `platform: 'linux'` 분기를 검증하면 `C:\...`나
+ * UNC 경로가 유효한 POSIX 절대경로로 통과한다.
+ */
+function isAbsoluteOn(value: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32' ? win32.isAbsolute(value) : posix.isAbsolute(value);
 }
 
 /**
@@ -87,10 +120,14 @@ function win32StateBase(env: NodeJS.ProcessEnv): string {
  * 규정했고 기본값이 정의돼 있으므로 이것은 실패가 아니라 명세된 정상 동작이다. 무시하지 않고
  * 그대로 쓰면 `state.db`가 현재 작업 디렉터리에 생겨, 다른 cwd에서 재시작할 때 기존
  * `pr_message` 매핑을 잃는다.
+ *
+ * 절대성 판정은 `posix.isAbsolute`로 고정한다. XDG는 이 함수가 담당하는 비win32 경로에만
+ * 적용되는 명세이고, 호스트를 따르는 `isAbsolute`를 쓰면 win32 호스트에서 `C:\...`나 UNC
+ * 경로가 유효한 XDG base로 통과한다.
  */
 function xdgDataBase(env: NodeJS.ProcessEnv): string {
   const xdg = env['XDG_DATA_HOME'];
-  if (xdg && xdg.trim() !== '' && isAbsolute(xdg)) return xdg;
+  if (xdg && xdg.trim() !== '' && posix.isAbsolute(xdg)) return xdg;
   return join(homedir(), '.local', 'share');
 }
 

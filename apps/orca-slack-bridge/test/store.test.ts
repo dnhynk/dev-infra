@@ -62,6 +62,16 @@ describe('resolveStatePath', () => {
     expect(resolveStatePath(null, { XDG_DATA_HOME: '.' }, 'linux')).toBe(fallback);
   });
 
+  // node:path의 최상위 isAbsolute는 인자로 받은 platform이 아니라 실행 호스트를 따른다.
+  // 고정하지 않으면 win32 호스트에서 linux 분기를 검증할 때 Windows 형식이 유효한 XDG
+  // base로 통과해, platform 인자로 나머지 분기를 검증한다는 전제가 무너진다.
+  // 상대경로만으로는 두 구현이 양쪽에서 모두 false라 이 어긋남이 드러나지 않는다.
+  it('XDG_DATA_HOME 절대성은 POSIX 규칙으로만 판정한다. Windows 형식은 무효다', () => {
+    const fallback = join(homedir(), '.local', 'share', 'orca-slack-bridge', 'state.db');
+    expect(resolveStatePath(null, { XDG_DATA_HOME: 'C:\\Users\\u\\data' }, 'linux')).toBe(fallback);
+    expect(resolveStatePath(null, { XDG_DATA_HOME: '\\\\srv\\share' }, 'linux')).toBe(fallback);
+  });
+
   // 설정 파일과 달리 DB 경로가 어긋나면 오류 없이 다른 파일이 열려 기존 카드를 잃는다.
   // 그래서 defaultConfigPath와 달리 XDG로 내려가지 않고 던진다.
   it('win32에 APPDATA가 없으면 XDG로 내려가지 않고 던진다', () => {
@@ -79,6 +89,53 @@ describe('resolveStatePath', () => {
 
   it('빈 문자열은 지정하지 않은 것으로 본다', () => {
     expect(resolveStatePath('  ', { [STATE_PATH_VAR]: 'D:\\env.db' }, 'win32')).toBe('D:\\env.db');
+  });
+
+  // 환경변수는 한 번 설정되면 cwd가 다른 프로세스에도 상속된다. 상대경로면 실행 위치마다
+  // 다른 파일이 조용히 열려 기존 pr_message 매핑을 잃고 Slack 루트가 중복된다. 사용자가
+  // 명시적으로 준 값이 잘못된 것이므로 상대 XDG_DATA_HOME처럼 조용히 대체하지 않는다.
+  it('상대 환경변수는 던진다. 메시지에 원인과 해결책을 담는다', () => {
+    expect(() => resolveStatePath(null, { [STATE_PATH_VAR]: 'state.db' }, 'linux')).toThrow(
+      new RegExp(`${STATE_PATH_VAR}가 상대경로다`),
+    );
+    expect(() =>
+      resolveStatePath(null, { [STATE_PATH_VAR]: 'sub/state.db', APPDATA: 'D:\\AppData' }, 'win32'),
+    ).toThrow(/실행 위치마다 다른 파일이 열린다/);
+    expect(() => resolveStatePath(null, { [STATE_PATH_VAR]: 'state.db' }, 'linux')).toThrow(
+      /절대경로를 지정하거나/,
+    );
+    expect(() => resolveStatePath(null, { [STATE_PATH_VAR]: 'state.db' }, 'linux')).toThrow(
+      /--state로 넘긴다/,
+    );
+  });
+
+  // --state는 매 실행에서 호출자가 눈으로 보고 넘기는 인자다. cwd 기준 상대경로가 통상적인
+  // CLI 의미이고 무엇이 열리는지 그 자리에서 알 수 있다. 환경변수와 판정이 다른 이유다.
+  it('상대 --state는 그대로 쓴다. 환경변수와 달리 던지지 않는다', () => {
+    expect(resolveStatePath('state.db', {}, 'linux')).toBe('state.db');
+    expect(resolveStatePath('sub/state.db', {}, 'win32')).toBe('sub/state.db');
+    // 상대 --state는 상대 환경변수를 이기고, 환경변수 판정에 걸리지도 않는다.
+    expect(resolveStatePath('state.db', { [STATE_PATH_VAR]: 'other.db' }, 'linux')).toBe(
+      'state.db',
+    );
+  });
+
+  // 절대성은 실행 호스트가 아니라 대상 platform의 경로 규칙으로 판정한다.
+  it('환경변수 절대성은 대상 platform 규칙을 따른다', () => {
+    // linux에서 'C:\state.db'는 파일 이름에 콜론과 역슬래시가 든 상대경로다.
+    expect(() => resolveStatePath(null, { [STATE_PATH_VAR]: 'C:\\state.db' }, 'linux')).toThrow(
+      new RegExp(`${STATE_PATH_VAR}가 상대경로다`),
+    );
+    expect(() => resolveStatePath(null, { [STATE_PATH_VAR]: '\\\\srv\\s.db' }, 'linux')).toThrow(
+      new RegExp(`${STATE_PATH_VAR}가 상대경로다`),
+    );
+    // win32에서 '/var/lib/state.db'는 현재 드라이브 루트 기준 절대경로다.
+    expect(resolveStatePath(null, { [STATE_PATH_VAR]: '/var/lib/state.db' }, 'win32')).toBe(
+      '/var/lib/state.db',
+    );
+    expect(resolveStatePath(null, { [STATE_PATH_VAR]: '/var/lib/state.db' }, 'linux')).toBe(
+      '/var/lib/state.db',
+    );
   });
 });
 
