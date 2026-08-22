@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { SqliteDigestStore, SchemaVersionError, resolveStatePath } from '../src/store/sqlite.js';
-import { SCHEMA_VERSION, STATE_PATH_VAR } from '../src/store/schema.js';
+import { MIGRATIONS, SCHEMA_VERSION, STATE_PATH_VAR } from '../src/store/schema.js';
 import { pullRequestKey } from '../src/identity/keys.js';
 
 // 실제 파일을 열어 검증한다. 모킹하면 검증 대상인 sqlite의 제약이 사라진다.
@@ -175,6 +175,8 @@ describe('SqliteDigestStore', () => {
       channelId: 'C0PRDIGEST',
       messageTs: '1750000000.000100',
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       at: '2026-08-22T00:00:00.000Z',
     });
 
@@ -184,6 +186,8 @@ describe('SqliteDigestStore', () => {
         channelId: 'C0PRDIGEST',
         messageTs: '1750000999.000999',
         renderFingerprint: 'fp-2',
+        factsFingerprint: 'facts-2',
+        summaryJson: null,
         at: '2026-08-22T01:00:00.000Z',
       }),
     ).toThrow(/UNIQUE constraint failed: pr_message\.pr_key/);
@@ -194,6 +198,8 @@ describe('SqliteDigestStore', () => {
       channelId: 'C0PRDIGEST',
       messageTs: '1750000000.000100',
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       createdAt: '2026-08-22T00:00:00.000Z',
       updatedAt: '2026-08-22T00:00:00.000Z',
     });
@@ -206,6 +212,8 @@ describe('SqliteDigestStore', () => {
       channelId: 'C0PRDIGEST',
       messageTs: '1750000000.000100',
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       at: '2026-08-22T00:00:00.000Z',
     };
     store.insertPrMessage({ prKey: PR, ...base });
@@ -222,6 +230,8 @@ describe('SqliteDigestStore', () => {
       channelId: 'C0PRDIGEST',
       messageTs: '1750000000.000100',
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       at: '2026-08-22T00:00:00.000Z',
     });
     first.close();
@@ -242,6 +252,8 @@ describe('SqliteDigestStore', () => {
       channelId: 'C0PRDIGEST',
       messageTs: '1750000000.000100',
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       at: '2026-08-22T00:00:00.000Z',
     });
 
@@ -250,41 +262,60 @@ describe('SqliteDigestStore', () => {
     expect(unchanged?.renderFingerprint).toBe('fp-1');
     expect(unchanged?.renderFingerprint === 'fp-1').toBe(true);
 
-    store.updateRenderFingerprint(PR, 'fp-2', '2026-08-22T02:00:00.000Z');
+    store.updateObservation(
+      PR,
+      { renderFingerprint: 'fp-2', factsFingerprint: 'facts-2', summaryJson: '{"t":1}' },
+      '2026-08-22T02:00:00.000Z',
+    );
     const changed = store.findPrMessage(PR);
     store.close();
 
     expect(changed?.renderFingerprint).toBe('fp-2');
+    expect(changed?.factsFingerprint).toBe('facts-2');
+    expect(changed?.summaryJson).toBe('{"t":1}');
     expect(changed?.updatedAt).toBe('2026-08-22T02:00:00.000Z');
     // created_at은 루트를 처음 만든 시각이므로 갱신이 건드리지 않는다.
     expect(changed?.createdAt).toBe('2026-08-22T00:00:00.000Z');
     // 갱신은 message identity를 바꾸지 않는다.
     expect(changed?.messageTs).toBe('1750000000.000100');
+    expect(changed?.channelId).toBe('C0PRDIGEST');
   });
 
-  it('갱신한 지문은 다시 열어도 남는다', () => {
+  it('갱신한 관찰 결과는 다시 열어도 남는다', () => {
     const first = new SqliteDigestStore(dbPath);
     first.insertPrMessage({
       prKey: PR,
       channelId: 'C0PRDIGEST',
       messageTs: '1750000000.000100',
       renderFingerprint: 'fp-1',
+      factsFingerprint: 'facts-1',
+      summaryJson: null,
       at: '2026-08-22T00:00:00.000Z',
     });
-    first.updateRenderFingerprint(PR, 'fp-2', '2026-08-22T02:00:00.000Z');
+    first.updateObservation(
+      PR,
+      { renderFingerprint: 'fp-2', factsFingerprint: 'facts-2', summaryJson: '{"t":1}' },
+      '2026-08-22T02:00:00.000Z',
+    );
     first.close();
 
     const second = new SqliteDigestStore(dbPath);
     const found = second.findPrMessage(PR);
     second.close();
     expect(found?.renderFingerprint).toBe('fp-2');
+    expect(found?.factsFingerprint).toBe('facts-2');
+    expect(found?.summaryJson).toBe('{"t":1}');
   });
 
-  it('매핑 행이 없는 PR의 지문은 갱신하지 못한다. 새 행을 만들어 덮지 않는다', () => {
+  it('매핑 행이 없는 PR의 관찰 결과는 갱신하지 못한다. 새 행을 만들어 덮지 않는다', () => {
     const store = new SqliteDigestStore(dbPath);
-    expect(() => store.updateRenderFingerprint(PR, 'fp-1', '2026-08-22T00:00:00.000Z')).toThrow(
-      /매핑 행이 없어/,
-    );
+    expect(() =>
+      store.updateObservation(
+        PR,
+        { renderFingerprint: 'fp-1', factsFingerprint: 'facts-1', summaryJson: null },
+        '2026-08-22T00:00:00.000Z',
+      ),
+    ).toThrow(/매핑 행이 없어/);
     expect(store.findPrMessage(PR)).toBeNull();
     store.close();
   });
@@ -298,11 +329,11 @@ describe('SqliteDigestStore', () => {
 
     expect(() => new SqliteDigestStore(dbPath)).toThrow(SchemaVersionError);
     expect(() => new SqliteDigestStore(dbPath)).toThrow(
-      new RegExp(`버전이 ${SCHEMA_VERSION + 1}인데 이 코드는 ${SCHEMA_VERSION}만 안다`),
+      new RegExp(`버전이 ${SCHEMA_VERSION + 1}인데 이 코드는 ${SCHEMA_VERSION}까지 안다`),
     );
   });
 
-  it('schema_version이 코드보다 낮아도 열지 않는다. C1에 migration이 없다', () => {
+  it('MIGRATIONS가 시작하는 버전보다 낮으면 올릴 문장이 없어 던진다', () => {
     new SqliteDigestStore(dbPath).close();
 
     const raw = new DatabaseSync(dbPath);
@@ -310,6 +341,162 @@ describe('SqliteDigestStore', () => {
     raw.close();
 
     expect(() => new SqliteDigestStore(dbPath)).toThrow(SchemaVersionError);
+  });
+
+  it('SCHEMA_VERSION과 MIGRATIONS 길이가 어긋나지 않는다', () => {
+    // 어긋나면 v1 파일이 중간 버전에서 멈추거나 없는 문장을 찾는다. 값 두 개를 함께 고치는
+    // 것을 잊지 않게 여기서 고정한다.
+    expect(MIGRATIONS).toHaveLength(SCHEMA_VERSION - 1);
+  });
+});
+
+/**
+ * v1 파일을 올려서 여는 경로.
+ *
+ * 실제 `%APPDATA%\orca-slack-bridge\state.db`가 v1이고 이미 게시된 카드의 매핑이 들어 있다.
+ * 그 파일을 열지 못하면 다음 게시가 루트를 하나 더 만든다. 그래서 "기존 행이 그대로 남는다"를
+ * 단언한다.
+ *
+ * v1 DDL을 이 파일에 그대로 적는다. 옛 스키마는 과거의 산출물이라 `schema.ts`에 남아 있지
+ * 않고, 남기면 지금 스키마와 헷갈린다. 여기 적힌 것이 migration이 실제로 만나는 모양이다.
+ */
+const V1_DDL = `
+CREATE TABLE schema_version (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  version    INTEGER NOT NULL,
+  applied_at TEXT    NOT NULL
+);
+
+CREATE TABLE pr_message (
+  pr_key             TEXT PRIMARY KEY,
+  channel_id         TEXT NOT NULL,
+  message_ts         TEXT NOT NULL,
+  render_fingerprint TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX pr_message_slack_identity ON pr_message (channel_id, message_ts);
+`;
+
+/** 게시된 카드의 매핑이 든 v1 파일을 만든다. */
+function writeV1(path: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const raw = new DatabaseSync(path);
+  raw.exec(V1_DDL);
+  raw
+    .prepare('INSERT INTO schema_version (id, version, applied_at) VALUES (1, 1, ?)')
+    .run('2026-08-22T12:58:31.014Z');
+  raw
+    .prepare(
+      `INSERT INTO pr_message
+         (pr_key, channel_id, message_ts, render_fingerprint, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(PR, 'C0PRDIGEST', '1787403740.833329', 'fp-v1', '2026-08-22T13:02:19.373Z', '2026-08-22T13:02:37.520Z');
+  raw.close();
+}
+
+describe('v1 → v2 migration', () => {
+  it('컬럼을 붙이고 버전을 올리며 기존 행을 그대로 둔다', () => {
+    writeV1(dbPath);
+
+    const store = new SqliteDigestStore(dbPath);
+    const found = store.findPrMessage(PR);
+    store.close();
+
+    // 기존 행이 살아 있다. 잃으면 다음 게시가 루트를 하나 더 만든다.
+    expect(found).toEqual({
+      prKey: PR,
+      channelId: 'C0PRDIGEST',
+      messageTs: '1787403740.833329',
+      renderFingerprint: 'fp-v1',
+      // 붙인 컬럼은 비어 있다. "비교 불가"이므로 다음 관찰이 한 번 요약하고 채운다.
+      factsFingerprint: null,
+      summaryJson: null,
+      createdAt: '2026-08-22T13:02:19.373Z',
+      updatedAt: '2026-08-22T13:02:37.520Z',
+    });
+
+    const raw = new DatabaseSync(dbPath);
+    const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    const columns = (raw.prepare('PRAGMA table_info(pr_message)').all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    raw.close();
+    expect(version).toEqual({ version: SCHEMA_VERSION });
+    expect(columns).toContain('facts_fingerprint');
+    expect(columns).toContain('summary_json');
+
+    // 올린 파일과 새로 만든 파일의 스키마가 갈라지면 안 된다. ALTER TABLE ADD COLUMN은
+    // 맨 뒤에만 붙일 수 있으므로 DDL의 컬럼 순서도 그것을 따라야 한다.
+    const freshPath = join(dir, 'fresh', 'state.db');
+    new SqliteDigestStore(freshPath).close();
+    const fresh = new DatabaseSync(freshPath);
+    const freshColumns = (fresh.prepare('PRAGMA table_info(pr_message)').all() as {
+      name: string;
+    }[]).map((c) => c.name);
+    fresh.close();
+    expect(columns).toEqual(freshColumns);
+  });
+
+  it('올린 파일을 다시 열어도 같은 행을 찾는다. 두 번째 열기는 아무것도 바꾸지 않는다', () => {
+    writeV1(dbPath);
+    new SqliteDigestStore(dbPath).close();
+
+    const second = new SqliteDigestStore(dbPath);
+    const found = second.findPrMessage(PR);
+    second.close();
+    expect(found?.messageTs).toBe('1787403740.833329');
+    expect(found?.renderFingerprint).toBe('fp-v1');
+  });
+
+  // 트랜잭션이 실제로 DDL을 되돌리는지 확인한다. 되돌리지 않으면 컬럼은 붙었는데 버전은
+  // v1인 파일이 남고, 다음 실행이 같은 ALTER TABLE을 다시 걸어 영영 열리지 않는다.
+  // 그 파일에는 이미 게시된 카드의 매핑이 들어 있다.
+  it('migration이 중간에 실패하면 파일이 v1 그대로 남는다', () => {
+    writeV1(dbPath);
+    // 첫 문장이 이미 적용된 파일. 트랜잭션이 없던 구현이 중간에 죽으면 이 모양이 된다.
+    const seed = new DatabaseSync(dbPath);
+    seed.exec('ALTER TABLE pr_message ADD COLUMN facts_fingerprint TEXT');
+    seed.close();
+
+    // 두 번째 ALTER는 성공하고 첫 번째가 duplicate column name으로 실패한다.
+    expect(() => new SqliteDigestStore(dbPath)).toThrow(/facts_fingerprint/);
+
+    const raw = new DatabaseSync(dbPath);
+    const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    const columns = (raw.prepare('PRAGMA table_info(pr_message)').all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    const rows = raw.prepare('SELECT pr_key, message_ts FROM pr_message').all();
+    raw.close();
+
+    expect(version).toEqual({ version: 1 });
+    // 같은 트랜잭션의 두 번째 문장이 되돌아갔다. 절반만 적용된 파일이 남지 않는다.
+    expect(columns).not.toContain('summary_json');
+    // 매핑 행은 그대로다.
+    expect(rows).toEqual([{ pr_key: PR, message_ts: '1787403740.833329' }]);
+  });
+
+  it('비어 있던 사실 지문은 갱신 한 번으로 채워진다', () => {
+    writeV1(dbPath);
+    const store = new SqliteDigestStore(dbPath);
+    expect(store.findPrMessage(PR)?.factsFingerprint).toBeNull();
+
+    store.updateObservation(
+      PR,
+      { renderFingerprint: 'fp-v1', factsFingerprint: 'facts-1', summaryJson: '{"t":1}' },
+      '2026-08-22T14:00:00.000Z',
+    );
+    const filled = store.findPrMessage(PR);
+    store.close();
+
+    expect(filled?.factsFingerprint).toBe('facts-1');
+    expect(filled?.summaryJson).toBe('{"t":1}');
+    // 채우는 갱신이 message identity를 건드리지 않는다.
+    expect(filled?.messageTs).toBe('1787403740.833329');
+    expect(filled?.createdAt).toBe('2026-08-22T13:02:19.373Z');
   });
 
   it('버전 행이 없는 파일은 손상으로 보고 던진다', () => {

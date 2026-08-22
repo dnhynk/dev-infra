@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   summarize,
+  serializeSummary,
+  parseSummary,
   MemorySummaryCache,
   validateDraft,
   deriveRisk,
@@ -269,5 +271,76 @@ describe('조립', () => {
     const before = p.calls;
     await summarize({ ...base }, { provider: p, cache });
     expect(p.calls).toBe(before);
+  });
+});
+
+/**
+ * durable store에 남기는 요약의 왕복.
+ *
+ * 이 두 함수가 OD-035의 호출 상한을 프로세스 밖으로 넘긴다. 되살리지 못하면 조용히
+ * 캐시 miss가 돼야 하고, 던져서 카드를 멈추면 안 된다.
+ */
+describe('요약 직렬화', () => {
+  const ok = {
+    kind: 'ok',
+    draft: { title: '제목', what: '무엇.', why: '왜.', reviewGist: '리뷰.' },
+    risk: 'high',
+    truncated: true,
+    fingerprint: 'fp-a',
+  } as const;
+
+  it('왕복하면 카드가 쓰는 값이 그대로 남는다', () => {
+    const json = serializeSummary(ok);
+    expect(json).not.toBeNull();
+    expect(parseSummary(json, 'fp-a')).toEqual(ok);
+  });
+
+  it('summarizer 입력을 담지 않는다', () => {
+    const json = serializeSummary(ok) ?? '';
+    // OD-036이 정한 전송 경계와 별개의 저장 경계를 만들지 않는다.
+    expect(Object.keys(JSON.parse(json)).sort()).toEqual([
+      'reviewGist',
+      'risk',
+      'title',
+      'truncated',
+      'what',
+      'why',
+    ]);
+  });
+
+  it('지문은 담지 않고 되살릴 때 호출자가 준다', () => {
+    // 되살리는 조건 자체가 "저장된 사실 지문이 이번 지문과 같다"이므로 두 곳에 두지 않는다.
+    expect(JSON.parse(serializeSummary(ok) ?? '')).not.toHaveProperty('fingerprint');
+    expect(parseSummary(serializeSummary(ok), 'fp-b')?.fingerprint).toBe('fp-b');
+  });
+
+  // 실패를 durable하게 캐시하면 provider 장애가 지나간 뒤에도 사실이 바뀔 때까지 축소 카드가
+  // 굳는다. C1에는 캐시를 비우는 수단이 없다. 프로세스 내 캐시의 판단과 다른 이유다.
+  it('실패한 요약은 남기지 않는다', () => {
+    expect(
+      serializeSummary({ kind: 'failed', reason: 'provider가 죽었다', risk: null, fingerprint: 'fp-a' }),
+    ).toBeNull();
+  });
+
+  it('되살릴 수 없으면 던지지 않고 null이다', () => {
+    expect(parseSummary(null, 'fp-a')).toBeNull();
+    expect(parseSummary('not json', 'fp-a')).toBeNull();
+    expect(parseSummary('null', 'fp-a')).toBeNull();
+    expect(parseSummary('[]', 'fp-a')).toBeNull();
+    // 필드가 빠지거나 타입이 어긋난 경우. 저장 형식이 바뀌어도 카드가 멈추지 않는다.
+    expect(parseSummary('{"title":"t","what":"w","why":"y"}', 'fp-a')).toBeNull();
+    expect(parseSummary('{"title":42,"what":"w","why":"y","reviewGist":null,"risk":null,"truncated":false}', 'fp-a')).toBeNull();
+    expect(parseSummary('{"title":"t","what":"w","why":"y","reviewGist":null,"risk":"세다","truncated":false}', 'fp-a')).toBeNull();
+    expect(parseSummary('{"title":"t","what":"w","why":"y","reviewGist":null,"risk":null,"truncated":"yes"}', 'fp-a')).toBeNull();
+  });
+
+  it('reviewGist와 risk의 null은 유효한 값이다', () => {
+    const none = parseSummary(
+      '{"title":"t","what":"w","why":"y","reviewGist":null,"risk":null,"truncated":false}',
+      'fp-a',
+    );
+    expect(none?.kind).toBe('ok');
+    expect(none?.risk).toBeNull();
+    expect(none?.kind === 'ok' ? none.draft.reviewGist : undefined).toBeNull();
   });
 });

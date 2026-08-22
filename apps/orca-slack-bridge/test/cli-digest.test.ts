@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { openDigestStore, formatDigestError } from '../src/cli.js';
@@ -39,6 +39,8 @@ const MAPPING: NewPrMessage = {
   channelId: CHANNEL,
   messageTs: TS,
   renderFingerprint: 'fp-1',
+  factsFingerprint: 'facts-1',
+  summaryJson: null,
   at: '2026-08-22T00:00:00Z',
 };
 
@@ -112,6 +114,46 @@ describe('dry-run store', () => {
     }
   });
 
+  // 실제 %APPDATA%\orca-slack-bridge\state.db가 v1이고 게시된 카드의 매핑이 들어 있다.
+  // dry-run이 그 행을 못 읽으면 이미 루트가 있는 PR을 create로 보고하고, 그 보고를 믿고
+  // 게시하면 루트가 하나 더 생긴다. 올리는 대상은 복사본이므로 원본은 v1로 남는다.
+  it('v1 파일을 원본을 바꾸지 않고 읽는다', () => {
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+CREATE TABLE schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, applied_at TEXT NOT NULL
+);
+CREATE TABLE pr_message (
+  pr_key TEXT PRIMARY KEY, channel_id TEXT NOT NULL, message_ts TEXT NOT NULL,
+  render_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);`);
+    raw.exec("INSERT INTO schema_version VALUES (1, 1, '2026-08-22T12:58:31.014Z')");
+    raw
+      .prepare('INSERT INTO pr_message VALUES (?, ?, ?, ?, ?, ?)')
+      .run(PR, CHANNEL, TS, 'fp-v1', MAPPING.at, MAPPING.at);
+    raw.close();
+    const before = fileprint(dbPath);
+
+    const dry = openDigestStore(dbPath, true);
+    try {
+      const found = dry.findPrMessage(PR);
+      expect(found?.messageTs).toBe(TS);
+      expect(found?.renderFingerprint).toBe('fp-v1');
+      // 붙인 컬럼은 비어 있다. 다음 실제 실행이 한 번 요약하고 채운다.
+      expect(found?.factsFingerprint).toBeNull();
+      expect(found?.summaryJson).toBeNull();
+    } finally {
+      dry.close();
+    }
+    // 원본은 v1 그대로다. migration은 복사본에만 걸렸다.
+    expect(fileprint(dbPath)).toEqual(before);
+    const after = new DatabaseSync(dbPath);
+    const version = after.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    after.close();
+    expect(version).toEqual({ version: 1 });
+  });
+
   it('모르는 스키마 버전이면 실제 실행과 똑같이 던진다', () => {
     openDigestStore(dbPath, false).close();
     const raw = new DatabaseSync(dbPath);
@@ -129,7 +171,13 @@ describe('dry-run store', () => {
     const store = openDigestStore(dbPath, true);
     try {
       expect(() => store.insertPrMessage(MAPPING)).toThrow(/dry-run/);
-      expect(() => store.updateRenderFingerprint(PR, 'fp-2', MAPPING.at)).toThrow(/dry-run/);
+      expect(() =>
+        store.updateObservation(
+          PR,
+          { renderFingerprint: 'fp-2', factsFingerprint: 'facts-2', summaryJson: null },
+          MAPPING.at,
+        ),
+      ).toThrow(/dry-run/);
     } finally {
       store.close();
     }
@@ -148,7 +196,7 @@ class ChannelLeakingStore implements DigestStore {
         `(channel ${input.channelId}, ts ${input.messageTs}): disk I/O error`,
     );
   }
-  updateRenderFingerprint(): void {}
+  updateObservation(): void {}
   close(): void {}
 }
 
