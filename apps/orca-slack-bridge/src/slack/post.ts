@@ -272,7 +272,10 @@ export class SlackWebApiPoster implements SlackPoster {
     const o = (typeof json === 'object' && json !== null ? json : {}) as Record<string, unknown>;
 
     if (o['ok'] !== true) {
-      const code = typeof o['error'] === 'string' && o['error'] !== '' ? o['error'] : 'unknown_error';
+      // 응답 body도 `fetchImpl`이 만든 값이다. wrapper가 token을 error에 넣으면 그대로
+      // `SlackApiError`의 message·code·stack에 실린다. 요청 실패 경로와 같은 마스킹을 건다.
+      const raw = typeof o['error'] === 'string' && o['error'] !== '' ? o['error'] : 'unknown_error';
+      const code = this.redact(raw);
       if (DEFINITELY_NOT_PROCESSED.has(code)) {
         return { kind: 'retry', code, afterMs: retryAfterMs(res) };
       }

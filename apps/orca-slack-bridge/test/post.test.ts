@@ -201,6 +201,25 @@ describe('SlackWebApiPoster · token이 실린 하위 오류', () => {
     expect(err.message).toContain(maskToken(TOKEN));
   });
 
+  it('ok:false 응답의 error 코드에서도 token을 마스킹한다', async () => {
+    // 응답 body도 `fetchImpl`이 만든 값이다. 여기서 마스킹하지 않으면 `SlackApiError`의
+    // message·code·stack 세 곳에 token이 그대로 남는다.
+    const fake = new FakeFetch([
+      { body: { ok: false, error: `invalid_auth authorization=Bearer ${TOKEN}` } },
+    ]);
+    const err = (await poster(fake, 0)
+      .post(postInput)
+      .catch((e: unknown) => e)) as SlackApiError;
+    expect(err).toBeInstanceOf(SlackApiError);
+    expect(err.code).not.toContain(TOKEN);
+    expect(err.message).not.toContain(TOKEN);
+    expect(err.stack ?? '').not.toContain(TOKEN);
+    // 지우기만 하지 않는다. verify.ts와 같은 마스킹 형식으로 남긴다.
+    expect(err.code).toContain(maskToken(TOKEN));
+    // 원래 진단 정보는 남는다.
+    expect(err.code).toContain('invalid_auth');
+  });
+
   it('update가 재시도를 소진해도 token이 오류에 실리지 않는다', async () => {
     const fake = new FakeFetch([leaking()]);
     const err = (await poster(fake, 1)

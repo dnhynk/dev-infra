@@ -502,6 +502,42 @@ describe('renderCard · section text 3000자 상한', () => {
   });
 });
 
+describe('renderCard · 상한이 astral 문자를 쪼개지 않는다', () => {
+  /**
+   * 상한은 UTF-16 code unit 단위이고 emoji 하나는 2 code unit이다. 자르는 지점이 그 문자
+   * 가운데에 떨어지면 surrogate pair가 갈라져 lone surrogate가 남는다. Slack에 보내는 JSON은
+   * 그 자리에 U+FFFD를 넣거나 요청을 거절하고, 어느 쪽이든 카드가 원문과 달라진다.
+   *
+   * 이 자리는 헤더 section이다. `이모지 *[project] owner/repo #N* · ` 앞머리가 홀수 code unit이라
+   * 자르는 지점이 emoji 한가운데로 떨어진다. 앞머리 길이에 기대는 재현이므로 lone surrogate가
+   * 실제로 없는지를 단언한다.
+   */
+  const EMOJI = '😀';
+  /** high surrogate 짝이 없는 code unit이 있는가. */
+  const hasLoneSurrogate = (value: string): boolean => {
+    for (let i = 0; i < value.length; i += 1) {
+      const c = value.charCodeAt(i);
+      if (c < 0xd800 || c > 0xdbff) continue;
+      const next = i + 1 < value.length ? value.charCodeAt(i + 1) : Number.NaN;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      i += 1;
+    }
+    return false;
+  };
+
+  const card = renderCard({ pr: { ...basePr, title: EMOJI.repeat(1600) }, summary: failedSummary });
+
+  it('자른 section에 lone surrogate가 남지 않는다', () => {
+    const texts = sectionTexts(card);
+    expect(Math.max(...texts.map((t) => t.length))).toBeGreaterThan(2900);
+    for (const t of texts) expect(hasLoneSurrogate(t)).toBe(false);
+  });
+
+  it('경계를 지키면서도 3000자를 넘지 않는다', () => {
+    for (const t of sectionTexts(card)) expect(t.length).toBeLessThanOrEqual(3000);
+  });
+});
+
 describe('deriveStatus', () => {
   it('merged가 review verdict보다 앞선다', () => {
     const pr: ProjectedPr = {

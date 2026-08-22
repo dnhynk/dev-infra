@@ -110,10 +110,28 @@ function cut(value: string, cap: number): string {
  *
  * 이스케이프 뒤의 길이로 센다. Slack이 보는 것은 전송된 문자열이고 `&amp;`는 5자다.
  * 자른 결과가 그대로 카드에 실리므로 `renderFingerprint`도 자른 결과를 해싱한다.
+ *
+ * **code point 경계에서 자른다.** 상한은 UTF-16 code unit 단위이고 `String.prototype.slice`도
+ * code unit 단위다. astral plane 문자(emoji 등)는 2 code unit이므로 자르는 지점이 그 문자
+ * 가운데에 떨어지면 surrogate pair가 갈라져 lone surrogate가 남는다. 그래서 code point를
+ * 하나씩 훑으며 예산 안에 **통째로** 들어가는 지점까지만 남긴다. 예산은 개수가 아니라 code
+ * unit 길이로 센다. code point 하나가 1 code unit일 수도 2 code unit일 수도 있어서다.
+ *
+ * 경계는 code point까지다. grapheme cluster(ZWJ emoji, 결합 문자)는 보존하지 않는다. Slack이
+ * 세는 단위가 code unit이고 카드가 거절되는 원인은 lone surrogate와 길이 초과뿐이다.
+ * `Intl.Segmenter`를 끌어오는 것은 이 상한이 요구하지 않는 일반화다.
  */
 function capSectionText(text: string): string {
   if (text.length <= SECTION_TEXT_CAP) return text;
-  return `${text.slice(0, SECTION_TEXT_CAP - SECTION_TRUNCATION_MARK.length)}${SECTION_TRUNCATION_MARK}`;
+  const budget = SECTION_TEXT_CAP - SECTION_TRUNCATION_MARK.length;
+  // `for...of`는 문자열을 code point 단위로 훑는다. `cp.length`가 그 code point의 code unit 수다.
+  let end = 0;
+  for (const cp of text) {
+    if (end + cp.length > budget) break;
+    end += cp.length;
+  }
+  // end <= budget이므로 mark를 붙인 결과도 SECTION_TEXT_CAP 이하다.
+  return `${text.slice(0, end)}${SECTION_TRUNCATION_MARK}`;
 }
 
 function section(text: string): SlackBlock {
