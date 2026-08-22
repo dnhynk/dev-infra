@@ -694,6 +694,10 @@ ID: OD-035
     PR 제목·본문, 변경 파일 경로, reviewer-result, CI 결론으로 사실 지문을 만든다. 지문이 같으면
     저장된 요약을 재사용하고 입력이 바뀔 때만 호출한다. head sha 자체는 요약 입력이 아니므로
     사실 지문에 넣지 않는다.
+    schema v2가 보존하는 것은 `facts_fingerprint`와 `summary_json`뿐이다. `summary_json`에는
+    `SummaryDraft`의 `title`·`what`·`why`·`reviewGist`와 파생한 `risk`·`truncated`만 들어가며,
+    PR body·changed paths·worker report 같은 입력 원문은 저장하지 않는다. 요약이 실패한 관찰은
+    `summary_json`을 null로 남기므로 다음 관찰에서 다시 시도한다.
   - 게이트 B(게시): 매 관찰마다 카드를 렌더하고 렌더 지문이 다를 때만 갱신한다.
     사실 지문 하나로 게시 여부까지 판정하지 않는다. `SummaryFacts`에 PR `state`가 없어서
     그렇게 하면 요약 입력은 그대로인 채 merge된 PR의 카드가 갱신되지 않음을 실행으로 확인했다.
@@ -732,7 +736,8 @@ ID: OD-043
     `orca-slack-bridge/state.db`를 쓴다. DB는 설정이 아니라 state이므로 `XDG_CONFIG_HOME`을 쓰지 않는다.
   - 절대경로 여부는 실행 호스트가 아니라 대상 platform 규칙으로 판정한다. 상대 `XDG_DATA_HOME`은
     XDG 명세대로 invalid로 보고 무시하지만, 상대 `ORCA_SLACK_BRIDGE_STATE`는 실행 cwd에 따라 서로 다른
-    DB를 조용히 열 수 있으므로 던진다. `--state`도 절대경로만 받는다.
+    DB를 조용히 열 수 있으므로 던진다. 반면 `--state`는 cwd 기준 상대경로를 허용한다. 매 실행에서
+    호출자가 직접 보고 넘기는 인자와 cwd가 다른 프로세스에 상속되는 환경변수는 값의 수명이 다르기 때문이다.
   - WAL과 `schema_version` 테이블을 쓰고, C1은 단일 프로세스이므로 파일 lock을 만들지 않는다.
     WAL 전환 실패와 접근 불가 store는 던진다.
   - schema migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 파일을 열지 못하게
@@ -849,7 +854,11 @@ ID: OD-072
   `task-update --result`로 `reviewer_result`를 기록하면 그 Task의 `worker_report`가 덮어써져
   `task.result`에서 원래 `worker_done`을 읽을 수 없다. C1은 `inbox`로 우회하지만 inbox는 전역 최신
   N건만 반환하고 `--run` 필터, cursor, pagination이 없어 durable 조회 계약이 아니다. 두 사실을 모두
-  보존하고 Run 범위에서 완전하게 조회할 source/API를 결정해야 한다.
+  보존하고 Run 범위에서 완전하게 조회할 source/API를 결정해야 한다. C1의 포화 감지도 완전하지 않다.
+  반환 행 수가 요청 상한에 닿았는지만 보므로 Orca CLI가 더 낮은 값으로 조용히 clamp하면
+  `saturated=false`가 되어 오래된 `worker_done`을 실제 부재로 오인할 수 있다. `--limit 3`은 3행,
+  `--limit 10`은 10행, 큰 limit은 당시 전체 행을 반환한다는 실측은 요청값까지 반환하는 동작만 확인했으며
+  clamp가 없다는 보장은 하지 못했다. 후속 조회 계약은 pagination뿐 아니라 이 감지 blind spot도 닫아야 한다.
 - **OD-076** (PR 1 : Task N cardinality): PR body는 `orca-task` id를 하나만 실을 수 있고 같은 key를
   서로 다른 값으로 중복하면 `conflict`다. 여러 Task가 한 PR을 이어서 갱신하면 metadata는 마지막 Task만
   가리킨다. OD-021은 반대 방향인 Task 1 : PR N만 규정하므로 다중 Task 이력의 표현·선택 규칙을 정해야 한다.

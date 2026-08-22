@@ -1,8 +1,8 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · 구현 기술 미정**
+상태: **Draft · C1 구현·검증 반영, 후속 slice 경계 미정**
 
-이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. 언어·framework·DB는 확정하지 않는다.
+이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 
 ## 1. 시스템 컨텍스트
 
@@ -53,13 +53,13 @@ Slack은 daemon과 Socket Mode WebSocket으로 연결하는 방향이다. 공개
 
 - Run·Task·Dispatch·Worker·Gate를 read-only로 읽는다.
 - `worker_done`을 우선 사용한다.
+- reviewer verdict는 correlated Task의 `task.result`에 기록된 Orca `reviewer_result`만 읽는다(DL-016, OD-028).
 - C1은 `worker-read`를 호출하지 않고 `worker_done`만 사용한다. fallback은 후속 범위다.
 - Gate resolution만 별도의 좁은 write adapter로 분리한다.
 
 ### GitHub Collector
 
-- GitHub 원본에서 PR·comment·check·merge 상태를 읽고, reviewer가 formal GitHub review를 남기는 계약이면 review verdict도 읽는다.
-- reviewer verdict는 Orca reviewer-result에서 읽는다(DL-016).
+- GitHub 원본에서 PR·comment·check·merge 상태를 읽는다. GitHub formal review는 reviewer verdict source로 사용하지 않는다.
 - GitHub Slack 메시지를 입력으로 사용하지 않는다.
 - C1은 polling하지 않는다. `digest` 명령 1회가 관찰 1회이며, 주기 실행은 O1에서 정한다.
 
@@ -206,7 +206,7 @@ Resolved Gate
   └─ coordinator delivery/outbox state
 ```
 
-SQLite, migration tool, DB 위치, retention, backup, single-instance locking은 TBD다.
+C1 durable store는 `node:sqlite`이고 platform별 기본 위치와 override 우선순위, WAL, `schema_version`, 덧붙이기 migration을 사용한다. C1은 단일 프로세스라 파일 lock을 만들지 않는다. future multi-writer locking, retention, backup, corruption recovery와 Slack 게시 atomicity/outbox는 후속 범위다.
 
 ## 8. 신뢰 경계
 

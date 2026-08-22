@@ -93,7 +93,7 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 - worker는 PR을 만들며 최종 merge를 직접 수행하지 않는다.
 - PR review는 전담 Codex agent가 맡는다. 배치는 [Agent 배치 정책](#42-agent-배치-정책)을 따른다.
 - reviewer는 승인 또는 수정 요청과 근거를 coordinator에게 반환한다.
-- Bridge가 review 상태를 관찰하려면 같은 verdict가 GitHub formal review 또는 별도로 확정한 Orca reviewer-result source에 durable하게 남아야 한다. 어느 source를 계약으로 삼을지는 TBD다.
+- reviewer verdict의 유일한 durable source는 correlated Orca Task의 `task.result`에 기록한 `reviewer_result`다. Bridge는 GitHub formal review를 verdict source로 사용하지 않고 `task.result`만 읽는다(DL-016, OD-028).
 - coordinator는 review 결과를 간단히 최종 확인한 뒤 merge한다.
 - 수정 요청은 가능한 한 원 worker에게 돌리고 재검토한다.
 - merge 뒤에는 다음 ready task를 자동으로 지시한다.
@@ -245,8 +245,8 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 | 제품 요구사항과 작업 규약 | 확정 spec, `AGENTS.md` |
 | orchestration 상태 | Orca live Run/Task/Worker/Gate |
 | 코드·worktree 상태 | Git working tree/worktree |
-| PR·review·CI·merge 상태 | GitHub 원본 |
-| reviewer verdict가 GitHub에 기록되지 않는 경우 | 확정할 Orca reviewer-result source |
+| PR·CI·merge 상태 | GitHub 원본 |
+| reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` |
 | 연속성 snapshot | `HANDOFF.md` |
 | 세션 대화 기억 | source of truth로 사용하지 않음 |
 
@@ -296,7 +296,6 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - 여러 Run이 같은 repository에 있을 때 선택 규칙
 - Run↔repository↔coordinator session identity
 - service tier를 supervised worker 경로에서 지정할 수단
-- reviewer verdict의 durable 관찰 source
 - ask/escalation↔Gate correlation
 - PR correlation metadata 형식
 - Fresh/Resume 시 Channel Adapter 자동 등록·session opt-in 검증 책임

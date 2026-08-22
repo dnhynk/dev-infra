@@ -36,7 +36,7 @@ TBD는 이 과정에서만 확정한다. 구현자가 편의상 먼저 채우지
 - context 열화 관측 가능성
 - handoff 저장·archive·redaction
 - coordinator single-writer 보장 가능성
-- reviewer verdict의 durable 관찰 위치
+- Orca `reviewer_result` 기록·관찰 계약 확인
 - worker ask/reply와 사람용 Gate 승격 계약
 
 출구 조건:

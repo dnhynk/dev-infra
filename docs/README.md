@@ -1,9 +1,9 @@
 # dev-infra 문서 인덱스
 
 상태: **C1 구현·검증 반영, 후속 slice 명세 초안**
-기준일: **2026-08-22**
+기준일: **2026-08-23**
 
-이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 기준 문서다. 현재 문서 루트는 `D:\dev-infra\docs`다. 현재 세션은 문서 작성 세션이며, 애플리케이션 코드·Slack 설정·GitHub 설정·Orca 상태는 변경하지 않았다.
+이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
 
 ## 문서 읽기 순서
 
@@ -64,7 +64,7 @@
 
 - `/init-orchestrate`와 컨텍스트 열화·handoff lifecycle은 하나의 workstream으로 다룬다.
 - 나머지 `orca-slack-bridge` 범위는 실제 크기와 위험을 확인한 뒤 독립적으로 검증 가능한 슬라이스로 나눈다.
-- 언어, 런타임, 패키지 매니저, 모노레포 도구, summarizer 제공자 등은 아직 정하지 않는다.
+- 구현 stack은 TypeScript on Node.js 26.x와 pnpm workspaces로 확정했으며 별도 monorepo 빌드 오케스트레이터는 두지 않는다. summarizer는 OpenAI API를 사용하고 기본 모델은 설정으로 교체 가능한 `gpt-5.6-luna`다.
 - 미정 사항은 구현자가 조용히 채우지 않고 [미결정 사항](open-decisions.md)에 기록해 빌드 과정에서 확정한다.
 
 ## 현재 산출물 경계
