@@ -26,7 +26,7 @@ Project↔Repository 관계도 아직 확정하지 않았다. 최소한 설정 �
 
 ## 2. PR correlation metadata
 
-사용자가 제시한 최소 후보는 PR body의 HTML comment다.
+worker는 PR body **맨 끝**에 다음 블록을 붙인다. 사람이 읽는 내용을 밀어내지 않는 위치다.
 
 ```html
 <!-- orca-run: run_abc -->
@@ -34,29 +34,31 @@ Project↔Repository 관계도 아직 확정하지 않았다. 최소한 설정 �
 <!-- orca-dispatch: dispatch_123 -->
 ```
 
-목표 연결:
+- `orca-run`, `orca-task`는 **필수**, `orca-dispatch`는 선택이다.
+- 작성 주체는 **worker**다. Orca가 dispatch preamble로 id를 주입하므로 worker가 자기 값을 안다.
+- cardinality는 task 1 : PR N이다. 한 Task가 PR을 여러 개 만들면 각 PR에 같은 task id가 붙는다.
+- key 이름은 Bridge 설정으로 override할 수 있다.
+
+연결 방향:
 
 ```text
 canonical repository + PR number
-  → Orca Run
-  → Task
-  → Dispatch/Worker
-  → worker_done
-  → 필요 시 제한된 transcript
+  → Orca Run → Task → Dispatch/Worker → worker_done → 필요 시 제한된 transcript
 ```
 
-이 형식은 화면에 거의 영향을 주지 않는 correlation ID라는 방향만 확정됐다. 다음은 구현 전에 결정한다.
+Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시점 body가 기준이다.
 
-- 최종 key 이름과 문법
-- 필수/선택 필드
-- PR 하나와 Task/Dispatch의 cardinality
-- metadata를 작성하는 주체
-- `/init-orchestrate`가 worker PR 규칙을 주입하는 방법
-- metadata 누락 시 숨김·uncorrelated 표시·수동 연결 중 어떤 동작을 할지
-- metadata 불일치 또는 변조를 검증할지와 검증 강도
-- 수정된 PR body와 최초 correlation 사이의 우선순위
+### 누락·불일치 정책
 
-Bridge는 metadata가 없거나 모순될 때 branch 이름이나 PR 제목만으로 조용히 확정하지 않는다. 신뢰·검증·fallback 정책은 미결정 장부에서 확정한다.
+| 상황 | 보고 |
+|---|---|
+| metadata 없음 | `uncorrelated(no_metadata)` |
+| task/dispatch만 있고 run 없음 | `uncorrelated(run_missing)` |
+| 가리키는 Run이 Orca에 없음 | `uncorrelated(run_not_found)` |
+| 같은 key가 서로 다른 값으로 중복 | `conflict` |
+| metadata의 task가 다른 Run에 속함 | `conflict` |
+
+`uncorrelated`는 실패가 아니라 **정상 출력**이다. Bridge는 branch 이름이나 PR 제목으로 추측해 확정하지 않고, 모순을 자동으로 한쪽으로 덮지 않는다.
 
 ## 3. Worker 완료 계약
 
@@ -65,8 +67,9 @@ Bridge는 metadata가 없거나 모순될 때 branch 이름이나 PR 제목만�
   - 첫 문장: 무엇을 했는가
   - 둘째 문장: 무엇을 발견했는가
   - 셋째 문장: 무엇이 남았는가
-- PR URL 또는 PR identity를 body에 포함할지, metadata만으로 연결할지는 TBD다.
-- PR 생성과 `worker_done` 전송의 strict ordering은 TBD이며, Bridge는 확정 전까지 event arrival order를 가정하지 않는다.
+- **PR을 만든 뒤에 `worker_done`을 보낸다.** 완료 신호가 리뷰 대상보다 먼저 도착하지 않게 한다.
+- **PR identity를 `worker_done`에 싣지 않는다.** 연결 방향이 PR → task이고 PR body의 correlation metadata가 유일한 연결점이다. worker 명령에서 raw `--payload` JSON은 PowerShell이 따옴표를 깨뜨릴 수 있어 쓰지 않는다.
+- `--files-modified`는 사용한다.
 - `worker_done`이 누락·중복·불완전할 때의 상태와 recovery는 `OD-070`에서 확정한다.
 - worker가 release된 뒤에도 필요하면 `worker-read`로 결과를 확인할 수 있다는 Orca capability를 활용할 수 있다.
 
@@ -131,7 +134,30 @@ Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator i
 
 ## 6. PR canonical state
 
-review verdict의 durable source도 먼저 정해야 한다. reviewer가 coordinator에게만 결과를 반환하고 GitHub formal review를 남기지 않으면 GitHub만 관찰하는 Bridge는 approval/changes-requested를 볼 수 없다. GitHub formal review를 의무화할지, 구조화된 Orca reviewer 결과를 추가 source로 삼을지는 TBD다.
+**review verdict의 durable source는 Orca다.** 대상 repository 전부에서 GitHub `reviewDecision`이 null이고, PR author와 review author가 같은 계정이라 GitHub이 self-approve를 막으므로 formal verdict가 원리적으로 불가능하다(DL-016).
+
+reviewer는 자기 review task에 결과를 기록한다.
+
+```text
+orca orchestration task-update --id <review_task> --status completed --result <json>
+```
+
+```json
+{
+  "kind": "reviewer_result", "schemaVersion": 1,
+  "verdict": "approve",
+  "pr": { "repo": "owner/name", "number": 31 },
+  "reviewedHeadSha": "…",
+  "findings": [{ "severity": "blocker", "file": "path.ts", "line": 750, "summary": "…" }],
+  "gates": { "lint": "pass", "test": "pass" }
+}
+```
+
+`verdict`는 `approve` 또는 `request_changes`다. `request_changes`여도 review task 자체는 `completed`다. 리뷰라는 작업은 끝났기 때문이다.
+
+`reviewedHeadSha`는 새 commit 이후 이전 approval이 유효한지 판정할 근거다.
+
+GitHub review 본문의 `## Verdict` / `## Gates` / `## Findings` 규약은 표시용 보조 사실로만 쓰고 상태 source로 삼지 않는다. 신뢰 경계상 untrusted content다.
 
 다음은 사용자에게 보여줄 의미 상태 후보이며 최종 enum이 아니다.
 
