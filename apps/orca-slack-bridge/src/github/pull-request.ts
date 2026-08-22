@@ -12,12 +12,24 @@ export type PullRequestFacts = {
   readonly state: string;
   readonly isDraft: boolean;
   readonly headRefName: string;
+  /** head commit sha. reviewer_result의 `reviewedHeadSha`와 대조할 대상이다. */
+  readonly headRefOid: string;
   readonly baseRefName: string;
   readonly mergedAt: string | null;
   /** GitHub formal review 판정. 관측된 모든 대상 repo에서 null이다(DL-016 근거). */
   readonly reviewDecision: string | null;
   readonly reviewCount: number;
   readonly checks: readonly CheckFact[];
+  /**
+   * 변경 파일 경로. summarizer의 `changedPaths` source다.
+   *
+   * `gh pr list --json files`는 **최대 100개까지만** 준다. 실측: `nodejs/node` PR #65461이
+   * `changedFiles` 1971에 `files` 100이었다. 그래서 이 배열 길이는 전체 수가 아니다.
+   * 응답에 함께 오는 additions/deletions/changeType은 C1 카드가 쓰지 않으므로 버린다.
+   */
+  readonly changedPaths: readonly string[];
+  /** gh `changedFiles`. 잘리지 않은 전체 변경 파일 수이며 `changedPaths.length`와 다를 수 있다. */
+  readonly changedFilesTotal: number;
 };
 
 export type CheckFact = {
@@ -28,7 +40,8 @@ export type CheckFact = {
 
 const FIELDS = [
   'number', 'title', 'body', 'url', 'state', 'isDraft',
-  'headRefName', 'baseRefName', 'mergedAt', 'reviewDecision', 'reviews', 'statusCheckRollup',
+  'headRefName', 'headRefOid', 'baseRefName', 'mergedAt', 'reviewDecision', 'reviews',
+  'statusCheckRollup', 'files', 'changedFiles',
 ].join(',');
 
 function str(v: unknown): string {
@@ -58,6 +71,11 @@ export async function listPullRequests(
     }
     const reviews = Array.isArray(o['reviews']) ? o['reviews'] : [];
     const rollup = Array.isArray(o['statusCheckRollup']) ? o['statusCheckRollup'] : [];
+    const files = Array.isArray(o['files']) ? o['files'] : [];
+    const changedFiles = o['changedFiles'];
+    if (typeof changedFiles !== 'number') {
+      throw new TypeError(`${repo.nameWithOwner} PR #${number} 응답에 changedFiles가 없다`);
+    }
     return {
       key: pullRequestKey(repo.githubId, number),
       number,
@@ -67,10 +85,13 @@ export async function listPullRequests(
       state: str(o['state']),
       isDraft: o['isDraft'] === true,
       headRefName: str(o['headRefName']),
+      headRefOid: str(o['headRefOid']),
       baseRefName: str(o['baseRefName']),
       mergedAt: strOrNull(o['mergedAt']),
       reviewDecision: strOrNull(o['reviewDecision']),
       reviewCount: reviews.length,
+      changedPaths: files.map((f) => str((f as Record<string, unknown>)['path'])),
+      changedFilesTotal: changedFiles,
       checks: rollup.map((c) => {
         const co = c as Record<string, unknown>;
         return {
