@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 import type { PullRequestKey } from '../identity/keys.js';
 import {
@@ -244,6 +244,126 @@ export class SqliteDigestStore implements DigestStore {
   }
 }
 
+/** `ReadOnlyDigestStore`가 연 복사본. 원본 파일이 없으면 세 값이 모두 "없음"이다. */
+type OpenedCopy = {
+  readonly db: DatabaseSync | null;
+  /** 복사본을 담은 임시 디렉터리. `close`가 통째로 지운다. */
+  readonly scratch: string | null;
+  /** 복사본에 `pr_message`가 있는지. 스키마가 없는 파일이면 조회하지 않는다. */
+  readonly schemaReady: boolean;
+};
+
+/**
+ * dry-run이 쓰는 읽기 전용 `DigestStore`.
+ *
+ * dry-run도 `findPrMessage`는 해야 한다. 기존 루트가 있으면 `update`, 없으면 `create`로
+ * 보고하는 것이 dry-run의 쓸모이기 때문이다. 그런데 `SqliteDigestStore`로 읽으면 그 읽기가
+ * 파일을 바꾼다. 생성자가 부모 디렉터리와 DB 파일을 만들고 `PRAGMA journal_mode = WAL`과 DDL을
+ * 쓰며 `close`가 checkpoint한다.
+ *
+ * 그래서 **원본을 아예 열지 않는다.** 원본에 하는 일은 `statSync`와 `copyFileSync`뿐이고
+ * SQLite 연결은 임시 디렉터리의 복사본에만 연다. 원본에 write handle이 생기지 않으므로 내용이
+ * 바뀔 수 없고 `-wal`·`-shm` 같은 곁파일도 원본 옆에 생기지 않는다. 이것이 "아무것도 쓰지
+ * 않는다"의 근거다. 파일이 없으면 복사할 것도 없으므로 열지 않고 "행 없음"으로 다룬다.
+ *
+ * `-wal`도 함께 복사한다. 이전 실행이 죽어 checkpoint되지 않은 `-wal`이 남으면 커밋된 행이 본
+ * 파일이 아니라 거기에만 있다. 복사하지 않으면 매핑이 있는 PR을 `create`로 보고한다. `-shm`은
+ * 복사하지 않는다. `-wal`의 색인일 뿐이고 SQLite가 복사본에서 다시 만든다. 동시 writer가 없다는
+ * 가정(OD-043)이 두 파일의 복사가 서로 어긋나지 않는 근거다.
+ *
+ * 기각한 대안 둘. `file:...?immutable=1`로 원본을 직접 여는 방법은 곁파일을 만들지 않지만
+ * SQLite가 `-wal`을 읽지 않아, `-wal`에만 있는 커밋된 행이 조회 결과에서 빠진다. `readOnly: true`
+ * 열기는 그 행을 읽지만 원본 옆에 `-shm`과 빈 `-wal`을 만들고 남긴다.
+ *
+ * write 메서드는 던진다. dry-run에서 `runDigest`는 Slack 호출 전에 돌아가므로 호출될 일이 없고,
+ * 호출된다면 흐름이 깨졌다는 뜻이다. 조용히 무시하면 게시하지 않은 카드의 매핑이 남는다.
+ */
+export class ReadOnlyDigestStore implements DigestStore {
+  private readonly opened: OpenedCopy;
+
+  constructor(private readonly path: string) {
+    this.opened = openCopy(path);
+  }
+
+  findPrMessage(prKey: PullRequestKey): PrMessageRecord | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_ROW).get(prKey) as PrMessageRow | undefined;
+    return row === undefined ? null : toRecord(row);
+  }
+
+  insertPrMessage(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. 루트 매핑을 기록하려 했다: ${this.path}`);
+  }
+
+  updateRenderFingerprint(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. 지문을 갱신하려 했다: ${this.path}`);
+  }
+
+  close(): void {
+    // 복사본이므로 checkpoint하지 않는다. 원본에는 애초에 열린 handle이 없다.
+    this.opened.db?.close();
+    if (this.opened.scratch !== null) {
+      rmSync(this.opened.scratch, { recursive: true, force: true });
+    }
+  }
+}
+
+/**
+ * 경로에 파일이 있는지 본다. **`ENOENT`만 부재로 접고 나머지 오류는 전파한다.**
+ *
+ * `existsSync`를 쓰지 않는 이유다. 그 함수는 경로 탐색 중의 `EACCES`·`EPERM`에서도 `false`를
+ * 돌려주므로, 읽을 수 없는 기존 store가 "없는 store"가 된다. 그러면 dry-run이 이미 루트가 있는
+ * PR을 `create`로 보고하고, 그 보고를 믿고 게시하면 루트가 하나 더 생긴다. 로드맵 §5의 "재관찰로
+ * 루트가 중복되지 않음"이 겨냥하는 실패가 이것이다. "판정할 수 없다"는 "없다"가 아니므로 조용히
+ * 넘어가지 않고 던진다. 조용한 발산이 시끄러운 실패보다 나쁘다(`win32StateBase`와 같은 이유).
+ *
+ * `ENOTDIR`도 전파한다. 경로 구성요소가 디렉터리가 아니면 그 자리에 DB가 있을 수 없다고 볼 수도
+ * 있지만, 그것은 "아직 만들지 않았다"가 아니라 store 경로 자체가 틀렸다는 뜻이다. 부재로 접으면
+ * 열릴 수 없는 경로를 dry-run이 `create`로 보고한다.
+ *
+ * 오류를 감싸지 않고 그대로 올린다. Node의 errno 오류는 이미 syscall과 경로를 message에 담고,
+ * 그 경로는 호출자가 준 store 경로라 채널 ID나 토큰처럼 가릴 값이 아니다.
+ */
+function pathExists(path: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw e;
+  }
+}
+
+/**
+ * 원본을 임시 디렉터리에 복사해 연다. 원본이 없으면 아무것도 열지 않는다.
+ *
+ * 여는 도중 실패하면 임시 디렉터리를 남기지 않는다. 호출자는 생성자에서 던진 store의 `close`를
+ * 부르지 않기 때문이다.
+ */
+function openCopy(path: string): OpenedCopy {
+  if (!pathExists(path)) return { db: null, scratch: null, schemaReady: false };
+
+  const scratch = mkdtempSync(join(tmpdir(), 'orca-slack-bridge-ro-'));
+  let db: DatabaseSync | null = null;
+  try {
+    const copy = join(scratch, 'state.db');
+    copyFileSync(path, copy);
+    if (pathExists(`${path}-wal`)) copyFileSync(`${path}-wal`, `${copy}-wal`);
+    db = new DatabaseSync(copy);
+    // 버전 판정은 실제 실행과 같은 함수를 쓴다. 모르는 버전이면 여기서도 던진다.
+    const version = readSchemaVersion(db, path);
+    if (version !== null && version !== SCHEMA_VERSION) {
+      throw new SchemaVersionError(path, version, SCHEMA_VERSION);
+    }
+    return { db, scratch, schemaReady: version !== null };
+  } catch (e) {
+    db?.close();
+    rmSync(scratch, { recursive: true, force: true });
+    throw e;
+  }
+}
+
 /**
  * WAL로 전환하고 실제로 전환됐는지 확인한다.
  *
@@ -275,11 +395,9 @@ function enableWal(db: DatabaseSync, path: string): void {
  * 버전은 모르는" 파일을 만나 판정할 근거를 잃는다.
  */
 function prepareSchema(db: DatabaseSync, path: string): void {
-  const versioned = db
-    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'")
-    .get();
+  const version = readSchemaVersion(db, path);
 
-  if (versioned === undefined) {
+  if (version === null) {
     db.exec('BEGIN');
     try {
       db.exec(SCHEMA_DDL);
@@ -295,6 +413,27 @@ function prepareSchema(db: DatabaseSync, path: string): void {
     return;
   }
 
+  if (version !== SCHEMA_VERSION) {
+    throw new SchemaVersionError(path, version, SCHEMA_VERSION);
+  }
+}
+
+/**
+ * `schema_version`의 버전을 읽는다. 테이블 자체가 없으면 null이다.
+ *
+ * null은 "아직 스키마가 없는 파일"이라는 뜻이고, 그 파일에는 `pr_message`도 없다. 두 테이블이
+ * 한 DDL·한 트랜잭션에서 만들어지기 때문이다. 테이블은 있는데 버전 행이 없으면 어느 버전의
+ * 컬럼을 읽어야 하는지 판정할 근거가 없으므로 던진다.
+ *
+ * SELECT만 한다. `prepareSchema`와 `ReadOnlyDigestStore`가 같은 판정을 써야 하기 때문이다.
+ * 둘이 갈라지면 dry-run이 실제 실행과 다른 버전 판정을 내린다.
+ */
+function readSchemaVersion(db: DatabaseSync, path: string): number | null {
+  const versioned = db
+    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'")
+    .get();
+  if (versioned === undefined) return null;
+
   const row = db.prepare('SELECT version FROM schema_version WHERE id = 1').get() as
     | { readonly version: number }
     | undefined;
@@ -304,7 +443,5 @@ function prepareSchema(db: DatabaseSync, path: string): void {
         'Bridge가 만든 파일이 아니거나 손상됐다.',
     );
   }
-  if (row.version !== SCHEMA_VERSION) {
-    throw new SchemaVersionError(path, row.version, SCHEMA_VERSION);
-  }
+  return row.version;
 }
