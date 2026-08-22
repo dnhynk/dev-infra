@@ -188,3 +188,18 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 이유: `/init-orchestrate` 스킬이 이 셋을 대상 repository 계약으로 넘기고 "계약이 없으면 묻는다"고 규정한다. 닫지 않으면 첫 Run이 부팅에서 멈춘다.
 - 더 중요한 이유: 닫지 않고 돌리면 첫 Run이 만드는 PR이 영구히 uncorrelated로 남는다. S0의 correlation 계층은 구현·검증됐으나 아직 correlated PR을 관측한 적이 없고, 이 Run이 그 첫 기회다.
 - 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 각 확정 기록에 있다.
+
+## 2026-08-22 · summarizer 계약
+
+### DL-026 · summarizer는 OpenAI API의 gpt-5.6-luna를 쓴다
+
+- provider를 인터페이스 뒤에 두고 기본 구현은 OpenAI API `gpt-5.6-luna`다. 설정으로 모델을 바꿀 수 있다.
+- 근거: luna 실측 단가 $0.20/$1.20 per MTok으로 월 30 PR 기준 약 $0.24다. `codex exec` CLI는 추가 과금이 없지만 호출당 16,245 input 토큰의 스캐폴딩을 싣고 PR 리뷰어와 같은 구독 할당량을 소모한다. 리뷰어가 throttle되면 orchestration이 멈추므로 월 몇 센트보다 비싼 대가다.
+- API key는 `ORCA_SLACK_BRIDGE_OPENAI_KEY`로 주입한다. 관례 이름 `OPENAI_API_KEY`를 쓰지 않는 이유는 DL-015/OD-005와 같다.
+
+### DL-027 · LLM이 만드는 필드를 줄인다
+
+- LLM 출력은 `title`, `what`, `why`, `reviewGist` 넷뿐이다.
+- `status`는 PR·Orca 사실에서 결정적으로 파생하고, `risk`는 reviewer-result의 severity 집계로 파생한다. 링크·버튼·검증 주장은 스키마에 없다.
+- 근거: 스펙이 "상태별 layout과 action을 코드로 결정한다"와 "source fact에 없는 성공·안전성·검증을 주장하지 않는다"를 요구한다. 스키마에서 제거하면 잘못된 주장이 원천적으로 불가능해진다.
+- 실측 근거도 있다. 스키마에 필드 설명 없이 luna를 호출했을 때 review 입력이 없는데도 `reviewGist`를 채우고 `why`에 없던 보안 주장을 넣었다. 검증 계층은 모델과 무관하게 필요하다.

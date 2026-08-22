@@ -63,10 +63,10 @@
 | OD-031 | review verdict 축약과 새 commit 후 approval | C2 전 | OPEN |
 | OD-032 | required/optional check와 merge-ready 정책 | C2 전 | OPEN |
 | OD-033 | review 핵심 comment 선택 규칙 | C1/C2 전 | OPEN |
-| OD-034 | summarizer provider/model/schema/language | C1 전 | OPEN |
-| OD-035 | summarizer 실패 fallback, cache, 호출 상한 | C1 전 | OPEN |
-| OD-036 | code/review/transcript의 LLM·Slack 전송 경계 | C1 전 | OPEN |
-| OD-037 | risk 산정 근거와 표시 조건 | C1 전 | OPEN |
+| OD-034 | summarizer provider/model/schema/language | C1 전 | DECIDED |
+| OD-035 | summarizer 실패 fallback, cache, 호출 상한 | C1 전 | DECIDED |
+| OD-036 | code/review/transcript의 LLM·Slack 전송 경계 | C1 전 | DECIDED |
+| OD-037 | risk 산정 근거와 표시 조건 | C1 전 | DECIDED |
 
 ## Slack과 durable store
 
@@ -616,5 +616,71 @@ ID: OD-005
     실질적 격리 이득이 작고 코드가 늘어난다. 필요해지면 재검토한다.
 영향 문서/파일: docs/ops/slack-app-setup.md, apps/orca-slack-bridge/src/project/config.ts, src/slack/verify.ts
 검증 방법: verify-slack이 관례 이름만 설정된 경우를 실패로 보고하는지 테스트로 확인했다(2026-08-22).
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-034
+상태: DECIDED
+결정: summarizer는 OpenAI API만 사용한다. 기본 모델은 `gpt-5.6-luna`이며 설정으로 교체할 수 있다.
+      구조화 출력은 `response_format`의 JSON Schema strict 모드로 강제한다. 출력 언어는 한국어다.
+      provider는 인터페이스 뒤에 두어 교체 비용을 낮춘다.
+근거:
+  - 실측 가격: luna $0.20/$1.20 per MTok. 린 프롬프트 기준 호출당 약 $0.0016,
+    월 30 PR × 5회 = 150 호출에 약 $0.24다.
+  - `codex exec` CLI 경로는 추가 과금이 없지만 호출당 16,245 input 토큰의 에이전트 스캐폴딩을
+    싣고(실측) Codex 구독 할당량을 PR 리뷰어와 공유한다. Bridge가 할당량을 소모하면
+    리뷰어가 throttle되어 orchestration이 멈춘다. 월 몇 센트보다 비싼 대가다.
+  - API 경로는 스캐폴딩이 없어 호출당 토큰이 약 30배 줄고 할당량 경합이 없다.
+대안과 기각 이유:
+  - `codex exec -m gpt-5.6-luna --output-schema`: 동작을 실측으로 확인했으나(8초, 유효 JSON)
+    위 할당량 경합과 스캐폴딩 때문에 기각.
+  - Anthropic API(haiku/opus): 동작하지만 luna 대비 5~25배 비싸고 이점이 없다. 기각.
+영향 문서/파일: apps/orca-slack-bridge/src/summarize
+검증 방법: 실제 PR 사실로 호출해 스키마 준수와 요약 품질을 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-037
+상태: DECIDED
+결정: risk는 LLM이 산정하지 않는다. reviewer-result의 `findings[].severity`를 집계해 파생한다.
+      blocker ≥ 1 → 높음, major ≥ 1 → 보통, 그 외 → 낮음. reviewer-result가 없으면 risk를 표시하지 않는다.
+근거:
+  - OD-073으로 severity가 구조화 사실이 됐으므로 추정할 이유가 없다.
+  - 스펙이 "source fact에 없는 성공·안전성·검증을 주장하지 않는다"를 요구한다.
+  - LLM 출력 스키마에서 아예 제거하면 잘못된 주장이 원천적으로 불가능하다.
+영향 문서/파일: src/summarize/contract.ts, renderer
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-036
+상태: DECIDED
+결정: summarizer에 보내는 것은 Task 목적, `worker_done` 본문, PR title, PR body(correlation
+      metadata 블록 제거 후 상한 적용), 변경 파일 **경로 목록**, reviewer-result의 findings,
+      CI 결론뿐이다.
+      보내지 않는 것: diff 본문, worker transcript, GitHub review 원문 전체, 환경변수·토큰·설정 값.
+      상한 초과로 잘린 경우 그 사실을 결과에 남기고 조용히 자르지 않는다.
+근거:
+  - 스펙이 transcript를 기본 입력으로 쓰지 않는다고 규정한다.
+  - 실측된 PR body가 15KB급이라 상한이 필요하다.
+  - 파일 경로만 보내면 변경 범주를 전달하면서 코드 본문 유출을 피한다.
+영향 문서/파일: src/summarize/contract.ts
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-035
+상태: DECIDED
+결정:
+  - 호출 상한: 사실 지문(PR key + head sha + reviewer-result + CI 결론 + 입력 사실 해시)이
+    바뀔 때만 호출한다. 지문이 같으면 이전 결과를 재사용한다. 관찰 횟수가 아니라 의미 있는
+    전이 횟수에 비례한다.
+  - 검증 실패 시: 1회 재시도한다. 재시도도 실패하면 요약 없이 사실만으로 축소 카드를 만들고
+    "요약 실패"를 표시한다.
+  - 어떤 실패도 Orca/GitHub 상태를 변경하지 않으며 실패를 성공처럼 숨기지 않는다.
+근거: UX 문서가 summarizer 실패를 드러내도록 요구하고, 스펙이 실패 시 상태 불변을 요구한다.
+영향 문서/파일: src/summarize/index.ts, renderer
 결정일: 2026-08-22
 ```
