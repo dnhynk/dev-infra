@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseArgs } from '../src/cli.js';
+import { parseArgs, decideEntrypoint } from '../src/cli.js';
 
 describe('명령 분기', () => {
   it('snapshot을 인식한다', () => {
@@ -60,5 +60,26 @@ describe('명령 분기', () => {
     expect(parseArgs(['snapshot', '--pr-limit', '0']).kind).toBe('error');
     expect(parseArgs(['snapshot', '--pr-limit', 'x']).kind).toBe('error');
     expect(parseArgs(['snapshot', '--pr-limit', '-3']).kind).toBe('error');
+  });
+});
+
+describe('진입점 판정', () => {
+  it('true면 실행한다', () => {
+    expect(decideEntrypoint(true, 'v26.7.0').kind).toBe('run');
+  });
+
+  it('false면 import된 상태이므로 실행하지 않는다', () => {
+    expect(decideEntrypoint(false, 'v26.7.0').kind).toBe('imported');
+  });
+
+  it('필드가 없으면 조용히 넘어가지 않고 원인을 밝힌다', () => {
+    // 회귀 방지: 이전 버전은 undefined를 falsy로 흘려 아무 출력 없이 exit 0으로 끝났다.
+    const d = decideEntrypoint(undefined, 'v20.19.0');
+    expect(d.kind).toBe('unsupported');
+    if (d.kind === 'unsupported') {
+      expect(d.message).toContain('import.meta.main');
+      expect(d.message).toContain('>=26');
+      expect(d.message).toContain('v20.19.0');
+    }
   });
 });

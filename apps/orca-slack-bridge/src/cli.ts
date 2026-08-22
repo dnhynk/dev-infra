@@ -93,10 +93,48 @@ async function main(): Promise<number> {
   return 0;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (e: unknown) => {
-    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
-    process.exit(1);
-  },
-);
+/** package.json engines가 요구하는 Node 버전. 진입점 판정이 이 버전의 API에 의존한다. */
+const REQUIRED_NODE = '>=26';
+
+export type Entrypoint =
+  | { readonly kind: 'run' }
+  | { readonly kind: 'imported' }
+  | { readonly kind: 'unsupported'; readonly message: string };
+
+/**
+ * 진입점 판정을 순수 함수로 분리해 test가 필드 부재 경로를 검증할 수 있게 한다.
+ * `import.meta.main`이 없는 런타임에서는 진입점 여부를 알 수 없다. 그때 조용히
+ * 넘어가면 CLI가 아무 출력 없이 exit 0으로 끝나 사용자가 성공으로 오인하므로,
+ * 경로 문자열 비교로 흉내내지 않고 지원 범위 밖으로 구분해 호출자가 실패시킨다.
+ */
+export function decideEntrypoint(main: boolean | undefined, nodeVersion: string): Entrypoint {
+  if (main === undefined) {
+    return {
+      kind: 'unsupported',
+      message:
+        'import.meta.main을 지원하지 않는 런타임이라 CLI 진입점을 판정할 수 없다.\n' +
+        `요구 Node 버전: ${REQUIRED_NODE} (package.json engines) / 실행 중인 버전: ${nodeVersion}`,
+    };
+  }
+  return main ? { kind: 'run' } : { kind: 'imported' };
+}
+
+/**
+ * 이 모듈이 프로세스의 진입점일 때만 CLI를 실행한다.
+ * 진입점 판정을 Node에 맡겨 경로 문자열 비교 없이 처리하므로,
+ * test가 `parseArgs`를 import해도 `main()`과 `process.exit`이 실행되지 않는다.
+ * 필드가 없는 런타임은 지원 범위 밖이므로 조용히 넘어가지 않고 즉시 실패한다.
+ */
+const entrypoint = decideEntrypoint(import.meta.main, process.version);
+if (entrypoint.kind === 'unsupported') {
+  process.stderr.write(entrypoint.message + '\n');
+  process.exit(1);
+} else if (entrypoint.kind === 'run') {
+  main().then(
+    (code) => process.exit(code),
+    (e: unknown) => {
+      process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+      process.exit(1);
+    },
+  );
+}
