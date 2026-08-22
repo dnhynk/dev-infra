@@ -18,7 +18,8 @@
 9. [확정 결정 기록](decision-log.md)
 10. [미결정 사항](open-decisions.md)
 11. [검증된 플랫폼 역량과 제약](platform-capabilities.md)
-12. [요구사항 추적표](traceability.md)
+12. [Slack App 준비 절차](ops/slack-app-setup.md)
+13. [요구사항 추적표](traceability.md)
 
 ## 문서 권위와 표기
 
