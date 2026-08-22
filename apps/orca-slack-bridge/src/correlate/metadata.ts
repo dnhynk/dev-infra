@@ -24,12 +24,16 @@ const VALUE = String.raw`[A-Za-z0-9_.:-]+`;
 /** metadata key는 식별자로 제한한다. 정규식 메타문자를 이스케이프할 필요가 없어진다. */
 const SAFE_KEY = /^[A-Za-z0-9_-]+$/;
 
-function extract(body: string, key: string): string[] {
+function commentRe(key: string): RegExp {
   if (!SAFE_KEY.test(key)) {
     throw new TypeError(`correlation key는 영숫자·밑줄·하이픈만 쓸 수 있다: ${key}`);
   }
   // <!-- key: value --> 형태. 공백은 관대하게 받는다.
-  const re = new RegExp(String.raw`<!--\s*` + key + String.raw`\s*:\s*(` + VALUE + String.raw`)\s*-->`, 'g');
+  return new RegExp(String.raw`<!--\s*` + key + String.raw`\s*:\s*(` + VALUE + String.raw`)\s*-->`, 'g');
+}
+
+function extract(body: string, key: string): string[] {
+  const re = commentRe(key);
   const values: string[] = [];
   for (const m of body.matchAll(re)) {
     const v = m[1];
@@ -67,4 +71,21 @@ export function parseCorrelationMetadata(
 
 export function hasAnyCorrelation(m: CorrelationMetadata): boolean {
   return m.runId !== null || m.taskId !== null || m.dispatchId !== null;
+}
+
+/**
+ * PR body에서 correlation metadata 블록을 지운다.
+ *
+ * summarizer에 보내는 본문에서 기계용 주석을 빼는 용도다(OD-036). 사람이 읽는 내용은
+ * 건드리지 않는다. 파싱과 같은 정규식을 쓴다. 두 곳에서 형식을 따로 정의하면 key 형식이
+ * 바뀔 때 한쪽만 바뀐다.
+ *
+ * 중복 key도 모두 지운다. `duplicates`는 correlation 판정의 입력이지 본문 정리의 조건이 아니다.
+ */
+export function stripCorrelationMetadata(body: string, keys: CorrelationKeys): string {
+  let out = body;
+  for (const key of [keys.run, keys.task, keys.dispatch]) {
+    out = out.replace(commentRe(key), '');
+  }
+  return out.trimEnd();
 }
