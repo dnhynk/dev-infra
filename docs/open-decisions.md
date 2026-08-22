@@ -42,18 +42,18 @@
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
 | OD-020 | Run↔repo cardinality와 Run↔worktree↔coordinator session identity | S0 전 | OPEN |
-| OD-021 | PR HTML metadata 최종 형식과 작성 주체 | AB-1/S0 전 | OPEN |
-| OD-022 | metadata 누락·불일치·변조 정책 | S0 전 | OPEN |
+| OD-021 | PR HTML metadata 최종 형식과 작성 주체 | AB-1/S0 전 | DECIDED |
+| OD-022 | metadata 누락·불일치·변조 정책 | S0 전 | DECIDED |
 | OD-023 | Orca polling/event/reconciliation 방식과 주기 | S0 전 | OPEN |
 | OD-024 | GitHub API와 `gh` adapter, 인증, 갱신 방식 | S0 전 | DECIDED |
 | OD-025 | `worker-read` fallback 조건과 최대 범위 | C1 전 | OPEN |
 | OD-026 | repository canonicalization, rename/fork/multiple remote | S0 전 | DECIDED |
 | OD-027 | Project↔Repository cardinality, 등록 주체, 설정/DB mapping과 routing | S0 전 | DECIDED |
 | OD-028 | reviewer verdict를 GitHub formal review와 Orca 중 어디에 durable하게 남길지 | C1/C2 전 | DECIDED |
-| OD-029 | PR 생성과 `worker_done` 전송의 ordering 및 PR identity 포함 방식 | AB-1/S0 전 | OPEN |
+| OD-029 | PR 생성과 `worker_done` 전송의 ordering 및 PR identity 포함 방식 | AB-1/S0 전 | DECIDED |
 | OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
 | OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | OPEN |
-| OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | OPEN |
+| OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | DECIDED |
 
 ## PR state와 요약
 
@@ -517,5 +517,81 @@ ID: OD-013
 영향 문서/파일: skills/init-orchestrate/SKILL.md §10, .gitignore
 검증 방법: `handoff` 스킬의 frontmatter와 template.md를 직접 읽어 상속 가능 범위와 결손 필드를
           확인(2026-08-22). 실제 Run에서 이 형식으로 승계가 성립하는지는 다음 실 Run에서 검증한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-021
+상태: DECIDED
+결정: PR body 맨 끝의 HTML comment 블록으로 correlation ID를 싣는다.
+      <!-- orca-run: <run_id> -->      필수
+      <!-- orca-task: <task_id> -->    필수
+      <!-- orca-dispatch: <id> -->     선택
+      작성 주체는 worker다. cardinality는 task 1 : PR N이다.
+근거:
+  - 화면에 거의 영향을 주지 않으면서 기계적으로 읽히는 형식이라는 방향이 확정돼 있었다.
+  - Orca가 dispatch preamble로 task/dispatch id를 worker에 주입하므로 worker가 자기 값을 안다.
+  - body 맨 끝에 두면 사람이 읽는 내용을 밀어내지 않는다.
+  - 값 이름은 S0 구현의 기본값과 일치하며 설정으로 override할 수 있다.
+대안과 기각 이유:
+  - coordinator가 PR body를 사후 수정: worker가 PR을 만드는 시점과 어긋나 창이 생긴다. 기각.
+  - branch 이름 규약: 계약이 "branch 이름으로 조용히 확정하지 않는다"를 금지한다. 기각.
+영향 문서/파일: contracts/observation-and-correlation.md §2, apps/orca-slack-bridge/src/correlate
+검증 방법: 첫 Run의 PR에서 snapshot이 correlated로 보고하는지 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-022
+상태: DECIDED
+결정: metadata가 없으면 `uncorrelated(no_metadata)`, run만 없으면 `run_missing`,
+      가리키는 Run이 없으면 `run_not_found`, 값이 모순되거나 task가 다른 Run에 속하면 `conflict`로 보고한다.
+      어느 경우에도 branch 이름·PR 제목으로 추측해 확정하지 않으며, 자동으로 한쪽을 덮지 않는다.
+근거: 관찰·상관관계 계약이 추측 확정을 금지한다. uncorrelated는 실패가 아니라 정상 출력이다.
+영향 문서/파일: apps/orca-slack-bridge/src/correlate/resolve.ts
+검증 방법: S0 테스트 13건과 live snapshot에서 확인했다(2026-08-22).
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-029
+상태: DECIDED
+결정: worker는 PR을 만든 뒤에 `worker_done`을 보낸다. PR identity는 `worker_done`에 싣지 않는다.
+      PR과 Orca의 유일한 연결점은 PR body의 correlation metadata(OD-021)다.
+근거:
+  - `worker_done`은 완료 신호인데 PR이 없으면 coordinator가 리뷰를 걸 수 없다.
+  - 연결 방향이 PR → task이므로 task 쪽에 PR을 실을 필요가 없다.
+  - orchestration 가이드가 worker 명령에서 raw `--payload` JSON을 피하라고 경고한다.
+    PowerShell이 JSON 따옴표를 쉽게 깨뜨리기 때문이다.
+대안과 기각 이유:
+  - `--payload`에 PR URL 포함: 위 quoting 위험이 있고 연결에 불필요하다. 기각.
+  - `worker_done` 먼저, PR 나중: 완료 보고와 리뷰 대상 사이에 창이 생긴다. 기각.
+영향 문서/파일: specs/orchestration-bootstrap-and-continuity.md §5, contracts/observation-and-correlation.md §3
+검증 방법: 첫 Run에서 PR 생성 시각이 worker_done보다 앞서는지 확인한다.
+결정일: 2026-08-22
+```
+
+```text
+ID: OD-073
+상태: DECIDED
+결정: reviewer는 자기 review task에 결과를 구조화해 기록한다.
+      orca orchestration task-update --id <review_task> --status completed --result <json>
+      {
+        "kind": "reviewer_result", "schemaVersion": 1,
+        "verdict": "approve" | "request_changes",
+        "pr": { "repo": "<owner/name>", "number": <n> },
+        "reviewedHeadSha": "<sha>",
+        "findings": [{ "severity": "blocker"|"major"|"minor", "file": "<path>", "line": <n>, "summary": "<text>" }],
+        "gates": { "<name>": "pass"|"fail" }
+      }
+      verdict가 request_changes여도 review task 자체는 completed다. 리뷰라는 작업은 끝났기 때문이다.
+근거:
+  - `task-update --result`가 중첩 객체·배열을 손실 없이 왕복 보존함을 실측했다.
+  - GitHub `reviewDecision`이 모든 대상 repository에서 null이므로 Orca가 유일한 durable source다(DL-016).
+  - severity taxonomy는 `vertical-live` reviewer가 이미 쓰는 값을 그대로 쓴다.
+  - `reviewedHeadSha`는 새 commit 이후 이전 approval의 유효성(OD-031)을 판정할 근거다.
+영향 문서/파일: contracts/observation-and-correlation.md §6, specs/orchestration-bootstrap-and-continuity.md §4
+검증 방법: 첫 Run의 review task에서 result를 읽어 스키마가 왕복되는지 확인한다.
+미검증: Windows에서 `--result` JSON 따옴표가 깨질 수 있다. 깨지면 파일 경유 수단을 찾는다.
 결정일: 2026-08-22
 ```

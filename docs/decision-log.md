@@ -179,3 +179,12 @@
 외부 write는 없다. `check`와 `--ack`는 클라이언트에 넣지 않았다.
 
 S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요한 C1에서, ingestion 정책(OD-023)은 상태를 갱신해야 하는 C1/C2에서 정한다.
+
+## 2026-08-22 · worker↔Bridge 계약
+
+### DL-025 · 첫 orchestration Run 전에 세 계약을 닫는다
+
+- OD-021 PR correlation metadata 형식, OD-029 PR/`worker_done` ordering, OD-073 reviewer-result 형식을 확정했다. OD-022는 S0 구현이 이미 만족하므로 함께 닫았다.
+- 이유: `/init-orchestrate` 스킬이 이 셋을 대상 repository 계약으로 넘기고 "계약이 없으면 묻는다"고 규정한다. 닫지 않으면 첫 Run이 부팅에서 멈춘다.
+- 더 중요한 이유: 닫지 않고 돌리면 첫 Run이 만드는 PR이 영구히 uncorrelated로 남는다. S0의 correlation 계층은 구현·검증됐으나 아직 correlated PR을 관측한 적이 없고, 이 Run이 그 첫 기회다.
+- 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 각 확정 기록에 있다.
