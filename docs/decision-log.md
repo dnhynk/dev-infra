@@ -135,7 +135,7 @@
 ### DL-019 · 작업 종류별 agent 배치를 동적으로 한다
 
 - coordinator는 모든 worker를 같은 기본 agent로 배치하지 않는다. 작업 종류와 난이도에 따라 brand·model·effort를 선택한다.
-- 정책 표는 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다. 10개 작업 종류에 대해 agent·model·effort를 지정한다.
+- 정책 표는 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다. 각 작업 종류에 대해 agent·model·effort를 지정한다.
 - `worker-start`의 `--agent`/`--model`/`--effort`로 표현한다. 새 메커니즘이 필요하지 않다.
 - 적용 여부는 요청값이 아니라 receipt의 `launch.effective`로 검증한다.
 - 배치가 다른 후속 Task에는 terminal을 재사용하지 않는다. `--model`/`--effort`가 `--terminal`과 결합 불가하기 때문이다.

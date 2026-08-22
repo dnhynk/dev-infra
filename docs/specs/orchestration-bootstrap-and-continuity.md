@@ -125,6 +125,8 @@ coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 work
 - 단순 반복의 `gpt-5.6-luna`는 벤더 설명이 "Fast and affordable agentic coding model"이다.
 - 사실 정리형 문서의 `gpt-5.6-terra`는 벤더 설명이 "Balanced agentic coding model for everyday work"로, 판단이 적은 정리 작업에 대응한다.
 - 리뷰 지적 반영 수정이 원 Dispatch 배치를 따르는 것은 [Coordinator 운영 계약](#4-coordinator-운영-계약)의 "수정 요청은 가능한 한 원 worker에게 돌린다"를 따른 결과다.
+- 실패·저확신 escalation에 `claude` `fable` `max`를 쓰는 것은 **사용자 판단**이다. 같은 배치로 다시 돌리면 같은 결론에 다시 도달하므로 계열을 바꾼다. 이 배치가 원 배치보다 나은 결과를 낸다는 실측은 없다.
+- escalation 트리거에 관측 가능한 저확신 신호 목록을 붙인 것은 무인 coordinator가 주관으로 판정할 수 없기 때문이다. 신호 없이 escalate를 허용하면 11행이 가장 비싼 기본 배치가 된다.
 
 `codex-auto-review`("Automatic approval review model for Codex")는 PR 리뷰의 대안 후보이나 모델 선택 UI에 노출되지 않고 동작을 검증하지 않았다. 검증 전에는 채택하지 않는다.
 
