@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 import type { PullRequestKey } from '../identity/keys.js';
@@ -261,7 +261,7 @@ type OpenedCopy = {
  * 파일을 바꾼다. 생성자가 부모 디렉터리와 DB 파일을 만들고 `PRAGMA journal_mode = WAL`과 DDL을
  * 쓰며 `close`가 checkpoint한다.
  *
- * 그래서 **원본을 아예 열지 않는다.** 원본에 하는 일은 `existsSync`와 `copyFileSync`뿐이고
+ * 그래서 **원본을 아예 열지 않는다.** 원본에 하는 일은 `statSync`와 `copyFileSync`뿐이고
  * SQLite 연결은 임시 디렉터리의 복사본에만 연다. 원본에 write handle이 생기지 않으므로 내용이
  * 바뀔 수 없고 `-wal`·`-shm` 같은 곁파일도 원본 옆에 생기지 않는다. 이것이 "아무것도 쓰지
  * 않는다"의 근거다. 파일이 없으면 복사할 것도 없으므로 열지 않고 "행 없음"으로 다룬다.
@@ -310,20 +310,46 @@ export class ReadOnlyDigestStore implements DigestStore {
 }
 
 /**
+ * 경로에 파일이 있는지 본다. **`ENOENT`만 부재로 접고 나머지 오류는 전파한다.**
+ *
+ * `existsSync`를 쓰지 않는 이유다. 그 함수는 경로 탐색 중의 `EACCES`·`EPERM`에서도 `false`를
+ * 돌려주므로, 읽을 수 없는 기존 store가 "없는 store"가 된다. 그러면 dry-run이 이미 루트가 있는
+ * PR을 `create`로 보고하고, 그 보고를 믿고 게시하면 루트가 하나 더 생긴다. 로드맵 §5의 "재관찰로
+ * 루트가 중복되지 않음"이 겨냥하는 실패가 이것이다. "판정할 수 없다"는 "없다"가 아니므로 조용히
+ * 넘어가지 않고 던진다. 조용한 발산이 시끄러운 실패보다 나쁘다(`win32StateBase`와 같은 이유).
+ *
+ * `ENOTDIR`도 전파한다. 경로 구성요소가 디렉터리가 아니면 그 자리에 DB가 있을 수 없다고 볼 수도
+ * 있지만, 그것은 "아직 만들지 않았다"가 아니라 store 경로 자체가 틀렸다는 뜻이다. 부재로 접으면
+ * 열릴 수 없는 경로를 dry-run이 `create`로 보고한다.
+ *
+ * 오류를 감싸지 않고 그대로 올린다. Node의 errno 오류는 이미 syscall과 경로를 message에 담고,
+ * 그 경로는 호출자가 준 store 경로라 채널 ID나 토큰처럼 가릴 값이 아니다.
+ */
+function pathExists(path: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw e;
+  }
+}
+
+/**
  * 원본을 임시 디렉터리에 복사해 연다. 원본이 없으면 아무것도 열지 않는다.
  *
  * 여는 도중 실패하면 임시 디렉터리를 남기지 않는다. 호출자는 생성자에서 던진 store의 `close`를
  * 부르지 않기 때문이다.
  */
 function openCopy(path: string): OpenedCopy {
-  if (!existsSync(path)) return { db: null, scratch: null, schemaReady: false };
+  if (!pathExists(path)) return { db: null, scratch: null, schemaReady: false };
 
   const scratch = mkdtempSync(join(tmpdir(), 'orca-slack-bridge-ro-'));
   let db: DatabaseSync | null = null;
   try {
     const copy = join(scratch, 'state.db');
     copyFileSync(path, copy);
-    if (existsSync(`${path}-wal`)) copyFileSync(`${path}-wal`, `${copy}-wal`);
+    if (pathExists(`${path}-wal`)) copyFileSync(`${path}-wal`, `${copy}-wal`);
     db = new DatabaseSync(copy);
     // 버전 판정은 실제 실행과 같은 함수를 쓴다. 모르는 버전이면 여기서도 던진다.
     const version = readSchemaVersion(db, path);
