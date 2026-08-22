@@ -59,7 +59,12 @@ export const SCHEMA_VERSION = 1;
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
 
-/** 열자마자 실행한다. WAL은 OD-043 결정이다. */
+/**
+ * 열자마자 실행한다. WAL은 OD-043 결정이다.
+ *
+ * 결과 mode를 반드시 읽는다. 전환에 실패해도 예외가 아니라 지금의 mode가 돌아오므로
+ * `exec`로 던져놓으면 WAL이 아닌 채로 열린다. 판정은 `sqlite.ts`의 `enableWal`에 있다.
+ */
 export const ENABLE_WAL = 'PRAGMA journal_mode = WAL';
 
 /**
