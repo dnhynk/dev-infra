@@ -99,27 +99,107 @@ owner user ID는 Gate 결정 권한의 근거다. Bridge는 room이나 channel �
 
 ## 5. Bridge에 주입
 
-토큰은 환경변수, 나머지는 저장소 밖 설정 파일에 둔다.
+**토큰은 환경변수, 식별자는 설정 파일**로 나눈다. 둘 다 저장소 밖이다.
 
-```text
-SLACK_APP_TOKEN=xapp-...     # Socket Mode 연결용
-SLACK_BOT_TOKEN=xoxb-...     # 메시지 생성·갱신용
+### 5-1. 토큰 — Windows 사용자 환경변수
+
+PowerShell에서 한 번 실행한다. `setx`는 레지스트리에 영구 기록한다.
+
+```powershell
+setx SLACK_BOT_TOKEN "xoxb-여기에-붙여넣기"
+setx SLACK_APP_TOKEN "xapp-여기에-붙여넣기"
 ```
 
-설정 파일 경로는 `ORCA_SLACK_BRIDGE_CONFIG` 또는 OS 기본 경로다. 현재 스키마는 [`config.example.json`](../../apps/orca-slack-bridge/config.example.json)에 있고, Slack 관련 키는 D2 구현 시점에 추가한다.
+**이미 떠 있는 프로세스에는 반영되지 않는다.** Orca 앱과 터미널을 재시작해야 새 프로세스가 값을 본다. `NVM_HOME` 때와 같은 성질이다([호스트 전제조건](../platform-capabilities.md#6-호스트-전제조건)).
 
-## 6. 확인
+현재 세션에서 바로 쓰려면 그 세션에만 추가로 설정한다.
 
-이 단계까지 끝나면 다음을 확인할 수 있어야 한다.
+```powershell
+$env:SLACK_BOT_TOKEN = "xoxb-..."
+$env:SLACK_APP_TOKEN = "xapp-..."
+```
 
-- App 설정 화면에서 Socket Mode가 켜져 있다.
-- Interactivity가 켜져 있고 Request URL은 비어 있다.
-- Bot token scope에 `chat:write`가 있다.
-- App-level token scope에 `connections:write`가 있다.
-- 대상 채널 멤버 목록에 봇이 있다.
-- `T…` / `C…` / `U…` 값을 모두 확보했다.
+> **범위에 대한 정직한 설명**: 사용자 환경변수는 같은 사용자로 실행되는 모든 프로세스가 읽는다. Orca가 띄우는 worker agent도 포함된다. 단일 사용자 머신에서 파일과 환경변수 사이에 실질적인 격리 차이는 없다. 의미 있는 경계는 **저장소에 넣지 않는다**, **로그에 남기지 않는다**, **Slack 메시지에 싣지 않는다** 세 가지다. Bridge는 토큰을 출력할 때 항상 마스킹한다.
 
-Socket Mode 연결과 메시지 게시의 실제 동작 확인은 Bridge가 Slack adapter를 구현한 뒤에 한다. **연결해 보기 전에는 "동작한다"고 기록하지 않는다.**
+### 5-2. 식별자 — 저장소 밖 설정 파일
+
+기본 경로는 `%APPDATA%\orca-slack-bridge\config.json`이다. `--config` 또는 `ORCA_SLACK_BRIDGE_CONFIG`로 바꿀 수 있다.
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\orca-slack-bridge" | Out-Null
+notepad "$env:APPDATA\orca-slack-bridge\config.json"
+```
+
+```json
+{
+  "slack": {
+    "teamId": "T01234567",
+    "ownerUserIds": ["U01234567"],
+    "channels": {
+      "prDigest": "C01234567",
+      "agentRuns": "C89ABCDEF"
+    }
+  },
+  "projects": [
+    { "name": "dev-infra", "repositories": ["dnhynk/dev-infra"] }
+  ]
+}
+```
+
+스키마 규칙:
+
+- `teamId`는 `T`, `ownerUserIds`는 `U`, 채널은 `C` 또는 `G`로 시작해야 한다. **채널 이름(`#pr-digest`)을 넣으면 거부한다.**
+- `ownerUserIds`는 비울 수 없다. Gate 결정 권한의 유일한 근거이기 때문이다.
+- **설정 어디에도 토큰을 넣으면 파싱이 거부한다.** `xoxb-`/`xapp-`로 시작하는 문자열이 발견되면 오류다. 잘못된 위치에 붙여넣는 사고를 막는 장치다.
+- `slack` 절은 선택이다. S0의 `snapshot`은 Slack을 쓰지 않으므로 없어도 동작한다.
+
+전체 스키마 예시는 [`config.example.json`](../../apps/orca-slack-bridge/config.example.json)에 있다.
+
+## 6. 검증
+
+설정과 토큰이 실제로 유효한지 확인한다. **메시지를 게시하지 않는다.**
+
+```powershell
+cd D:\dev-infra\apps\orca-slack-bridge
+pnpm build
+node dist/cli.js verify-slack
+```
+
+기대 출력:
+
+```text
+  OK   config.slack       team=T01234567 owners=1 channels=2
+  OK   SLACK_BOT_TOKEN    xoxb-1234…abcd (56자)
+  OK   auth.test          team=T01234567 bot_user=U0BOTID
+  OK   team 일치          설정과 같다
+  OK   SLACK_APP_TOKEN    xapp-1234…wxyz (60자)
+  OK   connections:write  WebSocket URL 발급 성공 (연결하지 않음)
+
+모든 확인 통과
+```
+
+무엇을 확인하는가:
+
+| 확인 | 방법 | 잡아내는 문제 |
+|---|---|---|
+| bot token 유효성 | `auth.test` | 만료·오타·잘못된 앱의 토큰 |
+| team 일치 | `auth.test`의 `team_id`와 설정 대조 | 다른 workspace의 토큰을 넣음 |
+| app token 유효성과 scope | `apps.connections.open` | `connections:write` 누락, bot token을 app token 자리에 넣음 |
+| 토큰 자리 바뀜 | 접두 검사 | `xoxb`/`xapp`를 서로 반대로 주입 |
+
+`apps.connections.open`은 만료되는 WebSocket URL을 발급받을 뿐 연결하지 않으며, URL은 출력하지 않는다.
+
+채널 ID 자체의 유효성은 확인하지 않는다. `conversations.info`가 `channels:read` scope를 요구하는데 그 scope를 부여하지 않았기 때문이다. 채널 ID가 틀리면 D2에서 첫 게시 시 드러난다.
+
+실패 시 진단:
+
+| 출력 | 원인 |
+|---|---|
+| `SLACK_BOT_TOKEN 환경변수가 비어 있다` | `setx` 후 터미널을 재시작하지 않았다 |
+| `xoxb-로 시작하지 않는다` | 두 토큰을 반대로 넣었다 |
+| `auth.test 실패: invalid_auth` | 토큰이 만료됐거나 앱을 재설치했다 |
+| `connections:write scope가 없다` | app-level token 생성 시 scope를 빠뜨렸다. 새로 발급해야 한다 |
+| `team 불일치` | 다른 workspace의 앱 토큰이다 |
 
 ## 알려진 제약
 

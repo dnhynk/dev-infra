@@ -1,7 +1,27 @@
 {
+  "slack": {
+    "teamId": "T01234567",
+    "ownerUserIds": [
+      "U01234567"
+    ],
+    "channels": {
+      "prDigest": "C01234567",
+      "agentRuns": "C89ABCDEF"
+    }
+  },
   "projects": [
-    { "name": "Tone & Move", "repositories": ["dnhynk/ToneAndMove"] },
-    { "name": "Vertical Live", "repositories": ["dnhynk/vertical-live"] }
+    {
+      "name": "dev-infra",
+      "repositories": [
+        "dnhynk/dev-infra"
+      ]
+    },
+    {
+      "name": "Vertical Live",
+      "repositories": [
+        "dnhynk/vertical-live"
+      ]
+    }
   ],
   "correlationKeys": {
     "run": "orca-run",

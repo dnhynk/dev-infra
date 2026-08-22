@@ -3,13 +3,17 @@ import { loadConfig, defaultConfigPath } from './project/config.js';
 import { GhCli } from './github/runner.js';
 import { OrcaCli } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
+import { verifySlack, formatVerify } from './slack/verify.js';
 
 function arg(argv: readonly string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-const USAGE = `orca-slack-bridge snapshot
+const USAGE = `orca-slack-bridge <snapshot|verify-slack>
+
+snapshot   Orca와 GitHub을 read-only로 1회 관찰한다
+verify-slack  Slack 토큰과 설정을 확인한다 (메시지를 게시하지 않는다)
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
