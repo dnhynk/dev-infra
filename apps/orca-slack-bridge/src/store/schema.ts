@@ -29,10 +29,12 @@ import type { PullRequestKey } from '../identity/keys.js';
  * 창 1 — crash. `chat.postMessage`가 성공한 뒤 `insertPrMessage` 전에 프로세스가 죽으면
  * 매핑 행이 없으므로 다음 실행이 루트를 하나 더 만든다.
  *
- * 창 2 — delivery unknown. 프로세스가 죽지 않아도, 요청은 Slack에 닿았는데 응답을 받지
- * 못하면 메시지가 만들어졌는지 알 수 없다. 호출자에게는 실패로 보이므로 매핑 행이 남지
- * 않고, 같은 실행의 재시도나 다음 관찰이 루트를 하나 더 만들 수 있다. 요청을 두 번 보내도
- * 같은 요청임을 Slack이 알아볼 안정적인 identity가 없으면 이 창은 닫히지 않는다.
+ * 창 2 — delivery unknown. 프로세스가 죽지 않아도 게시 여부를 알 수 없는 실패가 있다.
+ * 응답을 받지 못한 경우가 그렇고, 응답을 받았어도 Slack이 부분 성공 가능성을 명시하는
+ * 오류(`internal_error`, `fatal_error`)가 그렇다. 판정 기준은 `slack/post.ts`에 적었다.
+ * 호출자에게는 실패로 보이므로 매핑 행이 남지 않고, 같은 실행의 재시도나 다음 관찰이 루트를
+ * 하나 더 만들 수 있다. 요청을 두 번 보내도 같은 요청임을 Slack이 알아볼 안정적인 identity가
+ * 없으면 이 창은 닫히지 않는다.
  *
  * 두 창을 C1에서 닫지 않는다. 스펙 §9가 crash 경계별 atomicity와 outbox를 TBD로 두었고
  * 같은 성격의 미결정 항목이 OD-051이다. 지금 outbox나 2단계 commit이나 요청 idempotency
