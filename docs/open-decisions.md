@@ -637,7 +637,12 @@ ID: OD-034
     위 할당량 경합과 스캐폴딩 때문에 기각.
   - Anthropic API(haiku/opus): 동작하지만 luna 대비 5~25배 비싸고 이점이 없다. 기각.
 영향 문서/파일: apps/orca-slack-bridge/src/summarize
-검증 방법: 실제 PR 사실로 호출해 스키마 준수와 요약 품질을 확인한다.
+검증 방법: 실제 OpenAI API로 호출해 확인했다(2026-08-22).
+  - review 사실 없음 → reviewGist null, risk null. 3.0초
+  - review 사실 있음(blocker 1건) → reviewGist 채워짐, risk high. 2.2초
+  - 사실 지문이 같으면 재호출하지 않음(0ms)
+  스키마 필드 설명과 시스템 프롬프트를 넣은 뒤로는 review 입력 없이 reviewGist를 채우는
+  현상이 재현되지 않았다. 검증 계층은 그래도 유지한다.
 결정일: 2026-08-22
 ```
 
