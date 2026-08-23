@@ -28,6 +28,8 @@ import type { SummaryFacts } from '../src/summarize/contract.js';
 
 const RUN = 'run_test0001';
 const TASK = 'task_worker01';
+/** 같은 PR을 이어서 갱신하는 두 번째 Task(OD-076). */
+const SECOND_TASK = 'task_worker02';
 const REVIEW_TASK = 'task_review01';
 const REPO = 'o/r';
 const REPO_ID = 4242;
@@ -81,6 +83,18 @@ class FakeOrca implements OrcaRunner {
             created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
             created_at: '2026-08-22 00:00:00',
             completed_at: '2026-08-22 01:00:00',
+          },
+          {
+            id: SECOND_TASK,
+            run_id: RUN,
+            task_title: '후속 수정',
+            display_name: '후속 수정',
+            status: 'completed',
+            deps: '[]',
+            result: '{"provenance":"worker_report"}',
+            created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
+            created_at: '2026-08-22 00:05:00',
+            completed_at: '2026-08-22 01:05:00',
           },
           {
             id: REVIEW_TASK,
@@ -575,5 +589,104 @@ describe('C1 출구 조건', () => {
     expect(flat).not.toContain('--ack');
     expect(flat).not.toContain('check');
     expect(flat).not.toContain('task-update');
+  });
+});
+
+/**
+ * PR↔Task N 연관(OD-076)과 run-only degraded 입력(OD-077).
+ *
+ * store를 직접 열어 확인한다. `runDigest`의 반환값에는 저장된 연관이 실려 있지 않고, OD-076이
+ * 요구한 것은 "body가 latest 하나만 담아도 store에는 둘 다 남는다"이므로 판정 근거는 파일이다.
+ */
+describe('PR↔Task 연관과 degraded 입력', () => {
+  /** 같은 store 파일을 다시 열어 저장된 연관을 읽는다. */
+  function storedTasks(prKey: `pr:${number}#${number}`) {
+    const store = new SqliteDigestStore(dbPath);
+    try {
+      return store.listPrTasks(prKey);
+    } finally {
+      store.close();
+    }
+  }
+
+  const bodyFor = (task: string) =>
+    ['사람이 읽는 본문', '', `<!-- orca-run: ${RUN} -->`, `<!-- orca-task: ${task} -->`].join('\n');
+
+  it('두 Task가 한 PR을 갱신하면 body는 latest 하나이고 store에는 둘 다 남는다', async () => {
+    const slack = new FakeSlack();
+    const provider = new StubProvider();
+
+    const first = await digestOnce({ slack, provider, prs: [prRow({ body: bodyFor(TASK) })] });
+    expect(card(first).key).toBe(`pr:${REPO_ID}#7`);
+
+    // 두 번째 관찰의 body는 latest Task 하나만 가리킨다. 형식도 parser도 그대로다(OD-076).
+    const second = await digestOnce({ slack, provider, prs: [prRow({ body: bodyFor(SECOND_TASK) })] });
+    expect(card(second).key).toBe(`pr:${REPO_ID}#7`);
+    // 카드는 body의 latest Task 하나를 따른다. Task 목적이 그 Task의 제목으로 바뀐다.
+    expect(provider.calls.map((f) => f.taskPurpose)).toEqual(['digest CLI 통합', '후속 수정']);
+
+    const rows = storedTasks(`pr:${REPO_ID}#7`);
+    // 이것이 OD-076의 검증이다. 앞 Task가 뒤 Task에 덮이지 않는다.
+    expect(rows.map((r) => r.taskKey)).toEqual([`task:${TASK}`, `task:${SECOND_TASK}`]);
+    expect(rows.every((r) => r.runKey === `run:${RUN}`)).toBe(true);
+    // 루트는 하나뿐이다. Task가 바뀌었다고 카드를 새로 만들지 않는다.
+    expect(slack.posts).toHaveLength(1);
+  });
+
+  it('같은 Task를 반복 관측해도 연관 행이 늘지 않는다', async () => {
+    const slack = new FakeSlack();
+    await digestOnce({ slack });
+    await digestOnce({ slack });
+    expect(storedTasks(`pr:${REPO_ID}#7`)).toHaveLength(1);
+  });
+
+  it('dry-run은 연관을 기록하지 않는다', async () => {
+    await digestOnce({ slack: null });
+    expect(storedTasks(`pr:${REPO_ID}#7`)).toEqual([]);
+  });
+
+  // OD-077. orca-run은 있고 필수 orca-task가 없는 입력이다.
+  it('run-only PR은 degraded로 명시하고 카드도 연관도 만들지 않는다', async () => {
+    const slack = new FakeSlack();
+    const runOnly = prRow({
+      number: 9,
+      url: `https://github.com/${REPO}/pull/9`,
+      title: 'fix: run만 있는 PR',
+      headRefName: 'c2/correlation-store',
+      body: ['사람이 읽는 본문', '', `<!-- orca-run: ${RUN} -->`].join('\n'),
+    });
+    const report = await digestOnce({ slack, prs: [runOnly] });
+
+    expect(report.results).toEqual([
+      { kind: 'skipped', key: `pr:${REPO_ID}#9`, reason: 'run_only_degraded' },
+    ]);
+    // Task 카드를 만들지 않는다.
+    expect(slack.posts).toHaveLength(0);
+    expect(slack.updates).toHaveLength(0);
+    // branch 이름·제목·author로 Task를 보완하지 않는다. 저장된 연관이 없다는 것이 그 근거다.
+    expect(storedTasks(`pr:${REPO_ID}#9`)).toEqual([]);
+
+    // 사람이 읽는 출력에서 정상 출력과 구분된다.
+    const out = formatReport(report);
+    expect(out).toContain('invalid/degraded input');
+    expect(out).toContain('OD-077');
+  });
+
+  it('uncorrelated는 정상 출력으로, run-only는 degraded로 서로 다르게 적는다', async () => {
+    const out = formatReport(
+      await digestOnce({
+        slack: new FakeSlack(),
+        prs: [
+          prRow({ number: 8, url: `https://github.com/${REPO}/pull/8`, body: 'metadata 없는 본문' }),
+          prRow({
+            number: 9,
+            url: `https://github.com/${REPO}/pull/9`,
+            body: `<!-- orca-run: ${RUN} -->`,
+          }),
+        ],
+      }),
+    );
+    expect(out).toContain('uncorrelated — 실패가 아니라 정상 출력이다(OD-022)');
+    expect(out).toContain('run_only_degraded — invalid/degraded input이다');
   });
 });

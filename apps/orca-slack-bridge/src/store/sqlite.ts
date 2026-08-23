@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
-import type { PullRequestKey } from '../identity/keys.js';
+import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import {
   ENABLE_WAL,
   MIGRATIONS,
@@ -11,8 +11,10 @@ import {
   STATE_PATH_VAR,
   type DigestStore,
   type NewPrMessage,
+  type NewPrTask,
   type ObservationRecord,
   type PrMessageRecord,
+  type PrTaskRecord,
 } from './schema.js';
 
 /**
@@ -170,6 +172,24 @@ UPDATE pr_message
    SET render_fingerprint = ?, facts_fingerprint = ?, summary_json = ?, updated_at = ?
  WHERE pr_key = ?`;
 
+/**
+ * (PR, Task) 쌍을 기록한다. 이미 있으면 `last_seen_at`만 옮긴다.
+ *
+ * `ON CONFLICT DO UPDATE`를 쓰는 이유는 두 문장으로 나누면 조회와 갱신 사이에 판정이 낡기
+ * 때문이다. `run_key`와 `first_seen_at`은 갱신하지 않는다. 처음 관측한 사실이므로 뒤 관찰이
+ * 덮을 값이 아니다.
+ */
+const UPSERT_PR_TASK = `
+INSERT INTO pr_task (pr_key, task_key, run_key, first_seen_at, last_seen_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (pr_key, task_key) DO UPDATE SET last_seen_at = excluded.last_seen_at`;
+
+// 순서를 SQL에서 고정한다. 지정하지 않으면 같은 파일이 실행마다 다른 순서를 낼 수 있다.
+const SELECT_PR_TASKS = `
+SELECT pr_key, task_key, run_key, first_seen_at, last_seen_at
+  FROM pr_task WHERE pr_key = ?
+ ORDER BY first_seen_at, task_key`;
+
 /** sqlite가 돌려주는 pr_message 한 행. 컬럼명 그대로다. */
 type PrMessageRow = {
   readonly pr_key: string;
@@ -182,6 +202,25 @@ type PrMessageRow = {
   readonly created_at: string;
   readonly updated_at: string;
 };
+
+/** sqlite가 돌려주는 pr_task 한 행. 컬럼명 그대로다. */
+type PrTaskRow = {
+  readonly pr_key: string;
+  readonly task_key: string;
+  readonly run_key: string;
+  readonly first_seen_at: string;
+  readonly last_seen_at: string;
+};
+
+function toPrTaskRecord(row: PrTaskRow): PrTaskRecord {
+  return {
+    prKey: row.pr_key as PullRequestKey,
+    taskKey: row.task_key as TaskKey,
+    runKey: row.run_key as RunKey,
+    firstSeenAt: row.first_seen_at,
+    lastSeenAt: row.last_seen_at,
+  };
+}
 
 function toRecord(row: PrMessageRow): PrMessageRecord {
   return {
@@ -259,6 +298,16 @@ export class SqliteDigestStore implements DigestStore {
     }
   }
 
+  recordPrTask(input: NewPrTask): void {
+    this.db
+      .prepare(UPSERT_PR_TASK)
+      .run(input.prKey, input.taskKey, input.runKey, input.at, input.at);
+  }
+
+  listPrTasks(prKey: PullRequestKey): readonly PrTaskRecord[] {
+    return (this.db.prepare(SELECT_PR_TASKS).all(prKey) as PrTaskRow[]).map(toPrTaskRecord);
+  }
+
   close(): void {
     // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -323,6 +372,16 @@ export class ReadOnlyDigestStore implements DigestStore {
 
   updateObservation(): void {
     throw new Error(`dry-run은 store에 쓰지 않는다. 관찰 결과를 갱신하려 했다: ${this.path}`);
+  }
+
+  recordPrTask(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. PR↔Task 연관을 기록하려 했다: ${this.path}`);
+  }
+
+  listPrTasks(prKey: PullRequestKey): readonly PrTaskRecord[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_PR_TASKS).all(prKey) as PrTaskRow[]).map(toPrTaskRecord);
   }
 
   close(): void {

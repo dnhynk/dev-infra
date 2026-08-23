@@ -370,13 +370,18 @@ describe('카드 대상 판정', () => {
     expect(p).toEqual({ kind: 'skipped', key: pullRequestKey(REPO.githubId, 1), reason: 'conflict' });
   });
 
-  it('correlated지만 task가 없으면 task_missing이다', async () => {
+  // OD-077. run만 있고 필수 task가 없는 입력은 invalid/degraded이며 정상 출력과 구분된다.
+  it('correlated지만 task가 없으면 run_only_degraded다', async () => {
     const p = projectPullRequest(
       REPO, pr(),
       { kind: 'correlated', run: runKey('run_7804be5a654f'), task: null, dispatch: null },
       await facts(), CONFIG,
     );
-    expect(p).toEqual({ kind: 'skipped', key: pullRequestKey(REPO.githubId, 1), reason: 'task_missing' });
+    expect(p).toEqual({
+      kind: 'skipped',
+      key: pullRequestKey(REPO.githubId, 1),
+      reason: 'run_only_degraded',
+    });
   });
 });
 

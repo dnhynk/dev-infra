@@ -71,10 +71,13 @@ export type DigestAction =
   /** 매핑 행이 있고 렌더 지문이 같다. Slack을 호출하지 않는다. */
   | 'skip'
   /**
-   * 매핑 행의 채널이 설정의 대상 채널과 다르다. Slack에도 store에도 쓰지 않는다.
+   * 매핑 행의 채널이 설정의 대상 채널과 다르다. Slack에도 `pr_message` 매핑에도 쓰지 않는다.
    *
    * 예전 채널의 ts로 update하면 사람이 보는 채널이 아닌 곳을 갱신하고, 새로 게시하면 루트가
    * 둘이 된다. 어느 쪽도 조용히 고르지 않고 불일치를 드러낸다(UX §6).
+   *
+   * PR↔Task 연관은 그래도 남는다. 그것은 게시 대상 채널과 무관하게 이번 관찰이 관측한
+   * 사실이고, 불일치가 풀릴 때까지 버리면 그 사이의 Task를 영영 잃는다(OD-076).
    */
   | 'channel_mismatch';
 
@@ -218,6 +221,19 @@ async function digestOne(
     options.config.correlationKeys,
   );
   const factsFp = factsFingerprint(facts);
+
+  // PR body는 primary/latest Task 하나만 담으므로, 기록하지 않으면 이전 Task와의 연관을
+  // 다음 관찰이 복원할 수 없다(OD-076). 이 사실은 카드를 게시하는지·채널이 맞는지와 무관하게
+  // 이번 관찰이 관측한 것이므로 아래 Slack 게이트보다 앞에 둔다. dry-run은 store에 쓰지 않는다.
+  if (options.slack !== null) {
+    options.store.recordPrTask({
+      prKey: pr.key,
+      taskKey: pr.correlation.task,
+      runKey: pr.correlation.run,
+      at: options.now().toISOString(),
+    });
+  }
+
   const existing = options.store.findPrMessage(pr.key);
 
   // 게이트 A. 요약 입력이 그대로면 저장된 문구를 되살리고 provider를 부르지 않는다(OD-035).
@@ -301,6 +317,20 @@ async function digestOne(
 const REASON_CAP = 200;
 
 /**
+ * skip 이유마다 그것이 정상 출력인지 degraded 입력인지 한 줄로 말한다.
+ *
+ * reason 문자열만 찍으면 셋이 같은 무게로 보인다. `uncorrelated`는 정상 출력이고(OD-022)
+ * `run_only_degraded`는 계약을 어긴 입력이므로(OD-077) 사람이 그 차이를 봐야 한다.
+ */
+const SKIP_NOTE: Record<PrSkipReason, string> = {
+  uncorrelated: '실패가 아니라 정상 출력이다(OD-022)',
+  conflict: '모순을 자동으로 한쪽으로 덮지 않는다(OD-022)',
+  run_only_degraded:
+    'invalid/degraded input이다. orca-run은 있고 필수 orca-task가 없다(OD-021, OD-077). ' +
+    'branch 이름·제목·author로 Task를 보완하지 않는다',
+};
+
+/**
  * 사람이 읽는 보고.
  *
  * dry-run에서는 게시할 blocks를 그대로 출력한다. 실제 게시 전에 내용을 눈으로 확인하는 것이
@@ -313,7 +343,7 @@ export function formatReport(report: DigestReport): string {
   ];
   for (const r of report.results) {
     if (r.kind === 'skipped') {
-      lines.push(`${r.key}  카드 없음: ${r.reason}`);
+      lines.push(`${r.key}  카드 없음: ${r.reason} — ${SKIP_NOTE[r.reason]}`);
       continue;
     }
     lines.push(`${r.identity}  ${r.action}`);
