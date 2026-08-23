@@ -234,7 +234,42 @@ permission으로 단정하지 않는다(OD-067).
 
 비율을 전제하는 그래픽 progress bar는 사용하지 않는다(OD-069).
 
-### 3.2 Gate 결정 카드
+### 3.2 컬렉션 루트
+
+`#agent-runs`에는 Run 카드 말고 **컬렉션 루트가 하나 더 있다.** 관찰마다 갱신되는 메시지 하나이고
+**등록된 Run 수와 무관하게 항상 게시된다**(OD-080). 등록 열쇠(Orca repository id)가 통째로 어긋나면
+Run 카드가 하나도 없는데, 미등록 수를 보여야 하는 구간이 바로 그때이기 때문이다.
+
+```text
+📋 *관찰 요약* · Run 카드 0장 · 등록되지 않은 Run 1건
+이 메시지는 관찰마다 갱신되는 컬렉션 루트다. 등록된 Run이 하나도 없어도 남는다 — 등록 열쇠가 통째로 어긋난 구간에서도 미등록 수가 보여야 하기 때문이다
+
+*등록되지 않은 Run*
+1
+• run_aaa — 관측된 Orca repository id: other-id
+    ↳ [unregistered_repository] 관측된 Orca repository id가 설정에 없다: other-id
+각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의 projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해 등록 여부를 아직 판정하지 못한 것이다
+
+*degraded*
+관찰 전체
+• [unverified_platform_assumption] live/stale 판정은 run-use가 consumer_generation을 올린다는 미검증 가정 위에 있다
+Run 하나에 귀속되는 degraded는 그 Run의 카드에 있다
+```
+
+위 블록은 `renderRunCollectionCard`를 `cards: 0`과 §3.1이 쓴 것과 같은 미등록 Run 1건
+(`run_aaa`, `other-id`, `unregistered_repository`) · 컬렉션 degraded 1건
+(`unverified_platform_assumption`)으로 돌린 출력을 손대지 않고 옮긴 것이다. Slack 알림용
+fallback `text`는 `관찰 요약 · Run 카드 0장 · 등록되지 않은 Run 1건`이고 이 블록에 없다.
+
+이 카드에는 Run identity·진행·blocker가 없다. 컬렉션에 귀속되지 않는 사실이기 때문이다.
+미등록 Run 수와 컬렉션 수준 degraded는 Run 카드에도 실린다 — **중복은 의도다.** Run 카드 쪽은
+그 Run을 보는 사람이 컬렉션 사실을 함께 보게 하고, 이 카드 쪽은 Run 카드가 하나도 없어도 그
+사실이 남게 한다.
+
+**이 채널에 무엇을 덧붙이든 이 루트가 이미 있다는 것을 전제한다.** Run 하나에 귀속되지 않는
+표면을 새로 만들기 전에 이 카드에 실을 수 있는지 먼저 본다.
+
+### 3.3 Gate 결정 카드
 
 Run thread에 표시한다.
 
@@ -268,7 +303,7 @@ B
 버튼 label은 짧게 유지한다. 사람이 읽는 question/options 요약과 별도로 안정적 option ID·설명·recommendation·impact를
 Bridge sidecar에 저장해 Gate ID와 연결하고, action은 이 metadata로 판정한다(OD-050).
 
-### 3.3 자유형 결정 modal
+### 3.4 자유형 결정 modal
 
 `[직접 입력]`은 해당 Gate에 연결된 modal을 연다.
 
@@ -287,7 +322,7 @@ modal 제출 text는 해당 Gate의 `resolution`으로 저장한다. 일반 Slac
 필수값·형식 오류는 3초 안에 해당 input block에 `response_action=errors`로 표시해 modal을 유지한다.
 원격 Orca 작업이 끝나기를 ACK 전에 기다리지 않는다(OD-071).
 
-### 3.4 결정 기록과 작업 재개
+### 3.5 결정 기록과 작업 재개
 
 Orca resolution 성공 뒤:
 

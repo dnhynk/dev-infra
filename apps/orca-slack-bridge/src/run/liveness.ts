@@ -93,9 +93,19 @@ export function runIdentity(run: OrcaRun, tasks: readonly OrcaTask[]): RunIdenti
     if (found === undefined) grouped.set(key, { binding, tasks: 1 });
     else found.tasks += 1;
   }
+  // generation 오름차순이되 tie를 `bindingKey`로 깬다. **입력 순서에 tie를 남기지 않는다.**
+  // 같은 generation에 handle이나 paneKey가 다른 binding이 둘 이상이면 그 순서가 `task-list`의
+  // 출력 순서로 갈리고, Orca 정렬이 바뀌면 사실이 그대로여도 카드의 identity 절이 뒤바뀌어
+  // 렌더 지문이 흔들린다. 그러면 `publish.ts`의 `skip`이 발화하지 않는다.
   const observed: ObservedBinding[] = [...grouped.values()]
     .map((g) => ({ ...g, liveness: classifyBinding(run, g.binding) }))
-    .sort((a, b) => a.binding.generation - b.binding.generation);
+    .sort((a, b) => {
+      if (a.binding.generation !== b.binding.generation) {
+        return a.binding.generation - b.binding.generation;
+      }
+      const [x, y] = [bindingKey(a.binding), bindingKey(b.binding)];
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
 
   const liveness: BindingLiveness = observed.some((o) => o.liveness === 'live')
     ? 'live'

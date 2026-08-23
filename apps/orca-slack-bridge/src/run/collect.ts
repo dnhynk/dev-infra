@@ -76,6 +76,28 @@ function unreadableDegraded(f: UnreadableField): RunDegraded {
   };
 }
 
+/**
+ * 읽지 못한 칸의 표시 순서. **입력 순서에 tie를 남기지 않는 total order다.**
+ *
+ * `askThreadsFrom`이 주는 목록은 Orca `inbox`의 행 순서를 그대로 물려받는다. 그 순서로 degraded를
+ * 그리면 Orca 정렬이 바뀔 때 카드의 degraded 절이 뒤바뀌어 지문이 흔들린다. Run 목록과 blocker
+ * entry에 건 것과 같은 규율이다.
+ */
+function byUnreadableField(a: UnreadableField, b: UnreadableField): number {
+  const key = (f: UnreadableField): string =>
+    [f.subject, f.id, f.field, f.reason].join('\u0000');
+  const [x, y] = [key(a), key(b)];
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/** id 오름차순. Orca 조회 출력 순서가 카드에 새지 않게 원천에서 고정한다. */
+function byId<T>(pick: (row: T) => string): (a: T, b: T) => number {
+  return (a, b) => {
+    const [x, y] = [pick(a), pick(b)];
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+}
+
 async function readRunSources(orca: OrcaRunner, run: OrcaRun): Promise<RunSources> {
   // legacy Run은 읽기 전용 placeholder다. Task/Gate 조회를 시도하지 않는다(snapshot.ts와 같다).
   if (run.legacy) {
@@ -94,20 +116,24 @@ async function readRunSources(orca: OrcaRunner, run: OrcaRun): Promise<RunSource
   let taskCount = 0;
   try {
     const page = await listTaskPage(orca, run.id);
-    tasks = page.tasks;
+    // 원천 행의 순서를 여기서 고정한다. `unreadableTaskFields`·`unreadableGateFields`와 아래
+    // worker-show 실패가 이 순서 그대로 degraded 줄이 되고, 그 줄들이 카드에 그려진다. Orca
+    // 정렬이 바뀌면 사실이 그대로여도 지문이 흔들려 `publish.ts`의 `skip`이 발화하지 않는다.
+    // 집계(`aggregateTasks`·`aggregateDispatches`)와 badge 순서는 이 순서에 의존하지 않는다.
+    tasks = [...page.tasks].sort(byId((t) => t.id));
     taskCount = page.count;
   } catch (e) {
     degraded.push({ kind: 'query_failed', detail: `task-list 실패: ${message(e)}` });
   }
   let gates: readonly OrcaGate[] = [];
   try {
-    gates = await listGates(orca, run.id);
+    gates = [...(await listGates(orca, run.id))].sort(byId((g) => g.id));
   } catch (e) {
     degraded.push({ kind: 'query_failed', detail: `gate-list 실패: ${message(e)}` });
   }
   let workers: readonly OrcaWorker[] = [];
   try {
-    workers = await listWorkers(orca, run.id);
+    workers = [...(await listWorkers(orca, run.id))].sort(byId((w) => w.dispatchId));
   } catch (e) {
     degraded.push({ kind: 'query_failed', detail: `worker-list 실패: ${message(e)}` });
   }
@@ -254,7 +280,11 @@ export async function collectRunFacts(
   options: CollectOptions = {},
 ): Promise<RunCollection> {
   const now = options.now ?? (() => new Date());
-  const runs = await listRuns(orca);
+  // `runId`로 고정한다. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 미등록 목록의
+  // 상위 ENTRY_CAP건과 run-row degraded 줄의 순서가 관찰마다 뒤바뀌고, 사실이 그대로여도 렌더
+  // 지문이 흔들려 `publish.ts`의 `skip`이 컬렉션 카드와 모든 Run 카드에서 발화하지 않는다.
+  // `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 `ORDER BY`로 같은 것을 막는다.
+  const runs = [...(await listRuns(orca))].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
   const degraded: RunDegraded[] = [
     {
@@ -284,7 +314,9 @@ export async function collectRunFacts(
       detail: `inbox 실패: ${message(e)}. ask와 escalation badge가 없다`,
     });
   }
-  for (const f of askInbox.unreadable) degraded.push(unreadableDegraded(f));
+  for (const f of [...askInbox.unreadable].sort(byUnreadableField)) {
+    degraded.push(unreadableDegraded(f));
+  }
   // 포화는 **무조건** 컬렉션 수준으로 드러낸다. 이 Run에 미답 ask가 보일 때만 알리면 포화의 더
   // 나쁜 방향 — ask 행 자체가 조회 창 밖으로 밀려 badge도 degraded도 없이 사라지는 경우 — 이
   // 아무 흔적 없이 지나간다. 그 경우가 바로 아무것도 보이지 않는 경우다(OD-072).

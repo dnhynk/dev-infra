@@ -91,6 +91,24 @@ export type BlockerInput = {
   readonly agentWaits: readonly { readonly worker: OrcaWorker; readonly wait: OrcaAgentWait }[];
 };
 
+/**
+ * badge 안의 entry 순서. **입력 순서에 tie를 남기지 않는 total order다.**
+ *
+ * entry는 Orca `task-list`·`gate-list`·`worker-list`·`inbox`가 준 순서 그대로 쌓인다. 그 순서에
+ * 기대면 Orca 정렬이 바뀔 때 `render.ts`가 싣는 상위 ENTRY_CAP건과 그 나열이 관찰마다 뒤바뀌고,
+ * 사실이 그대로여도 렌더 지문이 흔들려 `publish.ts`의 `skip`이 발화하지 않는다. `collect.ts`가
+ * Run 목록에, `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 PR 목록에 거는 것과 같은 규율이다.
+ *
+ * **`detail`까지 키에 넣는다.** 앞의 네 ID가 모두 같은 두 entry가 생기면 그 tie가 입력 순서로
+ * 갈리고, 그러면 이 함수가 막으려던 것이 그 자리에 그대로 남는다.
+ */
+function byEntryKey(a: BlockerEntry, b: BlockerEntry): number {
+  const key = (e: BlockerEntry): string =>
+    [e.taskId ?? '', e.dispatchId ?? '', e.gateId ?? '', e.messageId ?? '', e.detail].join('\u0000');
+  const [x, y] = [key(a), key(b)];
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
 function entry(e: Partial<BlockerEntry> & { readonly detail: string }): BlockerEntry {
   return {
     taskId: e.taskId ?? null,
@@ -167,7 +185,7 @@ export function aggregateBlockers(input: BlockerInput): BlockerFacts {
   for (const source of BLOCKER_ORDER) {
     const entries = bySource.get(source);
     if (entries === undefined || entries.length === 0) continue;
-    badges.push({ source, count: entries.length, entries });
+    badges.push({ source, count: entries.length, entries: [...entries].sort(byEntryKey) });
   }
   return {
     badges,

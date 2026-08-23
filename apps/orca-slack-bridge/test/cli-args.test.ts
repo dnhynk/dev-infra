@@ -158,6 +158,56 @@ describe('runs 옵션', () => {
   });
 });
 
+/*
+ * 하이픈이 모자란 오타(OD-072의 write 규율).
+ *
+ * 회귀 방지: 검사가 `--`로 시작하는 토큰만 보면 `-dry-run`과 `dry-run`이 통과해 dryRun=false로
+ * 내려간다. 그러면 확인 없이 실제 채널에 게시된다 — `unknownWriteFlag`가 막으려던 결과 그대로다.
+ * `--dry-runn` 형태만 고정하면 이 구멍이 그대로 남는다.
+ */
+describe('write 명령의 하이픈 오타와 떠도는 위치 인자', () => {
+  for (const command of ['digest', 'runs'] as const) {
+    it(`${command}는 하이픈이 모자란 --dry-run 오타를 거부한다`, () => {
+      for (const typo of ['-dry-run', 'dry-run']) {
+        const p = parseArgs([command, typo]);
+        expect(p.kind).toBe('error');
+        if (p.kind === 'error') {
+          expect(p.message).toContain(command);
+          expect(p.message).toContain(typo);
+        }
+      }
+    });
+
+    it(`${command}는 값이 아닌 떠도는 위치 인자를 거부한다`, () => {
+      const p = parseArgs([command, '--dry-run', 'state.db']);
+      expect(p.kind).toBe('error');
+      if (p.kind === 'error') expect(p.message).toContain('state.db');
+    });
+  }
+
+  /*
+   * 대조군. 값 자리의 정상 토큰은 위치 인자가 아니다 — 거부하면 정상 호출이 통째로 막힌다.
+   * 값이 플래그 이름처럼 생겼어도 값 자리에 있으면 값이다.
+   */
+  it('값 자리의 정상 토큰은 거부하지 않는다', () => {
+    expect(parseArgs(['runs', '--state', 'state.db', '--dry-run']).kind).toBe('run');
+    expect(parseArgs(['digest', '--pr', '5', '--state', 'dry-run', '--dry-run']).kind).toBe('run');
+    const p = parseArgs(['digest', '--config', 'c.json', '--orca', 'orca', '--pr-limit', '10']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.configPath).toBe('c.json');
+      expect(p.orcaBin).toBe('orca');
+      expect(p.prLimit).toBe(10);
+    }
+  });
+
+  // write하지 않는 명령의 기존 동작은 바꾸지 않는다. 무시가 무해한 쪽에서 뺏을 것이 없다.
+  it('write하지 않는 명령의 위치 인자는 그대로 흐른다', () => {
+    expect(parseArgs(['snapshot', 'dry-run']).kind).toBe('run');
+    expect(parseArgs(['snapshot', '-dry-run']).kind).toBe('run');
+  });
+});
+
 describe('값 플래그의 값', () => {
   // 회귀 방지: 이전 버전은 `digest --pr`을 pr=null로 흘렸다. 좁히려던 의도와 반대로
   // 설정의 모든 PR에 실제 게시된다.

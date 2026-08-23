@@ -290,8 +290,17 @@ describe('runs 명령 배선', () => {
     expect(out).toContain('unregistered_repository');
   });
 
-  // dry-run은 Slack에도 store에도 쓰지 않는다. 세 겹으로 막힌다 —
-  // poster가 null이고, store가 읽기 전용이며, 그 store는 원본 파일을 열지도 않는다.
+  // dry-run이 막는 것은 두 종류이고 겹 수가 다르다.
+  //
+  // - **Slack write는 한 겹이다** — `runsPoster`가 `null`이라 `publish.ts`가 write 경로에
+  //   들어가지 않는다. 이 한 겹뿐이다. 실측: 이 한 겹만 끊고 store는 `ReadOnlyDigestStore`로 둔
+  //   채 `runRunObserver`를 돌리면 `chat.postMessage`가 **1건 실제로 나간 뒤에** store가 던진다.
+  //   store 겹은 Slack 호출 **뒤에** 오므로 Slack을 막지 못한다.
+  // - **store write는 두 겹이다** — store가 읽기 전용이라 세 write가 전부 던지고, 그 store는
+  //   원본 파일을 열지도 않아 파일 부작용도 없다.
+  //
+  // 그래서 "여러 겹이니 하나 건드려도 안전하다"가 아니다. `runsPoster`를 건드리면 실제 채널에
+  // 쓴다. 아래 테스트가 고정하는 것은 store 겹이다.
   it('dry-run은 store 파일을 만들지 않는다', async () => {
     const { code } = await captureRun(
       ['runs', '--dry-run', '--state', statePath],

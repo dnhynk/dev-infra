@@ -74,7 +74,7 @@ const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
 /**
  * 되돌릴 수 없는 외부 write를 하는 명령.
  *
- * 이 목록의 명령만 모르는 플래그를 거부한다. 근거는 `unknownWriteFlag`에 있다.
+ * 이 목록의 명령만 모르는 인자를 거부한다. 근거는 `unknownWriteFlag`에 있다.
  */
 const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs'];
 
@@ -93,7 +93,7 @@ const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs'];
  * 값이 `--`로 시작하면 오류로 본다. 값을 요구하는 자리에 플래그가 온 것이므로 오타이거나 값
  * 누락이다. `--config`·`--orca`·`--state`의 값이 `--`로 시작하는 정상적인 호출은 없다.
  *
- * `unknownDigestFlag`와 달리 이 검사는 **모든 명령**에 건다. 모르는 플래그를 무시하는 것은
+ * `unknownWriteFlag`와 달리 이 검사는 **모든 명령**에 건다. 모르는 인자를 무시하는 것은
  * `snapshot`에서 무해하지만, 값 없는 값 플래그는 어느 명령에서도 유효한 호출이 아니어서 뺏을
  * 정상 동작이 없다. 원인도 명령별이 아니라 `arg()` 한 곳에 있으므로 명령별 특례를 두지 않는다.
  */
@@ -109,25 +109,37 @@ function missingFlagValue(argv: readonly string[]): string | null {
 }
 
 /**
- * write하는 명령이 모르는 플래그를 찾는다. 없으면 null.
+ * write하는 명령이 모르는 인자를 찾는다. 없으면 null.
  *
- * 이 파서는 `indexOf`로 아는 이름만 찾으므로 모르는 플래그를 조용히 무시한다. `snapshot`과
+ * 이 파서는 `indexOf`로 아는 이름만 찾으므로 모르는 인자를 조용히 무시한다. `snapshot`과
  * `verify-slack`에서는 무시가 무해하지만 `digest`와 `runs`는 되돌릴 수 없는 외부 write를 한다.
  * `--dry-run`을 한 글자 틀리면 확인 없이 실제 채널에 게시된다. 그래서 write하는 명령에만
  * 검사를 건다. 다른 명령의 기존 동작은 바꾸지 않는다.
  *
+ * **`--`로 시작하는 토큰만 보지 않는다.** `runs -dry-run`과 `runs dry-run`은 하이픈이 모자란
+ * 오타이지 다른 뜻의 호출이 아닌데, `--`로 시작하는 것만 검사하면 둘 다 통과해 `dryRun`이
+ * false가 된다. 확인 없이 실제 채널에 게시된다 — 이 함수가 막으려던 바로 그 결과다.
+ * `digest`와 `runs`는 위치 인자를 하나도 받지 않으므로 떠도는 위치 인자에 뺏을 정상 동작이 없다.
+ *
  * **write하는 명령이 늘면 `WRITE_COMMANDS`에 넣는다.** 넣지 않으면 그 명령에서 `--dry-run`
  * 오타가 확인 없이 실제 게시로 간다.
  *
- * 값 자리를 따로 건너뛰지 않는다. `missingFlagValue`가 먼저 돌아 `--`로 시작하는 값을 이미
- * 거부하므로, `--`로 시작하는 토큰은 값일 수 없다. 건너뛰던 예전 코드가 `--state --dry-runn`의
- * 오타를 값으로 보아 통과시켰다.
+ * 값 플래그의 **값 자리는 건너뛴다.** 그 자리의 `state.db` 같은 토큰은 위치 인자가 아니라 값이다.
+ * 단, 값이 `--`로 시작하면 건너뛰지 않는다. 건너뛰던 예전 코드가 `--state --dry-runn`의 오타를
+ * 값으로 보아 통과시켰다. `missingFlagValue`가 먼저 돌아 그 형태를 이미 거부하지만, 그 순서에
+ * 기대지 않아야 검사 순서가 바뀌어도 오타가 값으로 먹히지 않는다.
  */
 function unknownWriteFlag(argv: readonly string[]): string | null {
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
-    if (token === undefined || !token.startsWith('--')) continue;
-    if (!VALUE_FLAGS.includes(token) && !BOOL_FLAGS.includes(token)) return token;
+    if (token === undefined) continue;
+    if (VALUE_FLAGS.includes(token)) {
+      const value = argv[i + 1];
+      if (value !== undefined && !value.startsWith('--')) i += 1;
+      continue;
+    }
+    if (BOOL_FLAGS.includes(token)) continue;
+    return token;
   }
   return null;
 }
@@ -144,7 +156,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if ((WRITE_COMMANDS as readonly string[]).includes(command)) {
     const unknown = unknownWriteFlag(argv);
     if (unknown !== null) {
-      return { kind: 'error', message: `${command}가 모르는 플래그다: ${unknown}` };
+      return { kind: 'error', message: `${command}가 모르는 인자다: ${unknown}` };
     }
   }
   const prLimitRaw = arg(argv, '--pr-limit');

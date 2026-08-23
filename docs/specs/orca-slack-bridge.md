@@ -207,6 +207,11 @@ permission 등으로 세분화한다(OD-067).
 D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된
 다중 repository routing은 O1 범위다(OD-068).
 
+`#agent-runs`에는 Run 루트 말고 **컬렉션 루트 메시지가 하나 더 있다.** Run 하나에 귀속되지 않는
+사실 — 이번 관찰의 Run 카드 수, 미등록 Run 수와 목록, 컬렉션 수준 degraded — 을 싣고 **등록된 Run
+수와 무관하게 항상 게시한다.** 등록 열쇠가 통째로 어긋나면 Run 루트가 하나도 없는데, 미등록 수가
+보여야 하는 구간이 바로 그때이기 때문이다(OD-080). layout은 UX §3.2에 있다.
+
 ### 6.2 Gate 표시
 
 coordinator가 코드와 문서만으로 결정할 수 없는 사항을 Orca Gate로 만들면 Run thread에 다음 의미를 표시한다.

@@ -1518,6 +1518,7 @@ ID: OD-080
   - 컬렉션 사실을 Run 카드에만 두기(현행 유지): 위 근거의 구간에서 사실이 사라진다. 기각.
 영향 문서/파일: apps/orca-slack-bridge/src/store/schema.ts, src/store/sqlite.ts,
                 apps/orca-slack-bridge/src/run/render.ts, src/run/publish.ts, src/cli.ts,
+                docs/ux/slack-surfaces.md §3.2, docs/specs/orca-slack-bridge.md §6,
                 docs/roadmap.md §7, docs/decision-log.md
 검증 방법: 등록 Run이 0인 컬렉션에서 post가 한 번 나가고 그 blocks에 미등록 수·목록과
            `unregistered_repository`/`query_failed` 구분이 실리는지 확인한다. 재관찰이 새 루트를
