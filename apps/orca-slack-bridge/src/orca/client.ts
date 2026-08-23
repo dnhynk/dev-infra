@@ -179,6 +179,10 @@ export type UnreadableFieldName =
  *
  * `result`를 읽지 못한 row는 reviewer_result shape를 보지 않는다. 같은 실패를 두 줄로 세면
  * degraded 건수가 실제 실패한 칸 수보다 커져 보고가 규모를 잘못 말한다.
+ *
+ * 여기 넘어온 task 전부를 본다. `pickReviewerResult`는 correlated Run의 task만 판정하지만,
+ * `kind`가 `reviewer_result`인 row가 OD-073 v1 shape를 어기는 것은 어느 Run에 있든 관측된
+ * 사실이다. 판정 범위에 맞춰 수집을 좁히면 사실을 세는 곳이 둘로 갈라진다(OD-079).
  */
 export function unreadableTaskFields(tasks: readonly OrcaTask[]): readonly UnreadableField[] {
   const out: UnreadableField[] = [];

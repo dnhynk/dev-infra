@@ -1414,6 +1414,9 @@ ID: OD-079
       `result`, 그 `result`를 reviewer_result로 읽는 shape 검사, gate의 `options`, `worker_done`의
       `payload`. digest 보고는 그 사실을 runId·row 종류·row id·칸 이름·이유와 함께 관찰 단위 `degraded`
       목록으로 낸다. gate와 message는 taskId로 자리를 특정할 수 없으므로 gate id·message id가 그 자리다.
+      degraded 수집 범위는 **이번 관찰이 읽은 row 전부**다. `pickReviewerResult`는 correlated Run의 task만
+      판정하지만, `kind`가 `reviewer_result`인 row가 v1 shape를 어기는 것은 어느 Run에 있든 관측된 사실이다.
+      판정 범위에 맞춰 수집을 좁히면 사실을 세는 곳이 판정 경로와 수집 경로 둘로 갈라진다.
 근거:
   - `origin/main` 9b9decbb을 빌드해 `node apps/orca-slack-bridge/dist/cli.js digest --pr 25 --dry-run`을
     실행하면 stdout 0바이트, stderr `JSON 필드를 파싱할 수 없다: {kind:reviewer_result,schemaVersion:1,...`,
