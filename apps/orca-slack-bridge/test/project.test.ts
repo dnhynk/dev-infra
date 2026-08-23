@@ -437,6 +437,21 @@ describe('ProjectedPr 조립', () => {
     expect(p.kind === 'card' && p.pr.truncation).toEqual({ prBody: true, changedFiles: false });
   });
 
+  it('mergedAt latch가 projection에서도 state 문자열을 이긴다 (OD-030)', async () => {
+    const f = await facts();
+    // 실측 조합이다. REST는 merged와 closed-unmerged를 모두 `state=closed`로 주므로
+    // `state`만 보면 merged가 closed로 떨어진다(evidence/t1-github-lifecycle.md §OD-030).
+    const closed = projectPullRequest(
+      REPO, pr({ state: 'CLOSED', mergedAt: '2026-08-22T12:00:00Z' }), CORRELATED, f, CONFIG,
+    );
+    expect(closed.kind === 'card' && closed.pr.terminal).toBe('merged');
+    // 한 응답이 서로 다른 계산 시점의 필드를 섞는 경우다(§OD-044). latch가 `state`를 이긴다.
+    const open = projectPullRequest(
+      REPO, pr({ state: 'OPEN', mergedAt: '2026-08-22T12:00:00Z' }), CORRELATED, f, CONFIG,
+    );
+    expect(open.kind === 'card' && open.pr.terminal).toBe('merged');
+  });
+
   it('모르는 state를 open으로 떨어뜨리지 않는다', async () => {
     const f = await facts();
     expect(() => projectPullRequest(REPO, pr({ state: 'DRAFTED' }), CORRELATED, f, CONFIG)).toThrow(

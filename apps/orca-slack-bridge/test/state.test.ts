@@ -4,7 +4,7 @@ import {
   deriveTerminal,
   reconcileTerminal,
 } from '../src/digest/state.js';
-import type { DigestStatus, PrAxes, PrTerminal } from '../src/digest/types.js';
+import type { PrAxes, PrTerminal } from '../src/digest/types.js';
 
 const MERGED_AT = '2026-08-23T05:10:18Z';
 
@@ -103,16 +103,9 @@ describe('deriveDigestStatus', () => {
   });
 
   it('mergePolicy가 unobserved인 동안 merge-ready 계열 값을 만들지 않는다', () => {
-    // required rule 조인은 C2-2다(OD-032). headline 다섯 값 밖으로 나가지 않는다.
-    const all: readonly DigestStatus[] = [
-      'merged',
-      'closed',
-      'changes_requested',
-      'review_approved',
-      'awaiting_review',
-    ];
+    // required rule 조인은 C2-2다(OD-032). check가 전부 통과해도 headline은 review 축을 따른다.
     const passing = [{ name: 'required-ci', status: 'COMPLETED', conclusion: 'SUCCESS' }];
-    expect(all).toContain(deriveDigestStatus({ ...axes, checks: passing }));
+    expect(deriveDigestStatus({ ...axes, checks: passing })).toBe('awaiting_review');
   });
 });
 
