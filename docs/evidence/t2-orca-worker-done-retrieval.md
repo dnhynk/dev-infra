@@ -17,8 +17,9 @@
 - **[문서]** `orca agent-context --json` 또는 `orca skills get orchestration --full`이 반환한 계약 서술.
 - **[추론]** 위 셋에서 끌어낸 판단. 관측이 아니다.
 
-**[관측]** 아래 모든 실험은 새 Run `run_c940ec042fc1`(objective에 `THROWAWAY` 포함)에서 수행했고,
-`run_36d28e6e947a`와 `run_7804be5a654f`에는 읽기 명령만 실행했다. §5에 남은 리소스를 열거한다.
+**[관측]** 아래 모든 실험은 새 Run `run_c940ec042fc1`과 `run_b82acb7fe8c2`(둘 다 objective에
+`THROWAWAY` 포함)에서 수행했고, `run_36d28e6e947a`와 `run_7804be5a654f`에는 읽기 명령만 실행했다.
+§5에 남은 리소스를 열거한다.
 
 ## 실험 하네스
 
@@ -30,10 +31,23 @@ $ orca orchestration run-create --objective "..." --from term_2bdfdfe6-... --jso
  "message":"This terminal is attested as term_2d44c6e9-... and cannot act as term_2bdfdfe6-...."}}
 ```
 
-**[관측]** 그래서 THROWAWAY 실험은 별도 터미널 두 개를 만들어 그 안에서 실행했다.
-worker terminal(`term_2058bfe6-...`)이 `worker_done`을 보내고 coordinator terminal(`term_2bdfdfe6-...`)이
-Run을 소유한다. **[관측]** 이 터미널들은 §5 기준으로 모두 닫았고, 이 worker 세션의 터미널
-(`term_2d44c6e9-...`)은 실험 전후 모두 `run-current` → `{"run":null}`로 Run에 바인딩되지 않았다.
+**[관측]** 그래서 Run을 만드는 명령은 그 Run의 coordinator가 될 터미널 **안에서**, `worker_done`은
+dispatch 대상 터미널 **안에서** 실행해야 한다. THROWAWAY 실험은 터미널 두 개를 새로 만들어 그 안에서
+돌렸다. coordinator terminal이 Run을 소유하고 worker terminal이 `worker_done`을 보낸다.
+
+```powershell
+$ORCA = 'C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe'
+$CO = (& $ORCA terminal create --title 'THROWAWAY-OD075-COORD'  --json | ConvertFrom-Json).result.terminal.handle
+$WK = (& $ORCA terminal create --title 'THROWAWAY-OD075-WORKER' --json | ConvertFrom-Json).result.terminal.handle
+```
+
+**[관측]** 아래 절차에서 "`$CO` 안에서"는 `orca terminal send --terminal $CO --text '<명령>' --enter`로
+그 터미널에 명령을 밀어 넣는다는 뜻이다. 출력은 그 터미널 스크롤백으로만 돌아오므로 `--json`을 파일로
+리다이렉트해 받는다. **[추론]** 세 셸(하네스를 돌리는 셸, `$CO`, `$WK`)은 변수를 공유하지 않는다.
+`$ORCA`와 위에서 캡처한 handle 값은 각 터미널 안에서 다시 대입해야 한다.
+**[관측]** 터미널 안에서 자기 handle은 `$env:ORCA_TERMINAL_HANDLE`이고 생성 시 받은 handle과 같다.
+**[관측]** 이 터미널들은 §5 기준으로 모두 닫았고, 실험을 돌린 worker 세션의 터미널은 실험 전후 모두
+`run-current` → `{"run":null}`로 Run에 바인딩되지 않았다.
 
 **[관측]** Windows에서 `orca.cmd`는 `orchestration send`와 `reply`를 거부하므로
 (`orca.cmd cannot safely forward orchestration message bodies`) 실험은
@@ -56,30 +70,36 @@ Run을 소유한다. **[관측]** 이 터미널들은 §5 기준으로 모두 �
 
 ### [실행 명령]
 
-```bash
-# 1. THROWAWAY Run/Task/Dispatch
-orca orchestration run-create --objective "THROWAWAY OD-075 worker_done retrieval probe (dev-infra T2). Safe to delete." --json
-orca orchestration task-create --spec "THROWAWAY task for OD-075 probe. No real work." --task-title "THROWAWAY OD-075 probe" --run run_c940ec042fc1 --json
-orca orchestration dispatch --task task_a027eb19b0e2 --to term_2058bfe6-3eb7-4713-a620-f171f64eee66 --run run_c940ec042fc1 --return-preamble --json
+§실험 하네스가 `$CO`·`$WK` handle을 잡아 놓았다고 본다. Run·Task·Dispatch ID는 하드코딩하지 않고
+그 자리에서 캡처한다.
 
-# 2. worker terminal에서 worker_done
-orca.exe orchestration send --from term_2058bfe6-3eb7-4713-a620-f171f64eee66 \
-  --type worker_done --subject "THROWAWAY-WD-SUBJECT-MARKER" \
-  --body "THROWAWAY-WD-BODY-MARKER 첫째 문장. 둘째 문장. 셋째 문장." \
-  --task-id task_a027eb19b0e2 --dispatch-id ctx_95ba7239bbaa --outcome succeeded \
-  --files-modified "docs/evidence/x.md,docs/evidence/y.md" \
-  --report-path "docs/evidence/throwaway.md" --json
+```powershell
+# 1. $CO 안에서. 먼저 $ORCA와 $WK를 이 터미널에 대입한 뒤,
+#    아래 세 줄을 이 한 세션에서 이어 실행한다($RUN/$TASK가 유지돼야 한다).
+$RUN  = (& $ORCA orchestration run-create --objective 'THROWAWAY OD-075 worker_done retrieval probe (dev-infra T2). Safe to delete.' --json | ConvertFrom-Json).result.run.id
+$TASK = (& $ORCA orchestration task-create --spec 'THROWAWAY task for OD-075 probe. No real work.' --task-title 'THROWAWAY OD-075 probe' --run $RUN --json | ConvertFrom-Json).result.task.id
+$CTX  = (& $ORCA orchestration dispatch --task $TASK --to $WK --run $RUN --return-preamble --json | ConvertFrom-Json).result.dispatch.id
 
-# 3. 덮어쓰기 전 조회
-orca orchestration task-list --run run_c940ec042fc1 --json
+# 2. $WK 안에서 worker_done. $ORCA와 1이 찍은 $TASK/$CTX를 이 터미널에 옮겨 적는다.
+#    이 dispatch의 preamble에는 dcap 토큰이 없다. attest된 --from만으로 보낸다.
+& $ORCA orchestration send --from $env:ORCA_TERMINAL_HANDLE `
+  --type worker_done --subject 'THROWAWAY-WD-SUBJECT-MARKER' `
+  --body 'THROWAWAY-WD-BODY-MARKER 첫째 문장. 둘째 문장. 셋째 문장.' `
+  --task-id $TASK --dispatch-id $CTX --outcome succeeded `
+  --files-modified 'docs/evidence/x.md,docs/evidence/y.md' `
+  --report-path 'docs/evidence/throwaway.md' --json
 
-# 4. OD-073 절차대로 reviewer_result 기록
-orca orchestration task-update --id task_a027eb19b0e2 --status completed \
-  --result '{"kind":"reviewer_result","schemaVersion":1,"verdict":"approve","pr":{"repo":"THROWAWAY/none","number":1},"reviewedHeadSha":"deadbeef","findings":[],"gates":{"docs":"pass"}}' \
-  --run run_c940ec042fc1 --json
+# 3. 덮어쓰기 전 조회. 권한이 필요 없어 아무 터미널에서나 된다.
+& $ORCA orchestration task-list --run $RUN --json
+
+# 4. $CO 안에서 OD-073 절차대로 reviewer_result 기록
+& $ORCA orchestration task-update --id $TASK --status completed `
+  --result '{"kind":"reviewer_result","schemaVersion":1,"verdict":"approve","pr":{"repo":"THROWAWAY/none","number":1},"reviewedHeadSha":"deadbeef","findings":[],"gates":{"docs":"pass"}}' `
+  --run $RUN --json
 
 # 5. 덮어쓰기 후 조회
-orca orchestration task-list --run run_c940ec042fc1 --json
+& $ORCA orchestration task-list --run $RUN --json
+& $ORCA orchestration dispatch-show --task $TASK --json
 ```
 
 ### [출력 발췌]
@@ -117,6 +137,19 @@ orca orchestration task-list --run run_c940ec042fc1 --json
 ```
 
 `completed_at` = `2026-08-23T04:30:54.858Z`, `status` = `completed`.
+
+### [재현]
+
+**[관측]** 위 절차를 새 THROWAWAY Run에서 처음부터 한 번 더 실행해 재현을 확인했다.
+`run_b82acb7fe8c2` / `task_33a60121fe62` / `ctx_8b5bbcee31c7` / `msg_24e91fbd2df6`(sequence 273).
+같은 Orca `1.4.187`.
+
+```text
+3단계 task.result  = worker_report 10개 필드 전부. completed_at = 2026-08-23 05:10:09
+5단계 task.result  = {"kind":"reviewer_result",...} 한 개. worker_report 필드 0개
+     completed_at = 2026-08-23T05:10:51.066Z
+dispatch-show      = dispatch.completed_at 2026-08-23 05:10:09 (덮이지 않음)
+```
 
 ### [결론]
 
@@ -189,6 +222,9 @@ done
 # 경계값
 orca orchestration inbox --json                    # --limit 생략
 orca orchestration inbox --limit 9007199254740991 --json
+for L in 0 -5 10.7 abc; do
+  orca orchestration inbox --limit "$L" --json; echo "exit=$?"
+done
 
 # 대조군: 상한이 실제로 있는 명령
 orca orchestration run-list --limit 100 --json
@@ -217,7 +253,44 @@ orca orchestration run-list --limit 101 --json
 ```text
 --limit 생략              -> 20 행
 --limit 9007199254740991  -> 132 행 (그 시점 T 전부). 오류 없음
---limit 0 / -5 / 10.7 / abc -> 0 행. 오류 아님
+```
+
+**[관측]** 양의 정수가 아닌 `--limit`은 **CLI가 거절한다.** 조회가 일어나지 않고 exit code는 1이다.
+
+```text
+$ orca orchestration inbox --limit 0 --json      # -5, 10.7도 같다
+{"id":"local","ok":false,
+ "error":{"code":"invalid_argument","message":"Invalid positive integer for --limit"}}
+exit=1
+
+$ orca orchestration inbox --limit abc --json
+{"id":"local","ok":false,
+ "error":{"code":"invalid_argument","message":"Invalid numeric value for --limit"}}
+exit=1
+```
+
+**[소스]** CLI 인자 단계에서 걸린다. IPC까지 가지 않는다.
+
+```js
+// app.asar.unpacked/out/cli/handlers/orchestration.js:528
+'orchestration inbox': async ({ flags, client, json }) => {
+  const result = await client.call('orchestration.inbox', {
+    limit: getOptionalPositiveIntegerFlag(flags, 'limit'), ...
+
+// app.asar.unpacked/out/cli/flags.js:39-59
+function getOptionalNumberFlag(flags, name) {
+  const value = flags.get(name);
+  if (typeof value !== 'string' || value.length === 0) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new RuntimeClientError('invalid_argument', `Invalid numeric value for --${name}`);
+  return parsed;
+}
+function getOptionalPositiveIntegerFlag(flags, name) {
+  const value = getOptionalNumberFlag(flags, name);
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value <= 0) throw new RuntimeClientError('invalid_argument', `Invalid positive integer for --${name}`);
+  return value;
+}
 ```
 
 **[관측]** 대조군. Orca에 상한이 **있는** 명령은 조용히 자르지 않고 거절한다.
@@ -284,9 +357,10 @@ OD-075가 걱정한 clamp 경로로 포화를 놓치지는 않는다.
 
 1. `--limit`을 생략하면 **20행**이다. `--terminal`을 함께 주면 생략 시 100행이다(**[소스]**).
    `orca/client.ts`는 항상 `--limit`을 명시하므로 지금 영향은 없다.
-2. `--limit`에 0·음수·소수·비숫자를 주면 **오류 없이 0행**이 온다. **[추론]** 값이 잘못 계산되면
-   "worker_done 없음"이 아니라 "메시지 자체가 없음"으로 보인다. `0 >= 0`이므로 C1의 포화식은
-   이 경우 `saturated=true`가 되어 우연히 안전한 쪽으로 떨어진다.
+2. `--limit`에 0·음수·소수·비숫자를 주면 CLI가 `invalid_argument`로 거절하고 exit 1로 끝난다.
+   조회 결과가 아니라 실패다. **[추론]** `OrcaCli.run`은 `execFile`을 쓰므로 비영 exit code에서
+   reject한다(`orca/client.ts:22`). 잘못 계산된 `--limit`은 포화식까지 가지 못하고 던져지며,
+   "메시지 없음"으로 조용히 둔갑하지 않는다. 이 경로는 실행해 보지 않았다.
 
 ### [남는 선택지]
 
@@ -295,7 +369,8 @@ OD-075가 걱정한 clamp 경로로 포화를 놓치지는 않는다.
    (`orca/client.ts`가 기록한 C1 실측 행당 평균 1.8KB, 이번 관측에서는 114행 216,220바이트).
 2. **Run 범위 조회로 바꾼다.** §(c)의 `inbox --terminal run:<run_id>`. **[관측]** 같은 unclamped
    `--limit`을 쓰면서 다른 Run의 메시지가 상한을 잡아먹지 않는다.
-3. **포화식을 유지하되 `--limit` 입력을 검증한다.** 양의 정수가 아니면 던진다.
+3. **포화식을 유지하되 `--limit` 입력을 Bridge에서도 검증한다.** **[관측]** CLI가 이미 양의 정수가
+   아닌 값을 거절하므로 이 선택지는 안전성이 아니라 오류 메시지 위치의 문제다.
 
 ---
 
@@ -415,7 +490,7 @@ function getRunMailboxHistory(runId, limit = 100, types) {
 #### `inbox --terminal "run:<run_id>" --limit <n> --json` ← **찾은 것**
 
 **[관측]** Run mailbox를 그대로 돌려준다. 권한이 필요 없고(Run에 바인딩되지 않은 이 worker
-터미널에서 성공), `--limit`이 clamp되지 않으며, 소비하지 않는다.
+터미널에서 성공), 소비하지 않는다. **[관측]** 아래 측정 범위(`L` = 3…5000, `T` = 97)에서 clamp는 없다.
 
 ```bash
 orca orchestration inbox --terminal "run:run_7804be5a654f" --limit 5000 --json
@@ -475,13 +550,16 @@ if (routing.run && (!to || (params.type === "worker_done" || params.type === "he
 | `worker-read --dispatch` | O | 없음 | 없음. 원시 텍스트. exited면 빈 결과 | cursor 있음 | 안 함 |
 | `check --run --peek` | O | **coordinator** | unread만 (실제 Run에서 37/38이 read) | 100 고정 | 안 함 |
 | `check --run --all` | O | **coordinator** | **있음** | **100 고정, cursor 없음** | 안 함 |
-| `inbox --terminal run:<id>` | O | 없음 | **있음** | **없음** | 안 함 |
-| `inbox` (전역) | X | 없음 | 있음 | 없음 | 안 함 |
+| `inbox --terminal run:<id>` | O | 없음 | **있음** | 측정 범위(L≤5000, T=97)에서 없음 | 안 함 |
+| `inbox` (전역) | X | 없음 | 있음 | 측정 범위(T=114…132)에서 없음 | 안 함 |
 | `worker-list --run` | O | 없음 | 없음 (`workerState`만) | 관측 못 함 | 안 함 |
 | `run-show --id` | O | 없음 | 없음 | — | 안 함 |
 
-**[관측]** 가설은 확인된다. `inbox --terminal "run:<run_id>"`가 Run 범위·무권한·무상한·비소비
-조회다. **[관측]** OD-075가 적은 "`inbox`에 `--run` 필터가 없다"는 서술은 `--run` 플래그에 대해서는
+**[관측]** 가설은 확인된다. `inbox --terminal "run:<run_id>"`가 Run 범위·무권한·비소비 조회다.
+**[추론]** 상한은 **없다.** 근거는 실행이 아니라 코드다 — `getAllMessagesForHandle`이 `--limit`을
+SQL `LIMIT ?`에 그대로 넘기고 `Math.min`도 스키마 max도 없다(**[소스]**). 실제로 측정한 범위는
+`L` = 3…5000, `T` = 97뿐이며 `T > 5000`인 Run mailbox는 만들지 않았다. 저확신으로 둔다.
+**[관측]** OD-075가 적은 "`inbox`에 `--run` 필터가 없다"는 서술은 `--run` 플래그에 대해서는
 맞지만, `--terminal`에 Run mailbox 주소를 넣으면 같은 효과를 얻는다는 사실을 빠뜨리고 있다.
 
 **[관측]** pagination은 어느 조회에도 없다. `inbox`에는 cursor 파라미터 자체가 없고
@@ -628,6 +706,10 @@ OD-062(허용 지연·비용 한도)와 OD-065(동시 Run 규모)가 열려 있�
 | `msg_a5080d33049b` (THROWAWAY worker_done, sequence 122) | **남음.** 전역 `inbox`에 보인다 |
 | `term_2bdfdfe6-...` (THROWAWAY coordinator) | 닫음. `terminal close --tab` |
 | `term_2058bfe6-...` (THROWAWAY worker) | 닫음. `terminal close --tab` |
+| `run_b82acb7fe8c2` (§(a) [재현] Run) | **남음.** Run을 지우는 CLI 명령이 없다 |
+| `task_33a60121fe62`, `ctx_8b5bbcee31c7` | **남음.** `worker-release` → `{"state":"retained","reason":"no_owned_resource"}` |
+| `msg_24e91fbd2df6` (재현 worker_done, sequence 273) | **남음.** 전역 `inbox`에 보인다 |
+| `term_e08e20a0-...`, `term_25ede6a0-...` (재현용 터미널 둘) | 닫음. `terminal close --tab` |
 | 임시 스크립트·원시 로그 | 시스템 temp에만 있다. 레포에 커밋하지 않았다 |
 
 **[관측]** `orca orchestration reset --messages`/`--all`은 전역 파괴 명령이므로 실행하지 않았다.
@@ -646,8 +728,9 @@ OD-062(허용 지연·비용 한도)와 OD-065(동시 Run 규모)가 열려 있�
 
 **[관측]** 아래는 확인하지 않았다. 관측한 것처럼 쓰지 않는다.
 
-1. **`T > 5000`에서의 `inbox` 동작.** 전역 메시지를 5000행 이상 쌓지 않았다. clamp 부재의 근거는
-   그 범위에서는 **[소스]**뿐이고 **[관측]**이 아니다.
+1. **`T > 5000`에서의 `inbox` 동작.** 전역 메시지도 한 Run mailbox도 5000행 이상 쌓지 않았다.
+   실제 측정 범위는 전역 `T` = 114…132, Run mailbox `T` = 97(`L` = 3…5000)이다. 그 범위 밖에서
+   clamp 부재의 근거는 **[소스]**뿐이고 **[관측]**이 아니다.
 2. **Orca의 messages retention.** 오래된 메시지를 자동으로 지우는지, 그 기준이 무엇인지 확인하지
    않았다. §(d) 유실 조건 2가 여기 걸려 있다.
 3. **`worker-list --run`과 `task-list --run`의 상한.** 각각 40행·38행만 관측했다. 상한이 있는지
@@ -665,8 +748,8 @@ OD-062(허용 지연·비용 한도)와 OD-065(동시 Run 규모)가 열려 있�
 
 **[추론]** 관측에 근거한 권장이며 결정은 사용자가 한다.
 
-- **(b)** C1의 포화 판정은 **바꿀 필요가 없다.** clamp가 없어 판정이 건전하다. 다만 `--limit` 입력이
-  양의 정수임을 보장하는 것이 좋다.
+- **(b)** C1의 포화 판정은 **바꿀 필요가 없다.** clamp가 없어 판정이 건전하고, 양의 정수가 아닌
+  `--limit`은 CLI가 이미 거절한다.
 - **(c)** `listWorkerDone`을 `inbox --terminal "run:<run_id>"` Run별 호출로 바꾸는 것이 가장 작은
   변경으로 Run 필터와 상한 압박을 동시에 해결한다. Bridge가 이미 Run 목록을 갖고 있어 추가 재료가 없다.
 - **(a)** `task.result` 덮어쓰기 자체는 Orca 동작이므로 Bridge에서 막을 수 없다. `worker_done`을
