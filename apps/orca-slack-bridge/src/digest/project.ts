@@ -11,11 +11,10 @@ import {
 import { projectForRepository, type BridgeConfig } from '../project/config.js';
 import { CAPS, type FindingFacts } from '../summarize/contract.js';
 import { prepareSummaryBody } from './facts.js';
+import { deriveTerminal } from './state.js';
 import type {
   CorrelatedOrigin,
-  DigestStatus,
   PrProjection,
-  PrState,
   ProjectedPr,
   ReviewedHeadMatch,
   ReviewerResult,
@@ -55,32 +54,6 @@ export function isCorrelatedOrigin(c: Correlation): c is CorrelatedOrigin {
   return c.kind === 'correlated' && c.task !== null;
 }
 
-/**
- * `gh pr list --json state`의 값을 옮긴다.
- *
- * 모르는 값을 `open`으로 떨어뜨리지 않는다. GitHub 계약이 바뀐 것이므로 드러낸다.
- */
-export function toPrState(raw: string): PrState {
-  switch (raw.toUpperCase()) {
-    case 'OPEN':
-      return 'open';
-    case 'CLOSED':
-      return 'closed';
-    case 'MERGED':
-      return 'merged';
-    default:
-      throw new TypeError(`알 수 없는 PR state다: ${raw}`);
-  }
-}
-
-/** 카드 상태. `digest/types.ts`의 `DigestStatus` JSDoc에 적힌 순서를 그대로 따른다. */
-export function deriveDigestStatus(pr: ProjectedPr): DigestStatus {
-  if (pr.state === 'merged') return 'merged';
-  if (pr.state === 'closed') return 'closed';
-  if (pr.review === null) return 'awaiting_review';
-  return pr.review.verdict === 'request_changes' ? 'changes_requested' : 'review_approved';
-}
-
 const SEVERITY_RANK: Record<FindingFacts['severity'], number> = {
   blocker: 0,
   major: 1,
@@ -117,6 +90,11 @@ function headMatch(reviewedHeadSha: string | null, headSha: string): ReviewedHea
  *
  * 결정적이어야 하므로 `completedAt`이 같거나 없을 때는 task id 사전순으로 정렬해 마지막을
  * 고른다. 임의 순서에 의존하면 같은 입력이 다른 카드를 내고 지문이 흔들린다.
+ *
+ * **이것이 OD-044가 요구하는 review reconcile이다.** 각 resource(Orca review task)의 자기
+ * timestamp(`completedAt`)와 자기 id로 고른다. PR `updated_at` 같은 상위 timestamp로 바꾸지
+ * 마라. 실측에서 review·check·mergeability가 바뀌어도 PR `updated_at`은 그대로였고, 같은
+ * `updated_at`의 두 응답이 서로 다른 head를 보였다. 전역 last-write-wins는 기각됐다.
  */
 export function pickReviewerResult(
   tasks: readonly OrcaTask[],
@@ -199,8 +177,9 @@ export function projectPullRequest(
   if (correlation.kind === 'conflict') {
     return { kind: 'skipped', key: pr.key, reason: 'conflict' };
   }
+  // orca-run만 있고 orca-task가 없는 입력이다. 추측으로 Task를 보완하지 않고 degraded로 남긴다(OD-077).
   if (!isCorrelatedOrigin(correlation)) {
-    return { kind: 'skipped', key: pr.key, reason: 'task_missing' };
+    return { kind: 'skipped', key: pr.key, reason: 'run_only_degraded' };
   }
 
   const headSha = pr.headRefOid;
@@ -229,10 +208,13 @@ export function projectPullRequest(
       title: pr.title,
       url: pr.url,
       headSha,
-      state: toPrState(pr.state),
+      // terminal 축. `mergedAt` latch가 `state` 문자열을 이긴다(`digest/state.ts`).
+      terminal: deriveTerminal(pr.state, pr.mergedAt),
       isDraft: pr.isDraft,
       review,
       checks: pr.checks,
+      // required rule 조인 전이므로 값이 없다. C2-2가 채운다(OD-032).
+      mergePolicy: 'unobserved',
       workerReport,
       truncation: {
         // summarizer 입력과 같은 계산을 쓴다. 두 값을 따로 계산하지 않는다.

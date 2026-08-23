@@ -197,6 +197,10 @@ class ChannelLeakingStore implements DigestStore {
     );
   }
   updateObservation(): void {}
+  recordPrTask(): void {}
+  listPrTasks(): readonly [] {
+    return [];
+  }
   close(): void {}
 }
 

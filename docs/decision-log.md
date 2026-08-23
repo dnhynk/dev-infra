@@ -242,7 +242,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 
 - 게이트 A는 요약 입력의 사실 지문으로 summarizer 호출 여부를 정한다. 지문이 같으면 저장된 요약을 재사용하고, head sha처럼 요약 입력이 아닌 값만 움직였을 때는 호출하지 않는다(OD-035).
 - 게이트 B는 매번 렌더한 결과의 지문으로 Slack 게시 여부를 정한다. 사실 지문으로 게시까지 막으면 `SummaryFacts`에 없는 PR `state` 변화, 특히 merge가 카드에 반영되지 않는다.
-- durable store migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 DB를 열 수 없게 만드는 파괴적 변경은 message identity를 잃어 Slack 루트 중복을 만들 수 있으므로 이 방식으로 다루지 않는다(OD-043). 현재 `SCHEMA_VERSION`은 2다.
+- durable store migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 DB를 열 수 없게 만드는 파괴적 변경은 message identity를 잃어 Slack 루트 중복을 만들 수 있으므로 이 방식으로 다루지 않는다(OD-043).
 
 ## 2026-08-23 · C2 계약 확정
 

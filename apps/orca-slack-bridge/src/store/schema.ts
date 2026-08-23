@@ -1,4 +1,4 @@
-import type { PullRequestKey } from '../identity/keys.js';
+import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 
 /**
  * durable store 스키마와 접근 경계.
@@ -20,6 +20,9 @@ import type { PullRequestKey } from '../identity/keys.js';
  * - PR당 매핑 행이 하나다 → `pr_message.pr_key`가 PRIMARY KEY다.
  * - 두 PR이 한 Slack 메시지를 가리키지 않는다 → `UNIQUE(channel_id, message_ts)`다.
  * - 재시작 후 기존 메시지를 찾아 update할 수 있다 → channel/ts를 그 행에 함께 남긴다.
+ * - 한 PR을 여러 Task가 이어서 갱신해도 이전 Task와의 연관이 남는다 → `pr_task`가 (PR, Task)
+ *   쌍마다 한 행이다(OD-076). PR body는 primary/latest Task 하나만 담으므로 body만으로는
+ *   이전 Task를 복원할 수 없다.
  *
  * 보장하지 않는다.
  *
@@ -54,7 +57,7 @@ import type { PullRequestKey } from '../identity/keys.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -66,6 +69,33 @@ export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
  * `exec`로 던져놓으면 WAL이 아닌 채로 열린다. 판정은 `sqlite.ts`의 `enableWal`에 있다.
  */
 export const ENABLE_WAL = 'PRAGMA journal_mode = WAL';
+
+/**
+ * `pr_task` 테이블 DDL. **`SCHEMA_DDL`과 `MIGRATIONS`가 같은 문자열을 쓴다.**
+ *
+ * 새 파일과 기존 파일이 다른 스키마로 갈라지는 것이 이 파일의 알려진 함정이다. 테이블 추가는
+ * 컬럼 추가와 달리 문장 전체를 두 곳에 적게 되므로 상수 하나로 묶어 갈라질 자리를 없앤다.
+ *
+ * 여기만 `IF NOT EXISTS`가 없다. `MIGRATIONS`가 이 문장을 v2 파일에 거는데, 그 파일에 이미
+ * `pr_task`가 있다면 이 코드가 만든 파일이 아니다. 모양을 대조하지 않은 채 v3으로 도장을 찍는
+ * 것보다 던지는 편이 맞다(`win32StateBase`와 같은 판정).
+ *
+ * `PRIMARY KEY (pr_key, task_key)`가 보장하는 것은 같은 (PR, Task) 쌍이 두 행이 되지 않는다는
+ * 것뿐이다. 한 PR에 여러 Task 행이 남는 것이 OD-076이 요구하는 모양이다.
+ */
+const PR_TASK_TABLE = `
+CREATE TABLE pr_task (
+  -- identity/keys.ts의 PullRequestKey와 TaskKey. 값은 pr_message.pr_key와 같은 형식이다.
+  pr_key        TEXT NOT NULL,
+  task_key      TEXT NOT NULL,
+  -- 이 Task가 속한 Run. resolveCorrelation이 이미 task↔run 일치를 대조한 뒤의 값이다.
+  -- Orca live 상태가 사라진 뒤에도 저장된 연관을 그것만으로 읽을 수 있게 함께 남긴다.
+  run_key       TEXT NOT NULL,
+  -- 이 쌍을 처음 관측한 시각과 마지막으로 관측한 시각. 둘 다 ISO8601이다.
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL,
+  PRIMARY KEY (pr_key, task_key)
+)`;
 
 /**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
@@ -111,6 +141,7 @@ CREATE TABLE IF NOT EXISTS pr_message (
 -- 두 PR이 같은 Slack 메시지를 가리키면 한 카드가 다른 카드를 덮어쓴다.
 CREATE UNIQUE INDEX IF NOT EXISTS pr_message_slack_identity
   ON pr_message (channel_id, message_ts);
+${PR_TASK_TABLE};
 `;
 
 /**
@@ -137,6 +168,10 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     'ALTER TABLE pr_message ADD COLUMN facts_fingerprint TEXT',
     'ALTER TABLE pr_message ADD COLUMN summary_json TEXT',
   ],
+  // v2 → v3: PR↔Task N 연관 테이블을 붙인다(OD-076). 기존 `pr_message` 행은 건드리지 않는다.
+  // 지금 있는 카드에는 body가 가리키는 Task 하나만 알려져 있고, 그 연관은 다음 관찰이 기록한다.
+  // 과거 Task를 소급해 채우지 않는다. 그 값을 만들 수 있는 authoritative source가 없다.
+  [PR_TASK_TABLE],
 ];
 
 /**
@@ -193,6 +228,36 @@ export type NewPrMessage = ObservationRecord & {
 };
 
 /**
+ * 한 관찰이 관측한 PR↔Task 연관 하나.
+ *
+ * PR body는 primary/latest Task 하나만 담으므로(OD-021, OD-076) 관찰 한 번이 관측하는 쌍도
+ * 하나다. 여러 Task가 한 PR을 이어서 갱신하면 관찰이 거듭되며 쌍이 쌓인다.
+ *
+ * `runKey`를 함께 받는 이유는 `resolveCorrelation`이 이미 "이 task가 그 run에 속한다"를 대조한
+ * 뒤의 값이기 때문이다. 여기서 다시 판정하지 않는다.
+ *
+ * `dispatchId`는 담지 않는다. OD-021에서 선택 값이고 재dispatch가 있으면 (PR, Task) 하나에
+ * 여러 값이 생긴다. 한 컬럼에 담으면 마지막 값이 앞선 값을 조용히 덮는다. OD-076이 요구한 것은
+ * PR↔Task N이고 Dispatch cardinality는 그 결정에 없다.
+ */
+export type NewPrTask = {
+  readonly prKey: PullRequestKey;
+  readonly taskKey: TaskKey;
+  readonly runKey: RunKey;
+  /** ISO8601. 처음이면 `first_seen_at`과 `last_seen_at` 둘 다, 아니면 `last_seen_at`만 받는다. */
+  readonly at: string;
+};
+
+/** 저장된 PR↔Task 연관 한 행. 시각은 ISO8601이다. */
+export type PrTaskRecord = {
+  readonly prKey: PullRequestKey;
+  readonly taskKey: TaskKey;
+  readonly runKey: RunKey;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+};
+
+/**
  * digest가 쓰는 durable store.
  *
  * 동기 인터페이스다. `node:sqlite`의 `DatabaseSync`가 동기 API이므로 Promise로 감싸면
@@ -227,6 +292,25 @@ export interface DigestStore {
    * 없다.
    */
   updateObservation(prKey: PullRequestKey, observation: ObservationRecord, at: string): void;
+  /**
+   * PR↔Task 연관 하나를 기록한다(OD-076). 같은 쌍을 다시 관측하면 `last_seen_at`만 옮긴다.
+   *
+   * **`insertPrMessage`와 달리 이미 있어도 던지지 않는다.** 그쪽이 던지는 이유는 덮어쓰면 이미
+   * 게시한 Slack 루트를 잃기 때문인데, 이 행에는 그런 외부 side effect가 없고 같은 쌍을 반복
+   * 관측하는 것이 정상 경로다.
+   *
+   * `run_key`는 처음 값을 유지한다. 같은 Task가 다른 Run을 가리키는 입력은
+   * `resolveCorrelation`이 `conflict`로 막으므로 여기까지 오지 않는다.
+   */
+  recordPrTask(input: NewPrTask): void;
+  /**
+   * 이 PR에 기록된 Task 연관 전부. 없으면 빈 배열이며 이는 정상 출력이다.
+   *
+   * body의 latest Task는 이 목록의 한 원소일 뿐이다. 목록에서 그것을 고르려면 `lastSeenAt`이
+   * 가장 늦은 행을 본다. 순서는 `firstSeenAt`, 같으면 `taskKey` 사전순으로 고정한다. 정렬을
+   * 지정하지 않으면 같은 파일이 실행마다 다른 순서를 낼 수 있다.
+   */
+  listPrTasks(prKey: PullRequestKey): readonly PrTaskRecord[];
   /** WAL 파일을 정리하고 열린 handle을 남기지 않는다. */
   close(): void;
 }

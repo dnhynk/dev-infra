@@ -31,10 +31,11 @@ import type { SummaryResult } from '../summarize/index.js';
  * `task`를 non-null로 좁힌다. `resolveCorrelation`은 `orca-run`만 있고 `orca-task`가 없는
  * PR body도 `correlated` + `task: null`로 보고한다. 그런 PR은 `worker_done`도 Task 목적도
  * 찾을 수 없어 카드 입력을 구성할 수 없다. 좁히는 지점은 projection이며
- * `correlate/resolve.ts`의 출력은 바꾸지 않는다. 그 출력은 S0에서 검증된 계약이고,
- * "run은 있고 task가 없다"를 어느 kind로 볼지는 OD-022의 누락 정책 표에 아직 행이 없다.
+ * `correlate/resolve.ts`의 출력은 바꾸지 않는다. 그 출력은 S0에서 검증된 계약이고, OD-077이
+ * 별도 `run_correlated` kind를 Run-level 제품 의미가 필요해질 때까지 미뤘다.
  *
- * 좁히기에서 탈락한 PR은 버리지 않는다. `PrProjection`의 `skipped`가 이유와 함께 남긴다.
+ * 좁히기에서 탈락한 PR은 버리지 않는다. `PrProjection`의 `skipped`가 이유와 함께 남기며,
+ * 그 이유는 정상 출력이 아니라 degraded 입력이다(`PrSkipReason`).
  *
  * 좁히는 방법: `c.task !== null` 검사만으로는 `c` 자체가 좁혀지지 않는다. TypeScript는
  * 속성 참조만 좁히고 객체 타입은 그대로 둔다. 타입 술어를 쓴다.
@@ -50,12 +51,33 @@ export type CorrelatedOrigin = Extract<Correlation, { readonly kind: 'correlated
 };
 
 /**
- * GitHub이 보고한 PR 상태.
+ * terminal 축.
  *
- * `gh pr list --json state`의 `OPEN`/`CLOSED`/`MERGED`를 소문자로 옮긴 값이다. 다른 값이
- * 오면 조용히 `open`으로 떨어뜨리지 않는다. GitHub 계약이 바뀐 것이므로 드러내야 한다.
+ * 상태 축 넷 중 유일하게 되돌릴 수 없는 값을 가지는 축이다. `merged`는 `mergedAt != null`이
+ * latch이고 오래된 snapshot의 `open`·`closed`로 내려가지 않는다(OD-030, OD-044). `closed`는
+ * terminal이 아니다. reopen이 지나간다.
+ *
+ * 파생과 reconcile은 `digest/state.ts`의 `deriveTerminal`·`reconcileTerminal`이 한다. 여기서
+ * `gh pr list --json state` 문자열을 그대로 옮기지 않는다. 그 문자열은 두 사실 중 약한 쪽이다.
  */
-export type PrState = 'open' | 'closed' | 'merged';
+export type PrTerminal = 'open' | 'closed' | 'merged';
+
+/**
+ * mergePolicy 축.
+ *
+ * **자리만 있고 아직 값이 없다.** merge-ready는 base branch의 effective required rule과 current
+ * head rollup을 조인해 `missing | pending | failing | passing`을 파생하고, optional check 실패는
+ * merge를 막지 않는다(OD-032). 그 조인은 C2-2가 채운다.
+ *
+ * 여기서 추측으로 채우지 않는다. 실측에서 required 여부는 rollup row가 아니라 base protection에
+ * 있었고, 미보고 required context는 rollup에도 `gh pr checks --required`에도 나타나지 않았다.
+ * 그래서 지금 가진 `checks` 축만으로는 이 축의 값을 만들 수 없다.
+ *
+ * merge queue·required reviews·up-to-date(strict)·conversation resolution은 C2 범위 밖이다.
+ */
+export type MergePolicy =
+  /** base branch의 required rule을 아직 조회하지 않았다. C2-2 전에는 항상 이 값이다. */
+  'unobserved';
 
 /**
  * reviewer가 본 commit과 현재 head의 관계.
@@ -118,32 +140,16 @@ export type WorkerReport = {
 };
 
 /**
- * 카드가 표시하는 상태.
+ * 카드 headline.
  *
- * **사실에서 결정적으로 파생 가능한 값만 넣는다.** 아래 순서로 처음 맞는 것을 고른다.
- *
- * 1. `state === 'merged'` → `merged`
- * 2. `state === 'closed'` → `closed`
- * 3. `review.verdict === 'request_changes'` → `changes_requested`
- * 4. `review.verdict === 'approve'` → `review_approved`
- * 5. 그 외 → `awaiting_review`
- *
- * 다음은 이 값에 넣지 않는다.
- *
- * - CI 결론: required/optional 구분과 merge-ready 판정이 아직 계약이 아니다(OD-032).
- *   카드는 `checks`를 check별 결론 그대로 표시한다.
- * - `worker_done` 유무: 리뷰와 다른 축의 사실이다. `workerReport`가 null인지로 표시한다(OD-070).
- * - draft 여부: `isDraft`로 따로 표시한다.
- * - risk: `SummaryResult.risk`가 싣는다(OD-037).
- * - reviewer가 본 commit이 현재 head와 다르다는 사실: verdict는 그대로 보고하고 그 사실은
- *   `ReviewerResult.headMatch`가 싣는다. 둘을 결합해 approval이 아직 유효한지 판정하는 것은
- *   OD-031이며 C2다.
- * - `merge_ready`: review·CI·merge 조건의 결합 판정이므로 C2다.
+ * 상태 전체가 아니라 카드 머리글 한 줄이 쓰는 파생값이다. 원본 축은 `ProjectedPr`에 그대로
+ * 남고, 파생은 `digest/state.ts`의 `deriveDigestStatus` 하나만 한다. 파생 순서와 여기 넣지
+ * 않는 것의 근거는 그 함수에 있다. 두 곳에 적으면 서로 어긋난다.
  */
 export type DigestStatus =
-  /** GitHub merged 사실. */
+  /** terminal이 `merged`다. `mergedAt` latch에서 온다. */
   | 'merged'
-  /** merge 없이 닫혔다. reopen과 close 전이 처리는 C2다. */
+  /** terminal이 `closed`다. terminal이 아니므로 다음 관측이 `open`으로 되돌릴 수 있다. */
   | 'closed'
   /** reviewer verdict가 `request_changes`다. */
   | 'changes_requested'
@@ -151,6 +157,27 @@ export type DigestStatus =
   | 'review_approved'
   /** reviewer_result가 관찰되지 않았다. 리뷰가 진행 중이라는 주장이 아니다. */
   | 'awaiting_review';
+
+/**
+ * PR 상태의 직교 축 넷.
+ *
+ * `deriveDigestStatus`의 입력이다. `ProjectedPr`이 구조적으로 이 모양을 만족하므로 카드
+ * 입력을 그대로 넘길 수 있고, 축이 아닌 값(제목, URL, worker 보고, 요약)은 파생에 닿지 않는다.
+ *
+ * 넷을 한 필드로 접지 않는다. 실측에서 draft와 reviewDecision은 `state`가 `OPEN`인 채로 함께
+ * 존재했고, `mergeable=MERGEABLE`인 PR도 draft·review·required check 때문에 BLOCKED였다.
+ * 접으면 그 조합과 전이가 사라진다(OD-030).
+ *
+ * `review`는 verdict만 본다. `headMatch`와 findings는 축이 아니라 카드가 따로 표시하는
+ * 사실이고, `headMatch`를 headline 파생에 넣는 것은 OD-031이 기각한 approval 유효성 판정이다.
+ */
+export type PrAxes = {
+  readonly terminal: PrTerminal;
+  readonly isDraft: boolean;
+  readonly review: { readonly verdict: ReviewerResult['verdict'] } | null;
+  readonly checks: readonly CheckFact[];
+  readonly mergePolicy: MergePolicy;
+};
 
 /**
  * 관측이 잘린 지점. 원인별로 따로 싣는다.
@@ -222,13 +249,16 @@ export type ProjectedPr = {
    * 관찰한 check 결론과 reviewer_result가 어느 commit의 사실인지 고정한다.
    */
   readonly headSha: string;
-  readonly state: PrState;
-  /** draft PR에 리뷰 결과가 없는 것은 정상이므로 카드가 그 이유를 표시할 수 있어야 한다. */
+  /** terminal 축. `mergedAt` latch가 `state` 문자열을 이긴다(`digest/state.ts`). */
+  readonly terminal: PrTerminal;
+  /** draft 축. draft PR에 리뷰 결과가 없는 것은 정상이므로 카드가 그 이유를 표시할 수 있어야 한다. */
   readonly isDraft: boolean;
   /** 없으면 null. 없다는 사실 자체를 카드가 표시한다. */
   readonly review: ReviewerResult | null;
-  /** head commit의 check 결론. 집계도 required 판정도 하지 않는다(OD-032). */
+  /** checks 축. head commit의 check 결론이다. 집계도 required 판정도 하지 않는다(OD-032). */
   readonly checks: readonly CheckFact[];
+  /** mergePolicy 축. C2-2가 required rule 조인으로 채울 때까지 `unobserved`다. */
+  readonly mergePolicy: MergePolicy;
   /** 없으면 null(OD-070). */
   readonly workerReport: WorkerReport | null;
   /** 관측이 잘린 지점. 카드가 부분 관측을 숨기지 않게 한다. */
@@ -246,12 +276,19 @@ export type PrSkipReason =
   /** correlation이 `conflict`다. 모순을 자동으로 한쪽으로 덮지 않는다(OD-022). */
   | 'conflict'
   /**
-   * `correlated`지만 `orca-task`가 없다.
+   * `orca-run`은 있고 필수 `orca-task`가 없다. **invalid/degraded input이다**(OD-077).
    *
-   * Task를 찾을 수 없으므로 Task 목적도 `worker_done`도 붙일 수 없고 카드 입력이 서지
-   * 않는다. `CorrelatedOrigin`이 컴파일로 막는 경우가 런타임에서 여기로 온다.
+   * 위 둘과 성격이 다르므로 이름이 그것을 말한다. `uncorrelated`는 metadata가 없거나 Run을
+   * 확정할 수 없는 정상 출력이지만, 이쪽은 OD-021이 `orca-task`를 필수로 정한 뒤의 계약 위반
+   * 입력이다. 원인은 누락이나 수동 편집 같은 partial input이다.
+   *
+   * Task를 찾을 수 없으므로 Task 목적도 `worker_done`도 붙일 수 없고 카드 입력이 서지 않는다.
+   * `CorrelatedOrigin`이 컴파일로 막는 경우가 런타임에서 여기로 온다.
+   *
+   * **branch 이름·PR 제목·author로 Task를 보완하지 않는다.** no-guessing 계약에 반하며
+   * OD-077이 그 대안을 기각했다. 별도 `run_correlated` kind도 만들지 않는다.
    */
-  | 'task_missing';
+  | 'run_only_degraded';
 
 /**
  * PR 하나에 대한 projection 결과.
