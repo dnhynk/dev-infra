@@ -369,8 +369,13 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   Run/coordinator identity로 쓴다. coordinator 환경변수는 보조 단서일 뿐이다(OD-020).
 - repository는 D1의 수동 등록 설정과 연결하고, live/stale Run은 `consumer_generation`으로 구분한다.
   `run-use` 인수 뒤 handle·pane key가 바뀌고 generation이 올라가므로 최초 handle은 유지되지 않는다.
-- 근거: Channel Adapter evidence가 env override와 fake hello 두 방향의 위조를 재현했고, orchestration의
-  `run-use` 계약은 새 소유자의 handle·pane key와 증가한 generation을 Run row에 기록한다.
+- 근거: Channel Adapter evidence가 env override와 fake hello 두 방향의 위조를 재현했다.
+- [문서] 프로젝트의 `~/.claude/skills/init-orchestrate/SKILL.md` §5는 `run-use` 인수 뒤 새 소유자의
+  handle·pane key를 기록하고 generation을 올린다고 서술한다.
+- [관측] `run-list`에서 승계를 반복한 `run_ebd0bb4592d2`만 generation이 `4`이고, 나머지 일반 Run은
+  모두 `1`이다(`run_legacy_local`은 `0`). 이번 Run에서 `run-use` 전후 증가는 직접 관측하지 않았다.
+- [추론] 이 분포가 프로젝트 문서와 일치하므로 위 결정을 채택한다. 다만 Orca 플랫폼 가이드에는
+  `consumer_generation` 계약이 없으므로, 플랫폼 동작이 바뀌면 live/stale 판정이 깨진다.
 - 이 Run에서 `<uuid>::<path>` worktree id가 반복 동작한 것은 관측일 뿐 형식 안정성 보장은 아니며 남은 위험이다.
 
 - 상세 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-020 확정 기록에 있다.

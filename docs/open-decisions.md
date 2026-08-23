@@ -228,7 +228,7 @@ ID: OD-028
 
 근거는 [플랫폼 검증 §2.7](platform-capabilities.md#27-run--coordinator-session--repository-identity).
 
-- **OD-020** (Run↔repo↔coordinator session identity): 실측 경로가 확보됐다. coordinator 세션의 `ORCA_TERMINAL_HANDLE`/`ORCA_PANE_KEY`가 Run row의 `coordinator_handle`/`coordinator_pane_key`와 동일 값이고, `ORCA_WORKTREE_ID`가 로컬 경로를 담아 Git remote를 거쳐 GitHub repository로 이어진다. 당시 남은 미결 세 가지 중 (1) 환경변수 신뢰 수준은 보조 단서로만 쓰는 것으로, (3) coordinator 재시작 시 handle 유지 여부는 `run-use`가 handle을 바꾸고 generation을 올리는 계약으로 닫혔다. (2) `<uuid>::<path>` 형식의 안정성은 이 Run에서 반복 사용해 동작한 관측만 있고 형식 보장은 관측하지 못했으므로 남는다.
+- **OD-020** (Run↔repo↔coordinator session identity): 실측 경로가 확보됐다. coordinator 세션의 `ORCA_TERMINAL_HANDLE`/`ORCA_PANE_KEY`가 Run row의 `coordinator_handle`/`coordinator_pane_key`와 동일 값이고, `ORCA_WORKTREE_ID`가 로컬 경로를 담아 Git remote를 거쳐 GitHub repository로 이어진다. 당시 남은 미결 세 가지 중 (1) 환경변수 신뢰 수준은 보조 단서로만 쓰기로 했다. (3) coordinator 재시작 시 handle 유지 여부는 Orca 플랫폼 계약으로 여전히 미검증이지만, OD-020은 Run row를 권위로 삼고 `consumer_generation`으로 live/stale을 구분하기로 했다. (2) `<uuid>::<path>` 형식의 안정성은 이 Run에서 반복 사용해 동작한 관측만 있고 형식 보장은 관측하지 못했으므로 남는다.
 - **OD-053** (Run↔현재 coordinator Channel routing): Channel Adapter가 MCP 서브프로세스로서 위 identity를 그대로 상속하고 `CLAUDE_CODE_SESSION_ID`는 자기 세션 값으로 받는 것을 실측했다. Adapter 자기소개 payload의 재료가 확정 가능하다. 단 coordinator pane 안의 자식 세션도 같은 `ORCA_*`를 상속하므로 세션 구분에는 `CLAUDE_CODE_SESSION_ID`가 필요하다. `CLAUDE_PID`는 조상 값이 상속되므로 사용 금지.
 - **OD-010** (`/init-orchestrate` 패키징과 호출 계약): 이 환경의 skill은 `~/.agents/skills/<name>/SKILL.md`에 있고 `~/.claude/skills`는 존재하지 않는다. `orchestration` skill은 discovery stub이고 실제 가이드는 `orca skills get orchestration --full`이 서빙한다. 같은 stub+런타임조회 패턴이 `/init-orchestrate`의 후보다. 실제 배치 위치는 coordinator 세션이 발견하는지 실측한 뒤 확정한다.
 - **OD-015** (successor 세션 생성 공식 수단): `orchestration coordinator-start`가 은퇴해 Orca orchestration 표면에는 없다(§7.2). 남은 후보는 `orca-cli`의 terminal/worktree 생성 계열이며 아직 조사하지 않았다.
@@ -1376,14 +1376,21 @@ ID: OD-020
     로컬 경로가 Git remote를 거쳐 GitHub repository로 이어지는 실측 경로를 확인했다.
   - docs/evidence/t5-channel-adapter.md §(c) 근거 5가 `.mcp.json` env override와 Claude Code 밖의
     fake hello 두 방향으로 identity 위조를 재현했다. 따라서 환경변수 단독은 신뢰 근거가 아니다.
-  - `orca skills get orchestration --full`의 `run-use` 계약상 Run을 인수하면 `coordinator_handle`과
-    `coordinator_pane_key`가 인수한 터미널 값으로 바뀌고 `consumer_generation`이 증가한다.
-    coordinator handle은 재시작·인수를 거쳐 유지되지 않으며 generation이 현재 소유자를 가리킨다.
+  - [문서] 프로젝트가 설치한 `~/.claude/skills/init-orchestrate/SKILL.md` §5는 `run-use` 인수 시
+    `coordinator_handle`·`coordinator_pane_key`가 인수한 터미널 값으로 바뀌고
+    `consumer_generation`이 증가한다고 서술한다.
+  - [관측] `run-list`에서 승계를 반복한 `run_ebd0bb4592d2`만 `consumer_generation=4`이고,
+    나머지 일반 Run은 모두 `1`이며 `run_legacy_local`은 `0`이다. 이번 Run에서 `run-use` 전후의
+    증가를 직접 관측한 것은 아니다.
+  - [추론] 이 분포는 프로젝트 스킬의 서술과 일치하므로 coordinator handle은 인수 뒤 바뀌고 generation이
+    현재 소유자를 구분한다고 판단한다. 그러나 `orca skills get orchestration --full`에는
+    `consumer_generation`이 없고 Orca 플랫폼은 이 동작을 문서화하지 않았다. 플랫폼 동작이 바뀌면
+    `consumer_generation` 기반 live/stale 판정이 깨지는 위험을 감수한다.
 대안과 기각 이유:
   - coordinator 환경변수를 authoritative identity로 사용: env override와 fake hello 양쪽 위조가
     재현됐으므로 기각하고 보조 단서로만 제한한다.
-  - 최초 coordinator handle을 Run 수명 동안 고정 identity로 사용: `run-use`가 handle·pane key를
-    바꾸고 generation을 올리므로 재시작·인수 뒤 현재 소유자를 가리키지 않아 기각한다.
+  - 최초 coordinator handle을 Run 수명 동안 고정 identity로 사용: 프로젝트 문서와 간접 관측상 인수 뒤
+    handle·pane key가 바뀌므로 현재 소유자를 가리키지 않을 수 있어 기각한다.
   - Git remote 기반 자동 repository 연결: D1은 설정 파일에 수동 등록한 repository만 관찰하고
     자동 발견·등록·routing은 O1 범위이므로 기각한다(OD-068).
 영향 문서/파일: docs/contracts/observation-and-correlation.md §5,
