@@ -187,6 +187,13 @@ Bridge는 event stream만 믿지 않고 현재 source snapshot과 reconcile할 �
 - 동일 상태 재관찰은 새 thread reply를 만들지 않는다.
 - merged 같은 terminal state를 오래된 review/check event가 되돌리지 않는다.
 
+PR reconciliation의 identity는 `(repository databaseId, PR number)`이고 `mergedAt`은 terminal latch,
+`headSha`는 review/check scope다. `merged` downgrade 금지는 timestamp 비교가 아니라 terminal dominance
+rule로 적용한다. 동일 head 안의 review/check는 각 resource의 timestamp와 id로 reconcile한다(OD-044).
+
+Slack root를 갱신할 수 없으면 GitHub current snapshot, Orca facts, Bridge store identity로 current 카드만
+재생성한다. GitHub·Slack history에서 과거 thread semantic transition을 재생하지 않는다(OD-046).
+
 ## 7. 최소 저장 개념
 
 확정 schema는 아니지만 다음 관계는 지속되어야 한다.
@@ -205,6 +212,9 @@ Orca Run
 Resolved Gate
   └─ coordinator delivery/outbox state
 ```
+
+PR body는 primary/latest Task 하나만 가리키고, PR↔Task N 연관은 Bridge durable store에 별도로 보존한다.
+OD-021의 body metadata와 parser 계약은 유지한다(OD-076).
 
 C1 durable store는 `node:sqlite`이고 platform별 기본 위치와 override 우선순위, WAL, `schema_version`, 덧붙이기 migration을 사용한다. C1은 단일 프로세스라 파일 lock을 만들지 않는다. future multi-writer locking, retention, backup, corruption recovery와 Slack 게시 atomicity/outbox는 후속 범위다.
 

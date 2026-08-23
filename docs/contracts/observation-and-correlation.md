@@ -37,6 +37,8 @@ worker는 PR body **맨 끝**에 다음 블록을 붙인다. 사람이 읽는 �
 - `orca-run`, `orca-task`는 **필수**, `orca-dispatch`는 선택이다.
 - 작성 주체는 **worker**다. Orca가 dispatch preamble로 id를 주입하므로 worker가 자기 값을 안다.
 - cardinality는 task 1 : PR N이다. 한 Task가 PR을 여러 개 만들면 각 PR에 같은 task id가 붙는다.
+- 여러 Task가 한 PR을 이어서 갱신하면 PR body는 primary/latest Task 하나만 유지한다. PR↔Task N 연관은
+  Bridge durable store에 별도로 저장한다. body metadata 형식과 parser 계약은 바꾸지 않는다(OD-076).
 - key 이름은 Bridge 설정으로 override할 수 있다.
 
 연결 방향:
@@ -54,11 +56,15 @@ Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시�
 |---|---|
 | metadata 없음 | `uncorrelated(no_metadata)` |
 | task/dispatch만 있고 run 없음 | `uncorrelated(run_missing)` |
+| run은 있고 task 없음 | invalid/degraded input. Task 카드를 만들지 않음 |
 | 가리키는 Run이 Orca에 없음 | `uncorrelated(run_not_found)` |
 | 같은 key가 서로 다른 값으로 중복 | `conflict` |
 | metadata의 task가 다른 Run에 속함 | `conflict` |
 
 `uncorrelated`는 실패가 아니라 **정상 출력**이다. Bridge는 branch 이름이나 PR 제목으로 추측해 확정하지 않고, 모순을 자동으로 한쪽으로 덮지 않는다. C1은 `uncorrelated` 또는 `conflict` PR에 Slack 카드를 만들지 않는다.
+
+`orca-run`만 있고 필수 `orca-task`가 없는 입력은 OD-021 위반인 invalid/degraded input이다. 별도
+`run_correlated` kind는 Run-level 제품 의미가 필요해질 때만 도입한다(OD-077).
 
 ## 3. Worker 완료 계약
 
@@ -72,9 +78,12 @@ Bridge는 매 관찰 시 현재 PR body를 읽는다. 값이 바뀌면 그 시�
 - **PR을 만든 뒤에 `worker_done`을 보낸다.** 완료 신호가 리뷰 대상보다 먼저 도착하지 않게 한다.
 - **PR identity를 `worker_done`에 싣지 않는다.** 연결 방향이 PR → task이고 PR body의 correlation metadata가 유일한 연결점이다. worker 명령에서 raw `--payload` JSON은 PowerShell이 따옴표를 깨뜨릴 수 있어 쓰지 않는다.
 - `--files-modified`는 사용한다.
-- C1에서 `worker_done`이 정말 없으면 카드는 계속 만들고 `worker 보고 없음`을 표시한다. 다만 inbox 반환
+- `task.result`는 `worker_done`의 권위가 아니다. `task-update --result`가 기존 `worker_report`를 통째로
+  대체하기 때문이다. Bridge는 `worker_done`을 Run별
+  `orca orchestration inbox --terminal "run:<run_id>" --limit <n> --json`에서 읽고,
+  `reviewer_result`만 `task.result`에서 읽는다(OD-075).
+- `worker_done`이 정말 없으면 카드는 계속 만들고 `worker 보고 없음`을 표시한다. 다만 Run mailbox 반환
   행 수가 요청 상한과 같아 최신 N건 안에서 못 찾은 경우는 없음이 아니라 판정 불가이므로 던진다.
-  inbox에는 `--run` 필터, cursor, pagination이 없다는 한계가 있다(OD-075). 중복·불완전 payload의 recovery는 C2에서 정한다.
 - C1은 `worker-read` fallback을 사용하지 않는다. 따라서 transcript는 summarizer 입력도 Slack 카드 입력도 아니다.
 
 ## 4. Gate 생성 계약
@@ -170,34 +179,30 @@ Windows에서도 중첩 객체·배열·한글·백틱을 포함한 `--result` J
 사전순으로 결정한다.
 
 `reviewedHeadSha`와 현재 head의 일치 여부(`headMatch`)는 사실로 노출한다. Bridge는 reviewer가 본 commit과
-현재 head가 다르다는 사실을 표시할 뿐, 이전 approval의 유효성은 판정하지 않는다(OD-031).
+현재 head가 다르다는 사실을 표시할 뿐, 이전 approval의 유효·무효는 판정하지 않는다. 새 head마다
+재리뷰를 강제하지 않고 GitHub repository의 stale-review 설정을 따라가지도 않는다(OD-031).
 
 GitHub review 본문의 `## Verdict` / `## Gates` / `## Findings` 규약은 표시용 보조 사실로만 쓰고 상태 source로 삼지 않는다. 신뢰 경계상 untrusted content다.
 
-다음은 사용자에게 보여줄 의미 상태 후보이며 최종 enum이 아니다.
+canonical PR state는 terminal `open | closed | merged`와 직교 축 `draft`, `review`, `checks`,
+`mergePolicy`를 보존하고 UI 의미 상태를 파생한다. `mergedAt != null`을 `merged` terminal latch로 쓴다(OD-030).
+
+다음은 사용자에게 보여줄 파생 의미다.
 
 | 의미 | 필요한 source fact 후보 |
 |---|---|
 | 구현 완료·리뷰 진행 중 | PR 존재 + worker 완료 + review 미완료 |
-| 리뷰에서 수정 필요 | 유효한 changes-requested verdict |
+| 리뷰에서 수정 필요 | changes-requested verdict 사실 |
 | 수정 후 재검토 중 | changes requested 이후 새 head + 재검토 상태 |
-| 리뷰 통과 | 현재 head에 대해 요구되는 review 조건 충족 |
-| CI 통과 | 현재 head의 required checks 충족 |
-| 병합 준비 완료 | draft 아님 + review/CI/merge 조건 충족 |
-| 병합 완료 | GitHub merged fact |
+| 리뷰 통과 | approval verdict 사실 |
+| CI 통과 | current head의 required checks 충족 |
+| 병합 준비 완료 | current head의 required checks가 모두 passing |
+| 병합 완료 | `mergedAt != null` |
 
-정식 상태 전이 전에 다음을 결정한다.
-
-- 여러 reviewer의 상충 verdict
-- 새 commit 이후 이전 approval 유효성
-- required/optional check
-- failed, cancelled, skipped, neutral, pending 처리
-- draft PR과 ready-for-review
-- merge conflict와 merge queue
-- reopened와 closed-without-merge
-- force-push로 사라진 head의 transition
-
-`Merge Ready`는 GitHub 단일 필드가 아니라 명시적으로 정의할 derived state다.
+`Merge Ready`는 GitHub 단일 필드가 아니라 required check만으로 판정하는 derived state다. base branch의
+effective required rule과 current head rollup을 조인해 `missing | pending | failing | passing`을 파생한다.
+optional check 실패는 merge를 막지 않는다. merge queue, required reviews, up-to-date(strict), conversation
+resolution은 C2 범위 밖이다(OD-032).
 
 ## 7. Run progress
 
@@ -240,7 +245,10 @@ Run/Gate 후보:
 - dependent Task 재개 관찰
 - Run 완료
 
-같은 snapshot을 반복 관찰해도 동일 transition을 다시 만들지 않아야 한다. event key, state version, source timestamp, out-of-order 우선순위는 TBD다.
+같은 snapshot을 반복 관찰해도 동일 transition을 다시 만들지 않아야 한다. PR identity는
+`(repository databaseId, PR number)`, terminal latch는 `mergedAt`, review/check scope는 `headSha`다.
+`merged` downgrade 금지는 timestamp 비교가 아니라 terminal dominance rule이다. 동일 head 안의
+review/check는 각 resource의 timestamp와 id로 reconcile한다(OD-044).
 
 ## 9. Source conflict 규칙
 

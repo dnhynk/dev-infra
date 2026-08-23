@@ -223,7 +223,8 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 ### DL-030 · 사실은 노출하고 판정은 하지 않는다
 
 - C1은 source fact를 조합해 보여주되 C2에 남겨 둔 정책을 대신 판정하지 않는다.
-- `headMatch`는 reviewer가 본 commit과 현재 head가 같은지 여부를 사실로 싣는다. 이전 approval의 유효성은 OD-031의 미결정 범위이므로 C1이 판정하지 않는다.
+- `headMatch`는 reviewer가 본 commit과 현재 head가 같은지 여부를 사실로 싣는다. C1은 이전 approval의
+  유효성을 판정하지 않았고, C2에서도 이 사실만 표시하고 유효·무효를 판정하지 않기로 확정했다(OD-031).
 - 실제 게시 카드가 `병합 완료`, 리뷰 판정 `request_changes`, `reviewer가 본 commit이 현재 head와 다르다`를 함께 표시했다. 서로 다른 source fact를 불편하다는 이유로 숨기거나 하나의 결론으로 덮지 않는다.
 
 ### DL-031 · 조용한 실패를 만들지 않는다
@@ -242,3 +243,43 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 게이트 A는 요약 입력의 사실 지문으로 summarizer 호출 여부를 정한다. 지문이 같으면 저장된 요약을 재사용하고, head sha처럼 요약 입력이 아닌 값만 움직였을 때는 호출하지 않는다(OD-035).
 - 게이트 B는 매번 렌더한 결과의 지문으로 Slack 게시 여부를 정한다. 사실 지문으로 게시까지 막으면 `SummaryFacts`에 없는 PR `state` 변화, 특히 merge가 카드에 반영되지 않는다.
 - durable store migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 DB를 열 수 없게 만드는 파괴적 변경은 message identity를 잃어 Slack 루트 중복을 만들 수 있으므로 이 방식으로 다루지 않는다(OD-043). 현재 `SCHEMA_VERSION`은 2다.
+
+## 2026-08-23 · C2 계약 확정
+
+### DL-034 · canonical PR state는 terminal과 직교 축으로 보존한다
+
+- terminal은 `open | closed | merged`이고 `draft`·`review`·`checks`·`mergePolicy`는 직교 축이다. UI 의미 상태는 이 사실들에서 파생한다(OD-030).
+- `mergedAt != null`을 `merged` terminal latch로 쓴다.
+- 근거: GitHub 표본에서 draft와 review는 open state와 함께 존재했고, merged와 closed-unmerged는 `mergedAt`으로 구분됐다.
+
+### DL-035 · approval은 사실만 표시하고 merge-ready는 required check만 본다
+
+- `headMatch`를 계속 표시하되 이전 approval의 유효·무효는 Bridge가 판정하지 않는다. 새 head마다 재리뷰를 강제하지 않고 repository의 stale-review 설정도 따라가지 않는다(OD-031).
+- merge-ready는 base branch의 effective required rule과 current head rollup을 조인해 `missing | pending | failing | passing`을 파생한다. optional check 실패는 merge를 막지 않는다(OD-032).
+- merge queue, required reviews, up-to-date(strict), conversation resolution은 C2 범위 밖이다.
+- 근거: stale approval 유지와 dismissal이 모두 관측됐고, 미보고 required는 merge를 막았지만 optional failure가 남은 PR은 실제 merge됐다.
+
+### DL-036 · PR reconciliation은 terminal dominance를 쓴다
+
+- identity는 `(repository databaseId, PR number)`, terminal latch는 `mergedAt`, review/check scope는 `headSha`다(OD-044).
+- `merged` downgrade 금지는 timestamp 비교가 아니라 terminal dominance rule이다.
+- 동일 head 안의 review/check는 각 resource의 timestamp와 id로 reconcile한다.
+- 근거: 같은 PR `updated_at`에서 서로 다른 head가 관측됐고 review/check 변화가 PR timestamp를 갱신하지 않아 전역 timestamp last-write-wins가 성립하지 않았다.
+
+### DL-037 · 유실된 Slack 카드는 current 상태만 재생성한다
+
+- GitHub current snapshot, Orca facts, Bridge store identity로 current 카드를 다시 만든다(OD-046).
+- 과거 thread의 semantic transition은 재생하지 않는다.
+- 근거: GitHub history는 여러 endpoint와 pagination을 합쳐야 하고 status check 보존 기한이 있어 완전 재생을 보장하지 못한다. Slack history 탐색도 현재 scope와 identity만으로 원본을 확정할 수 없다.
+
+### DL-038 · `worker_done`과 `reviewer_result`의 권위를 분리한다
+
+- `worker_done`은 `orca orchestration inbox --terminal "run:<run_id>" --limit <n> --json`에서 읽고, `reviewer_result`는 `task.result`에서 읽는다. `task.result`를 `worker_done`의 권위로 쓰지 않는다(OD-075).
+- 근거: `task-update --result`가 기존 worker_report 전체를 대체하지만 Run mailbox에는 원본 `worker_done`이 비소비 상태로 남는 것을 실측했다.
+
+### DL-039 · PR body와 다중 Task 연관을 분리한다
+
+- PR body는 primary/latest Task 하나만 유지하고 PR↔Task N 연관은 Bridge durable store에 따로 저장한다. OD-021 body metadata 형식과 parser 계약은 바꾸지 않는다(OD-076).
+- `orca-run`은 있고 필수 `orca-task`가 없는 PR은 invalid/degraded input이다. 별도 `run_correlated` kind는 Run-level 제품 의미가 필요해질 때만 도입한다(OD-077).
+- 근거: current body는 다중 Task 이력을 보존하지 못하고 key 누적은 conflict가 되며, run-only 입력은 Task 목적과 `worker_done`을 제공하지 못한다.
+- 각 결정의 실측 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-030, OD-031, OD-032, OD-044, OD-046, OD-075, OD-076, OD-077 확정 기록에 있다.

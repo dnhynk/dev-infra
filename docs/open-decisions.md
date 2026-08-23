@@ -54,17 +54,17 @@
 | OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
 | OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | DECIDED |
 | OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | DECIDED |
-| OD-075 | `task.result`가 덮어쓴 `worker_report`의 durable 조회·pagination 계약 | C2 전 | OPEN |
-| OD-076 | PR 1 : Task N correlation metadata와 cardinality | AB-1/C2 전 | OPEN |
-| OD-077 | run만 있고 task가 없는 PR의 correlation kind와 처리 정책 | S0/C2 전 | OPEN |
+| OD-075 | `task.result`가 덮어쓴 `worker_report`의 durable 조회·pagination 계약 | C2 전 | DECIDED |
+| OD-076 | PR 1 : Task N correlation metadata와 cardinality | AB-1/C2 전 | DECIDED |
+| OD-077 | run만 있고 task가 없는 PR의 correlation kind와 처리 정책 | S0/C2 전 | DECIDED |
 
 ## PR state와 요약
 
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
-| OD-030 | canonical PR state와 transition | C2 전 | OPEN |
-| OD-031 | review verdict 축약과 새 commit 후 approval | C2 전 | OPEN |
-| OD-032 | required/optional check와 merge-ready 정책 | C2 전 | OPEN |
+| OD-030 | canonical PR state와 transition | C2 전 | DECIDED |
+| OD-031 | review verdict 축약과 새 commit 후 approval | C2 전 | DECIDED |
+| OD-032 | required/optional check와 merge-ready 정책 | C2 전 | DECIDED |
 | OD-033 | review 핵심 comment 선택 규칙 | C1/C2 전 | DECIDED |
 | OD-034 | summarizer provider/model/schema/language | C1 전 | DECIDED |
 | OD-035 | summarizer 실패 fallback, cache, 호출 상한 | C1 전 | DECIDED |
@@ -79,9 +79,9 @@
 | OD-041 | Socket Mode 최종 채택과 reconnect 정책 | 실제 Slack 통합 전 | OPEN |
 | OD-042 | owner/workspace allowlist 관리 | D2 전 | OPEN |
 | OD-043 | durable store 기술·경로·migration·locking | C1 전 | DECIDED |
-| OD-044 | event idempotency와 out-of-order 우선순위 | C2 전 | OPEN |
+| OD-044 | event idempotency와 out-of-order 우선순위 | C2 전 | DECIDED |
 | OD-045 | retention, backup, corruption recovery | 운영 자동화 전 | OPEN |
-| OD-046 | Slack message 삭제·archive·channel 변경 복구 | C2/D1 전 | OPEN |
+| OD-046 | Slack message 삭제·archive·channel 변경 복구 | C2/D1 전 | DECIDED |
 | OD-047 | Slack identity 영역에서 Project와 Repository를 둘 다 표시할지와 fallback | C1/D1 전 | DECIDED |
 | OD-048 | 공통 channel topology의 최종 채택 여부 | 첫 Slack 설정 전 | OPEN |
 | OD-049 | GitHub 공식 Slack App 설치와 repo별 review/workflow 구독 범위 | 운영 환경 준비 전 | OPEN |
@@ -601,7 +601,8 @@ ID: OD-073
     `task-list --json`으로 읽어 무손실 왕복을 확인했다.
   - GitHub `reviewDecision`이 모든 대상 repository에서 null이므로 Orca가 유일한 durable source다(DL-016).
   - severity taxonomy는 `vertical-live` reviewer가 이미 쓰는 값을 그대로 쓴다.
-  - `reviewedHeadSha`는 현재 head와 같은지를 드러내는 사실이다. 이전 approval의 유효성 판정은 OD-031에 남긴다.
+  - `reviewedHeadSha`는 현재 head와 같은지를 드러내는 사실이다. OD-031은 이 사실만 표시하고 이전
+    approval의 유효·무효를 Bridge가 판정하지 않는 것으로 확정됐다.
 영향 문서/파일: contracts/observation-and-correlation.md §6, specs/orchestration-bootstrap-and-continuity.md §4
 검증 방법: 실제 reviewer terminal의 권한 거부 3건과 coordinator 기록, task-list JSON 왕복을 확인했다(2026-08-23).
 결정일: 2026-08-23
@@ -848,21 +849,159 @@ ID: OD-072
 결정일: 2026-08-22
 ```
 
-## 2026-08-23 C1 계약 실측이 연 신규 항목
+```text
+ID: OD-030
+상태: DECIDED
+결정: terminal을 `open | closed | merged`로 두고 `draft`·`review`·`checks`·`mergePolicy`를 직교 축으로
+      보존한 뒤 UI 의미 상태를 파생한다. `merged`는 `mergedAt != null`을 terminal latch로 쓴다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-030에서 GraphQL state는 OPEN/CLOSED/MERGED였지만 draft와
+    reviewDecision은 별도 축이었고, mergeable인 PR도 draft·review·required check 때문에 BLOCKED였다.
+  - 같은 절에서 merged PR은 `mergedAt`이 있었고 closed-unmerged는 `mergedAt=null`이었다.
+대안과 기각 이유:
+  - REST state 단독: merged와 closed-unmerged를 구분하지 못해 기각.
+  - GraphQL state 단독 또는 원본 축 없이 draft/review/check를 한 enum에 접기: 직교 사실과 전이를 잃어 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §5, docs/contracts/observation-and-correlation.md §6,
+                docs/architecture/orca-slack-bridge.md §6, docs/traceability.md
+검증 방법: docs/evidence/t1-github-lifecycle.md §OD-030의 open/draft/review/merged/closed 표본으로 축과 latch를 대조한다.
+결정일: 2026-08-23
+```
 
-- **OD-075** (`task.result`와 `worker_done` 조회): coordinator가 OD-073에 따라
-  `task-update --result`로 `reviewer_result`를 기록하면 그 Task의 `worker_report`가 덮어써져
-  `task.result`에서 원래 `worker_done`을 읽을 수 없다. C1은 `inbox`로 우회하지만 inbox는 전역 최신
-  N건만 반환하고 `--run` 필터, cursor, pagination이 없어 durable 조회 계약이 아니다. 두 사실을 모두
-  보존하고 Run 범위에서 완전하게 조회할 source/API를 결정해야 한다. C1의 포화 감지도 완전하지 않다.
-  반환 행 수가 요청 상한에 닿았는지만 보므로 Orca CLI가 더 낮은 값으로 조용히 clamp하면
-  `saturated=false`가 되어 오래된 `worker_done`을 실제 부재로 오인할 수 있다. `--limit 3`은 3행,
-  `--limit 10`은 10행, 큰 limit은 당시 전체 행을 반환한다는 실측은 요청값까지 반환하는 동작만 확인했으며
-  clamp가 없다는 보장은 하지 못했다. 후속 조회 계약은 pagination뿐 아니라 이 감지 blind spot도 닫아야 한다.
-- **OD-076** (PR 1 : Task N cardinality): PR body는 `orca-task` id를 하나만 실을 수 있고 같은 key를
-  서로 다른 값으로 중복하면 `conflict`다. 여러 Task가 한 PR을 이어서 갱신하면 metadata는 마지막 Task만
-  가리킨다. OD-021은 반대 방향인 Task 1 : PR N만 규정하므로 다중 Task 이력의 표현·선택 규칙을 정해야 한다.
-- **OD-077** (run-only correlation kind): `orca-run`은 있지만 `orca-task`가 없는 PR은 parser 결과가
-  `correlated`인데 task가 null이다. OD-021은 `orca-task`를 필수로 규정하지만 OD-022의 누락 정책 표에는
-  이 행과 전용 kind가 없다. C1은 임시로 `PrProjection.skipped(task_missing)` 처리하며 `resolve.ts`의
-  correlation 합타입은 바꾸지 않았다. `uncorrelated` reason 또는 별도 kind와 downstream 정책을 정해야 한다.
+```text
+ID: OD-031
+상태: DECIDED
+결정: 사실만 표시하고 판정하지 않는다. `headMatch`를 계속 싣되 이전 approval의 유효·무효를 Bridge가
+      판정하지 않는다. 새 head마다 재리뷰를 강제하지 않고, GitHub repository의 stale-review 설정을 따라가지도 않는다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-031에서 approval commit과 현재 head가 달라도 APPROVED가 유지된
+    사례와, 새 head 뒤 같은 review가 DISMISSED되어 REVIEW_REQUIRED가 된 사례가 모두 관측됐다.
+  - 같은 절은 API에 별도 staleApproval fact가 없고 commit/head 불일치는 오래된 head를 봤다는 사실만 준다고 확인했다.
+대안과 기각 이유:
+  - head 불일치 approval을 무조건 무효화: approval이 유지된 실제 표본과 충돌해 기각.
+  - repository stale-review 설정 추종: 같은 head mismatch가 APPROVED 유지와 DISMISSED로 갈렸고 기존 durable
+    verdict source는 Orca이므로, repository별 GitHub 정책을 Bridge의 approval 유효성 source로 추가하지 않는다.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §5, docs/contracts/observation-and-correlation.md §6,
+                docs/traceability.md
+검증 방법: docs/evidence/t1-github-lifecycle.md §OD-031의 유지·dismiss 두 표본에서 `headMatch` 사실만 동일하게 노출되는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-032
+상태: DECIDED
+결정: required check만으로 판정한다. base branch의 effective required rule과 head rollup을 조인해
+      missing/pending/failing/passing을 파생한다. optional check 실패는 merge를 막지 않는다.
+      merge queue·required reviews·up-to-date(strict)·conversation resolution은 C2 범위 밖이다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-032에서 required 여부는 rollup row가 아니라 base protection에 있었고,
+    미보고 required context는 rollup과 `gh pr checks --required`에 나타나지 않았다.
+  - 같은 절의 독립 재현에서 optional failure가 남아도 실제 merge는 성공했고, 미보고 required가 있으면 405로 거절됐다.
+대안과 기각 이유:
+  - head rollup 또는 `gh pr checks --required` 단독: 미보고 required를 놓쳐 기각.
+  - 모든 check success 또는 `mergeStateStatus=CLEAN` 단독: optional failure 상태의 실제 merge에 반해 기각.
+  - merge queue·review·strict·conversation까지 C2 판정에 포함: 실측은 required/optional check 경계만
+    독립 재현했고 이 조건들은 별도 policy/API이므로 C2 판정 근거에 포함하지 않는다.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §5, docs/contracts/observation-and-correlation.md §6,
+                docs/architecture/orca-slack-bridge.md §6, docs/traceability.md
+검증 방법: docs/evidence/t1-github-lifecycle.md §OD-032의 missing required 405와 optional failure merge 200을 재현한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-044
+상태: DECIDED
+결정: identity는 `(repository databaseId, PR number)`, terminal latch는 `mergedAt`, review/check scope는
+      `headSha`다. merged downgrade 금지는 timestamp 비교가 아니라 terminal dominance rule로 명시한다.
+      동일 head 안의 review/check는 각 resource의 timestamp와 id로 reconcile한다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-044에서 같은 `updated_at`의 응답이 서로 다른 head를 보였고,
+    mergeability와 check 변화는 PR `updated_at`을 바꾸지 않아 전역 last-write-wins가 성립하지 않았다.
+  - 같은 절에서 PR id는 안정적 identity, head SHA는 version scope였으며 review/check id는 resource identity로 관측됐다.
+대안과 기각 이유:
+  - PR `updated_at` 단독 last-write-wins: review/check/mergeability의 엄격한 version이 아니어서 기각.
+  - id 또는 SHA 문자열 순서 사용: identity일 뿐 시간 순서를 표현하지 않아 기각.
+  - 전체 상태 선형 rank: closed PR의 reopen을 막아 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §9, docs/contracts/observation-and-correlation.md §8,
+                docs/architecture/orca-slack-bridge.md §6, docs/traceability.md
+검증 방법: docs/evidence/t1-github-lifecycle.md §OD-044의 stale head, 동일 resource 진행→완료, merged 재조회 표본으로 규칙을 대조한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-046
+상태: DECIDED
+결정: current 카드만 재생성한다. GitHub current snapshot + Orca facts + Bridge store identity로 현재 상태
+      카드를 다시 만들고, 과거 thread의 semantic transition 재생은 하지 않는다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-046에서 merged PR의 current facts와 history는 조회됐지만 check는
+    400일 뒤 archive되고 다시 10일 뒤 삭제되어 과거 semantic transition의 완전 재생을 보장하지 못했다.
+  - docs/evidence/t4-slack-inbound.md §(d)에서 Slack 오류는 삭제·archive·channel 변경을 단독 확정하지 못하고,
+    현재 App에는 history/read scope와 event subscription이 없음을 확인했다.
+대안과 기각 이유:
+  - GitHub history로 과거 thread 완전 재생: pagination과 retention 때문에 완전성을 보장하지 못해 기각.
+  - Slack history에서 기존 메시지 탐색: 현재 scope로 불가능하고 text·bot identity로 원본을 확정할 수 없어 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §5.4·§9, docs/architecture/orca-slack-bridge.md §6,
+                docs/traceability.md
+검증 방법: 저장된 Slack coordinate를 유실한 fixture에서 세 current source로 루트만 재생성하고 과거 thread가 생기지 않는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-075
+상태: DECIDED
+결정: `task.result`를 권위로 쓰지 않는다. `worker_done`은
+      `orca orchestration inbox --terminal "run:<run_id>" --limit <n> --json`에서 읽고,
+      `reviewer_result`는 `task.result`에서 읽는다.
+근거:
+  - docs/evidence/t2-orca-worker-done-retrieval.md §(a)에서 `task-update --result`가 worker_report 10개 필드를
+    전부 덮어썼고 실제 Run 38개 Task 중 15개가 reviewer_result로 대체된 상태였다.
+  - 같은 문서 §(c)에서 Run mailbox 조회는 권한 없이 성공하고 소비하지 않았으며, worker_done 전부가
+    `run:*` 주소로 라우팅됨을 전역 표본과 Orca send handler에서 확인했다.
+대안과 기각 이유:
+  - `task.result`에서 두 사실을 함께 읽기: reviewer_result 기록이 worker_report를 대체해 기각.
+  - `check --run --all`: coordinator 권한이 필요하고 100행 고정 상한·cursor 부재가 있어 기각.
+  - `worker-read`: 원시 transcript이고 settled+exited Dispatch에서 빈 결과여서 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §5.2, docs/contracts/observation-and-correlation.md §3,
+                docs/traceability.md
+검증 방법: docs/evidence/t2-orca-worker-done-retrieval.md §(c)의 Run mailbox 조회를 반복해 body/payload와 비소비 상태를 대조한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-076
+상태: DECIDED
+결정: PR body는 primary/latest Task 하나만 유지하고, PR↔Task N 연관은 Bridge durable store에 별도로 저장한다.
+      OD-021의 body metadata 형식과 parser 계약은 개정하지 않는다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-076에서 current body는 한 Task만 가리켰고, 서로 다른 Task
+    comment를 중복하면 현 parser가 conflict로 처리함을 확인했다.
+  - 같은 절에서 commit trailer와 GraphQL body edit history는 단서를 남겼지만 authoritative correlation에
+    필요한 신뢰성과 retention 계약은 없었다.
+대안과 기각 이유:
+  - current body의 단일 task로 전체 이력 복원: 이전 Task를 잃어 기각.
+  - 여러 `orca-task` comment 누적 또는 body schema 개정: 현 parser 계약을 깨뜨리므로 기각.
+  - commit trailer/body edit history를 권위로 사용: 누락·force-push·보존 불확실성 때문에 기각.
+영향 문서/파일: docs/contracts/observation-and-correlation.md §2, docs/specs/orca-slack-bridge.md §9,
+                docs/architecture/orca-slack-bridge.md §7, docs/traceability.md
+검증 방법: 한 PR을 두 Task가 갱신하는 fixture에서 body는 latest 하나이고 store association은 둘 다 남는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-077
+상태: DECIDED
+결정: `orca-run`은 있고 `orca-task`가 없는 PR은 invalid/degraded input으로 명시한다. OD-021이 task를
+      필수로 이미 정했기 때문이다. 별도 `run_correlated` kind는 Run-level 제품 의미가 필요해질 때만 도입한다.
+근거:
+  - docs/evidence/t1-github-lifecycle.md §OD-077에서 GitHub는 run-only body를 허용했지만 실제 정상 PR 9개에는
+    사례가 없었고, 현재 downstream은 Task 목적과 worker_done을 찾지 못해 `task_missing`으로 skip했다.
+  - 같은 절에서 정상 경로의 partial-write window는 관측되지 않았고 실제 경로는 누락·수동 편집 같은 partial input이었다.
+대안과 기각 이유:
+  - 완전한 Task correlation로 취급: Task 목적과 report를 추측해야 하므로 기각.
+  - branch/title/author로 Task 보완: no-guessing 계약에 반해 기각.
+  - 즉시 `run_correlated` kind 도입: 현재 Task 카드 범위에 Run-level 제품 의미가 없어 기각.
+영향 문서/파일: docs/contracts/observation-and-correlation.md §2, docs/specs/orca-slack-bridge.md §5.4,
+                docs/traceability.md
+검증 방법: run-only fixture가 invalid/degraded로 명시되고 Task 카드를 만들지 않으며 추측 보완하지 않는지 확인한다.
+결정일: 2026-08-23
+```
