@@ -49,14 +49,31 @@ export type OrcaRun = {
   readonly updatedAt: Date;
 };
 
+/**
+ * task row의 `result` 한 칸을 읽은 결과.
+ *
+ * 합타입으로 둔다. `unknown` 하나로 두고 실패를 null로 접으면 "result가 없다"와 "읽지
+ * 못했다"가 같은 값이 되어 소비자가 후자를 빠뜨린다. `PrProjection`이 "카드를 만들지 않았다"를
+ * 반환값에서 빠뜨릴 수 없게 하는 것과 같은 이유다(OD-079).
+ */
+export type TaskResult =
+  /** 읽었다. `value`가 null이면 result가 없는 정상 row다. */
+  | { readonly kind: 'value'; readonly value: unknown }
+  /** 읽지 못했다. `reason`은 `parseJsonField`가 만든 메시지 그대로다. */
+  | { readonly kind: 'unreadable'; readonly reason: string };
+
 export type OrcaTask = {
   readonly id: string;
   readonly runId: string;
   readonly title: string;
   readonly status: string;
   readonly deps: readonly string[];
-  /** 구조화 결과. reviewer verdict가 여기 실린다(DL-016). */
-  readonly result: unknown;
+  /**
+   * 구조화 결과. reviewer verdict가 여기 실린다(DL-016).
+   *
+   * 읽지 못한 row는 `unreadable`이며 그것도 관측 결과다. 버리지 않는다(OD-079).
+   */
+  readonly result: TaskResult;
   /** created_by_process_incarnation에서 뽑은 작업 디렉터리. 형식이 다르면 null. */
   readonly worktreePath: string | null;
   readonly createdAt: Date;
@@ -105,6 +122,56 @@ export async function listRuns(runner: OrcaRunner): Promise<OrcaRun[]> {
   });
 }
 
+/**
+ * task row의 `result`를 읽는다. **파싱 실패를 이 task 하나에 가둔다**(OD-079).
+ *
+ * `parseJsonField`는 그대로 던진다. 파싱 실패를 fallback으로 덮으면 데이터 손실을 조용히
+ * 넘기기 때문이고, 그 계약은 여기서 바꾸지 않는다. 여기서 하는 것은 **실패의 범위를 좁히는
+ * 것**이다.
+ *
+ * 좁혀야 하는 이유는 조회 표면이 정한다. `run-list`에 필터가 없어 관측 1회가 이 호스트의 모든
+ * Run을 훑으므로, 카드와 아무 관계 없는 Run의 row가 같은 목록에 섞여 온다. 실측(2026-08-24,
+ * 로컬 Orca DB Run 16개 전수): 따옴표 없는 JSON이 든 row가 `run_59bccb319e7f`의
+ * `task_5694362d24f8` 하나였고, 그 row 때문에 `digest --pr 25 --dry-run`이 stdout 0바이트에
+ * exit 1로 끝났다. 관측을 중단하는 것은 OD-072가 정한 "degraded를 숨기지 않는다"가 아니라
+ * 무관한 row 하나가 나머지 관측을 없애는 것이다.
+ *
+ * 좁히는 범위는 `result` 한 칸이다. 같은 row의 `deps`는 여전히 던진다. 그 값은 아직 소비자가
+ * 없어 degraded로 실어 보낼 곳이 없고, 쓰지 않는 값을 위해 실패를 삼키면 그것이 조용한 관용이다.
+ */
+function readTaskResult(raw: unknown): TaskResult {
+  try {
+    return { kind: 'value', value: parseJsonField<unknown>(raw, null) };
+  } catch (e) {
+    return { kind: 'unreadable', reason: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * result를 읽지 못한 task 하나. 어느 Run의 어느 task가 왜 실패했는지 그대로 남긴다(OD-079).
+ */
+export type UnreadableTaskResult = {
+  readonly runId: string;
+  readonly taskId: string;
+  readonly reason: string;
+};
+
+/**
+ * 관측한 task 중 result를 읽지 못한 것만 사실로 모은다.
+ *
+ * 별도 채널로 세지 않고 관측된 task에서 그대로 파생한다. 두 곳에 두면 서로 어긋난다.
+ */
+export function unreadableTaskResults(
+  tasks: readonly OrcaTask[],
+): readonly UnreadableTaskResult[] {
+  const out: UnreadableTaskResult[] = [];
+  for (const t of tasks) {
+    if (t.result.kind !== 'unreadable') continue;
+    out.push({ runId: t.runId, taskId: t.id, reason: t.result.reason });
+  }
+  return out;
+}
+
 export async function listTasks(runner: OrcaRunner, runId: string): Promise<OrcaTask[]> {
   const r = await call<{ tasks?: unknown[] }>(runner, [
     'orchestration', 'task-list', '--run', runId, '--json',
@@ -118,9 +185,7 @@ export async function listTasks(runner: OrcaRunner, runId: string): Promise<Orca
       title: str(o['task_title']) || str(o['display_name']),
       status: str(o['status']),
       deps: parseJsonField<string[]>(o['deps'], []),
-      result: o['result'] === null || o['result'] === undefined
-        ? null
-        : parseJsonField<unknown>(o['result'], null),
+      result: readTaskResult(o['result']),
       worktreePath: inc === '' ? null : worktreePathFromIncarnation(inc),
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
       completedAt: (() => {

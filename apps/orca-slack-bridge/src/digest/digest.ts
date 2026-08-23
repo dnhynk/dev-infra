@@ -4,7 +4,13 @@ import { listPullRequests, type PullRequestFacts } from '../github/pull-request.
 import { fetchRepositoryIdentity } from '../github/repository.js';
 import type { GhRunner } from '../github/runner.js';
 import { runKey, taskKey, type PullRequestKey } from '../identity/keys.js';
-import { listWorkerDone, type OrcaRunner, type OrcaTask } from '../orca/client.js';
+import {
+  listWorkerDone,
+  unreadableTaskResults,
+  type OrcaRunner,
+  type OrcaTask,
+  type UnreadableTaskResult,
+} from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
 import type { SlackPoster, ThreadPoster } from '../slack/post.js';
 import { buildCorrelationView, collectRuns } from '../snapshot/snapshot.js';
@@ -174,6 +180,18 @@ export type DigestReport = {
   readonly observedAt: string;
   /** Slack과 store에 쓰지 않았다는 사실. 출력이 실제 게시처럼 읽히지 않게 한다. */
   readonly dryRun: boolean;
+  /**
+   * 이번 관찰에서 `result`를 읽지 못한 Orca task 전부(OD-079).
+   *
+   * 카드별이 아니라 관찰 단위다. `run-list`에 필터가 없어 관측 1회가 이 호스트의 모든 Run을
+   * 훑으므로, 여기 실리는 Run이 이번에 카드를 만든 PR과 무관할 수 있다. 그 무관함이 바로
+   * 이 목록을 카드 아래가 아니라 보고 위에 두는 이유다.
+   *
+   * **비어 있지 않은데 카드가 나왔다면 그 카드는 이 실패를 알지 못한 채 그려진 것이다.**
+   * 읽지 못한 row가 reviewer_result였는지 아닌지도 알 수 없으므로, 같은 Run의 카드에서
+   * "리뷰 결과 없음"은 "reviewer_result를 관측하지 못했다"까지만 뜻한다.
+   */
+  readonly degraded: readonly UnreadableTaskResult[];
   readonly results: readonly DigestResult[];
 };
 
@@ -249,7 +267,14 @@ export async function runDigest(
     }
   }
 
-  return { observedAt: options.now().toISOString(), dryRun: options.slack === null, results };
+  return {
+    observedAt: options.now().toISOString(),
+    dryRun: options.slack === null,
+    // 읽지 못한 row를 버리지 않고 관찰 결과로 싣는다. 파싱 실패는 task 하나에 갇히고
+    // 나머지 Run은 그대로 관측된다(OD-079).
+    degraded: runs.flatMap((r) => unreadableTaskResults(r.tasks)),
+    results,
+  };
 }
 
 /**
@@ -492,6 +517,17 @@ export function formatReport(report: DigestReport): string {
     `observed ${report.observedAt}  mode=${report.dryRun ? 'dry-run' : 'live'}`,
     '',
   ];
+  // 카드보다 위에 둔다. dry-run은 카드마다 blocks 전문을 찍으므로 아래에 두면 묻힌다.
+  if (report.degraded.length > 0) {
+    lines.push(
+      `degraded: Orca task result ${report.degraded.length}건을 읽지 못했다. ` +
+        '실패를 그 task에 가두고 나머지는 관측했다(OD-079)',
+    );
+    for (const d of report.degraded) {
+      lines.push(`  ${d.runId} / ${d.taskId}: ${d.reason.slice(0, REASON_CAP)}`);
+    }
+    lines.push('');
+  }
   for (const r of report.results) {
     if (r.kind === 'skipped') {
       lines.push(`${r.key}  카드 없음: ${r.reason} — ${SKIP_NOTE[r.reason]}`);
@@ -520,6 +556,9 @@ export function formatReport(report: DigestReport): string {
     lines.push('');
   }
   const cards = report.results.filter((r) => r.kind === 'card').length;
-  lines.push(`카드 ${cards}건 / 관찰 ${report.results.length}건`);
+  lines.push(
+    `카드 ${cards}건 / 관찰 ${report.results.length}건 / ` +
+      `읽지 못한 task result ${report.degraded.length}건`,
+  );
   return lines.join('\n');
 }

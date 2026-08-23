@@ -57,6 +57,7 @@
 | OD-075 | `task.result`가 덮어쓴 `worker_report`의 durable 조회·pagination 계약 | C2 전 | DECIDED |
 | OD-076 | PR 1 : Task N correlation metadata와 cardinality | AB-1/C2 전 | DECIDED |
 | OD-077 | run만 있고 task가 없는 PR의 correlation kind와 처리 정책 | S0/C2 전 | DECIDED |
+| OD-079 | Orca task result 파싱 실패의 봉쇄 범위와 노출 형태 | C2 전 | DECIDED |
 
 ## PR state와 요약
 
@@ -1402,4 +1403,36 @@ ID: OD-020
            이 Run에서 worktree id를 `<uuid>::<path>` 형식으로 반복 사용해 모두 동작했지만 형식 계약의
            보장은 관측하지 못했다. 이 형식의 안정성은 남은 위험이며 관측을 보장으로 격상하지 않는다.
 결정일: 2026-08-23
+```
+
+```text
+ID: OD-079
+상태: DECIDED
+결정: `parseJsonField`는 파싱 실패에 계속 던진다. 호출부인 `listTasks`가 그 실패를 **task 하나에 가두고**
+      읽지 못했다는 사실을 `TaskResult`의 `unreadable`로 남긴다. digest 보고는 그 사실을 runId·taskId·이유와
+      함께 관찰 단위 `degraded` 목록으로 낸다.
+근거:
+  - `origin/main` 9b9decbb을 빌드해 `node apps/orca-slack-bridge/dist/cli.js digest --pr 25 --dry-run`을
+    실행하면 stdout 0바이트, stderr `JSON 필드를 파싱할 수 없다: {kind:reviewer_result,schemaVersion:1,...`,
+    exit 1이었다. 카드도 리포트도 나오지 않았다.
+  - 같은 시점 로컬 Orca DB의 Run 16개를 전수 조사한 결과 깨진 row는 하나였다. `run_59bccb319e7f`의
+    `task_5694362d24f8`이며 `result`에 따옴표 없는 JSON이 들어 있었다. 이전 세션 probe가 남긴 값으로
+    관측 대상 Run과 무관하다.
+  - `run-list`에 필터가 없어 관측 1회가 이 호스트의 모든 Run을 훑는다. 그래서 무관한 Run의 row 하나가
+    관측 전체를 중단시킨다.
+  - OD-072가 정한 것은 degraded를 성공처럼 숨기지 않는 것이지 degraded를 만나면 관측을 멈추는 것이 아니다.
+    docs/contracts/observation-and-correlation.md §6·§7도 degraded를 표시하라고 하지 중단하라고 하지 않는다.
+대안과 기각 이유:
+  - fallback으로 덮기: 파싱 실패를 null로 접으면 "result가 없다"와 "읽지 못했다"가 같은 값이 되어 데이터
+    손실을 숨기므로 기각. `orca/coerce.ts` 주석이 적은 근거 그대로이고 그 계약은 유지한다.
+  - 그대로 중단: 무관한 row 하나가 나머지 관측을 전부 없애므로 기각. 위 재현이 그 결과다.
+  - 같은 row의 `deps`·`options`까지 함께 가두기: 두 값은 아직 소비자가 없어 degraded로 실어 보낼 곳이
+    없으므로 기각. 쓰지 않는 값을 위해 실패를 삼키는 것이 조용한 관용이다.
+영향 문서/파일: apps/orca-slack-bridge/src/orca/client.ts, apps/orca-slack-bridge/src/digest/project.ts,
+                apps/orca-slack-bridge/src/digest/digest.ts, apps/orca-slack-bridge/src/snapshot/snapshot.ts,
+                docs/decision-log.md
+검증 방법: 위 실측 문자열을 그대로 쓴 fixture에서 정상 task는 관측되고 깨진 task만 degraded로 나오는지
+           확인한다. `parseJsonField`가 같은 문자열에 여전히 던지는지도 함께 고정한다. 실제 CLI 재실행이
+           exit 0으로 바뀌고 보고와 `--json`에 runId·taskId·이유가 나오는지 확인한다.
+결정일: 2026-08-24
 ```

@@ -104,7 +104,11 @@ export function pickReviewerResult(
   const needle = repository.nameWithOwner.trim().toLowerCase();
   const matches: { task: OrcaTask; result: OrcaReviewerResult }[] = [];
   for (const task of tasks) {
-    const result = parseReviewerResult(task.result, task.id);
+    // 읽지 못한 result는 여기서 판정하지 않는다. 어느 Run의 어느 task가 왜 실패했는지는
+    // `unreadableTaskResults`가 관측 결과로 싣는다(OD-079). 여기서 던지면 이 PR과 무관한
+    // Run의 row 하나가 카드를 통째로 없앤다.
+    if (task.result.kind === 'unreadable') continue;
+    const result = parseReviewerResult(task.result.value, task.id);
     if (result === null) continue;
     if (result.prNumber !== prNumber) continue;
     if (result.repo.toLowerCase() !== needle) continue;

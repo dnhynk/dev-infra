@@ -13,7 +13,10 @@ import {
   listWorkerDone,
   listTasks,
   parseReviewerResult,
+  unreadableTaskResults,
   type OrcaRunner,
+  type OrcaTask,
+  type TaskResult,
   type WorkerDoneInbox,
   type WorkerDoneMessage,
 } from '../src/orca/client.js';
@@ -33,6 +36,24 @@ const CONFIG: BridgeConfig = {
   projects: [{ name: 'dev-infra', repositories: ['dnhynk/dev-infra'] }],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
+
+/**
+ * fixture의 읽은 result를 값으로 꺼낸다.
+ *
+ * `OrcaTask.result`가 합타입이므로 테스트도 그대로 다룬다. 읽지 못한 fixture를 값처럼 쓰면
+ * 검증 대상이 조용히 달라진다.
+ */
+function resultValue(task: OrcaTask | undefined): Record<string, unknown> {
+  if (task === undefined || task.result.kind !== 'value') {
+    throw new Error('fixture의 result를 읽지 못했다');
+  }
+  return task.result.value as Record<string, unknown>;
+}
+
+/** 값 하나를 읽은 result로 감싼다. */
+function readResult(value: unknown): TaskResult {
+  return { kind: 'value', value };
+}
 
 const CORRELATED: Correlation = {
   kind: 'correlated',
@@ -240,8 +261,8 @@ describe('Orca 사실 수집', () => {
   it('task result에서 reviewer_result만 읽고 나머지는 null이다', async () => {
     const tasks = await listTasks(new FakeOrca(), 'run_7804be5a654f');
     // worker_report provenance는 리뷰 결과가 아니다.
-    expect(parseReviewerResult(tasks[0]?.result, 'task_56972eaff901')).toBeNull();
-    expect(parseReviewerResult(tasks[1]?.result, 'task_8bf3d72f262a')).toEqual({
+    expect(parseReviewerResult(resultValue(tasks[0]), 'task_56972eaff901')).toBeNull();
+    expect(parseReviewerResult(resultValue(tasks[1]), 'task_8bf3d72f262a')).toEqual({
       verdict: 'request_changes',
       repo: 'dnhynk/dev-infra',
       prNumber: 1,
@@ -353,7 +374,7 @@ describe('reviewer_result 엄격 검증', () => {
     const f = await facts();
     const base = f.tasks[1];
     if (base === undefined) throw new Error('fixture가 깨졌다');
-    const broken = [{ ...base, result: { ...(base.result as object), schemaVersion: 2 } }];
+    const broken = [{ ...base, result: readResult({ ...resultValue(base), schemaVersion: 2 }) }];
     expect(() => projectPullRequest(REPO, pr(), CORRELATED, { ...f, tasks: broken }, CONFIG)).toThrow(
       /schemaVersion 2/,
     );
@@ -636,12 +657,12 @@ describe('reviewer_result 파생', () => {
       ...base,
       id: 'task_2379c41dcc5f',
       completedAt: new Date('2026-08-22T11:23:14.067Z'),
-      result: {
+      result: readResult({
         kind: 'reviewer_result', schemaVersion: 1, verdict: 'approve',
         pr: { repo: 'dnhynk/dev-infra', number: 1 },
         reviewedHeadSha: '7e9479ebdebe35fc9956b65c0f851ff096c56130',
         findings: [],
-      },
+      }),
     };
     // 입력 순서를 뒤집어도 같은 결과가 나와야 한다.
     for (const tasks of [[...f.tasks, later], [later, ...f.tasks]]) {
@@ -656,7 +677,7 @@ describe('reviewer_result 파생', () => {
     const tie = {
       ...base,
       id: 'task_zzzzzzzzzzzz',
-      result: { ...(base.result as object), verdict: 'approve', findings: [] },
+      result: readResult({ ...resultValue(base), verdict: 'approve', findings: [] }),
     };
     expect(pickReviewerResult([tie, base], REPO, 1)?.verdict).toBe('approve');
     expect(pickReviewerResult([base, tie], REPO, 1)?.verdict).toBe('approve');
@@ -687,12 +708,12 @@ describe('reviewer_result 파생', () => {
     if (base === undefined) throw new Error('fixture가 깨졌다');
     const wide = {
       ...base,
-      result: {
-        ...(base.result as object),
+      result: readResult({
+        ...resultValue(base),
         findings: Array.from({ length: 12 }, (_, i) => ({
           severity: 'minor', file: `f${i}.ts`, line: null, summary: `f ${i}`,
         })),
-      },
+      }),
     };
     const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, tasks: [wide] }, CONFIG);
     expect(p.kind === 'card' && p.pr.review?.findings).toHaveLength(10);
@@ -723,7 +744,9 @@ describe('DigestStatus 파생', () => {
     const f = await facts();
     const base = f.tasks[1];
     if (base === undefined) throw new Error('fixture가 깨졌다');
-    const approved = [{ ...base, result: { ...(base.result as object), verdict: 'approve', findings: [] } }];
+    const approved = [
+      { ...base, result: readResult({ ...resultValue(base), verdict: 'approve', findings: [] }) },
+    ];
     expect(deriveDigestStatus(await card({}, approved))).toBe('review_approved');
   });
 
@@ -845,5 +868,95 @@ describe('inbox 포화', () => {
     const got = await listWorkerDone(new SaturatingInbox([otherRun]), 1);
     expect(got.saturated).toBe(true);
     expect(() => pickWorkerReport(got, origin)).toThrow(/부재를 증명할 수 없다/);
+  });
+});
+
+/**
+ * 깨진 task result 봉쇄 (OD-079).
+ *
+ * 실측된 깨진 row를 그대로 fixture에 넣는다.
+ * `orca orchestration task-list --run run_59bccb319e7f --json`(2026-08-24)의 `task_5694362d24f8`
+ * `result`이며, 이전 세션 probe가 남긴 따옴표 없는 JSON이다.
+ */
+describe('깨진 task result 봉쇄', () => {
+  const BROKEN_RESULT =
+    '{kind:reviewer_result,schemaVersion:1,verdict:approve,pr:{repo:THROWAWAY/none,number:10},' +
+    'reviewedHeadSha:deadbeef,findings:[],gates:{evidence_discipline:pass},note:two words}';
+
+  /** 같은 목록에 깨진 row와 정상 reviewer_result row가 섞여 온다. */
+  const mixed: OrcaRunner = {
+    async run(args: readonly string[]): Promise<string> {
+      if (args[1] !== 'task-list') throw new Error('예상치 못한 호출: ' + args.join(' '));
+      return JSON.stringify({
+        id: 'x',
+        ok: true,
+        result: {
+          runId: 'run_59bccb319e7f',
+          count: 2,
+          tasks: [
+            {
+              id: 'task_5694362d24f8', run_id: 'run_59bccb319e7f',
+              task_title: 'THROWAWAY PR10 reviewer probe',
+              display_name: 'THROWAWAY PR10 reviewer probe',
+              status: 'completed', deps: '[]', result: BROKEN_RESULT,
+              created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+              created_at: '2026-08-23 04:50:32', completed_at: '2026-08-23T04:52:36.700Z',
+            },
+            {
+              id: 'task_8bf3d72f262a', run_id: 'run_59bccb319e7f',
+              task_title: 'R1 · PR #1 리뷰', display_name: 'R1 · PR #1 리뷰',
+              status: 'completed', deps: '[]',
+              result: JSON.stringify({
+                kind: 'reviewer_result', schemaVersion: 1, verdict: 'approve',
+                pr: { repo: 'dnhynk/dev-infra', number: 1 },
+                reviewedHeadSha: 'dbdc4e9d8c9bb75a980b6070b4dd8448bbff22c5',
+                findings: [],
+              }),
+              created_by_process_incarnation: 'ccb3c8ee::D:/dev-infra@@2798f0da:87e85235',
+              created_at: '2026-08-23 04:55:00', completed_at: '2026-08-23T04:56:00.000Z',
+            },
+          ],
+        },
+      });
+    },
+  };
+
+  it('깨진 row 하나가 같은 목록의 나머지를 없애지 않는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    expect(tasks.map((t) => t.id)).toEqual(['task_5694362d24f8', 'task_8bf3d72f262a']);
+    expect(tasks[0]?.result.kind).toBe('unreadable');
+    // 깨진 row의 나머지 칸은 그대로 읽는다. 못 읽은 것은 `result` 한 칸이다.
+    expect(tasks[0]?.completedAt?.toISOString()).toBe('2026-08-23T04:52:36.700Z');
+    expect(resultValue(tasks[1])).toMatchObject({ kind: 'reviewer_result', verdict: 'approve' });
+  });
+
+  it('어느 Run의 어느 task가 왜 실패했는지 사실로 남긴다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    const degraded = unreadableTaskResults(tasks);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      runId: 'run_59bccb319e7f',
+      taskId: 'task_5694362d24f8',
+    });
+    // 이유는 `parseJsonField`가 만든 메시지 그대로다. 읽지 못한 값이 그 안에 남는다.
+    expect(degraded[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+    expect(degraded[0]?.reason).toContain('{kind:reviewer_result');
+  });
+
+  it('깨진 row와 섞여도 정상 task의 reviewer_result를 읽는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    expect(pickReviewerResult(tasks, REPO, 1)?.verdict).toBe('approve');
+  });
+
+  /**
+   * 봉쇄가 관대함이 되지 않는지 본다.
+   *
+   * 깨진 row의 **문자열**은 `THROWAWAY/none#10`의 approve처럼 읽히지만 그것은 읽지 못한 값이다.
+   * 여기서 verdict가 나오면 파싱 실패를 추측으로 메운 것이다.
+   */
+  it('읽지 못한 row에서 verdict를 만들어내지 않는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    const throwaway = repositoryIdentity(999, 'THROWAWAY/none');
+    expect(pickReviewerResult(tasks, throwaway, 10)).toBeNull();
   });
 });

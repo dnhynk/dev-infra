@@ -38,6 +38,19 @@ const REPO = 'o/r';
 const REPO_ID = 4242;
 const HEAD = 'a'.repeat(40);
 const CHANNEL = 'C_TEST_CHANNEL';
+/** 이 PR과 무관한 Run. 관측 1회가 모든 Run을 훑기 때문에 같은 목록에 섞여 온다(OD-079). */
+const FOREIGN_RUN = 'run_59bccb319e7f';
+const FOREIGN_TASK = 'task_5694362d24f8';
+/**
+ * 실측된 깨진 `result`. 따옴표가 없어 JSON으로 읽히지 않는다.
+ *
+ * `orca orchestration task-list --run run_59bccb319e7f --json`(2026-08-24)의
+ * `task_5694362d24f8` `result`를 그대로 옮겼다. 이전 세션의 throwaway probe가 남긴 값이고
+ * 이 Run과 아무 관계가 없다.
+ */
+const BROKEN_RESULT =
+  '{kind:reviewer_result,schemaVersion:1,verdict:approve,pr:{repo:THROWAWAY/none,number:10},' +
+  'reviewedHeadSha:deadbeef,findings:[],gates:{evidence_discipline:pass},note:two words}';
 
 let dir: string;
 let dbPath: string;
@@ -54,8 +67,12 @@ afterEach(() => {
 /** 실측 형태를 그대로 흉내낸 합성 fixture (DL-023). */
 class FakeOrca implements OrcaRunner {
   readonly calls: string[][] = [];
-  /** null이면 reviewer task 자체가 없다. 리뷰 전 상태를 만든다. */
-  constructor(private readonly verdict: 'approve' | 'request_changes' | null = 'approve') {}
+  constructor(
+    /** null이면 reviewer task 자체가 없다. 리뷰 전 상태를 만든다. */
+    private readonly verdict: 'approve' | 'request_changes' | null = 'approve',
+    /** 참이면 깨진 result를 가진 무관한 Run 하나를 관측에 섞는다(OD-079). */
+    private readonly foreign = false,
+  ) {}
   async run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
     const wrap = (result: unknown): string => JSON.stringify({ id: 'x', ok: true, result });
@@ -70,6 +87,37 @@ class FakeOrca implements OrcaRunner {
             legacy: 0,
             created_at: '2026-08-22T00:00:00Z',
             updated_at: '2026-08-22T00:00:00Z',
+          },
+          ...(this.foreign
+            ? [
+                {
+                  id: FOREIGN_RUN,
+                  objective: 'THROWAWAY PR10 reviewer probe',
+                  coordinator_handle: 'term_1235a5d1',
+                  coordinator_pane_key: 'e119e82a:ed65e315',
+                  legacy: 0,
+                  created_at: '2026-08-23T04:50:00Z',
+                  updated_at: '2026-08-23T04:52:36Z',
+                },
+              ]
+            : []),
+        ],
+      });
+    }
+    if (args[1] === 'task-list' && args[3] === FOREIGN_RUN) {
+      return wrap({
+        tasks: [
+          {
+            id: FOREIGN_TASK,
+            run_id: FOREIGN_RUN,
+            task_title: 'THROWAWAY PR10 reviewer probe',
+            display_name: 'THROWAWAY PR10 reviewer probe',
+            status: 'completed',
+            deps: '[]',
+            result: BROKEN_RESULT,
+            created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+            created_at: '2026-08-23 04:50:32',
+            completed_at: '2026-08-23T04:52:36.700Z',
           },
         ],
       });
@@ -320,6 +368,8 @@ type Once = {
   readonly thread?: ThreadPoster | null;
   /** reviewer verdict. null이면 reviewer task 자체가 없어 리뷰 전 상태가 된다. */
   readonly verdict?: 'approve' | 'request_changes' | null;
+  /** 참이면 깨진 result를 가진 무관한 Run 하나가 관측에 섞인다(OD-079). */
+  readonly foreign?: boolean;
   readonly gh?: GhOver;
 };
 
@@ -328,7 +378,7 @@ async function digestOnce(opts: Once = {}): Promise<DigestReport> {
   const store = new SqliteDigestStore(dbPath);
   try {
     return await runDigest(
-      new FakeOrca(opts.verdict === undefined ? 'approve' : opts.verdict),
+      new FakeOrca(opts.verdict === undefined ? 'approve' : opts.verdict, opts.foreign ?? false),
       new FakeGh(opts.prs ?? [prRow()], opts.buildConclusion, opts.gh),
       {
         config: CONFIG,
@@ -1152,5 +1202,43 @@ describe('runDigest 전이 경계', () => {
     expect(card(mismatched).transitions.map((t) => t.outcome)).toEqual(['unposted']);
     // 관측한 사실 자체는 남는다(`recordPrTask`와 같은 근거).
     expect(readPrState(PR_KEY)?.reviewVerdict).toBe('approve');
+  });
+});
+
+/**
+ * 깨진 task result 하나가 관측 전체를 죽이지 않는다(OD-079).
+ *
+ * 실제로 재현된 실패다. `origin/main` 9b9decbb에서 `digest --pr 25 --dry-run`이 stdout 0바이트에
+ * exit 1로 끝났고, 원인은 이 Run과 무관한 `run_59bccb319e7f`의 row 하나였다.
+ */
+describe('runDigest 깨진 task result 봉쇄', () => {
+  it('무관한 Run의 깨진 row가 있어도 나머지는 그대로 관측된다', async () => {
+    const withBroken = await digestOnce({ foreign: true });
+    const clean = await digestOnce({ slack: null });
+
+    // 카드는 깨진 row가 없을 때와 같다. 봉쇄가 정상 경로를 바꾸지 않는다.
+    expect(card(withBroken).card).toEqual(card(clean).card);
+    expect(card(withBroken).fingerprint).toBe(card(clean).fingerprint);
+  });
+
+  it('어느 Run의 어느 task가 왜 실패했는지 사실로 남긴다', async () => {
+    const report = await digestOnce({ foreign: true });
+    expect(report.degraded).toHaveLength(1);
+    expect(report.degraded[0]).toMatchObject({ runId: FOREIGN_RUN, taskId: FOREIGN_TASK });
+    // 이유는 `parseJsonField`가 만든 메시지 그대로다. 읽지 못한 값이 그 안에 남는다.
+    expect(report.degraded[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+    expect(report.degraded[0]?.reason).toContain('{kind:reviewer_result');
+  });
+
+  it('깨진 row가 없으면 degraded도 비어 있다', async () => {
+    expect((await digestOnce({})).degraded).toEqual([]);
+  });
+
+  it('사람이 읽는 보고가 그 사실을 숨기지 않는다', async () => {
+    const text = formatReport(await digestOnce({ foreign: true }));
+    expect(text).toContain(`${FOREIGN_RUN} / ${FOREIGN_TASK}`);
+    expect(text).toContain('읽지 못한 task result 1건');
+    // 깨진 row가 있어도 카드는 그대로 나온다.
+    expect(text).toContain('카드 1건');
   });
 });

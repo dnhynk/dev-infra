@@ -64,7 +64,8 @@ describe('collectRuns', () => {
     const runs = await collectRuns(new FakeOrca());
     const live = runs.find((r) => r.run.id === 'run_a48566be983b');
     expect(live?.tasks[0]?.deps).toEqual([]);
-    expect((live?.tasks[0]?.result as { verdict: string }).verdict).toBe('approve');
+    const result = live?.tasks[0]?.result;
+    expect(result?.kind === 'value' && (result.value as { verdict: string }).verdict).toBe('approve');
     expect(live?.gates[0]?.options).toEqual(['A', 'B']);
   });
 

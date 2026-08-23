@@ -405,3 +405,21 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 근거는 새로 만들지 않았다. `src/github/required-checks.ts`의 `RequiredCheckState` 주석과
   `src/github/branch-rules.ts`의 `RuleSourceStatus` 주석에 실측과 함께 있고 그 코드는 merge됐다.
 - 상세 계약은 [관찰·상관관계 계약](contracts/observation-and-correlation.md) §6에 있다.
+
+## 2026-08-24 · 깨진 task result 봉쇄
+
+### DL-053 · 파싱 실패는 계속 던지고 호출부가 관측 단위로 가둔다
+
+- `parseJsonField`의 throw는 유효하다. 파싱 실패를 fallback으로 덮으면 데이터 손실을 조용히 넘긴다.
+  이 결정은 그 선택을 뒤집지 않고 **실패의 범위만 좁힌다**(OD-079).
+- 두 가지를 구분한다. **계약**은 "파싱 실패는 던진다"이고 **범위**는 "task 하나"다. 계약을 관대하게
+  바꾸는 것과 범위를 좁히는 것은 같은 일이 아니다.
+- 좁히는 지점은 `listTasks`가 읽는 `result` 한 칸이다. `OrcaTask.result`가 합타입이 되어 소비자는
+  "읽지 못했다"를 "결과가 없다"로 접을 수 없다. 같은 row의 `deps`는 여전히 던진다.
+- 읽지 못한 것을 없는 것으로 세지 않는다. `digest` 보고와 `--json`이 `degraded`에 runId·taskId·이유를
+  싣고, `snapshot` 요약은 Run 줄에 `unreadable=<taskId>`를 붙인다.
+- 카드는 이 사실을 싣지 않는다. degraded를 카드에 항상 표시하는 것은 D1/D2 규칙이고(OD-072),
+  C1 카드가 표시하는 degraded는 요약 실패·입력 절단·worker 보고 없음 셋이다. 그래서 같은 Run에
+  읽지 못한 row가 있는 카드의 "리뷰 결과 없음"은 **"reviewer_result를 관측하지 못했다"까지만** 뜻한다.
+  그 이상을 뜻하게 하려면 `ProjectedPr`에 사실을 하나 더 실어야 하고 그것은 이 결정의 범위가 아니다.
+- 재현 근거는 [미결정 사항](open-decisions.md)의 OD-079에 있다. 여기서 다시 적지 않는다.
