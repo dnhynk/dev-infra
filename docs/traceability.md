@@ -19,9 +19,9 @@
 | B: context 열화 감지·handoff·새 session 부팅 자동화 | 확정 목표, 감지·승계 수단 확정 (OD-014, OD-015, DL-017) | [B 문제](product-vision.md#b-수동-컨텍스트-승계), [승계 lifecycle](specs/orchestration-bootstrap-and-continuity.md#6-컨텍스트-승계-lifecycle) |
 | A와 B를 하나의 workstream으로 처리 | 사용자 확정 | [로드맵 AB](roadmap.md#2-workstream-ab--bootstrap--continuity) |
 | C: Agent 대화가 아니라 상태 변화를 요약 | 확정 | [설계 철학](product-vision.md#상태-변화가-중심이다), [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
-| worker 완료→PR, review→수정/승인, CI→ready, merge→완료 lifecycle | 확정 방향, 세부 상태 TBD | [PR Digest lifecycle](specs/orca-slack-bridge.md#51-관심-lifecycle), [상관관계 계약](contracts/observation-and-correlation.md#6-pr-canonical-state) |
+| worker 완료→PR, review→수정/승인, CI→ready, merge→완료 lifecycle | canonical state·stale approval·required-check 판정 확정 (OD-030~032) | [PR Digest lifecycle](specs/orca-slack-bridge.md#51-관심-lifecycle), [상관관계 계약](contracts/observation-and-correlation.md#6-pr-canonical-state) |
 | `worker_done`을 정확히 한 번, 3문장 의미 요약 | 확정 | [Worker 계약](specs/orchestration-bootstrap-and-continuity.md#5-worker와-pr-관찰-계약), [관찰 계약](contracts/observation-and-correlation.md#3-worker-완료-계약) |
-| C1은 `worker_done`만 사용하고 released worker transcript까지 `worker-read`하지 않음 | 확정 | [Worker 완료 계약](contracts/observation-and-correlation.md#3-worker-완료-계약) |
+| Bridge는 `worker_done`을 Run mailbox에서, `reviewer_result`를 `task.result`에서 읽고 `worker-read`하지 않음 | 확정 (OD-025, OD-075) | [Worker 완료 계약](contracts/observation-and-correlation.md#3-worker-완료-계약) |
 | PR 카드 하나를 상태마다 update | 확정 | [Slack projection](specs/orca-slack-bridge.md#54-slack-projection), [PR UX](ux/slack-surfaces.md#2-pr-digest) |
 | PR 카드의 what/why/current/impact/review/risk/validation | 확정 의미 | [PR UX](ux/slack-surfaces.md#2-pr-digest) |
 | `#github`과 `#pr-digest` 역할 분리 | 확정, `raw` 용어 정정 | [제품 철학](product-vision.md#운영-사실과-사람용-의미를-분리한다), [플랫폼 검증](platform-capabilities.md#5-github) |
@@ -29,10 +29,10 @@
 | Orca run/task/worker/gate read-only 관찰 | C1은 명령 1회 관찰, polling은 O1 | [Orca Collector](architecture/orca-slack-bridge.md#orca-collector), [OD-023](open-decisions.md#확정-기록) |
 | GitHub title/body/branch/commit/files/stats/review/comments/CI/merge 직접 조회 | 확정 방향 | [Bridge 입력](specs/orca-slack-bridge.md#52-입력-사실), [GitHub 검증](platform-capabilities.md#52-원본-상태-조회) |
 | GitHub Slack 메시지를 파싱하지 않음 | 확정 | [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
-| PR body의 Orca Run/Task/Dispatch HTML metadata | 확정 방향, 형식 TBD | [Correlation 계약](contracts/observation-and-correlation.md#2-pr-correlation-metadata) |
+| PR body의 Orca Run/Task/Dispatch HTML metadata | 형식 확정; primary/latest Task만 body에 두고 PR↔Task N은 store에 보존, run-only는 degraded (OD-021, OD-076, OD-077) | [Correlation 계약](contracts/observation-and-correlation.md#2-pr-correlation-metadata) |
 | 최소 facts→LLM structured JSON→deterministic renderer | 확정 | [의미 압축](specs/orca-slack-bridge.md#53-의미-압축) |
 | transcript 50,000자를 기본 입력으로 보내지 않음 | 확정 | [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
-| repo+PR와 Slack message ts, Run/Task 상태를 durable store에 보관 | C1은 node:sqlite | [Durability](specs/orca-slack-bridge.md#9-durability와-멱등성), [OD-043](open-decisions.md#확정-기록) |
+| repo+PR와 Slack message ts, PR↔Task N, Run/Task 상태를 durable store에 보관 | C1은 node:sqlite; C2 association·reconciliation 확정 (OD-043, OD-044, OD-046, OD-076) | [Durability](specs/orca-slack-bridge.md#9-durability와-멱등성), [PR projection 일관성](architecture/orca-slack-bridge.md#6-pr-projection의-일관성) |
 | Root=current, thread=중요 상태 변화 이력 | 확정 | [공통 UX](ux/slack-surfaces.md#1-공통-원칙) |
 | D: Orca Run 하나=Slack root 하나 | 확정 | [Run Observer](specs/orca-slack-bridge.md#6-d--run-observer), [Run UX](ux/slack-surfaces.md#3-agent-runs) |
 | Task/PR/blocker 현재 상태와 사람 개입 필요 여부 표시 | 확정 의미, 집계 TBD | [Run Observer](specs/orca-slack-bridge.md#61-기본-단위), [Run progress 계약](contracts/observation-and-correlation.md#7-run-progress) |

@@ -100,7 +100,15 @@ worker는 PR을 만든 뒤 `worker_done`을 보낸다. C1의 관찰은 `digest` 
 - merge-ready 조건 충족
 - merged
 
-정확한 canonical state, 여러 reviewer의 상충 verdict, 새 commit 후 approval 유효성, required check, draft, merge queue, merge conflict, closed-without-merge 처리는 C2에서 정한다.
+canonical PR state는 terminal `open | closed | merged`와 직교 축 `draft`, `review`, `checks`,
+`mergePolicy`를 보존하고 UI 의미 상태를 파생한다. `mergedAt != null`을 `merged` terminal latch로 쓴다.
+
+`headMatch`는 계속 사실로 표시하지만 Bridge는 이전 approval의 유효·무효를 판정하지 않는다. 새 head마다
+재리뷰를 강제하지 않고 GitHub repository의 stale-review 설정도 따라가지 않는다.
+
+merge-ready는 required check만으로 판정한다. base branch의 effective required rule과 current head rollup을
+조인해 `missing | pending | failing | passing`을 파생하며 optional check 실패는 merge를 막지 않는다.
+merge queue, required reviews, up-to-date(strict), conversation resolution은 C2 범위 밖이다(OD-030~032).
 
 ### 5.2 입력 사실
 
@@ -108,8 +116,8 @@ Orca에서:
 
 - Task 목적
 - Run/Task/Dispatch/Worker identity
-- `worker_done`
-- correlated Task의 `task.result`에 기록된 `reviewer_result`
+- Run mailbox의 `worker_done`: `orca orchestration inbox --terminal "run:<run_id>" --limit <n> --json`
+- correlated Task의 `task.result`에 기록된 `reviewer_result`; `task.result`를 `worker_done`의 권위로 쓰지 않는다
 - C1에서는 transcript를 읽지 않는다
 
 GitHub에서:
@@ -150,10 +158,14 @@ Renderer는 다음을 보장해야 한다.
 ### 5.4 Slack projection
 
 - C1의 대상은 correlated PR뿐이다. uncorrelated 또는 conflict PR에는 카드를 만들지 않는다.
+- `orca-run`은 있고 필수 `orca-task`가 없는 PR은 invalid/degraded input이며 Task 카드를 만들지 않는다.
+  별도 `run_correlated` kind는 Run-level 제품 의미가 필요해질 때만 도입한다(OD-077).
 - C1의 첫 외부 write는 실제 `#pr-digest`에 한다.
 - 모든 카드 상단은 Project가 등록됐으면 `[Project] owner/repo #N`, 아니면 `owner/repo #N`으로 표시한다.
 - PR 하나당 루트 메시지 하나를 만든다.
 - 상태가 바뀌면 Bridge 자신이 작성한 같은 메시지를 `chat.update`로 갱신한다.
+- 저장된 Slack 메시지를 갱신할 수 없으면 GitHub current snapshot, Orca facts, Bridge store identity로
+  current 카드만 재생성한다. 과거 thread의 semantic transition은 재생하지 않는다(OD-046).
 - C1은 thread transition을 만들지 않는다. 중요한 상태 변화의 thread는 C2다.
 - 모바일에서 무엇을, 왜, 현재 어떤 상태로 바꾸는지와 위험·검증·PR 링크를 짧게 파악할 수 있어야 한다.
 
@@ -277,6 +289,7 @@ Channel reply tool 또는 localhost IPC를 통해 coordinator가 application rec
 - canonical repository identity
 - Project↔Repository mapping과 Slack routing identity
 - PR number와 Slack channel/message identity
+- PR body의 primary/latest Task와 별도로 보존하는 PR↔Task N 연관
 - 현재 projected PR state
 - Orca Run/Task/Dispatch identity
 - Run의 Slack message identity
@@ -302,6 +315,10 @@ C1 durable store는 `node:sqlite`다. 기본 경로는 Windows에서 `%APPDATA%\
 그러나 C1은 Slack 루트가 PR당 절대 하나임을 보장하지 않는다. `chat.postMessage` 성공 뒤 `insertPrMessage` 전에 crash하면 매핑 행이 없고, 게시 성공 여부를 알 수 없는 delivery failure에서도 매핑 행을 남길 수 없어 다음 관찰이 새 루트를 만들 수 있다. 두 창의 atomicity·outbox·요청 idempotency 계약은 아직 열려 있다.
 
 OD-043이 확정한 범위는 `node:sqlite`, 경로 우선순위와 platform별 기본값, WAL, `schema_version`, 덧붙이기 migration, C1 단일 프로세스에서 파일 lock을 만들지 않는다는 계약이다. future multi-writer locking, retention, backup, corruption recovery와 위 두 게시 창은 후속 범위다.
+
+PR event reconciliation은 `(repository databaseId, PR number)`를 identity로, `mergedAt`을 terminal latch로,
+`headSha`를 review/check scope로 쓴다. `merged` downgrade 금지는 timestamp 비교가 아니라 terminal dominance
+rule이며, 동일 head 안의 review/check는 각 resource timestamp와 id로 reconcile한다(OD-044).
 
 ## 10. 보안 경계
 
