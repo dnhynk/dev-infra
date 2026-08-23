@@ -5,7 +5,12 @@ import { OrcaCli } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
 import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
 import { runDigest, formatReport } from './digest/digest.js';
-import { SlackWebApiPoster, botToken } from './slack/post.js';
+import {
+  SlackWebApiPoster,
+  botToken,
+  type SlackPoster,
+  type ThreadPoster,
+} from './slack/post.js';
 import { ReadOnlyDigestStore, SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
 import type { DigestStore } from './store/schema.js';
 import {
@@ -223,6 +228,27 @@ export function formatDigestError(e: unknown, channel: string): string {
   return message.replaceAll(channel, maskToken(channel));
 }
 
+/**
+ * digest의 Slack write 경계를 만든다.
+ *
+ * **dry-run은 poster를 아예 만들지 않는다.** 토큰도 읽지 않으므로 write 경로 자체가 없다.
+ *
+ * 루트와 thread를 **같은 인스턴스**가 맡는다. 토큰을 한 번만 읽고 재시도 규율이 한 곳에 있다
+ * (`slack/post.ts`의 `SlackWebApiPoster`). `digest`는 두 경계를 따로 받으므로 인터페이스는 둘이다.
+ *
+ * `runDigestCommand`에서 떼어 export한다. 이 배선을 다시 `thread: null`로 되돌리면 실패하는
+ * 테스트가 필요한데, `runDigestCommand`는 실제 `gh`·`orca` 프로세스를 만들어 그 자리에서 볼 수
+ * 없기 때문이다. 호출자는 이 반환값을 통째로 펼쳐 쓴다 — 뒤에서 한 축만 덮어쓰지 않는다.
+ */
+export function digestPosters(
+  dryRun: boolean,
+  env: NodeJS.ProcessEnv,
+): { readonly slack: SlackPoster | null; readonly thread: ThreadPoster | null } {
+  if (dryRun) return { slack: null, thread: null };
+  const poster = new SlackWebApiPoster({ token: botToken(env) });
+  return { slack: poster, thread: poster };
+}
+
 async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<number> {
   if (config.slack === null) {
     process.stderr.write('digest는 설정의 slack 섹션이 필요하다. 게시 채널은 설정에서만 읽는다\n');
@@ -236,11 +262,8 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
       config,
       channel,
       store,
-      // dry-run은 poster를 아예 만들지 않는다. 토큰도 읽지 않으므로 write 경로가 없다.
-      slack: parsed.dryRun ? null : new SlackWebApiPoster({ token: botToken(process.env) }),
-      // thread 게시 경계는 아직 없다. 전이 판정과 dedupe는 그대로 돌고, 아직 참인 전이는
-      // 기록되지 않은 채 다음 관측의 후보로 남는다(`digest/transition.ts`). 실제 게시는 C2-4다.
-      thread: null,
+      // 루트와 thread write 경계. dry-run이면 둘 다 null이다.
+      ...digestPosters(parsed.dryRun, process.env),
       provider: summaryProvider(process.env),
       cache: new MemorySummaryCache(),
       prLimit: parsed.prLimit,

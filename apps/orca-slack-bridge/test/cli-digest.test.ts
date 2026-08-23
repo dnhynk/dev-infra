@@ -4,7 +4,9 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { openDigestStore, formatDigestError } from '../src/cli.js';
+import { openDigestStore, formatDigestError, digestPosters } from '../src/cli.js';
+import { SlackWebApiPoster } from '../src/slack/post.js';
+import { BOT_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore, SchemaVersionError } from '../src/store/sqlite.js';
 import { SCHEMA_VERSION } from '../src/store/schema.js';
 import { pullRequestKey } from '../src/identity/keys.js';
@@ -254,5 +256,36 @@ describe('digest 오류 출력', () => {
   it('채널 ID가 없는 오류는 그대로 둔다', () => {
     expect(formatDigestError(new Error('gh 호출 실패'), CHANNEL)).toBe('gh 호출 실패');
     expect(formatDigestError('문자열 오류', CHANNEL)).toBe('문자열 오류');
+  });
+});
+
+/**
+ * digest가 받는 Slack write 경계의 배선.
+ *
+ * 회귀 방지: 이전 버전은 `thread: null`을 넘겼다. 전이 판정과 dedupe는 전부 돌지만 thread에는
+ * 아무것도 나가지 않았고, 그 사실이 프로덕션 경로에서만 참이라 단위 테스트가 잡지 못했다.
+ * 이 describe가 그 자리를 고정한다 — `digestPosters`가 다시 `thread: null`을 돌려주면 실패한다.
+ */
+describe('digest write 경계 배선', () => {
+  // 실제 토큰 형태를 리터럴로 적으면 GitHub push protection이 커밋을 막는다.
+  const TOKEN = ['xoxb', 'FAKE', 'NOTAREALBOTTOKENVALUE'].join('-');
+
+  it('실제 실행은 thread 경계를 받는다', () => {
+    const { slack, thread } = digestPosters(false, { [BOT_TOKEN_VAR]: TOKEN });
+    expect(slack).toBeInstanceOf(SlackWebApiPoster);
+    // null이면 전이가 판정만 되고 영영 나가지 않는다.
+    expect(thread).not.toBeNull();
+    expect(thread).toBeInstanceOf(SlackWebApiPoster);
+    // 루트와 thread는 같은 인스턴스다. 토큰을 한 번만 읽고 재시도 규율도 한 곳에 있다.
+    expect(thread).toBe(slack);
+  });
+
+  it('dry-run은 두 경계를 모두 만들지 않고 토큰도 읽지 않는다', () => {
+    // 토큰이 없는 환경이다. 읽었다면 여기서 던진다.
+    expect(digestPosters(true, {})).toEqual({ slack: null, thread: null });
+  });
+
+  it('실제 실행에서 토큰이 없으면 게시를 시작하지 않는다', () => {
+    expect(() => digestPosters(false, {})).toThrow(BOT_TOKEN_VAR);
   });
 });

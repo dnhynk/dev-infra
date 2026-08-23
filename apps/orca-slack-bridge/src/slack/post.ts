@@ -102,9 +102,12 @@ export interface SlackPoster {
 /**
  * PR thread에 전이를 남기는 write 경계.
  *
- * `SlackPoster`와 **따로 둔다.** 합치면 이 파일의 Web API 구현이 thread reply까지 하게 되는데,
- * 실제 게시는 C2-4이고 C2-3의 범위가 아니다. 인터페이스를 먼저 두면 전이 판정과 dedupe 배선을
- * 전부 실행 경로에 넣은 채로 게시 경계만 뒤에 붙일 수 있다.
+ * `SlackPoster`와 **따로 둔다.** 호출자가 루트 write와 thread write를 따로 끄고 켤 수 있어야 하기
+ * 때문이다 — `digest`는 `slack`과 `thread`를 각각 null로 받고, 채널이 어긋난 관측처럼 루트는
+ * 알아도 어느 thread에 매달지 확정할 수 없는 경우가 있다.
+ *
+ * 인터페이스가 둘이라는 것이 구현도 둘이라는 뜻은 아니다. Web API 구현은 `SlackWebApiPoster`
+ * 하나가 둘 다 맡는다. 근거는 그 클래스에 적었다.
  *
  * **재시도 정책은 `post`와 같다.** thread reply도 `chat.postMessage`이고, 같은 요청임을 Slack이
  * 알아볼 identity가 없다. 게시 여부를 알 수 없는 실패를 재시도하면 thread에 같은 전이가 두 번
@@ -184,8 +187,18 @@ type Attempt =
   | { readonly kind: 'ok'; readonly message: PostedMessage }
   | { readonly kind: 'retry'; readonly code: string; readonly afterMs: number };
 
-/** `chat.postMessage`/`chat.update` 구현. 이 클래스 밖에서 Slack write를 하지 않는다. */
-export class SlackWebApiPoster implements SlackPoster {
+/**
+ * `chat.postMessage`/`chat.update` 구현. 이 클래스 밖에서 Slack write를 하지 않는다.
+ *
+ * `SlackPoster`와 `ThreadPoster`를 **한 클래스가 함께** 구현한다. 두 인터페이스를 따로 둔 이유는
+ * 호출자가 루트 write와 thread write를 따로 끄고 켤 수 있어야 했기 때문이지(`digest`의 `slack`과
+ * `thread`가 각각 null을 받는다) Web API 구현이 둘이어야 해서가 아니다.
+ *
+ * 함께 두는 근거는 재시도 규율이다. `reply`의 재시도 정책은 `post`와 같아야 하는데, 같은 `call`을
+ * 같은 `retryDeliveryUnknown=false`로 부르면 그 규율이 **한 곳에만** 있다. 클래스를 나누면
+ * `call`·`attempt`·`redact`와 토큰 마스킹이 복사되고, 복사본은 한쪽만 고쳐진다.
+ */
+export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetries: number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -216,6 +229,30 @@ export class SlackWebApiPoster implements SlackPoster {
       'chat.update',
       { channel: input.channel, ts: input.ts, text: input.text, blocks: input.blocks },
       true,
+    );
+  }
+
+  /**
+   * thread reply. **재시도 정책이 `post`와 같다.**
+   *
+   * `chat.update`가 아니라 `chat.postMessage`이고, 같은 요청임을 Slack이 알아볼 identity가 없다.
+   * 게시 여부를 알 수 없는 실패를 재시도하면 thread에 같은 전이가 두 번 남고 되돌릴 수 없다.
+   * 그래서 `post`와 똑같이 `retryDeliveryUnknown=false`로 부른다. 근거 전문은 `ThreadPoster`에 있다.
+   *
+   * 중복 reply를 막는 것은 재시도 정책이 아니라 durable dedupe key다(`store/schema.ts`의
+   * `PR_THREAD_EVENT_TABLE`). 여기서 재시도로 그것을 대신하지 않는다.
+   */
+  async reply(input: ThreadReplyInput): Promise<PostedMessage> {
+    return this.call(
+      'chat.postMessage',
+      {
+        channel: input.channel,
+        // Slack의 파라미터 이름이다. 이 값이 빠지면 루트가 하나 더 생긴다.
+        thread_ts: input.threadTs,
+        text: input.text,
+        blocks: input.blocks,
+      },
+      false,
     );
   }
 
