@@ -17,8 +17,8 @@
 - **[문서]** `orca agent-context --json` 또는 `orca skills get orchestration --full`이 반환한 계약 서술.
 - **[추론]** 위 셋에서 끌어낸 판단. 관측이 아니다.
 
-**[관측]** 아래 모든 실험은 새 Run `run_c940ec042fc1`과 `run_b82acb7fe8c2`(둘 다 objective에
-`THROWAWAY` 포함)에서 수행했고, `run_36d28e6e947a`와 `run_7804be5a654f`에는 읽기 명령만 실행했다.
+**[관측]** 아래 모든 실험은 objective에 `THROWAWAY`를 포함해 새로 만든 Run들(§5에 열거)에서만
+수행했고, `run_36d28e6e947a`와 `run_7804be5a654f`에는 읽기 명령만 실행했다.
 §5에 남은 리소스를 열거한다.
 
 ## 실험 하네스
@@ -35,16 +35,13 @@ $ orca orchestration run-create --objective "..." --from term_2bdfdfe6-... --jso
 dispatch 대상 터미널 **안에서** 실행해야 한다. THROWAWAY 실험은 터미널 두 개를 새로 만들어 그 안에서
 돌렸다. coordinator terminal이 Run을 소유하고 worker terminal이 `worker_done`을 보낸다.
 
-```powershell
-$ORCA = 'C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe'
-$CO = (& $ORCA terminal create --title 'THROWAWAY-OD075-COORD'  --json | ConvertFrom-Json).result.terminal.handle
-$WK = (& $ORCA terminal create --title 'THROWAWAY-OD075-WORKER' --json | ConvertFrom-Json).result.terminal.handle
-```
-
-**[관측]** 아래 절차에서 "`$CO` 안에서"는 `orca terminal send --terminal $CO --text '<명령>' --enter`로
-그 터미널에 명령을 밀어 넣는다는 뜻이다. 출력은 그 터미널 스크롤백으로만 돌아오므로 `--json`을 파일로
-리다이렉트해 받는다. **[추론]** 세 셸(하네스를 돌리는 셸, `$CO`, `$WK`)은 변수를 공유하지 않는다.
-`$ORCA`와 위에서 캡처한 handle 값은 각 터미널 안에서 다시 대입해야 한다.
+**[추론]** 세 셸(하네스를 돌리는 셸, `$CO`, `$WK`)은 변수를 공유하지 않는다. **[관측]** 그래서 절차는
+사람이 값을 옮겨 적는 단계를 두지 않는다. §(a) [실행 명령]의 스크립트가 두 터미널을
+`terminal create --command`로 만들어 각 터미널 안에서 runner를 실행하고, Run·Task·Dispatch ID와
+명령 출력(`--json`)은 전부 작업 디렉터리 파일(`ids.json`, `step*.json`)로만 오간다. 단계 순서는
+`step*.go`/`step*.done` 마커 파일이 강제한다.
+**[관측]** 하니스 셸에 Orca 터미널 identity는 필요 없다. `ORCA_TERMINAL_HANDLE`이 비어 있는 새 셸에서
+`terminal create`와 [3]·[5] 조회가 성공했다(§(a) [재현 확인]).
 **[관측]** 터미널 안에서 자기 handle은 `$env:ORCA_TERMINAL_HANDLE`이고 생성 시 받은 handle과 같다.
 **[관측]** 이 터미널들은 §5 기준으로 모두 닫았고, 실험을 돌린 worker 세션의 터미널은 실험 전후 모두
 `run-current` → `{"run":null}`로 Run에 바인딩되지 않았다.
@@ -70,36 +67,218 @@ $WK = (& $ORCA terminal create --title 'THROWAWAY-OD075-WORKER' --json | Convert
 
 ### [실행 명령]
 
-§실험 하네스가 `$CO`·`$WK` handle을 잡아 놓았다고 본다. Run·Task·Dispatch ID는 하드코딩하지 않고
-그 자리에서 캡처한다.
+절차는 아래 스크립트 하나가 전부다. `# OD-075`로 시작하는 코드 블록 전체를 `od075-repro.ps1`로
+저장(UTF-8)하고 아무 PowerShell 7 셸에서 실행한다. 미리 잡아 둘 변수도, 터미널 사이에서 옮겨 적을
+값도 없다.
 
 ```powershell
-# 1. $CO 안에서. 먼저 $ORCA와 $WK를 이 터미널에 대입한 뒤,
-#    아래 세 줄을 이 한 세션에서 이어 실행한다($RUN/$TASK가 유지돼야 한다).
-$RUN  = (& $ORCA orchestration run-create --objective 'THROWAWAY OD-075 worker_done retrieval probe (dev-infra T2). Safe to delete.' --json | ConvertFrom-Json).result.run.id
-$TASK = (& $ORCA orchestration task-create --spec 'THROWAWAY task for OD-075 probe. No real work.' --task-title 'THROWAWAY OD-075 probe' --run $RUN --json | ConvertFrom-Json).result.task.id
-$CTX  = (& $ORCA orchestration dispatch --task $TASK --to $WK --run $RUN --return-preamble --json | ConvertFrom-Json).result.dispatch.id
+pwsh -NoProfile -File od075-repro.ps1
+```
 
-# 2. $WK 안에서 worker_done. $ORCA와 1이 찍은 $TASK/$CTX를 이 터미널에 옮겨 적는다.
-#    이 dispatch의 preamble에는 dcap 토큰이 없다. attest된 --from만으로 보낸다.
-& $ORCA orchestration send --from $env:ORCA_TERMINAL_HANDLE `
-  --type worker_done --subject 'THROWAWAY-WD-SUBJECT-MARKER' `
-  --body 'THROWAWAY-WD-BODY-MARKER 첫째 문장. 둘째 문장. 셋째 문장.' `
-  --task-id $TASK --dispatch-id $CTX --outcome succeeded `
-  --files-modified 'docs/evidence/x.md,docs/evidence/y.md' `
-  --report-path 'docs/evidence/throwaway.md' --json
+스크립트는 [0] 셸 조건 출력 → THROWAWAY 터미널 2개 생성 → [1] `$CO` runner가 Run·Task·Dispatch
+생성 후 ID를 `ids.json`에 기록 → [2] `$WK` runner가 `ids.json`을 읽어 `worker_done` 전송 → [3] 하니스가
+덮어쓰기 전 `task-list` 조회 → [4] `$CO` runner가 `task-update --result` 실행 → [5] 덮어쓰기 후
+`task-list`·`dispatch-show` 조회 → 판정 → 정리 순서로 진행한다.
 
-# 3. 덮어쓰기 전 조회. 권한이 필요 없어 아무 터미널에서나 된다.
-& $ORCA orchestration task-list --run $RUN --json
+```powershell
+# OD-075 §(a) 재현 스크립트 — `task-update --result`의 worker_report 덮어쓰기를 처음부터 재현한다.
+#
+# 실행법: 이 블록 전체를 od075-repro.ps1 로 저장(UTF-8)하고, 아무 PowerShell 7 셸에서
+#     pwsh -NoProfile -File od075-repro.ps1
+# 전제: 이 호스트에서 Orca 앱이 실행 중일 것. 미리 설정할 변수·환경은 없다.
+#
+# 셸 구조: 하니스 셸(이 스크립트) + THROWAWAY 터미널 2개($CO coordinator, $WK worker).
+# 세 셸은 변수를 공유하지 않으므로 모든 값 전달은 $WORK 아래 파일로만 한다:
+#   ids.json(Run·Task·Dispatch ID), step*.go(단계 개시 지시), step*.done(단계 완료 신호),
+#   step*.json(각 명령의 --json 원문). 단계 순서는 이 마커 파일들이 강제한다.
+# run-create·task-update는 $CO runner가, worker_done은 $WK runner가, 조회([3]·[5])는 하니스가
+# 직접 실행한다. 직접 실행 위치의 근거는 §실험 하네스의 터미널 identity attest 관측이다.
 
-# 4. $CO 안에서 OD-073 절차대로 reviewer_result 기록
-& $ORCA orchestration task-update --id $TASK --status completed `
-  --result '{"kind":"reviewer_result","schemaVersion":1,"verdict":"approve","pr":{"repo":"THROWAWAY/none","number":1},"reviewedHeadSha":"deadbeef","findings":[],"gates":{"docs":"pass"}}' `
-  --run $RUN --json
+$ErrorActionPreference = 'Stop'
+$ORCA = 'C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe'  # orca.cmd는 orchestration send를 거부한다(§실험 하네스)
+$WR_FIELDS = @('provenance','outcome','messageId','reportedBy','subject','body',
+               'completedBy','filesModified','reportPath','completedAt')     # (a)가 소실을 주장하는 10필드
 
-# 5. 덮어쓰기 후 조회
-& $ORCA orchestration task-list --run $RUN --json
-& $ORCA orchestration dispatch-show --task $TASK --json
+# [0] 셸 조건을 transcript에 남긴다 — 이 하니스는 기존 셸의 어떤 값에도 기대지 않는다.
+"[0] pwsh=$($PSVersionTable.PSVersion)  cmdline=$([Environment]::CommandLine)"
+"[0] 사전 셸 변수 RUN/TASK/CTX/CO/WK 개수: $(@(Get-Variable RUN,TASK,CTX,CO,WK -ErrorAction SilentlyContinue).Count)"
+"[0] env RUN='$env:RUN' TASK='$env:TASK' CTX='$env:CTX' ORCA_TERMINAL_HANDLE='$env:ORCA_TERMINAL_HANDLE'"
+if (-not (Test-Path $ORCA)) { throw "orca.exe가 없다: $ORCA" }
+$WORK = Join-Path ([IO.Path]::GetTempPath()) ('od075-repro-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Path $WORK | Out-Null
+"[0] WORK=$WORK"
+
+function Wait-Marker([string[]]$Paths, [int]$TimeoutSec) {
+  $dl = (Get-Date).AddSeconds($TimeoutSec)
+  while ($true) {
+    foreach ($p in $Paths) { if (Test-Path $p) { return $p } }
+    if ((Get-Date) -gt $dl) { throw "timeout(${TimeoutSec}s): $($Paths -join ' | ')" }
+    Start-Sleep -Milliseconds 500
+  }
+}
+function Show-Raw([string]$Label, [string]$Path) { ''; "== $Label =="; Get-Content $Path -Raw }
+function Get-Stamp([string]$Path) {  # 표기 훼손 방지: ConvertFrom-Json은 날짜 문자열을 DateTime으로 바꾸므로 원문에서 읽는다
+  [regex]::Match((Get-Content $Path -Raw), '"completed_at":\s*"([^"]+)"').Groups[1].Value
+}
+
+$CO = $null; $WK = $null; $ids = $null
+try {
+  # ── runner 스크립트 생성. @@표시자@@는 아래 .Replace()로 실제 값이 들어간다. ──
+  $wkRunner = @'
+# $WK(worker) runner — 하니스가 terminal create --command로 실행한다.
+$ErrorActionPreference = 'Stop'
+$ORCA = '@@ORCA@@'
+$WORK = '@@WORK@@'
+function Wait-Go([string]$Name) {
+  $dl = (Get-Date).AddSeconds(300)
+  while ($true) {
+    if (Test-Path (Join-Path $WORK 'stop.go')) { exit 0 }
+    if (Test-Path (Join-Path $WORK $Name)) { return }
+    if ((Get-Date) -gt $dl) { throw "timeout: $Name" }
+    Start-Sleep -Milliseconds 500
+  }
+}
+try {
+  # [2] worker_done — dispatch 대상인 이 터미널에서 attest된 --from만으로 보낸다
+  #     (이 dispatch의 preamble에는 dcap 토큰이 없다). $TASK/$CTX는 셸 간 공유가 안 되므로
+  #     $CO runner가 남긴 ids.json 파일에서 읽는다.
+  Wait-Go 'step2.go'
+  $ids = Get-Content (Join-Path $WORK 'ids.json') -Raw | ConvertFrom-Json
+  & $ORCA orchestration send --from $env:ORCA_TERMINAL_HANDLE `
+    --type worker_done --subject 'THROWAWAY-WD-SUBJECT-MARKER' `
+    --body 'THROWAWAY-WD-BODY-MARKER 첫째 문장. 둘째 문장. 셋째 문장.' `
+    --task-id $ids.task --dispatch-id $ids.ctx --outcome succeeded `
+    --files-modified 'docs/evidence/x.md,docs/evidence/y.md' `
+    --report-path 'docs/evidence/throwaway.md' --json | Set-Content (Join-Path $WORK 'step2.json')
+  if ($LASTEXITCODE -ne 0) { throw "send exit=$LASTEXITCODE" }
+  Set-Content (Join-Path $WORK 'step2.done') 'ok'
+  Wait-Go 'stop.go'
+} catch { $_ | Out-String | Set-Content (Join-Path $WORK 'wk-error.txt') }
+'@
+  $wkRunner.Replace('@@ORCA@@',$ORCA).Replace('@@WORK@@',$WORK) |
+    Set-Content -Path (Join-Path $WORK 'wk-runner.ps1') -Encoding utf8BOM
+
+  $coRunner = @'
+# $CO(coordinator) runner — 하니스가 terminal create --command로 실행한다.
+$ErrorActionPreference = 'Stop'
+$ORCA = '@@ORCA@@'
+$WORK = '@@WORK@@'
+$WK   = '@@WK@@'
+function Wait-Go([string]$Name) {
+  $dl = (Get-Date).AddSeconds(300)
+  while ($true) {
+    if (Test-Path (Join-Path $WORK 'stop.go')) { exit 0 }
+    if (Test-Path (Join-Path $WORK $Name)) { return }
+    if ((Get-Date) -gt $dl) { throw "timeout: $Name" }
+    Start-Sleep -Milliseconds 500
+  }
+}
+try {
+  # [1] Run·Task·Dispatch 생성 — run-create는 attest된 이 터미널을 coordinator로 만든다.
+  #     ID는 하드코딩하지 않고 그 자리에서 캡처해 ids.json 파일로 다른 셸에 넘긴다.
+  & $ORCA orchestration run-create --objective 'THROWAWAY OD-075 worker_done retrieval probe (dev-infra T2). Safe to delete.' --json | Set-Content (Join-Path $WORK 'step1-run.json')
+  $RUN = (Get-Content (Join-Path $WORK 'step1-run.json') -Raw | ConvertFrom-Json).result.run.id
+  if ($LASTEXITCODE -ne 0 -or -not $RUN) { throw "run-create 실패 exit=$LASTEXITCODE" }
+  & $ORCA orchestration task-create --spec 'THROWAWAY task for OD-075 probe. No real work.' --task-title 'THROWAWAY OD-075 probe' --run $RUN --json | Set-Content (Join-Path $WORK 'step1-task.json')
+  $TASK = (Get-Content (Join-Path $WORK 'step1-task.json') -Raw | ConvertFrom-Json).result.task.id
+  if ($LASTEXITCODE -ne 0 -or -not $TASK) { throw "task-create 실패 exit=$LASTEXITCODE" }
+  & $ORCA orchestration dispatch --task $TASK --to $WK --run $RUN --return-preamble --json | Set-Content (Join-Path $WORK 'step1-dispatch.json')
+  $CTX = (Get-Content (Join-Path $WORK 'step1-dispatch.json') -Raw | ConvertFrom-Json).result.dispatch.id
+  if ($LASTEXITCODE -ne 0 -or -not $CTX) { throw "dispatch 실패 exit=$LASTEXITCODE" }
+  @{ run = $RUN; task = $TASK; ctx = $CTX } | ConvertTo-Json -Compress | Set-Content (Join-Path $WORK 'ids.json')
+  Set-Content (Join-Path $WORK 'step1.done') 'ok'
+  # [4] reviewer_result 기록(OD-073 형식) — 하니스가 [3] 조회를 마치고 step4.go를 만들 때까지 기다린다.
+  Wait-Go 'step4.go'
+  & $ORCA orchestration task-update --id $TASK --status completed `
+    --result '{"kind":"reviewer_result","schemaVersion":1,"verdict":"approve","pr":{"repo":"THROWAWAY/none","number":1},"reviewedHeadSha":"deadbeef","findings":[],"gates":{"docs":"pass"}}' `
+    --run $RUN --json | Set-Content (Join-Path $WORK 'step4.json')
+  if ($LASTEXITCODE -ne 0) { throw "task-update exit=$LASTEXITCODE" }
+  Set-Content (Join-Path $WORK 'step4.done') 'ok'
+  Wait-Go 'stop.go'
+} catch { $_ | Out-String | Set-Content (Join-Path $WORK 'co-error.txt') }
+'@
+
+  # worker 터미널을 먼저 만든다 — 그 handle이 co-runner의 dispatch --to에 들어가야 한다.
+  $WK = (& $ORCA terminal create --title 'THROWAWAY-OD075-WORKER' --command ('pwsh -NoProfile -File "' + (Join-Path $WORK 'wk-runner.ps1') + '"') --json | ConvertFrom-Json).result.terminal.handle
+  if ($LASTEXITCODE -ne 0 -or -not $WK) { throw 'worker 터미널 생성 실패' }
+  "[하네스] WK=$WK"
+  $coRunner.Replace('@@ORCA@@',$ORCA).Replace('@@WORK@@',$WORK).Replace('@@WK@@',$WK) |
+    Set-Content -Path (Join-Path $WORK 'co-runner.ps1') -Encoding utf8BOM
+  $CO = (& $ORCA terminal create --title 'THROWAWAY-OD075-COORD' --command ('pwsh -NoProfile -File "' + (Join-Path $WORK 'co-runner.ps1') + '"') --json | ConvertFrom-Json).result.terminal.handle
+  if ($LASTEXITCODE -ne 0 -or -not $CO) { throw 'coordinator 터미널 생성 실패' }
+  "[하네스] CO=$CO — runner가 곧바로 [1]을 실행한다"
+
+  # [1] 완료 대기.
+  if ((Wait-Marker @((Join-Path $WORK 'step1.done'), (Join-Path $WORK 'co-error.txt')) 120) -like '*error*') {
+    Show-Raw 'co-error.txt' (Join-Path $WORK 'co-error.txt'); throw '[1] 실패'
+  }
+  $ids = Get-Content (Join-Path $WORK 'ids.json') -Raw | ConvertFrom-Json
+  "[1] RUN=$($ids.run)  TASK=$($ids.task)  CTX=$($ids.ctx)   (생성 응답 원문: $WORK\step1-*.json)"
+
+  # [2] 개시 → 완료 대기.
+  Set-Content (Join-Path $WORK 'step2.go') 'go'
+  if ((Wait-Marker @((Join-Path $WORK 'step2.done'), (Join-Path $WORK 'wk-error.txt')) 120) -like '*error*') {
+    Show-Raw 'wk-error.txt' (Join-Path $WORK 'wk-error.txt'); throw '[2] 실패'
+  }
+  Show-Raw '[2] worker_done 전송 응답' (Join-Path $WORK 'step2.json')
+
+  # [3] 덮어쓰기 전 조회 — 권한이 필요 없어 하니스 셸에서 바로 실행한다.
+  & $ORCA orchestration task-list --run $ids.run --json | Set-Content (Join-Path $WORK 'step3.json')
+  if ($LASTEXITCODE -ne 0) { Show-Raw 'step3.json' (Join-Path $WORK 'step3.json'); throw "[3] task-list exit=$LASTEXITCODE" }
+  Show-Raw '[3] task-list (덮어쓰기 전)' (Join-Path $WORK 'step3.json')
+  $before = (Get-Content (Join-Path $WORK 'step3.json') -Raw | ConvertFrom-Json).result.tasks[0].result | ConvertFrom-Json
+  $beforeHas = @($WR_FIELDS | Where-Object { $null -ne $before.PSObject.Properties[$_] })
+  "[3] task.result: provenance=$($before.provenance), worker_report 필드 $($beforeHas.Count)/10 ($($beforeHas -join ','))"
+  "[3] tasks.completed_at = $(Get-Stamp (Join-Path $WORK 'step3.json'))"
+
+  # [4] 개시 → 완료 대기.
+  Set-Content (Join-Path $WORK 'step4.go') 'go'
+  if ((Wait-Marker @((Join-Path $WORK 'step4.done'), (Join-Path $WORK 'co-error.txt')) 120) -like '*error*') {
+    Show-Raw 'co-error.txt' (Join-Path $WORK 'co-error.txt'); throw '[4] 실패'
+  }
+  Show-Raw '[4] task-update 응답' (Join-Path $WORK 'step4.json')
+
+  # [5] 덮어쓰기 후 조회.
+  & $ORCA orchestration task-list --run $ids.run --json | Set-Content (Join-Path $WORK 'step5-task.json')
+  if ($LASTEXITCODE -ne 0) { throw "[5] task-list exit=$LASTEXITCODE" }
+  & $ORCA orchestration dispatch-show --task $ids.task --json | Set-Content (Join-Path $WORK 'step5-dispatch.json')
+  if ($LASTEXITCODE -ne 0) { throw "[5] dispatch-show exit=$LASTEXITCODE" }
+  Show-Raw '[5] task-list (덮어쓰기 후)' (Join-Path $WORK 'step5-task.json')
+  Show-Raw '[5] dispatch-show' (Join-Path $WORK 'step5-dispatch.json')
+  $after = (Get-Content (Join-Path $WORK 'step5-task.json') -Raw | ConvertFrom-Json).result.tasks[0].result | ConvertFrom-Json
+  $afterHas = @($WR_FIELDS | Where-Object { $null -ne $after.PSObject.Properties[$_] })
+  "[5] task.result: kind=$($after.kind), 남은 worker_report 필드 $($afterHas.Count)/10"
+  "[5] tasks.completed_at    = $(Get-Stamp (Join-Path $WORK 'step5-task.json'))"
+  "[5] dispatch.completed_at = $(Get-Stamp (Join-Path $WORK 'step5-dispatch.json'))"
+
+  ''
+  if ($beforeHas.Count -eq 10 -and $afterHas.Count -eq 0 -and $after.kind -eq 'reviewer_result') {
+    "[판정] 재현 성공 — task-update --result가 task.result를 통째로 대체했다: worker_report 10필드 → 0필드"
+  } else {
+    throw "[판정] 재현 실패 — before=$($beforeHas.Count)/10, after=$($afterHas.Count)/10, kind=$($after.kind)"
+  }
+}
+finally {
+  try {
+    Set-Content (Join-Path $WORK 'stop.go') 'stop'   # runner들을 종료시킨다. 탭은 자동으로 닫히지 않으므로 명시적으로 닫는다.
+    Start-Sleep -Seconds 2
+    foreach ($h in @($CO, $WK)) {
+      if ($h) {
+        $c = (& $ORCA terminal close --terminal $h --tab --json) -join ' '
+        "[정리] terminal close --tab $h -> ok=$([regex]::Match($c, '"ok":\s*(\w+)').Groups[1].Value)"
+      }
+    }
+  } catch { "[정리] 실패: $_" }
+  if ($ids) {
+    ''
+    '== THROWAWAY 잔존 리소스 — Run·Task·Dispatch·메시지를 지우는 CLI는 없다 (§5) =='
+    "run=$($ids.run)  task=$($ids.task)  ctx=$($ids.ctx)"
+    $m = $null
+    if (Test-Path (Join-Path $WORK 'step2.json')) { $m = (Get-Content (Join-Path $WORK 'step2.json') -Raw | ConvertFrom-Json).result.message }
+    if ($m) { "worker_done msg=$($m.id) (sequence $($m.sequence))" }
+    "원시 출력 보존: $WORK"
+  }
+}
 ```
 
 ### [출력 발췌]
@@ -138,18 +317,32 @@ $CTX  = (& $ORCA orchestration dispatch --task $TASK --to $WK --run $RUN --retur
 
 `completed_at` = `2026-08-23T04:30:54.858Z`, `status` = `completed`.
 
-### [재현]
+### [재현 확인]
 
-**[관측]** 위 절차를 새 THROWAWAY Run에서 처음부터 한 번 더 실행해 재현을 확인했다.
-`run_b82acb7fe8c2` / `task_33a60121fe62` / `ctx_8b5bbcee31c7` / `msg_24e91fbd2df6`(sequence 273).
-같은 Orca `1.4.187`.
+**[관측]** 위 [실행 명령]이 문서에 실린 텍스트만으로 재현됨을 다음 조건에서 확인했다. Orca `1.4.187`.
 
-```text
-3단계 task.result  = worker_report 10개 필드 전부. completed_at = 2026-08-23 05:10:09
-5단계 task.result  = {"kind":"reviewer_result",...} 한 개. worker_report 필드 0개
-     completed_at = 2026-08-23T05:10:51.066Z
-dispatch-show      = dispatch.completed_at 2026-08-23 05:10:09 (덮이지 않음)
-```
+- **실행 파일**: 이 문서의 스크립트 블록에서 기계적으로 추출한 파일. 실행 뒤 문서 블록을 다시
+  추출해 실행 파일과 줄 단위로 대조했다 — 198줄, 차이 0줄.
+- **셸 조건**: `pwsh -NoProfile -File`로 실행한 새 셸. 스크립트의 [0] 출력이 transcript 안에서 증명한다 —
+  사전 셸 변수(RUN/TASK/CTX/CO/WK) 0개, `ORCA_TERMINAL_HANDLE` 빈 값(하니스 셸은 Orca 터미널이
+  아니다). 하니스 셸에 절차 밖 명령은 치지 않았다 — `-File` 실행이므로 하니스가 실행한 명령은
+  스크립트 본문이 전부다.
+- **생성 리소스**: `run_8eeeb70eb69d` / `task_8b2fcf88508e` / `ctx_bedbf7ddc020` /
+  `msg_f06eb865f94e`(sequence 311).
+- **결과**: [3] `worker_report` 10/10 필드, `tasks.completed_at` = `2026-08-23 05:58:25` →
+  [5] `kind=reviewer_result`, `worker_report` 0/10 필드, `tasks.completed_at` =
+  `2026-08-23T05:58:26.146Z`(형식도 ISO8601 ms로 바뀜), `dispatch.completed_at` =
+  `2026-08-23 05:58:25` 유지. 판정 출력 "재현 성공", exit code 0.
+
+**[관측]** 같은 스크립트 텍스트의 직전 실행(Orca 터미널 안에서 실행해 `ORCA_TERMINAL_HANDLE`이
+설정된 셸)도 같은 판정이었다: `run_00cbddfc6c25` / `task_f86a859efba8` / `ctx_5b7df884ff60` /
+`msg_c1adbeb3bd07`(sequence 309), 10필드 → 0필드, `dispatch.completed_at` 유지. 하니스 셸의
+Orca identity 유무는 결과를 바꾸지 않았다.
+
+**[관측]** 스크립트 이전 형태의 절차로도 같은 대체가 두 번 관측됐다: `run_c940ec042fc1`([출력 발췌]의
+Run)과 `run_b82acb7fe8c2`(`task_33a60121fe62` / `ctx_8b5bbcee31c7` / `msg_24e91fbd2df6` sequence 273,
+10필드 → 0필드, `tasks.completed_at` `2026-08-23 05:10:09` → `2026-08-23T05:10:51.066Z`,
+`dispatch.completed_at` 유지).
 
 ### [결론]
 
@@ -706,17 +899,25 @@ OD-062(허용 지연·비용 한도)와 OD-065(동시 Run 규모)가 열려 있�
 | `msg_a5080d33049b` (THROWAWAY worker_done, sequence 122) | **남음.** 전역 `inbox`에 보인다 |
 | `term_2bdfdfe6-...` (THROWAWAY coordinator) | 닫음. `terminal close --tab` |
 | `term_2058bfe6-...` (THROWAWAY worker) | 닫음. `terminal close --tab` |
-| `run_b82acb7fe8c2` (§(a) [재현] Run) | **남음.** Run을 지우는 CLI 명령이 없다 |
+| `run_b82acb7fe8c2` (§(a) [재현 확인]의 스크립트 이전 재현 Run) | **남음.** Run을 지우는 CLI 명령이 없다 |
 | `task_33a60121fe62`, `ctx_8b5bbcee31c7` | **남음.** `worker-release` → `{"state":"retained","reason":"no_owned_resource"}` |
 | `msg_24e91fbd2df6` (재현 worker_done, sequence 273) | **남음.** 전역 `inbox`에 보인다 |
 | `term_e08e20a0-...`, `term_25ede6a0-...` (재현용 터미널 둘) | 닫음. `terminal close --tab` |
+| `run_00cbddfc6c25` (§(a) [재현 확인] 스크립트 1차 실행 Run) | **남음.** Run을 지우는 CLI 명령이 없다 |
+| `task_f86a859efba8`, `ctx_5b7df884ff60`, `msg_c1adbeb3bd07` (sequence 309) | **남음.** 위 Run에 속함 |
+| `run_8eeeb70eb69d` (§(a) [재현 확인] clean-shell 실행 Run) | **남음.** Run을 지우는 CLI 명령이 없다 |
+| `task_8b2fcf88508e`, `ctx_bedbf7ddc020`, `msg_f06eb865f94e` (sequence 311) | **남음.** 위 Run에 속함 |
+| 재현 확인용 터미널 넷 (`term_2db5ad59-…`/`term_eb76d066-…`, `term_36bffd24-…`/`term_1d22d7b9-…`) | 닫음. 스크립트의 `terminal close --tab`, transcript에 `ok=true` |
+| CLI 계약 probe 터미널 셋 (`THROWAWAY-T2FIX2-PROBE*`, Run·메시지 생성 없음) | 닫음. `terminal close --tab` |
 | 임시 스크립트·원시 로그 | 시스템 temp에만 있다. 레포에 커밋하지 않았다 |
 
 **[관측]** `orca orchestration reset --messages`/`--all`은 전역 파괴 명령이므로 실행하지 않았다.
 
 **[관측]** 실험 전부터 있던 THROWAWAY Run이 넷 더 있다. 내가 만들지 않았고 건드리지도 않았다:
 `run_e2c19c691c49`(OD-075 T2 probe, 04:15:42), `run_f039af831871`(T3 Gate observation, 04:25:23),
-`run_ebd0bb4592d2`, `run_a48566be983b`.
+`run_ebd0bb4592d2`, `run_a48566be983b`. 그 뒤 다른 세션이 만든 같은 objective의 THROWAWAY Run도
+있다: `run_69731cd65fd8`(05:28:46, `run-list`로 관측). 이 문서의 실험이 만든 Run은 위 표의 넷
+(`run_c940ec042fc1`, `run_b82acb7fe8c2`, `run_00cbddfc6c25`, `run_8eeeb70eb69d`)이 전부다.
 
 **[관측]** 실험 뒤 `run-show --id run_36d28e6e947a`는 `coordinator_handle: term_29548394-...`,
 `consumer_generation: 1`을 반환했다. 이 handle은 이 Dispatch preamble이 지정한 coordinator handle과
