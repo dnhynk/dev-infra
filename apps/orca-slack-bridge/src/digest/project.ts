@@ -177,8 +177,9 @@ export function projectPullRequest(
   if (correlation.kind === 'conflict') {
     return { kind: 'skipped', key: pr.key, reason: 'conflict' };
   }
+  // orca-run만 있고 orca-task가 없는 입력이다. 추측으로 Task를 보완하지 않고 degraded로 남긴다(OD-077).
   if (!isCorrelatedOrigin(correlation)) {
-    return { kind: 'skipped', key: pr.key, reason: 'task_missing' };
+    return { kind: 'skipped', key: pr.key, reason: 'run_only_degraded' };
   }
 
   const headSha = pr.headRefOid;

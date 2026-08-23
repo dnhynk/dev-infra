@@ -5,7 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { SqliteDigestStore, SchemaVersionError, resolveStatePath } from '../src/store/sqlite.js';
 import { MIGRATIONS, SCHEMA_VERSION, STATE_PATH_VAR } from '../src/store/schema.js';
-import { pullRequestKey } from '../src/identity/keys.js';
+import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 
 // 실제 파일을 열어 검증한다. 모킹하면 검증 대상인 sqlite의 제약이 사라진다.
 let dir: string;
@@ -23,6 +23,9 @@ afterEach(() => {
 
 const PR = pullRequestKey(123456, 7);
 const OTHER_PR = pullRequestKey(123456, 8);
+const RUN = runKey('run_36d28e6e947a');
+const TASK_A = taskKey('task_42914531e46b');
+const TASK_B = taskKey('task_8bf3d72f262a');
 
 describe('resolveStatePath', () => {
   it('명시 경로가 환경변수와 기본 경로를 이긴다', () => {
@@ -410,6 +413,16 @@ function writeV1(path: string): void {
  * 문자열은 다르다.
  *
  * 인덱스는 이름으로 정렬한다. 같아야 하는 것은 생성 순서가 아니라 집합이다.
+ *
+ * **완전한 대조가 아니다.** 대조하는 것은 테이블 집합, `table_info`가 주는 컬럼 (`cid`,
+ * 이름, 타입, `notnull`, 기본값, PK 위치), 그리고 `index_list`/`index_info`가 주는 인덱스
+ * 이름·unique·origin·partial 여부와 인덱스 컬럼이다. 여기까지다.
+ *
+ * 대조하지 못하는 것: CHECK 제약, foreign key, trigger, 컬럼 collation, 인덱스 sort order,
+ * partial index의 WHERE 절, `table_info`가 숨기는 generated/hidden 컬럼. 이 중 하나가 새
+ * 파일과 올린 파일 사이에서 갈라져도 이 가드는 통과한다. `schema.ts`의 규율(파괴적 변경
+ * 금지, 덧붙이기만)이 이 부류가 들어올 경로를 좁히고 있어 지금은 확장하지 않는다. 그런
+ * 요소를 `SCHEMA_DDL`에 새로 넣는다면 이 함수도 함께 넓혀야 한다.
  */
 function readSchemaShape(path: string) {
   const db = new DatabaseSync(path);
@@ -559,5 +572,187 @@ describe('v1 → v2 migration', () => {
     raw.close();
 
     expect(() => new SqliteDigestStore(dbPath)).toThrow(/버전 행이 없다/);
+  });
+});
+
+/**
+ * v2 파일을 올려서 여는 경로.
+ *
+ * v1과 같은 이유로 여기에 v2 DDL을 그대로 적는다. 옛 스키마는 `schema.ts`에 남아 있지 않고,
+ * 여기 적힌 것이 migration이 실제로 만나는 모양이다. v1 → v3 경로는 위 describe가 이미
+ * 검증하므로(두 단계를 순서대로 적용한다) 여기서는 v2 → v3 한 단계만 본다.
+ */
+const V2_DDL = `
+CREATE TABLE schema_version (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  version    INTEGER NOT NULL,
+  applied_at TEXT    NOT NULL
+);
+
+CREATE TABLE pr_message (
+  pr_key             TEXT PRIMARY KEY,
+  channel_id         TEXT NOT NULL,
+  message_ts         TEXT NOT NULL,
+  render_fingerprint TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  facts_fingerprint  TEXT,
+  summary_json       TEXT
+);
+
+CREATE UNIQUE INDEX pr_message_slack_identity ON pr_message (channel_id, message_ts);
+`;
+
+/** 게시된 카드의 매핑이 든 v2 파일을 만든다. */
+function writeV2(path: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const raw = new DatabaseSync(path);
+  raw.exec(V2_DDL);
+  raw
+    .prepare('INSERT INTO schema_version (id, version, applied_at) VALUES (1, 2, ?)')
+    .run('2026-08-22T12:58:31.014Z');
+  raw
+    .prepare(
+      `INSERT INTO pr_message
+         (pr_key, channel_id, message_ts, render_fingerprint, created_at, updated_at,
+          facts_fingerprint, summary_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      PR, 'C0PRDIGEST', '1787403740.833329', 'fp-v2',
+      '2026-08-22T13:02:19.373Z', '2026-08-22T13:02:37.520Z',
+      'facts-v2', '{"kind":"ok"}',
+    );
+  raw.close();
+}
+
+describe('v2 → v3 migration', () => {
+  // 이 파일의 알려진 함정이다. SCHEMA_DDL에만 있고 MIGRATIONS에는 없는 테이블(또는 그 반대)이
+  // 생기면 새 파일과 기존 파일이 다른 스키마로 갈라진다. 컬럼 이름뿐 아니라
+  // type·notnull·default·PK와 인덱스까지 대조한다.
+  it('올린 v2 파일과 새로 만든 v3 파일의 스키마가 같다', () => {
+    writeV2(dbPath);
+    new SqliteDigestStore(dbPath).close();
+
+    const freshPath = join(dir, 'fresh', 'state.db');
+    new SqliteDigestStore(freshPath).close();
+    expect(readSchemaShape(dbPath)).toEqual(readSchemaShape(freshPath));
+  });
+
+  it('pr_task를 붙이고 버전을 올리며 기존 매핑 행을 그대로 둔다', () => {
+    writeV2(dbPath);
+
+    const store = new SqliteDigestStore(dbPath);
+    const found = store.findPrMessage(PR);
+    // 붙인 테이블은 비어 있다. 과거 Task를 소급해 채우지 않는다.
+    const tasks = store.listPrTasks(PR);
+    store.close();
+
+    expect(found).toEqual({
+      prKey: PR,
+      channelId: 'C0PRDIGEST',
+      messageTs: '1787403740.833329',
+      renderFingerprint: 'fp-v2',
+      factsFingerprint: 'facts-v2',
+      summaryJson: '{"kind":"ok"}',
+      createdAt: '2026-08-22T13:02:19.373Z',
+      updatedAt: '2026-08-22T13:02:37.520Z',
+    });
+    expect(tasks).toEqual([]);
+
+    const raw = new DatabaseSync(dbPath);
+    const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    raw.close();
+    expect(version).toEqual({ version: SCHEMA_VERSION });
+  });
+
+  // 트랜잭션이 CREATE TABLE도 되돌리는지 본다. 되돌리지 않으면 테이블은 있는데 버전은 v2인
+  // 파일이 남고, 다음 실행이 같은 CREATE TABLE을 다시 걸어 영영 열리지 않는다.
+  it('migration이 실패하면 파일이 v2 그대로 남는다', () => {
+    writeV2(dbPath);
+    const seed = new DatabaseSync(dbPath);
+    seed.exec('CREATE TABLE pr_task (x TEXT)');
+    seed.close();
+
+    expect(() => new SqliteDigestStore(dbPath)).toThrow(/pr_task/);
+
+    const raw = new DatabaseSync(dbPath);
+    const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    const rows = raw.prepare('SELECT pr_key, message_ts FROM pr_message').all();
+    raw.close();
+    expect(version).toEqual({ version: 2 });
+    expect(rows).toEqual([{ pr_key: PR, message_ts: '1787403740.833329' }]);
+  });
+});
+
+/**
+ * PR↔Task N 연관(OD-076).
+ *
+ * PR body는 primary/latest Task 하나만 담으므로, 이 표가 남기지 않으면 이전 Task와의 연관을
+ * 어디에서도 복원할 수 없다.
+ */
+describe('pr_task 연관', () => {
+  const AT1 = '2026-08-23T01:00:00.000Z';
+  const AT2 = '2026-08-23T02:00:00.000Z';
+  const AT3 = '2026-08-23T03:00:00.000Z';
+
+  it('한 PR에 Task가 여럿 남는다. 뒤 Task가 앞 Task를 덮지 않는다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordPrTask({ prKey: PR, taskKey: TASK_A, runKey: RUN, at: AT1 });
+    store.recordPrTask({ prKey: PR, taskKey: TASK_B, runKey: RUN, at: AT2 });
+    const rows = store.listPrTasks(PR);
+    store.close();
+
+    expect(rows).toEqual([
+      { prKey: PR, taskKey: TASK_A, runKey: RUN, firstSeenAt: AT1, lastSeenAt: AT1 },
+      { prKey: PR, taskKey: TASK_B, runKey: RUN, firstSeenAt: AT2, lastSeenAt: AT2 },
+    ]);
+  });
+
+  it('같은 쌍을 다시 관측하면 행이 늘지 않고 lastSeenAt만 옮긴다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordPrTask({ prKey: PR, taskKey: TASK_A, runKey: RUN, at: AT1 });
+    store.recordPrTask({ prKey: PR, taskKey: TASK_A, runKey: RUN, at: AT3 });
+    const rows = store.listPrTasks(PR);
+    store.close();
+
+    // insertPrMessage와 달리 던지지 않는다. 같은 쌍의 반복 관측이 정상 경로다.
+    expect(rows).toEqual([
+      { prKey: PR, taskKey: TASK_A, runKey: RUN, firstSeenAt: AT1, lastSeenAt: AT3 },
+    ]);
+  });
+
+  it('다른 PR의 연관은 섞이지 않고, 없는 PR은 빈 배열이다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordPrTask({ prKey: PR, taskKey: TASK_A, runKey: RUN, at: AT1 });
+    store.recordPrTask({ prKey: OTHER_PR, taskKey: TASK_B, runKey: RUN, at: AT2 });
+
+    expect(store.listPrTasks(PR).map((r) => r.taskKey)).toEqual([TASK_A]);
+    expect(store.listPrTasks(OTHER_PR).map((r) => r.taskKey)).toEqual([TASK_B]);
+    expect(store.listPrTasks(pullRequestKey(999999, 1))).toEqual([]);
+    store.close();
+  });
+
+  it('재시작해도 같은 파일에서 연관을 그대로 읽는다', () => {
+    const first = new SqliteDigestStore(dbPath);
+    first.recordPrTask({ prKey: PR, taskKey: TASK_A, runKey: RUN, at: AT1 });
+    first.recordPrTask({ prKey: PR, taskKey: TASK_B, runKey: RUN, at: AT2 });
+    first.close();
+
+    const second = new SqliteDigestStore(dbPath);
+    const rows = second.listPrTasks(PR);
+    second.close();
+    expect(rows.map((r) => r.taskKey)).toEqual([TASK_A, TASK_B]);
+  });
+
+  // firstSeenAt이 같으면 taskKey 사전순으로 고정한다. 정렬을 지정하지 않으면 같은 파일이
+  // 실행마다 다른 순서를 낼 수 있다.
+  it('firstSeenAt이 같으면 taskKey 사전순이다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordPrTask({ prKey: PR, taskKey: TASK_B, runKey: RUN, at: AT1 });
+    store.recordPrTask({ prKey: PR, taskKey: TASK_A, runKey: RUN, at: AT1 });
+    const rows = store.listPrTasks(PR);
+    store.close();
+    expect(rows.map((r) => r.taskKey)).toEqual([TASK_A, TASK_B]);
   });
 });

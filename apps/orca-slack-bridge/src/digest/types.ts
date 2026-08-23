@@ -31,10 +31,11 @@ import type { SummaryResult } from '../summarize/index.js';
  * `task`를 non-null로 좁힌다. `resolveCorrelation`은 `orca-run`만 있고 `orca-task`가 없는
  * PR body도 `correlated` + `task: null`로 보고한다. 그런 PR은 `worker_done`도 Task 목적도
  * 찾을 수 없어 카드 입력을 구성할 수 없다. 좁히는 지점은 projection이며
- * `correlate/resolve.ts`의 출력은 바꾸지 않는다. 그 출력은 S0에서 검증된 계약이고,
- * "run은 있고 task가 없다"를 어느 kind로 볼지는 OD-022의 누락 정책 표에 아직 행이 없다.
+ * `correlate/resolve.ts`의 출력은 바꾸지 않는다. 그 출력은 S0에서 검증된 계약이고, OD-077이
+ * 별도 `run_correlated` kind를 Run-level 제품 의미가 필요해질 때까지 미뤘다.
  *
- * 좁히기에서 탈락한 PR은 버리지 않는다. `PrProjection`의 `skipped`가 이유와 함께 남긴다.
+ * 좁히기에서 탈락한 PR은 버리지 않는다. `PrProjection`의 `skipped`가 이유와 함께 남기며,
+ * 그 이유는 정상 출력이 아니라 degraded 입력이다(`PrSkipReason`).
  *
  * 좁히는 방법: `c.task !== null` 검사만으로는 `c` 자체가 좁혀지지 않는다. TypeScript는
  * 속성 참조만 좁히고 객체 타입은 그대로 둔다. 타입 술어를 쓴다.
@@ -275,12 +276,19 @@ export type PrSkipReason =
   /** correlation이 `conflict`다. 모순을 자동으로 한쪽으로 덮지 않는다(OD-022). */
   | 'conflict'
   /**
-   * `correlated`지만 `orca-task`가 없다.
+   * `orca-run`은 있고 필수 `orca-task`가 없다. **invalid/degraded input이다**(OD-077).
    *
-   * Task를 찾을 수 없으므로 Task 목적도 `worker_done`도 붙일 수 없고 카드 입력이 서지
-   * 않는다. `CorrelatedOrigin`이 컴파일로 막는 경우가 런타임에서 여기로 온다.
+   * 위 둘과 성격이 다르므로 이름이 그것을 말한다. `uncorrelated`는 metadata가 없거나 Run을
+   * 확정할 수 없는 정상 출력이지만, 이쪽은 OD-021이 `orca-task`를 필수로 정한 뒤의 계약 위반
+   * 입력이다. 원인은 누락이나 수동 편집 같은 partial input이다.
+   *
+   * Task를 찾을 수 없으므로 Task 목적도 `worker_done`도 붙일 수 없고 카드 입력이 서지 않는다.
+   * `CorrelatedOrigin`이 컴파일로 막는 경우가 런타임에서 여기로 온다.
+   *
+   * **branch 이름·PR 제목·author로 Task를 보완하지 않는다.** no-guessing 계약에 반하며
+   * OD-077이 그 대안을 기각했다. 별도 `run_correlated` kind도 만들지 않는다.
    */
-  | 'task_missing';
+  | 'run_only_degraded';
 
 /**
  * PR 하나에 대한 projection 결과.
