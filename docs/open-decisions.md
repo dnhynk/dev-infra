@@ -743,7 +743,6 @@ ID: OD-043
     WAL 전환 실패와 접근 불가 store는 던진다.
   - schema migration은 `ALTER TABLE ADD COLUMN`처럼 덧붙이는 변경만 허용한다. 기존 파일을 열지 못하게
     하는 파괴적 변경은 살아 있는 카드 mapping을 잃고 루트 메시지를 중복시키므로 이 방식으로 다루지 않는다.
-    현재 `SCHEMA_VERSION`은 2다.
 근거:
   - DL-018에서 이 호스트의 node:sqlite 동작을 재확인했고 외부 의존성이 늘지 않는다. C1에는 daemon이 없어 동시 writer가 없다.
   - 설정 파일은 머신 간에 옮겨도 의미가 유지되는 값을 담지만 DB 절대경로는 그렇지 않다.
