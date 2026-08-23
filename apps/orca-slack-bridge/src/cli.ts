@@ -238,6 +238,9 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
       store,
       // dry-run은 poster를 아예 만들지 않는다. 토큰도 읽지 않으므로 write 경로가 없다.
       slack: parsed.dryRun ? null : new SlackWebApiPoster({ token: botToken(process.env) }),
+      // thread 게시 경계는 아직 없다. 전이 판정과 dedupe는 그대로 돌고, 아직 참인 전이는
+      // 기록되지 않은 채 다음 관측의 후보로 남는다(`digest/transition.ts`). 실제 게시는 C2-4다.
+      thread: null,
       provider: summaryProvider(process.env),
       cache: new MemorySummaryCache(),
       prLimit: parsed.prLimit,

@@ -209,6 +209,15 @@ rule로 적용한다. 동일 head 안의 review/check는 각 resource의 timesta
 Slack root를 갱신할 수 없으면 GitHub current snapshot, Orca facts, Bridge store identity로 current 카드만
 재생성한다. GitHub·Slack history에서 과거 thread semantic transition을 재생하지 않는다(OD-046).
 
+thread transition의 보존 범위는 다음과 같다. transition 후보는 reconcile된 **현재** 상태에서 만들고, 이미
+기록한 것은 durable dedupe key로 거른다. 그래서 같은 상태 재관찰과 Bridge 재시작이 reply를 늘리지 않고,
+게시하지 못한 채로 남은 transition도 그 사실이 아직 참이면 다음 관찰에서 다시 후보가 된다.
+
+누락되는 것은 하나다. **참이었다가 다시 거짓이 된 사실은 기록되지 않는다.** 그 사이에 게시하지 못했다면
+다음 관찰의 후보 집합에 없기 때문이다. 이 경계는 과소보고 쪽이며 "동일 상태 재관찰은 새 thread reply를
+만들지 않는다"와 같은 방향이다. PR을 Bridge가 처음 관찰할 때도 같은 이유로 transition을 만들지 않는다.
+이전 상태를 모르는 상태에서 현재 참인 사실을 transition으로 내보내는 것이 곧 과거 재생이다(OD-046).
+
 ## 7. 최소 저장 개념
 
 확정 schema는 아니지만 다음 관계는 지속되어야 한다.

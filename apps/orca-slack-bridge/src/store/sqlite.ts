@@ -2,7 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
+import type { CheckFact } from '../github/pull-request.js';
 import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
+import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
   ENABLE_WAL,
   MIGRATIONS,
@@ -12,9 +14,13 @@ import {
   type DigestStore,
   type NewPrMessage,
   type NewPrTask,
+  type NewThreadEvent,
   type ObservationRecord,
   type PrMessageRecord,
+  type PrStateRecord,
+  type PrStateSnapshot,
   type PrTaskRecord,
+  type PrThreadEventRecord,
 } from './schema.js';
 
 /**
@@ -190,6 +196,104 @@ SELECT pr_key, task_key, run_key, first_seen_at, last_seen_at
   FROM pr_task WHERE pr_key = ?
  ORDER BY first_seen_at, task_key`;
 
+/**
+ * 직전 관측 상태를 덮어쓴다.
+ *
+ * `ON CONFLICT DO UPDATE`를 쓴다. 조회 후 INSERT/UPDATE를 고르면 두 문장 사이에서 판정이 낡고,
+ * 관측마다 덮어쓰는 것이 이 표의 정상 경로다(`schema.ts`).
+ */
+const UPSERT_PR_STATE = `
+INSERT INTO pr_state
+  (pr_key, terminal, merged_at, review_verdict, reviewed_head_sha, head_sha, checks_head_sha,
+   checks_json, observed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (pr_key) DO UPDATE SET
+  terminal = excluded.terminal,
+  merged_at = excluded.merged_at,
+  review_verdict = excluded.review_verdict,
+  reviewed_head_sha = excluded.reviewed_head_sha,
+  head_sha = excluded.head_sha,
+  checks_head_sha = excluded.checks_head_sha,
+  checks_json = excluded.checks_json,
+  observed_at = excluded.observed_at`;
+
+const SELECT_PR_STATE = `
+SELECT pr_key, terminal, merged_at, review_verdict, reviewed_head_sha, head_sha, checks_head_sha,
+       checks_json, observed_at
+  FROM pr_state WHERE pr_key = ?`;
+
+const INSERT_THREAD_EVENT = `
+INSERT INTO pr_thread_event (pr_key, dedupe_key, kind, message_ts, recorded_at)
+VALUES (?, ?, ?, ?, ?)`;
+
+// 순서를 SQL에서 고정한다. 지정하지 않으면 같은 파일이 실행마다 다른 순서를 낼 수 있다.
+const SELECT_THREAD_EVENTS = `
+SELECT pr_key, dedupe_key, kind, message_ts, recorded_at
+  FROM pr_thread_event WHERE pr_key = ?
+ ORDER BY recorded_at, dedupe_key`;
+
+/** sqlite가 돌려주는 pr_state 한 행. 컬럼명 그대로다. */
+type PrStateRow = {
+  readonly pr_key: string;
+  readonly terminal: string;
+  readonly merged_at: string | null;
+  readonly review_verdict: string | null;
+  readonly reviewed_head_sha: string | null;
+  readonly head_sha: string;
+  readonly checks_head_sha: string;
+  readonly checks_json: string;
+  readonly observed_at: string;
+};
+
+/** sqlite가 돌려주는 pr_thread_event 한 행. 컬럼명 그대로다. */
+type PrThreadEventRow = {
+  readonly pr_key: string;
+  readonly dedupe_key: string;
+  readonly kind: string;
+  readonly message_ts: string | null;
+  readonly recorded_at: string;
+};
+
+/**
+ * 저장한 `checks_json`을 되읽는다.
+ *
+ * **JSON 파싱 실패를 빈 목록으로 접지 않는다.** 빈 목록은 "직전 관측에 check가 없었다"는
+ * 사실이고, 그렇게 접으면 완료 snapshot 뒤에 도착한 진행 snapshot을 되돌릴 근거가 조용히
+ * 사라진다(OD-044). 이 값을 쓰는 쪽은 이 파일이 직접 쓴 것뿐이므로 깨졌다면 파일이 손상된
+ * 것이고, 그 사실은 드러나야 한다.
+ */
+function parseChecks(json: string, prKey: string): readonly CheckFact[] {
+  const parsed: unknown = JSON.parse(json);
+  if (!Array.isArray(parsed)) {
+    throw new TypeError(`${prKey}의 pr_state.checks_json이 배열이 아니다`);
+  }
+  return parsed as readonly CheckFact[];
+}
+
+function toPrStateRecord(row: PrStateRow): PrStateRecord {
+  return {
+    prKey: row.pr_key as PullRequestKey,
+    terminal: row.terminal as PrTerminal,
+    mergedAt: row.merged_at,
+    reviewVerdict: row.review_verdict as ReviewerResult['verdict'] | null,
+    reviewedHeadSha: row.reviewed_head_sha,
+    headSha: row.head_sha,
+    checksHeadSha: row.checks_head_sha,
+    checks: parseChecks(row.checks_json, row.pr_key),
+    observedAt: row.observed_at,
+  };
+}
+
+function toThreadEventRecord(row: PrThreadEventRow): PrThreadEventRecord {
+  return {
+    prKey: row.pr_key as PullRequestKey,
+    dedupeKey: row.dedupe_key,
+    kind: row.kind,
+    messageTs: row.message_ts,
+    recordedAt: row.recorded_at,
+  };
+}
+
 /** sqlite가 돌려주는 pr_message 한 행. 컬럼명 그대로다. */
 type PrMessageRow = {
   readonly pr_key: string;
@@ -308,6 +412,48 @@ export class SqliteDigestStore implements DigestStore {
     return (this.db.prepare(SELECT_PR_TASKS).all(prKey) as PrTaskRow[]).map(toPrTaskRecord);
   }
 
+  findPrState(prKey: PullRequestKey): PrStateRecord | null {
+    const row = this.db.prepare(SELECT_PR_STATE).get(prKey) as PrStateRow | undefined;
+    return row === undefined ? null : toPrStateRecord(row);
+  }
+
+  savePrState(prKey: PullRequestKey, state: PrStateSnapshot, at: string): void {
+    this.db
+      .prepare(UPSERT_PR_STATE)
+      .run(
+        prKey,
+        state.terminal,
+        state.mergedAt,
+        state.reviewVerdict,
+        state.reviewedHeadSha,
+        state.headSha,
+        state.checksHeadSha,
+        JSON.stringify(state.checks),
+        at,
+      );
+  }
+
+  listThreadEvents(prKey: PullRequestKey): readonly PrThreadEventRecord[] {
+    return (this.db.prepare(SELECT_THREAD_EVENTS).all(prKey) as PrThreadEventRow[]).map(
+      toThreadEventRecord,
+    );
+  }
+
+  recordThreadEvent(input: NewThreadEvent): void {
+    try {
+      this.db
+        .prepare(INSERT_THREAD_EVENT)
+        .run(input.prKey, input.dedupeKey, input.kind, input.messageTs, input.at);
+    } catch (e) {
+      // 조용히 덮어쓰지 않는다. 덮어쓰면 thread에 중복 reply가 남은 사실이 store에서 사라진다.
+      const detail = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `${input.prKey}의 전이 ${input.dedupeKey}를 기록할 수 없다: ${detail}`,
+        { cause: e },
+      );
+    }
+  }
+
   close(): void {
     // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -382,6 +528,29 @@ export class ReadOnlyDigestStore implements DigestStore {
     const { db, schemaReady } = this.opened;
     if (db === null || !schemaReady) return [];
     return (db.prepare(SELECT_PR_TASKS).all(prKey) as PrTaskRow[]).map(toPrTaskRecord);
+  }
+
+  findPrState(prKey: PullRequestKey): PrStateRecord | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_PR_STATE).get(prKey) as PrStateRow | undefined;
+    return row === undefined ? null : toPrStateRecord(row);
+  }
+
+  savePrState(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. 관측 상태를 저장하려 했다: ${this.path}`);
+  }
+
+  listThreadEvents(prKey: PullRequestKey): readonly PrThreadEventRecord[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_THREAD_EVENTS).all(prKey) as PrThreadEventRow[]).map(
+      toThreadEventRecord,
+    );
+  }
+
+  recordThreadEvent(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. thread 전이를 기록하려 했다: ${this.path}`);
   }
 
   close(): void {

@@ -15,13 +15,11 @@ import type { DigestStatus, MergePolicy, PrAxes, PrTerminal } from './types.js';
  *
  * **terminal만 dominance로 합친다.** review와 check는 `headSha`가 scope이고, 같은 head 안에서는
  * 각 resource의 자기 timestamp와 자기 id로 reconcile한다(OD-044). reviewer_result에 대한 그
- * 규칙은 `digest/project.ts`의 `pickReviewerResult`에 있다. check는 아직 여기서 reconcile하지
- * 않는다. 지금 한 관측 안의 rollup row만 보고, 이전 관측과 합치는 규칙은 C2-3이다.
+ * 규칙은 `digest/project.ts`의 `pickReviewerResult`에, 이전 관측의 check와 합치는 규칙은
+ * `digest/transition.ts`의 `reconcileChecks`에 있다. 이 파일은 한 관측 안의 rollup row만 본다.
  *
- * **`reconcileTerminal`은 이번 변경에 프로덕션 호출자가 없다.** 이전 관측을 들고 있는 쪽이
- * 호출자이고 그것은 C2-3(전이 판정)이다. C2-3이 durable store에서 이전 terminal을 읽어
- * 넘긴다. C2-1은 저장을 만들지 않는다. schema v3 승격은 C2-5가 가져갔고, 두 Task가 같은
- * 버전 번호를 다루면 새 파일용 DDL과 기존 파일용 MIGRATIONS가 갈라진다.
+ * `reconcileTerminal`의 프로덕션 호출자는 `digest/transition.ts`의 `reconcileObservation`
+ * 하나이며, 이전 terminal은 `pr_state`에서 온다.
  */
 
 /**

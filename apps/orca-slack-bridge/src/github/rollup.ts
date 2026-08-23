@@ -17,7 +17,8 @@ export type CheckFact = {
    *
    * OD-044는 동일 head 안의 check/status를 각 resource의 timestamp와 id로 reconcile한다고 확정했다.
    * id가 없으면 완료 snapshot 뒤에 늦게 도착한 진행 snapshot을 같은 resource로 묶을 수 없다.
-   * C2는 이 사실을 싣기만 하고 reconcile 규칙 자체는 쓰지 않는다.
+   * 이 파일은 사실을 싣기만 하고, 그 규칙은 `digest/transition.ts`의 `reconcileChecks`에 있다.
+   * 빈 값이면 묶을 근거가 없으므로 그 함수가 이전 관측 쪽을 버린다.
    */
   readonly id: string;
   /** `CheckRun.name` 또는 `StatusContext.context`. required rule의 context와 맞추는 키다. */

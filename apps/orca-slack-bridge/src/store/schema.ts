@@ -1,4 +1,6 @@
+import type { CheckFact } from '../github/pull-request.js';
 import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
+import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 
 /**
  * durable store 스키마와 접근 경계.
@@ -52,12 +54,16 @@ import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
  * 검증하지 않는 것은 위의 두 창이다. 그 둘에서는 매핑 행이 아예 없으므로 재관찰이 루트를
  * 새로 만든다.
  *
- * 담지 않는 것: thread transition 기록, Gate↔action correlation, coordinator notification
- * pending, 관찰 cursor. 각각 C2/D2/D3의 사실이고, 지금 만들면 쓰이지 않는 스키마가 된다.
+ * - **thread에 이미 기록한 전이가 다시 기록되지 않는다** → `pr_thread_event`의 PRIMARY KEY가
+ *   (PR, dedupe key)다. 보장 범위는 `PR_THREAD_EVENT_TABLE`에 적었다.
+ * - 이전 관측의 terminal과 check resource를 다음 관측이 읽을 수 있다 → `pr_state`가 PR당 한 행이다.
+ *
+ * 담지 않는 것: Gate↔action correlation, coordinator notification pending, 관찰 cursor.
+ * 각각 D2/D3의 사실이고, 지금 만들면 쓰이지 않는 스키마가 된다.
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -95,6 +101,87 @@ CREATE TABLE pr_task (
   first_seen_at TEXT NOT NULL,
   last_seen_at  TEXT NOT NULL,
   PRIMARY KEY (pr_key, task_key)
+)`;
+
+/**
+ * `pr_state` 테이블 DDL. `PR_TASK_TABLE`과 같은 이유로 상수 하나로 묶는다.
+ *
+ * 이 표가 담는 것은 **직전 관측의 사실**이고 용도는 하나다. 다음 관측을 이 값과 reconcile하는
+ * 것(OD-044). 카드에 그릴 값을 여기서 읽지 않는다 — 카드는 reconcile 결과에서 나온다.
+ *
+ * `terminal`은 **reconcile된 뒤의 값**을 적는다. 관측한 값을 그대로 적으면 오래된 snapshot이
+ * `merged`를 지워, 그 다음 관측에는 되돌릴 근거 자체가 남지 않는다. `merged` downgrade 금지는
+ * timestamp 비교가 아니라 terminal dominance rule이다(OD-044, `digest/state.ts`).
+ *
+ * `merged_at`은 `merged` latch의 occurred time이다. 한 번 채워지면 비우지 않는다. 같은 이유로
+ * 오래된 snapshot의 `mergedAt: null`이 이 값을 지우지 않는다.
+ *
+ * `checks_json`은 reconcile된 `CheckFact` 배열이다. 배열을 정규화된 표로 펼치지 않는다. 이
+ * 값을 조건으로 조회하는 코드가 없고(읽는 곳은 "이 PR의 직전 check 전부" 하나뿐이다) 표로
+ * 펼치면 `CheckFact`가 늘 때마다 파괴적 migration이 필요해진다. 파괴적 변경은 `MIGRATIONS`가
+ * 다루지 않는 부류다.
+ *
+ * `checks_head_sha`가 `checks_json`의 scope다. 이 값이 다르면 두 관측의 check는 서로 다른
+ * commit의 사실이라 resource 단위로 합칠 대상이 아니다(OD-044: review/check scope는 headSha다).
+ */
+const PR_STATE_TABLE = `
+CREATE TABLE pr_state (
+  -- identity/keys.ts의 PullRequestKey. pr_message.pr_key와 같은 형식이다.
+  pr_key            TEXT PRIMARY KEY,
+  -- reconcile된 terminal. 관측값이 아니다.
+  terminal          TEXT NOT NULL,
+  -- merged latch의 occurred time. 한 번 채워지면 비우지 않는다.
+  merged_at         TEXT,
+  -- 직전 관측의 reviewer verdict와 그 reviewer가 본 commit. 없으면 둘 다 NULL이다.
+  review_verdict    TEXT,
+  reviewed_head_sha TEXT,
+  -- 직전 관측의 현재 head와 checks가 매달린 head. 둘은 다를 수 있다(OD-044).
+  head_sha          TEXT NOT NULL,
+  checks_head_sha   TEXT NOT NULL,
+  -- reconcile된 CheckFact 배열의 JSON. scope는 checks_head_sha다.
+  checks_json       TEXT NOT NULL,
+  observed_at       TEXT NOT NULL
+)`;
+
+/**
+ * `pr_thread_event` 테이블 DDL. `PR_TASK_TABLE`과 같은 이유로 상수 하나로 묶는다.
+ *
+ * **이 표가 보장하는 것과 보장하지 않는 것을 구분한다.** `pr_message`와 같은 규율이다.
+ *
+ * 보장한다.
+ *
+ * - 같은 (PR, dedupe key)로 두 행이 생기지 않는다 → PRIMARY KEY가 강제한다.
+ * - Bridge가 재시작해도 무엇을 이미 기록했는지 안다 → 판정 근거가 프로세스 메모리가 아니라
+ *   이 파일이다. 같은 사실을 다시 관측하면 후보 key가 이미 여기 있으므로 reply가 생기지 않는다.
+ * - 첫 관측에서 과거를 재생하지 않는다 → 그때는 현재 참인 후보 전부를 `message_ts` NULL로
+ *   적어 둔다(seed). 게시하지 않았다는 사실이 행에 남는다(OD-046).
+ *
+ * 보장하지 않는다.
+ *
+ * - **thread reply가 PR당 전이당 하나라는 것.** `pr_message`와 같은 두 창이 그대로 있다.
+ *   reply가 게시된 뒤 이 행을 넣기 전에 죽으면(창 1), 그리고 게시 여부를 알 수 없는 실패로
+ *   호출자가 실패를 받으면(창 2, `slack/post.ts`의 판정) 행이 남지 않아 다음 관측이 같은
+ *   전이를 다시 게시한다. 두 창은 C1에서 닫지 않기로 한 것과 같은 미결정 항목이다(스펙 §9,
+ *   OD-051). 여기서 outbox나 요청 idempotency key를 만들지 않는다.
+ * - **전이가 빠짐없이 기록된다는 것.** 후보는 지금 참인 사실에서 나온다. 참이었다가 다시
+ *   거짓이 된 사실은 다음 관측에서 후보가 아니므로 기록되지 않는다. 이 표는 과소보고 쪽으로
+ *   안전하며 "한 번만 기록"(로드맵 §6)이 요구하는 방향과 같다.
+ *
+ * `message_ts`는 게시된 reply의 ts다. NULL은 seed 행이며 "이 전이는 게시하지 않기로 했다"는
+ * 뜻이다. 게시에 실패한 전이는 행 자체가 없다 — 실패를 기록으로 바꾸면 그 전이가 영영 사라진다.
+ */
+const PR_THREAD_EVENT_TABLE = `
+CREATE TABLE pr_thread_event (
+  -- identity/keys.ts의 PullRequestKey. pr_message.pr_key와 같은 형식이다.
+  pr_key      TEXT NOT NULL,
+  -- 전이 하나를 식별하는 값. 관측 순서가 아니라 전이의 내용에서 파생한다(digest/transition.ts).
+  dedupe_key  TEXT NOT NULL,
+  -- 전이 종류. dedupe_key에 이미 들어 있지만 사람이 이 표를 읽을 수 있어야 한다.
+  kind        TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  -- 게시된 thread reply의 ts. NULL은 seed 행이고 게시하지 않았다는 뜻이다.
+  message_ts  TEXT,
+  PRIMARY KEY (pr_key, dedupe_key)
 )`;
 
 /**
@@ -142,6 +229,8 @@ CREATE TABLE IF NOT EXISTS pr_message (
 CREATE UNIQUE INDEX IF NOT EXISTS pr_message_slack_identity
   ON pr_message (channel_id, message_ts);
 ${PR_TASK_TABLE};
+${PR_STATE_TABLE};
+${PR_THREAD_EVENT_TABLE};
 `;
 
 /**
@@ -172,6 +261,11 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // 지금 있는 카드에는 body가 가리키는 Task 하나만 알려져 있고, 그 연관은 다음 관찰이 기록한다.
   // 과거 Task를 소급해 채우지 않는다. 그 값을 만들 수 있는 authoritative source가 없다.
   [PR_TASK_TABLE],
+  // v3 → v4: 전이 판정에 필요한 두 표를 붙인다(OD-044, OD-046). 기존 행은 건드리지 않는다.
+  // 둘 다 비어 있는 채로 시작하고, 그것이 맞다. `pr_state`가 비었다는 것은 "이전 관측을 모른다"는
+  // 뜻이고 그 PR의 첫 관측은 전이를 내지 않는다. 과거 상태를 GitHub history로 채우지 않는다 —
+  // check는 400일 뒤 archive되고 다시 10일 뒤 삭제되어 완전 재생을 보장할 수 없다(OD-046).
+  [PR_STATE_TABLE, PR_THREAD_EVENT_TABLE],
 ];
 
 /**
@@ -258,6 +352,58 @@ export type PrTaskRecord = {
 };
 
 /**
+ * 한 PR에 대한 직전 관측 상태.
+ *
+ * 다음 관측을 reconcile할 때만 쓴다(OD-044). 카드가 읽는 값이 아니다.
+ *
+ * `terminal`은 reconcile된 값이고 `mergedAt`은 latch의 occurred time이다. 둘 다 내려가지
+ * 않는다 — 근거는 `PR_STATE_TABLE`에 있다.
+ *
+ * `checks`의 scope는 `checksHeadSha`다. 이 값이 다른 두 관측의 check는 서로 다른 commit의
+ * 사실이므로 resource 단위로 합치지 않는다.
+ */
+export type PrStateSnapshot = {
+  readonly terminal: PrTerminal;
+  readonly mergedAt: string | null;
+  readonly reviewVerdict: ReviewerResult['verdict'] | null;
+  readonly reviewedHeadSha: string | null;
+  readonly headSha: string;
+  readonly checksHeadSha: string;
+  readonly checks: readonly CheckFact[];
+};
+
+/** 저장된 직전 관측 상태 한 행. `observedAt`은 ISO8601이다. */
+export type PrStateRecord = PrStateSnapshot & {
+  readonly prKey: PullRequestKey;
+  readonly observedAt: string;
+};
+
+/**
+ * thread에 기록한 전이 하나.
+ *
+ * `messageTs`가 null이면 seed 행이다. 첫 관측에서 "지금 참인 사실"을 게시 없이 기준선으로만
+ * 남긴 것이며, 그 전이는 앞으로도 게시되지 않는다(OD-046).
+ */
+export type NewThreadEvent = {
+  readonly prKey: PullRequestKey;
+  readonly dedupeKey: string;
+  readonly kind: string;
+  /** 게시된 reply의 ts. seed 행은 null이다. */
+  readonly messageTs: string | null;
+  /** ISO8601. */
+  readonly at: string;
+};
+
+/** 저장된 thread 전이 한 행. 시각은 ISO8601이다. */
+export type PrThreadEventRecord = {
+  readonly prKey: PullRequestKey;
+  readonly dedupeKey: string;
+  readonly kind: string;
+  readonly messageTs: string | null;
+  readonly recordedAt: string;
+};
+
+/**
  * digest가 쓰는 durable store.
  *
  * 동기 인터페이스다. `node:sqlite`의 `DatabaseSync`가 동기 API이므로 Promise로 감싸면
@@ -311,6 +457,33 @@ export interface DigestStore {
    * 지정하지 않으면 같은 파일이 실행마다 다른 순서를 낼 수 있다.
    */
   listPrTasks(prKey: PullRequestKey): readonly PrTaskRecord[];
+  /**
+   * 직전 관측 상태를 읽는다. 없으면 null이며 **이는 정상 출력이다.**
+   *
+   * null은 "이 PR을 처음 관측한다"는 뜻이고, 그때 할 일은 정해져 있다. 이전 상태를 모르므로
+   * 전이를 만들지 않고 지금 참인 사실을 기준선으로만 남긴다(OD-046). GitHub history로 과거를
+   * 채우지 않는다.
+   */
+  findPrState(prKey: PullRequestKey): PrStateRecord | null;
+  /**
+   * 직전 관측 상태를 덮어쓴다. 행이 없으면 만든다. `at`은 ISO8601이다.
+   *
+   * **`insertPrMessage`와 달리 이미 있어도 던지지 않는다.** 그쪽이 던지는 이유는 덮어쓰면 이미
+   * 게시한 Slack 루트를 잃기 때문인데, 이 행에는 그런 외부 side effect가 없고 관측마다 덮어쓰는
+   * 것이 정상 경로다. 넘기는 값은 reconcile된 상태여야 한다 — 관측한 그대로를 적으면 오래된
+   * snapshot이 `merged` latch를 지운다(`PR_STATE_TABLE`).
+   */
+  savePrState(prKey: PullRequestKey, state: PrStateSnapshot, at: string): void;
+  /** 이 PR에 이미 기록한 전이 전부. 없으면 빈 배열이며 이는 정상 출력이다. */
+  listThreadEvents(prKey: PullRequestKey): readonly PrThreadEventRecord[];
+  /**
+   * 전이 하나를 기록한다. **같은 (PR, dedupe key)가 이미 있으면 던진다.**
+   *
+   * `recordPrTask`와 반대다. 같은 쌍의 반복 관측이 정상인 그쪽과 달리, 여기서 충돌이 났다는
+   * 것은 호출자가 이미 기록한 전이를 다시 게시했다는 뜻이다. 조용히 덮으면 thread에 중복
+   * reply가 남은 사실이 store에서 사라진다.
+   */
+  recordThreadEvent(input: NewThreadEvent): void;
   /** WAL 파일을 정리하고 열린 handle을 남기지 않는다. */
   close(): void;
 }

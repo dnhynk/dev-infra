@@ -201,6 +201,14 @@ class ChannelLeakingStore implements DigestStore {
   listPrTasks(): readonly [] {
     return [];
   }
+  findPrState(): null {
+    return null;
+  }
+  savePrState(): void {}
+  listThreadEvents(): readonly [] {
+    return [];
+  }
+  recordThreadEvent(): void {}
   close(): void {}
 }
 
