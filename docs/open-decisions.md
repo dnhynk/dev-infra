@@ -116,6 +116,7 @@
 | OD-064 | health/log/audit format과 secret 마스킹 | 실제 통합 전 | OPEN |
 | OD-065 | 초기 동시 repository/Run 규모 | S0 전 | OPEN |
 | OD-068 | D1의 수동 등록 다중 repo 범위와 O1 자동 발견/routing 경계 | D1/O1 전 | DECIDED |
+| OD-078 | D1이 Orca Run을 등록된 repository에 잇는 열쇠 | D1 전 | DECIDED |
 
 ## 결정 기록 형식
 
@@ -1402,4 +1403,39 @@ ID: OD-020
            이 Run에서 worktree id를 `<uuid>::<path>` 형식으로 반복 사용해 모두 동작했지만 형식 계약의
            보장은 관측하지 못했다. 이 형식의 안정성은 남은 위험이며 관측을 보장으로 격상하지 않는다.
 결정일: 2026-08-23
+```
+
+```text
+ID: OD-078
+상태: DECIDED
+결정: 설정의 `projects[].orcaRepositoryIds`에 등록한 **Orca repository id**로 Run을 repository에
+      연결한다. 관측된 `<repositoryId>::<path>`의 `::` 앞부분과 exact 문자열 비교한다. Git remote를
+      읽지 않는다. 등록에 맞지 않는 Run은 버리지 않고 수를 세어 사실로 노출한다.
+근거:
+  - [관측] Run row(`run-list`)에는 repository 필드가 없다. Task의 `created_by_process_incarnation`과
+    worker의 `resource.worktreeId`에 있는 `<id>::<path>`만이 관측 가능한 연결점이다.
+  - [관측] 경로에서 `owner/name`을 얻을 수단이 Orca 조회 표면에 없다.
+  - [관측] `worker-list` 전체에서 repository id `ccb3c8ee-6d9e-42af-af36-9fdac6566fcc` 하나가
+    경로 59개를 덮었다. 앞부분은 worktree가 아니라 repository의 id다.
+  - [관측] `orca worktree list --json`의 `repoId`가 같은 값이고 같은 행의 `path`와 나란히 있어
+    사용자가 등록할 값을 한 번에 찾을 수 있다.
+  - [관측] coordinator worktree는 `D:/dev-infra`이고 Orca가 만든 worktree는
+    `C:/Users/dongh/orca/workspaces/dev-infra/<name>`이다. 뿌리가 다르다.
+대안과 기각 이유:
+  - 로컬 경로 등록: 뿌리가 둘이라 한쪽만 등록하면 Run 절반이 조용히 빠지고, 정규화(대소문자,
+    구분자)와 segment 경계 처리(`D:/dev-infra`가 `D:/dev-infra-2`를 먹지 않게)를 요구하므로 기각.
+  - Run ID 직접 등록: Run ID는 매 Run 새로 생기므로 사용자가 매번 설정을 고쳐야 해 기각.
+  - PR correlation(`orca-run` 주석) 단독: PR이 아직 없는 Run을 표시하지 못해 "PR 이전 단계의 Run
+    진행 표시"라는 D1 목적을 깨뜨리므로 기각.
+  - Git remote 기반 자동 연결: 자동 발견·자동 등록은 O1 범위이므로 기각(OD-068).
+남는 위험: `<uuid>::<path>` 형식 안정성은 docs/platform-capabilities.md §7.1에 미검증으로 기록돼 있고,
+           이 id가 Orca 재설치·DB 재생성 뒤에도 유지되는지는 관측하지 않았다. 둘 중 하나가 깨지면
+           등록이 전부 어긋난다. 그래서 미등록 Run을 버리지 않고 세어 노출하는 것이 완화책이다(OD-072).
+영향 문서/파일: docs/contracts/observation-and-correlation.md §5,
+                docs/architecture/orca-slack-bridge.md §2, docs/roadmap.md §7, docs/traceability.md,
+                apps/orca-slack-bridge/src/project/config.ts, apps/orca-slack-bridge/src/run/collect.ts,
+                apps/orca-slack-bridge/config.example.json
+검증 방법: 등록된 id의 Run만 표시 대상이 되고, 대소문자만 다른 id는 매칭되지 않으며, 미등록 Run이
+           수와 관측된 id와 함께 노출되는지 확인한다.
+결정일: 2026-08-24
 ```

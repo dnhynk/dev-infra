@@ -67,6 +67,7 @@ class FakeOrca implements OrcaRunner {
             objective: 'C1',
             coordinator_handle: 'term_1',
             coordinator_pane_key: 'a:b',
+            consumer_generation: 1,
             legacy: 0,
             created_at: '2026-08-22T00:00:00Z',
             updated_at: '2026-08-22T00:00:00Z',
@@ -86,6 +87,9 @@ class FakeOrca implements OrcaRunner {
             deps: '[]',
             result: '{"provenance":"worker_report"}',
             created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
+            created_by_terminal_handle: 'term_1',
+            created_by_pane_key: 'a:b',
+            created_by_run_generation: 1,
             created_at: '2026-08-22 00:00:00',
             completed_at: '2026-08-22 01:00:00',
           },
@@ -98,6 +102,9 @@ class FakeOrca implements OrcaRunner {
             deps: '[]',
             result: '{"provenance":"worker_report"}',
             created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
+            created_by_terminal_handle: 'term_1',
+            created_by_pane_key: 'a:b',
+            created_by_run_generation: 1,
             created_at: '2026-08-22 00:05:00',
             completed_at: '2026-08-22 01:05:00',
           },
@@ -122,6 +129,9 @@ class FakeOrca implements OrcaRunner {
                     ],
                   }),
                   created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
+            created_by_terminal_handle: 'term_1',
+            created_by_pane_key: 'a:b',
+            created_by_run_generation: 1,
                   created_at: '2026-08-22 00:10:00',
                   completed_at: '2026-08-22 01:10:00',
                 },
@@ -304,7 +314,7 @@ class FailingProvider implements SummaryProvider {
 
 const CONFIG: BridgeConfig = {
   slack: null,
-  projects: [{ name: 'demo', repositories: [REPO] }],
+  projects: [{ name: 'demo', repositories: [REPO], orcaRepositoryIds: [] }],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
 

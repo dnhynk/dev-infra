@@ -149,7 +149,8 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 - 현재 owner 개입 필요 여부
 
 D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견·Git remote 기반 자동 등록·자동 발견된
-다중 repository routing은 O1 범위다(OD-068).
+다중 repository routing은 O1 범위다(OD-068). Run과 등록된 repository를 잇는 열쇠는 설정의
+`orcaRepositoryIds`이고, 등록에 맞지 않는 Run은 버리지 않고 수를 노출한다(OD-078).
 Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·
 `consumer_generation`을 권위로 읽고 live/stale은 generation으로 구분한다. coordinator 환경변수는 보조
 단서로만 쓴다(OD-020).

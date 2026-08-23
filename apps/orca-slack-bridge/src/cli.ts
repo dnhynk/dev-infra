@@ -3,6 +3,7 @@ import { loadConfig, defaultConfigPath, type BridgeConfig } from './project/conf
 import { GhCli } from './github/runner.js';
 import { OrcaCli } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
+import { collectRunFacts, formatRunCollection } from './run/collect.js';
 import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import {
@@ -21,7 +22,7 @@ import {
   type SummaryProvider,
 } from './summarize/index.js';
 
-export type Command = 'snapshot' | 'verify-slack' | 'digest';
+export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs';
 
 export type ParsedArgs =
   | { readonly kind: 'help' }
@@ -55,7 +56,7 @@ function arg(argv: readonly string[], name: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest'];
+const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs'];
 
 function isCommand(v: string | undefined): v is Command {
   return v !== undefined && (COMMANDS as readonly string[]).includes(v);
@@ -154,11 +155,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
-const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest>
+const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (메시지를 게시하지 않는다)
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
+runs          Orca를 read-only로 1회 읽어 Run 진행 사실을 출력한다 (게시하지 않는다)
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
@@ -172,7 +174,8 @@ digest 전용:
   --dry-run         Slack에도 store에도 쓰지 않고 만들 blocks와 결정을 출력한다
 
 digest 외의 명령은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만
-게시하며 채널을 코드에서 만들지 않는다.`;
+게시하며 채널을 코드에서 만들지 않는다. runs는 Slack에 게시하지 않는다 — Run 카드 게시는
+D1-C 범위다.`;
 
 /**
  * summarizer provider를 만든다.
@@ -304,6 +307,16 @@ async function main(): Promise<number> {
 
   if (parsed.command === 'digest') {
     return await runDigestCommand(parsed, config);
+  }
+
+  if (parsed.command === 'runs') {
+    const bin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
+    const collection = await collectRunFacts(new OrcaCli(bin), config);
+    process.stdout.write(
+      (parsed.json ? JSON.stringify(collection, null, 2) : formatRunCollection(collection)) +
+        '\n',
+    );
+    return 0;
   }
 
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';

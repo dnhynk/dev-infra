@@ -48,6 +48,9 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
 - coordinator 세션의 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID`는 보조 단서로만 쓴다.
 - global worker list의 Run↔worktree 정보는 repository 후보 복구에 사용할 수 있지만 historical/released worker를 liveness로 사용하지 않는다.
 - Git remote 기반 자동 repository 등록은 O1에서 다룬다.
+- Run↔repository 연결은 설정의 `projects[].orcaRepositoryIds`와 관측된 `<id>::<path>` 앞부분의 exact
+  비교다. 경로로 비교하지 않는다 — coordinator worktree와 Orca worktree는 뿌리가 다르고 id 하나가 둘 다
+  덮는다(OD-078).
 - 설정 또는 durable store의 Project↔Repository mapping을 적용한다.
 - 자동 발견된 다중 repository routing도 O1에서 다룬다(OD-068).
 

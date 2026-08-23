@@ -405,3 +405,27 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 근거는 새로 만들지 않았다. `src/github/required-checks.ts`의 `RequiredCheckState` 주석과
   `src/github/branch-rules.ts`의 `RuleSourceStatus` 주석에 실측과 함께 있고 그 코드는 merge됐다.
 - 상세 계약은 [관찰·상관관계 계약](contracts/observation-and-correlation.md) §6에 있다.
+
+## 2026-08-24 · D1 Run↔repository 연결 열쇠
+
+### DL-052 · Run은 설정에 등록한 Orca repository id로 repository에 연결한다
+
+- OD-068은 "설정 파일에 수동 등록한 repository만 관찰한다"까지만 정했고 **무엇으로 Run과 잇는지는
+  정하지 않았다.** 그 공백을 채운다. OD-068은 그대로 유효하다.
+- 열쇠는 `projects[].orcaRepositoryIds`에 등록하는 Orca repository id다. Task의
+  `created_by_process_incarnation`과 worker의 `resource.worktreeId`에 있는 `<id>::<path>`의 `::`
+  앞부분과 **exact 문자열 비교**한다. 대소문자를 접지 않는다.
+- [관측] Run row에는 repository 필드가 없고, 경로에서 `owner/name`을 얻을 수단도 Orca 조회 표면에
+  없다. 관측 가능한 연결점은 저 `<id>::<path>` 하나뿐이다.
+- [관측] `worker-list` 전체에서 repository id 하나가 경로 59개를 덮었다. 앞부분은 worktree가 아니라
+  repository의 id다. `orca worktree list --json`의 `repoId`가 같은 값이며 같은 행의 `path`와 나란히
+  있어 사용자가 등록할 값을 한 번에 찾는다.
+- 경로 등록을 기각한 이유: coordinator worktree(`D:/dev-infra`)와 Orca가 만든
+  worktree(`C:/Users/dongh/orca/workspaces/dev-infra/<name>`)는 뿌리가 다르다. 한쪽만 등록하면 Run
+  절반이 조용히 빠진다. 정규화와 segment 경계 처리도 필요해진다. id 하나가 둘 다 덮는다.
+- Git remote는 읽지 않는다. 자동 발견·자동 등록·자동 routing은 O1 범위다(OD-068).
+- **남는 위험과 완화책.** `<uuid>::<path>` 형식 안정성은 미검증이고(platform-capabilities §7.1),
+  이 id가 Orca 재설치·DB 재생성 뒤에도 유지되는지는 관측하지 않았다. 그래서 등록에 맞지 않는 Run을
+  버리지 않고 수와 관측된 id를 함께 노출한다. 카드가 조용히 비는 대신 "등록되지 않은 Run N건"이
+  뜬다(OD-072).
+- 상세 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-078 확정 기록에 있다.

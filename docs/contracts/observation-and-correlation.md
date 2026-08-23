@@ -127,6 +127,12 @@ D1의 연결은 다음 권위 경계를 따른다.
 
 ```text
 설정 파일에 수동 등록한 Repository (OD-068)
+  ├─ repositories: owner/name        — GitHub 축이 쓴다
+  └─ orcaRepositoryIds: <id>         — Orca 축이 쓴다 (OD-078)
+        ↕ exact 문자열 비교
+     Task.created_by_process_incarnation  = <id>::<path>@@<hash>:<uuid>
+     worker.resource.worktreeId           = <id>::<path>
+        ↓
   ↔ Orca Run row
       ├─ coordinator_handle
       ├─ coordinator_pane_key
@@ -136,6 +142,12 @@ D1의 연결은 다음 권위 경계를 따른다.
 Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator inbox다. D1은 설정 파일에 수동 등록한
 repository만 관찰하며, repository 연결은 그 설정을 따른다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된
 다중 repository routing은 O1 범위다(OD-068).
+
+Run을 등록된 repository에 잇는 열쇠는 설정의 `orcaRepositoryIds`다. Run row에는 repository 필드가 없고 경로에서
+`owner/name`을 얻을 수단도 조회 표면에 없으므로, 관측 가능한 연결점은 `<id>::<path>`의 앞부분 하나뿐이다.
+이 앞부분은 worktree가 아니라 repository의 id이며 id 하나가 여러 worktree 경로를 덮는다. 경로가 아니라 id로
+등록하고 exact 문자열로 비교한다. 등록에 맞지 않는 Run은 버리지 않고 수와 관측된 id를 함께 노출한다 —
+id 형식이나 발급이 바뀌었을 때 카드가 조용히 비는 대신 그 사실이 드러나야 한다(OD-078, OD-072).
 
 Run/coordinator identity는 Orca Run row가 권위다. `run-list`가 반환하는 `coordinator_handle`·
 `coordinator_pane_key`·`consumer_generation`을 사용하고, coordinator 세션의 `ORCA_TERMINAL_HANDLE`·

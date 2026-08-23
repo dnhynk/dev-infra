@@ -30,7 +30,7 @@ const REPO = repositoryIdentity(1042577813, 'dnhynk/dev-infra');
 
 const CONFIG: BridgeConfig = {
   slack: null,
-  projects: [{ name: 'dev-infra', repositories: ['dnhynk/dev-infra'] }],
+  projects: [{ name: 'dev-infra', repositories: ['dnhynk/dev-infra'], orcaRepositoryIds: [] }],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
 
@@ -421,7 +421,7 @@ describe('ProjectedPr 조립', () => {
 
   it('설정에 없는 repository는 project가 null이다 (OD-047)', async () => {
     const p = projectPullRequest(REPO, pr(), CORRELATED, await facts(), {
-      ...CONFIG, projects: [{ name: '다른', repositories: ['someone/else'] }],
+      ...CONFIG, projects: [{ name: '다른', repositories: ['someone/else'], orcaRepositoryIds: [] }],
     });
     expect(p.kind === 'card' && p.pr.project).toBeNull();
   });

@@ -1,7 +1,12 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { unwrap } from './envelope.js';
-import { parseJsonField, parseOrcaTimestamp, worktreePathFromIncarnation } from './coerce.js';
+import {
+  parseJsonField,
+  parseOrcaTimestamp,
+  repositoryIdFromWorktreeId,
+  worktreePathFromIncarnation,
+} from './coerce.js';
 import type { FindingFacts } from '../summarize/contract.js';
 
 const execFileAsync = promisify(execFile);
@@ -44,6 +49,17 @@ export type OrcaRun = {
   readonly objective: string;
   readonly coordinatorHandle: string | null;
   readonly coordinatorPaneKey: string | null;
+  /**
+   * 현재 소유자 세대. `run-use` 인수마다 올라간다.
+   *
+   * OD-020이 live/stale 판정의 권위로 삼은 값이다. 없거나 정수가 아니면 던진다. 0으로 메우면
+   * 모든 Run이 "한 번도 소유된 적 없음"으로 보여 판정이 조용히 뒤집힌다.
+   *
+   * **[미검증 가정]** 이 증가 동작을 Orca 플랫폼이 문서화하지 않았다.
+   * `docs/platform-capabilities.md` §7.2에 미검증으로 기록돼 있다. 플랫폼이 바뀌면
+   * `run/liveness.ts`의 판정이 깨진다.
+   */
+  readonly consumerGeneration: number;
   readonly legacy: boolean;
   readonly createdAt: Date;
   readonly updatedAt: Date;
@@ -59,6 +75,22 @@ export type OrcaTask = {
   readonly result: unknown;
   /** created_by_process_incarnation에서 뽑은 작업 디렉터리. 형식이 다르면 null. */
   readonly worktreePath: string | null;
+  /**
+   * created_by_process_incarnation의 `::` 앞부분. Orca repository id다. 형식이 다르면 null.
+   *
+   * 설정에 수동 등록한 repository id와 exact 비교해 Run을 repository에 연결한다(OD-078).
+   * Git remote를 읽지 않는다 — 자동 발견은 O1 범위다(OD-068).
+   */
+  readonly repositoryId: string | null;
+  /**
+   * 이 Task를 만든 binding. Run row의 현재 소유자와 대조해 live/stale을 가른다(OD-020).
+   *
+   * 실측(2026-08-24, `task-list --run run_36d28e6e947a`): 63행 중 39행이
+   * `created_by_run_generation: 1` + `term_29548394…`, 24행이 `2` + `term_6354ef22…`였고
+   * 뒤쪽이 같은 시점 Run row의 `consumer_generation: 2` · `coordinator_handle`과 일치했다.
+   * 즉 한 Run 안에 여러 세대의 binding이 남고, 어느 것이 현재 소유자인지는 Run row가 정한다.
+   */
+  readonly createdBy: RunBindingFacts;
   readonly createdAt: Date;
   /**
    * 완료 시각. 완료 전이면 null.
@@ -68,6 +100,18 @@ export type OrcaTask = {
    * `2026-08-22T11:39:33.963Z`다. `parseOrcaTimestamp`가 둘 다 받는다.
    */
   readonly completedAt: Date | null;
+};
+
+/**
+ * 한 Run에 대한 소유자 binding 한 벌.
+ *
+ * Run row에서 읽으면 **현재 소유자**이고, Task row에서 읽으면 그 Task를 만든 소유자다.
+ * 두 값을 비교하는 것이 `run/liveness.ts`의 전부다.
+ */
+export type RunBindingFacts = {
+  readonly handle: string | null;
+  readonly paneKey: string | null;
+  readonly generation: number;
 };
 
 export type OrcaGate = {
@@ -85,6 +129,13 @@ export type OrcaGate = {
 function str(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
+/** 정수를 요구한다. 어긋나면 던진다. 판정의 근거가 되는 값을 기본값으로 메우지 않는다. */
+function requireInt(v: unknown, at: string): number {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v)) {
+    throw new TypeError(`${at}이(가) 정수가 아니다: ${String(v)}`);
+  }
+  return v;
+}
 function strOrNull(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
 }
@@ -98,6 +149,7 @@ export async function listRuns(runner: OrcaRunner): Promise<OrcaRun[]> {
       objective: str(o['objective']),
       coordinatorHandle: strOrNull(o['coordinator_handle']),
       coordinatorPaneKey: strOrNull(o['coordinator_pane_key']),
+      consumerGeneration: requireInt(o['consumer_generation'], `run ${str(o['id'])}의 consumer_generation`),
       legacy: o['legacy'] === 1 || o['legacy'] === true,
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
       updatedAt: parseOrcaTimestamp(str(o['updated_at'])),
@@ -106,10 +158,24 @@ export async function listRuns(runner: OrcaRunner): Promise<OrcaRun[]> {
 }
 
 export async function listTasks(runner: OrcaRunner, runId: string): Promise<OrcaTask[]> {
-  const r = await call<{ tasks?: unknown[] }>(runner, [
+  return (await listTaskPage(runner, runId)).tasks;
+}
+
+/**
+ * Task 행과 함께 `task-list.result.count`를 돌려준다.
+ *
+ * D1의 분모가 이 `count`다(OD-069). 행 수로 대체하지 않는다 — 지금은 두 값이 같지만 원천이
+ * 말하는 분모는 `count`이고, 행이 잘리는 조회 계약이 생기면 행 수가 조용히 작아진다.
+ * 실측(2026-08-24, `run_36d28e6e947a`): `count: 63`, 행 63개.
+ */
+export async function listTaskPage(
+  runner: OrcaRunner,
+  runId: string,
+): Promise<{ tasks: OrcaTask[]; count: number }> {
+  const r = await call<{ tasks?: unknown[]; count?: unknown }>(runner, [
     'orchestration', 'task-list', '--run', runId, '--json',
   ]);
-  return (r.tasks ?? []).map((row) => {
+  const tasks = (r.tasks ?? []).map((row) => {
     const o = row as Record<string, unknown>;
     const inc = str(o['created_by_process_incarnation']);
     return {
@@ -122,6 +188,15 @@ export async function listTasks(runner: OrcaRunner, runId: string): Promise<Orca
         ? null
         : parseJsonField<unknown>(o['result'], null),
       worktreePath: inc === '' ? null : worktreePathFromIncarnation(inc),
+      repositoryId: inc === '' ? null : repositoryIdFromWorktreeId(inc),
+      createdBy: {
+        handle: strOrNull(o['created_by_terminal_handle']),
+        paneKey: strOrNull(o['created_by_pane_key']),
+        generation: requireInt(
+          o['created_by_run_generation'],
+          `task ${str(o['id'])}의 created_by_run_generation`,
+        ),
+      },
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
       completedAt: (() => {
         const v = strOrNull(o['completed_at']);
@@ -129,6 +204,11 @@ export async function listTasks(runner: OrcaRunner, runId: string): Promise<Orca
       })(),
     };
   });
+  const count = r.count;
+  return {
+    tasks,
+    count: typeof count === 'number' && Number.isSafeInteger(count) ? count : tasks.length,
+  };
 }
 
 export async function listGates(runner: OrcaRunner, runId: string): Promise<OrcaGate[]> {
@@ -150,6 +230,78 @@ export async function listGates(runner: OrcaRunner, runId: string): Promise<Orca
       resolvedAt: resolvedAt === null ? null : parseOrcaTimestamp(resolvedAt),
     };
   });
+}
+
+/**
+ * 한 Dispatch 행. Task 하나에 여러 행이 남는다.
+ *
+ * **Task 수를 세는 데 쓰지 않는다.** OD-069가 retry Dispatch를 새 Task로 세지 못하게 했다.
+ * 실측(2026-08-24, `worker-list --run run_36d28e6e947a`): Task 63건에 Dispatch 71행이었고
+ * 8개 Task가 2행씩이었다. 이 행들은 attempt 이력으로만 쓴다.
+ */
+export type OrcaWorker = {
+  readonly dispatchId: string;
+  readonly taskId: string;
+  readonly runId: string;
+  /**
+   * Dispatch 상태. 실측 값은 `completed`·`failed`·`dispatched`이고
+   * docs/evidence/t3-*.md §(b)에서 `circuit_broken`도 관측됐다. enum으로 좁히지 않는다 —
+   * 모르는 값이 오면 그대로 badge에 실려야 하고, 던지면 카드가 통째로 사라진다.
+   */
+  readonly dispatchStatus: string;
+  /** `resource.worktreeId`의 `::` 앞부분. 형식이 다르거나 resource가 없으면 null. */
+  readonly repositoryId: string | null;
+};
+
+/**
+ * Run의 Dispatch 행 전부를 읽는다.
+ *
+ * `worker-list`는 terminal resource accounting 표면이라 historical·released worker도 함께 준다.
+ * **liveness 근거로 쓰지 않는다**(docs/contracts §5). 여기서 쓰는 것은 attempt 수와
+ * repository 후보 두 가지뿐이다.
+ */
+export async function listWorkers(runner: OrcaRunner, runId: string): Promise<OrcaWorker[]> {
+  const r = await call<{ workers?: unknown[] }>(runner, [
+    'orchestration', 'worker-list', '--run', runId, '--json',
+  ]);
+  return (r.workers ?? []).map((row) => {
+    const o = row as Record<string, unknown>;
+    const resource = isRecord(o['resource']) ? o['resource'] : {};
+    const worktreeId = str(resource['worktreeId']);
+    return {
+      dispatchId: str(o['dispatchId']),
+      taskId: str(o['taskId']),
+      runId: str(o['runId']),
+      dispatchStatus: str(o['dispatchStatus']),
+      repositoryId: worktreeId === '' ? null : repositoryIdFromWorktreeId(worktreeId),
+    };
+  });
+}
+
+/**
+ * 한 Dispatch의 agent 대기 관측. 없으면 null.
+ *
+ * `worker-show.result.observation.agentWait`만 읽는다. 실측(t3 §(b))에서 permission 확인 화면은
+ * `{source:"prompt-text", reason:"codex-interactive-prompt"}`로 나타났고 permission 전용 enum은
+ * 없었다. 그래서 이 값을 permission으로 단정하지 않고 넓은 "interaction 대기"로만 싣는다(OD-067).
+ */
+export type OrcaAgentWait = {
+  readonly source: string;
+  readonly reason: string;
+};
+
+/** 활성 Dispatch 하나의 `agentWait`를 읽는다. Dispatch 수만큼 호출되므로 호출자가 좁힌다. */
+export async function showAgentWait(
+  runner: OrcaRunner,
+  dispatchId: string,
+): Promise<OrcaAgentWait | null> {
+  const r = await call<{ observation?: unknown }>(runner, [
+    'orchestration', 'worker-show', '--dispatch', dispatchId, '--json',
+  ]);
+  const observation = isRecord(r.observation) ? r.observation : {};
+  const wait = observation['agentWait'];
+  if (!isRecord(wait)) return null;
+  return { source: str(wait['source']), reason: str(wait['reason']) };
 }
 
 /**
@@ -361,13 +513,36 @@ export async function listWorkerDone(
   runner: OrcaRunner,
   limit = INBOX_LIMIT,
 ): Promise<WorkerDoneInbox> {
+  return workerDoneFrom(await readInbox(runner, limit));
+}
+
+/**
+ * `inbox` 한 번의 원본 행.
+ *
+ * `worker_done`(C1)과 ask/escalation(D1)이 같은 목록에서 나온다. 두 소비자가 각자 `inbox`를
+ * 부르면 관찰 1회가 2회가 되고 두 결과의 시점이 어긋난다. 조회는 한 번 하고 거르기는 순수
+ * 함수로 나눈다.
+ */
+export type OrcaInbox = {
+  readonly rows: readonly Record<string, unknown>[];
+  /** 반환 행 수가 요청 상한과 같았다. 참이면 **부재를 증명할 수 없다.** */
+  readonly saturated: boolean;
+  readonly limit: number;
+};
+
+export async function readInbox(runner: OrcaRunner, limit = INBOX_LIMIT): Promise<OrcaInbox> {
   const r = await call<{ messages?: unknown[] }>(runner, [
     'orchestration', 'inbox', '--limit', String(limit), '--json',
   ]);
-  const rows = r.messages ?? [];
+  const rows = (r.messages ?? []).map((row) => row as Record<string, unknown>);
+  // 포화 판정은 걸러낸 결과가 아니라 **반환된 전체 행 수**로 한다.
+  return { rows, saturated: rows.length >= limit, limit };
+}
+
+/** 읽은 inbox에서 `worker_done`만 고른다. */
+export function workerDoneFrom(inbox: OrcaInbox): WorkerDoneInbox {
   const out: WorkerDoneMessage[] = [];
-  for (const row of rows) {
-    const o = row as Record<string, unknown>;
+  for (const o of inbox.rows) {
     if (o['type'] !== 'worker_done') continue;
     const payload = parseJsonField<unknown>(o['payload'], null);
     const p = isRecord(payload) ? payload : {};
@@ -388,7 +563,83 @@ export async function listWorkerDone(
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
     });
   }
-  // 포화 판정은 worker_done 수가 아니라 **반환된 전체 행 수**로 한다. 잘린 것은 목록이지
-  // 목록에서 걸러낸 결과가 아니다.
-  return { messages: out, saturated: rows.length >= limit, limit };
+  return { messages: out, saturated: inbox.saturated, limit: inbox.limit };
+}
+
+/**
+ * worker가 보낸 ask 한 건과 그 답변 여부.
+ *
+ * 실측(2026-08-24, `inbox --limit 5000`): `question` 14행 전부가 `thread_id`를 자기 message ID로
+ * 두었고, coordinator 답변은 같은 `thread_id`를 가진 `type:"status"` 행으로 같은 목록에 있었다.
+ * 14건 모두 답변 행을 찾았다. `orca orchestration`에는 question record를 직접 읽는 명령이 없으므로
+ * (`--help` 목록에 `question-*`이 없다) 답변 여부는 이 thread 대조로만 판정한다.
+ */
+export type OrcaAsk = {
+  readonly messageId: string;
+  readonly runId: string;
+  readonly taskId: string | null;
+  readonly dispatchId: string | null;
+  readonly subject: string;
+  readonly createdAt: Date;
+  /**
+   * 같은 thread에 뒤따르는 메시지를 관찰했는가.
+   *
+   * 거짓이고 inbox가 포화가 아니면 **미답 ask**다. 포화면 판정 불가이므로 호출자가 degraded로
+   * 싣는다(OD-072). 여기서 포화를 answered로 접지 않는다.
+   */
+  readonly answered: boolean;
+};
+
+/** worker가 보낸 escalation 한 건. `thread_id`가 null이라 ask와 자동으로 이어지지 않는다. */
+export type OrcaEscalation = {
+  readonly messageId: string;
+  readonly runId: string;
+  readonly taskId: string | null;
+  readonly dispatchId: string | null;
+  readonly subject: string;
+  readonly createdAt: Date;
+};
+
+export type AskInbox = {
+  readonly asks: readonly OrcaAsk[];
+  readonly escalations: readonly OrcaEscalation[];
+  readonly saturated: boolean;
+  readonly limit: number;
+};
+
+/**
+ * 읽은 inbox에서 ask와 escalation을 고르고 ask의 답변 여부를 판정한다.
+ *
+ * ask와 escalation을 **합치지 않는다.** 실측에서 같은 `taskId`·`dispatchId`에 둘이 동시에
+ * 존재했고, 둘을 한 수로 접으면 한 원인이 두 번 셈된다(OD-067).
+ */
+export function askThreadsFrom(inbox: OrcaInbox): AskInbox {
+  const replied = new Set<string>();
+  for (const o of inbox.rows) {
+    const thread = strOrNull(o['thread_id']);
+    // 자기 자신을 thread로 여는 question 행은 답변이 아니다.
+    if (thread !== null && thread !== str(o['id'])) replied.add(thread);
+  }
+  const asks: OrcaAsk[] = [];
+  const escalations: OrcaEscalation[] = [];
+  for (const o of inbox.rows) {
+    const type = o['type'];
+    if (type !== 'question' && type !== 'escalation') continue;
+    const payload = parseJsonField<unknown>(o['payload'], null);
+    const p = isRecord(payload) ? payload : {};
+    const common = {
+      messageId: str(o['id']),
+      runId: str(o['run_id']),
+      taskId: strOrNull(p['taskId']),
+      dispatchId: strOrNull(p['dispatchId']),
+      subject: str(o['subject']),
+      createdAt: parseOrcaTimestamp(str(o['created_at'])),
+    };
+    if (type === 'question') {
+      asks.push({ ...common, answered: replied.has(common.messageId) });
+    } else {
+      escalations.push(common);
+    }
+  }
+  return { asks, escalations, saturated: inbox.saturated, limit: inbox.limit };
 }

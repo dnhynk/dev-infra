@@ -45,7 +45,27 @@ export function parseOrcaTimestamp(value: string): Date {
   return d;
 }
 
-/** `<workspaceUuid>::<로컬 경로>` 형태에서 경로를 꺼낸다. 형식이 다르면 null. */
+/**
+ * `<repositoryId>::<로컬 경로>` 형태에서 앞부분을 꺼낸다. 형식이 다르면 null.
+ *
+ * 실측(2026-08-24, `orca worktree list --json`): 이 앞부분은 worktree가 아니라 **repository**의
+ * id다. `ccb3c8ee-6d9e-42af-af36-9fdac6566fcc` 하나가 `D:/dev-infra`와
+ * `C:/Users/dongh/orca/workspaces/dev-infra/*` 를 함께 덮었고, 같은 응답의 `repoId` 필드와 값이
+ * 같았다. Task의 `created_by_process_incarnation`(`<id>::<path>@@<hash>:<uuid>`)도 같은 앞부분을
+ * 가지므로 두 표면에 같은 함수를 쓴다.
+ *
+ * **이 형식의 안정성은 계약이 아니다.** `docs/platform-capabilities.md` §7.1이 `<uuid>::<path>`
+ * 파싱 안정성을 미검증으로 기록했고, 이 id가 Orca 재설치나 DB 재생성 뒤에도 유지되는지는
+ * 관측하지 않았다. 형식이 바뀌면 이 함수는 null을 돌려주고 등록 대조가 전부 어긋난다.
+ * 그 상태를 조용히 넘기지 않는 것이 `run/collect.ts`의 미등록 Run 계수다(OD-078).
+ */
+export function repositoryIdFromWorktreeId(worktreeId: string): string | null {
+  const idx = worktreeId.indexOf('::');
+  if (idx <= 0) return null;
+  return worktreeId.slice(0, idx);
+}
+
+/** `<repositoryId>::<로컬 경로>` 형태에서 경로를 꺼낸다. 형식이 다르면 null. */
 export function worktreePathFromId(worktreeId: string): string | null {
   const idx = worktreeId.indexOf('::');
   if (idx < 0) return null;

@@ -60,7 +60,7 @@
 | merge·production DB·secret·force push·rollback 등 위험 action 제한 | 확정 초기 제외 | [보안 경계](specs/orca-slack-bridge.md#10-보안-경계) |
 | 고위험 action은 후속 이중 확인 | 후속 | [Slack UX 비허용](ux/slack-surfaces.md#7-초기-비허용-ui) |
 | Claude tool permission relay는 가능하지만 V1 비활성화 | 확정 후속 | [Channels 검증](platform-capabilities.md#33-channels-계약), [Out of Scope](specs/orca-slack-bridge.md#14-명시적-out-of-scope) |
-| 새 Run 자동 발견→Git remote→Slack thread | O1 범위; D1은 설정에 수동 등록한 repository만 관찰 (OD-068) | [최종 운영 UX](specs/orca-slack-bridge.md#12-전체-제품의-최종-운영-ux), [O1](roadmap.md#10-bridge-slice-o1--운영-자동화) |
+| 새 Run 자동 발견→Git remote→Slack thread | O1 범위; D1은 설정에 수동 등록한 repository만 관찰하고 Orca repository id로 연결 (OD-068, OD-078) | [최종 운영 UX](specs/orca-slack-bridge.md#12-전체-제품의-최종-운영-ux), [O1](roadmap.md#10-bridge-slice-o1--운영-자동화) |
 | degraded owner 알림 | 카드는 항상 표시, owner action 필수 상태만 thread 알림 (OD-072) | [Degraded UX](ux/slack-surfaces.md#6-error와-degraded-ux) |
 | Windows startup/systemd/PM2 등 상시 실행 | 최종 목표, 방식 TBD | [최종 운영 UX](specs/orca-slack-bridge.md#12-전체-제품의-최종-운영-ux) |
 | 하나의 workspace, 통합 `#github/#pr-digest/#agent-runs/#deploys/#prod-alerts` | 권장 목표, 최종 topology TBD | [제안된 Slack 구조](product-vision.md#5-제안된-slack-정보-구조), [OD-048](open-decisions.md#slack과-durable-store) |

@@ -34,6 +34,23 @@ export type ProjectConfig = {
   readonly name: string;
   /** `owner/name` 목록. 대소문자를 구분하지 않고 비교한다. */
   readonly repositories: readonly string[];
+  /**
+   * 이 Project에 속한 **Orca repository id** 목록. 없으면 빈 배열.
+   *
+   * D1이 Orca Run을 이 Project에 연결하는 유일한 열쇠다(OD-078). Run row에는 repository 필드가
+   * 없고, Task의 `created_by_process_incarnation`과 worker의 `resource.worktreeId`에 있는
+   * `<repositoryId>::<path>` 앞부분만이 관측 가능한 연결점이다. Git remote는 읽지 않는다 —
+   * 자동 발견·자동 등록은 O1 범위다(OD-068).
+   *
+   * 값을 얻는 방법: `orca worktree list --json`의 `repoId`(= worktree `id`의 `::` 앞부분).
+   * 대조는 **exact 문자열 비교**다. 경로가 아니라 id로 등록하므로 정규화도 prefix 매칭도 없다.
+   *
+   * **[미검증 위험]** 이 id가 Orca 재설치·DB 재생성 뒤에도 유지되는지는 관측하지 않았고,
+   * `<uuid>::<path>` 형식 안정성은 `docs/platform-capabilities.md` §7.1이 미검증으로 기록했다.
+   * 둘 중 하나가 깨지면 등록이 어긋나 Run이 통째로 사라진다. 그래서 `run/collect.ts`는 맞지
+   * 않는 Run을 버리지 않고 **세어서 degraded 사실로 노출한다**(OD-072).
+   */
+  readonly orcaRepositoryIds: readonly string[];
 };
 
 export type CorrelationKeys = {
@@ -131,6 +148,7 @@ export function parseConfig(raw: unknown): BridgeConfig {
   if (!Array.isArray(projectsRaw)) throw new TypeError('설정에 projects 배열이 없다');
 
   const seen = new Map<string, string>();
+  const seenOrcaIds = new Map<string, string>();
   const projects = projectsRaw.map((p, i) => {
     if (!isRecord(p)) throw new TypeError(`projects[${i}]가 객체가 아니다`);
     const name = p['name'];
@@ -154,7 +172,35 @@ export function parseConfig(raw: unknown): BridgeConfig {
       seen.set(key, name.trim());
       return r.trim();
     });
-    return { name: name.trim(), repositories };
+    const idsRaw = p['orcaRepositoryIds'];
+    if (idsRaw !== undefined && !Array.isArray(idsRaw)) {
+      throw new TypeError(`projects[${i}].orcaRepositoryIds가 배열이 아니다`);
+    }
+    const orcaRepositoryIds = (idsRaw ?? []).map((v, j) => {
+      if (typeof v !== 'string' || v.trim() === '') {
+        throw new TypeError(
+          `projects[${i}].orcaRepositoryIds[${j}]가 비어 있지 않은 문자열이 아니다: ${String(v)}`,
+        );
+      }
+      // `::`가 들어오면 worktree id를 통째로 붙여넣은 것이다. id만 등록해야 exact 비교가 성립한다.
+      if (v.includes('::')) {
+        throw new TypeError(
+          `projects[${i}].orcaRepositoryIds[${j}]에 '::'가 있다. ` +
+            `worktree id 전체가 아니라 '::' 앞의 repository id만 등록한다: ${v}`,
+        );
+      }
+      const id = v.trim();
+      const prevProject = seenOrcaIds.get(id);
+      if (prevProject !== undefined && prevProject !== name.trim()) {
+        // 한 repository id가 두 Project에 속하면 Run routing이 모호해진다.
+        throw new TypeError(
+          `Orca repository id ${id}가 여러 Project에 등록됐다: ${prevProject}, ${name.trim()}`,
+        );
+      }
+      seenOrcaIds.set(id, name.trim());
+      return id;
+    });
+    return { name: name.trim(), repositories, orcaRepositoryIds };
   });
 
   const keysRaw = raw['correlationKeys'];
@@ -193,6 +239,19 @@ export function projectForRepository(config: BridgeConfig, nameWithOwner: string
   const needle = nameWithOwner.trim().toLowerCase();
   for (const p of config.projects) {
     if (p.repositories.some((r) => r.toLowerCase() === needle)) return p.name;
+  }
+  return null;
+}
+
+/**
+ * Orca repository id로 등록된 Project를 찾는다. 없으면 null. 추측하지 않는다(OD-078).
+ *
+ * **exact 비교다.** 대소문자를 접지 않는다. 이 값은 사람이 읽는 이름이 아니라 Orca가 발급한
+ * id이고, 관측된 값은 소문자 UUID였다. 접으면 실제로 다른 id를 같다고 말할 근거가 없다.
+ */
+export function projectForOrcaRepositoryId(config: BridgeConfig, id: string): string | null {
+  for (const p of config.projects) {
+    if (p.orcaRepositoryIds.includes(id)) return p.name;
   }
   return null;
 }
