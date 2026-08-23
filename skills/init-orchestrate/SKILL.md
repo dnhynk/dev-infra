@@ -11,8 +11,8 @@ description: >-
 # /init-orchestrate
 
 이 세션을 Orca orchestration Run의 coordinator로 부팅한다. coordinator는 Task DAG를 만들고,
-worker를 worktree에 배정하고, reviewer의 판정을 확인해 merge하고, 다음 ready task를 지시한다.
-사용자 판단이 정말 필요한 사안 외에는 무인으로 계속한다.
+worker를 worktree에 배정하고, reviewer의 판정을 확인해 merge하고, 완료된 worker·worktree·branch를
+정리한 뒤 다음 ready task를 지시한다. 사용자 판단이 정말 필요한 사안 외에는 무인으로 계속한다.
 
 ## 호출 형태
 
@@ -94,7 +94,9 @@ handoff 문서만 읽고 바로 mutation하지 않는다.
    coordinator handle과 pane key가 이 터미널 값으로 바뀌고 consumer generation이 올라간다.
    `--takeover-legacy`는 플랫폼이 자동 채택한 legacy Run 전용이며 일반 Run에는 거부된다.
 7. §7의 Run 마커를 이 세션 값으로 갱신한다. 갱신하지 않으면 monitor가 이 세션을 coordinator로 인식하지 못한다.
-8. 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은 PR을 중복 merge하지 않는다.
+8. 아직 진행 중인 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은
+   PR을 중복 merge하지 않는다. 이미 merge된 Task에 worker·worktree·branch가 남아 있으면 재사용하지
+   않고 §8의 정리 절차를 멱등하게 마친다.
 9. 두 번 실패한 디버깅 접근을 다시 시도하지 않는다. handoff의 기각 기록을 확인한다.
 
 사용자에게 올릴 것은 스펙 충돌, handoff 모호성, coordinator 권한 중복, 민감한 신규 판단뿐이다.
@@ -154,7 +156,8 @@ rollover-monitor는 마커가 없으면 아무것도 하지 않는다.
 
 session id와 창 크기는 **세션마다 다르다.** 승계할 때마다 새 coordinator가 마커를 자기 값으로 갱신해야 monitor가 그 세션을 감시한다.
 
-Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승계가 시도된다.
+Run이 끝날 때는 §8의 정리 대기가 없음을 먼저 확인하고 handoff와 마커를 지운다. 마커가 남아 있는 한
+열화 시 승계가 시도된다.
 
 ## 8. 운영 계약
 
@@ -166,8 +169,40 @@ Run이 끝나면 마커를 지운다. 마커가 남아 있는 한 열화 시 승
 - 각 Task의 agent·model·effort는 §9의 배치 정책을 따른다.
 - 수정 요청은 가능한 한 원 worker에게 돌리고 재검토한다. 같은 terminal을 재사용하면
   이전 배치가 유지된다.
-- merge 뒤에는 다음 ready task를 자동으로 지시한다.
+- 완료 보고가 수락된 worker와 reviewer는 즉시 후속 Dispatch에 재사용하지 않는 한
+  `worker-release`한다. 성공·실패 모두 같으며, 출력은 release 뒤에도 `worker-read`로 확인한다.
+- merge를 확인한 뒤에는 해당 Task가 만든 worktree와 local·remote branch를 §8의 절차로 정리하고,
+  정리 결과를 재조회한 다음 다음 ready task를 자동으로 지시한다.
 - 한 Task가 사람 결정을 기다려도 그 결정과 독립인 ready task와 worker는 계속 실행한다.
+
+### 완료와 리소스 정리
+
+정리는 Run 끝에 몰아서 하지 않고 Task가 merge될 때마다 수행한다. 다음 순서를 지킨다.
+
+1. 수락한 `worker_done`마다 같은 agent에 같은 배치의 즉시 후속 Task가 있으면 새 Dispatch로 terminal
+   ownership을 넘긴다. 그렇지 않으면 coordinator가 Delivery를 ack하거나 다시 wait하기 전에
+   `orca orchestration worker-release --dispatch <dispatch_id> --json`을 실행한다. 사용자가 terminal
+   보존을 명시한 경우에만 `worker-retain`하고 정리 예외를 기록한다. timeout, heartbeat, question,
+   escalation, 미수락 완료 보고는 release 근거가 아니다.
+2. review와 CI 조건을 충족해 PR을 merge한 뒤 GitHub에서 실제 `MERGED` 상태, merge commit, head
+   repository와 head branch를 다시 조회하고 이를 정리 대상의 source of truth로 쓴다. squash/rebase
+   merge에서는 원 branch commit이 base branch의 조상이 아니므로 `git branch --merged`나 commit ancestry로
+   정리 대상을 열거하지 않는다. `worker_done`, `merge_ready`, terminal 종료도 merge 근거가 아니다.
+3. Task worktree에 미커밋 변경, push되지 않은 고유 commit, 실행 중인 Dispatch·agent·setup 작업이 없는지
+   확인한다. 하나라도 남았거나 ownership을 증명할 수 없으면 강제 정리하지 않고 `cleanup_pending`으로
+   handoff에 남겨 reconcile한다.
+4. 이 Run이 해당 Task를 위해 만든 worktree만 full worktree id로 식별해
+   `orca worktree rm --worktree id:<repo-id>::<path> --run-hooks --json`으로 제거한다. `--force`를 기본값으로
+   쓰지 않으며 coordinator/active worktree, 기존 worktree, 다른 Run이나 사용자가 인수한 worktree는
+   제거하지 않는다.
+5. worktree 제거를 확인한 뒤 2번에서 확인한 정확한 PR head branch만 local과 해당 head repository의
+   remote에서 삭제한다. base·default·protected·현재 branch와 Run 전에 존재하던 branch는 건드리지 않는다.
+   먼저 안전 삭제를 시도하되 squash/rebase merge라서 거부되면, PR이 실제 `MERGED`이고 branch identity가
+   일치하며 remote PR head에 push되지 않은 local commit이 없다는 2·3번의 증거가 모두 있을 때만 그 정확한
+   local branch를 강제 삭제한다. `git branch --merged`의 빈 결과는 미병합이나 `cleanup_pending`의 근거가 아니다.
+6. Orca Worker/Dispatch/Worktree와 Git local/remote branch를 다시 조회한다. worker가 released됐거나
+   의도적으로 retained됐고, worktree와 branch가 제거됐거나 근거 있는 예외로 기록됐을 때만 Task 정리를
+   완료로 표시한다. 명령이 중간에 실패해도 확인된 단계부터 멱등하게 재개한다.
 
 ### worker 질문과 사람용 Gate
 
@@ -245,6 +280,8 @@ Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·mo
 - **`run_id`를 기계적으로 읽히는 형태로 넣는다.** §3의 fresh/resume 판별이 이 값에 의존한다.
 - repository 경로, predecessor session id, rollover 사유
 - Task DAG 상태와 의존, worker·dispatch 상태, worktree·branch·PR·review·CI 상태
+- Task별 정리 상태: released/retained worker, worktree 제거 여부, local·remote branch 제거 여부와
+  `cleanup_pending` 사유·다음 안전한 조치
 - open Gate와 사용자 응답 대기 사항, 독립적으로 계속할 수 있는 Task
 - 진행 중이던 외부 효과 또는 비멱등 작업
 
