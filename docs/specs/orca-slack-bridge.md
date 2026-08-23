@@ -66,6 +66,7 @@ Slack의 3초 acknowledgement 제한 때문에 네트워크 요청 ACK와 Gate r
 | worker 완료 요약 | Orca `worker_done` | 우선 요약 입력으로 사용 |
 | 상세 worker transcript | Orca `worker-read` | C1에서는 읽지 않음; fallback은 후속 범위 |
 | Gate 질문·선택지·상태·결정 | Orca Gate | 표시하고 제한적으로 resolve |
+| Gate option metadata와 ask↔Gate mapping | Bridge durable store | Gate ID에 연결해 기계 판정과 correlation에 사용 |
 | PR·check·merge 상태 | GitHub API 또는 `gh` 원본 | 읽고 projection |
 | reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` | 읽고 projection |
 | Slack 메시지 위치·표시 이력 | Bridge durable store | create/update/thread bookkeeping |
@@ -182,14 +183,23 @@ Orca Run 하나를 Slack 루트 메시지 하나에 대응시킨다.
 - project/repository
 - Run identity와 제목
 - 실행 중·결정 필요·완료 등 현재 상태
-- Task 전체 수와 완료·진행·대기 수
+- 현재 `task-list.count`와 Task 상태별 수
+- Task 진행 상태와 분리된 Dispatch attempt 이력
 - 관련 PR과 핵심 상태
-- open blocker 수
+- 원천별 blocker badge와 correlation ID
 - 현재 사람 개입 필요 여부
 
-동적으로 추가·취소·실패·재시도된 Task와 여러 Dispatch를 진행률에 반영하는 규칙은 TBD다.
+Task를 분모 단위로 삼아 `현재 Task 상태별 수 / 현재 task-list.count`를 표시하고 실행 중 추가된 Task를
+즉시 반영한다. Dispatch는 attempt 이력으로 분리한다. 완료율·성공률 공식은 만들지 않으며 Orca 원천에는
+`cancelled` Task 상태가 없다(OD-069).
 
-`blocker`, open Gate, Gate에 blocked된 Task, dependency waiting, worker ask, CI failure, permission pause는 서로 다른 상태다. 카드의 blocker 수에 무엇을 포함할지는 별도 taxonomy로 확정한다.
+`blocker`, open Gate, Gate에 blocked된 Task, dependency waiting, worker ask, CI failure, interaction 대기는
+서로 다른 원천 badge로 표시하고 `taskId`·`dispatchId`·Gate ID·message ID를 함께 노출한다. 고유 blocker
+총합은 dedup 정책이 확정되기 전에는 표시하지 않는다. `agentWait`는 provider별 근거가 더 있을 때만
+permission 등으로 세분화한다(OD-067).
+
+D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된
+다중 repository routing은 O1 범위다(OD-068).
 
 ### 6.2 Gate 표시
 
@@ -204,7 +214,12 @@ coordinator가 코드와 문서만으로 결정할 수 없는 사항을 Orca Gat
 - 선택지 버튼
 - 직접 입력 modal 버튼
 
-이 정보가 Orca Gate의 어떤 필드 또는 별도 metadata에서 오는지는 TBD다.
+Orca Gate의 `question`과 `options`에는 사람이 읽는 짧은 요약만 둔다. 안정적 option ID, 설명,
+recommendation, impact는 Bridge sidecar에 저장하고 Gate ID로 연결한다. button·modal의 기계 판정은 이
+metadata를 사용하며 question/options 자유 텍스트를 parsing하지 않는다(OD-050).
+
+ask를 사람용 Gate로 승격할 때 Bridge는 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}`를
+durable하게 저장하고 이를 권위 correlation으로 쓴다. Gate question은 표시용이며 correlation source가 아니다(OD-019).
 
 ### 6.3 결정 이후
 
@@ -217,6 +232,10 @@ Gate가 해결되면 thread에서 다음을 구분해 보여준다.
 
 Channel transport write만 성공했다고 “작업 재개”로 표시하지 않는다.
 
+카드에는 degraded 상태를 항상 표시한다. Channel pending·미해결 Gate·correlation 실패처럼 owner 개입 없이는
+진행되지 않는 상태만 thread에 알리고, summarizer 실패·source stale처럼 자가 복구되는 상태는 badge만
+표시한다. C1의 기존 degraded 표현은 유지한다(OD-072).
+
 ## 7. Slack Control Plane
 
 ### 7.1 초기 허용 입력
@@ -226,37 +245,45 @@ Channel transport write만 성공했다고 “작업 재개”로 표시하지 �
 
 일반 channel/thread 메시지, 다른 bot 메시지, room membership만을 근거로 coordinator에 prompt를 전달하지 않는다.
 
+Slack inbound는 `@slack/socket-mode`를 쓴다. daemon은 연결 직전 WebSocket URL을 발급하고
+`hello.connection_info.app_id`를 확인하며 `warning`/`refresh_requested` 때 연결을 overlap한다.
+exponential backoff을 적용하고 reconnect 단절 구간의 event replay는 보장하지 않는다(OD-041).
+사전 인증된 Socket 위에서는 HTTP signing secret 검증을 적용하지 않는다(OD-042).
+
 ### 7.2 처리 순서
 
-1. Slack 요청을 제한 시간 안에 ACK한다.
-2. payload의 실제 `user.id`를 owner allowlist와 비교한다.
-3. workspace/team, action ID, Gate ID, option을 서버 측 기록과 대조한다.
+1. Slack 요청을 3초 안에 ACK하고 ACK 처리와 Orca 업무 처리를 분리한다.
+2. 인증된 Socket Mode envelope의 `team.id`와 exact `user.id`를 모두 검사하고, 설정됐으면 `api_app_id`도 대조한다.
+3. action ID, Gate ID, 안정적 option ID를 서버 측 sidecar 기록과 대조한다.
 4. Orca에서 Gate가 아직 open인지 읽는다.
 5. 중복·경합 응답 여부를 확인한다.
 6. Orca의 공식 `gate-resolve` interface로 resolution을 기록한다.
-7. resolution과 coordinator notification 상태를 durable store에 기록한다.
+7. Gate별 직렬화, 같은 논리 요청의 retry request ID 재사용과 `mutation.replayed` 처리, resolve 전후 재조회로
+   결과를 확정하고 durable outbox와 reconcile한다. Orca 내부 transaction 원자성은 가정하지 않는다.
 8. 기존 coordinator에 Channel notification을 시도한다.
 9. coordinator는 Orca Gate source of truth를 다시 읽고 후속 orchestration을 진행한다.
 
 Slack payload를 바로 Claude prompt로 보내거나 Slack을 결정 저장소로 사용하지 않는다.
 
-직접 입력 action은 예외적인 fast path를 가진다. sender/action을 빠르게 검증하고 button payload의 `trigger_id`가 만료되기 전에 ACK와 `views.open`을 3초 안에 끝낸다. 비-owner에게 modal을 열지 않는다. 실제 Gate resolution은 modal submission을 별도로 ACK한 뒤 수행한다. modal validation error를 화면에 남길 방식은 `OD-071`에서 확정한다.
+직접 입력 action은 예외적인 fast path를 가진다. sender/action을 빠르게 검증하고 button payload의 `trigger_id`가 만료되기 전에 ACK와 `views.open`을 3초 안에 끝낸다. 비-owner에게 modal을 열지 않는다. modal submission의 로컬 형식·필수값 오류는 3초 안에 input `block_id`별 `response_action=errors`로 ACK해 modal을 유지한다. 유효한 제출은 ACK한 뒤 원격 Orca 작업을 비동기로 수행한다(OD-071).
 
 ## 8. Channel Adapter
 
 Channel은 새 Web session이나 새 clone을 만드는 수단이 아니라 이미 열린 기존 로컬 coordinator 세션에 외부 이벤트를 push하는 수단이다.
 
-Custom Channel Adapter는 Claude Code가 coordinator session별 subprocess로 실행하고 stdio MCP로 통신한다. 등록만으로는 충분하지 않고 각 session에서 channel opt-in과 적용되는 조직 policy를 통과해야 한다. 여러 coordinator가 동시에 열리면 Adapter instance도 여러 개일 수 있으므로 각 instance의 Run/session binding 계약이 필요하다.
+Custom Channel Adapter는 Claude Code가 coordinator session별 subprocess로 실행하고 stdio MCP로 통신한다.
+daemon은 Windows named pipe를 listen하고 Adapter가 재시도 client로 연결하므로 기동 순서에 의존하지 않는다(OD-052).
+등록만으로는 충분하지 않고 각 session에서 channel opt-in과 적용되는 조직 policy를 통과해야 한다.
 
 개념 notification:
 
 ```xml
-<channel source="orca-slack" gate_id="gate_84" decision="B">
-Owner resolved gate gate_84.
-</channel>
+<channel source="orca-slack" gate_id="gate_84"></channel>
 ```
 
-정확한 payload는 TBD다. Channel에서 실제 decision text를 신뢰해 실행하기보다 `gate_id`를 전달하고 coordinator가 Orca에서 resolution을 다시 읽는 방향을 유지한다.
+payload에는 `gate_id`만 싣고 coordinator가 자기 Orca 권한으로 Gate를 다시 읽는다. binding은 인증하지 않으며
+`CLAUDE_CODE_SESSION_ID`는 routing 식별자로도 신뢰 근거로는 쓰지 않는다. 잘못 라우팅되거나 위조된 Adapter가
+받아도 ID 외 내용을 노출하지 않는다(OD-053).
 
 반드시 고려할 현재 제약:
 
@@ -264,23 +291,32 @@ Owner resolved gate gate_84.
 - 열린 세션에서 명시적으로 channel이 활성화된 동안만 event가 도착한다.
 - notification write에는 Claude가 실제 처리했다는 ACK가 없다.
 - policy나 세션 설정에 따라 notification이 silent drop될 수 있다.
-- custom Channel 개발·allowlist 경로는 버전별 검증이 필요하다.
+- custom Channel은 현재 development flag가 유일한 경로이고 매 기동 확인이 필요하며, research preview라 버전별 재검증이 필요하다.
 
 따라서 최소한 다음 상태를 구분한다.
 
 - Gate가 Orca에서 resolved됨
 - coordinator notification이 pending임
-- Channel Adapter에 전달을 시도함
-- coordinator의 실제 후속 상태가 아직 관찰되지 않음
+- transport write를 시도함
+- application receipt를 받음
+- Orca 효과를 관찰해 consumed됨
+- coordinator의 실제 후속 Task 상태가 아직 관찰되지 않음
 
-`delivered`, `processed`, `resumed`의 정확한 정의와 ACK 방식은 구현 전에 확정한다.
+transport write 성공은 전달을 증명하지 않고 application receipt만 전달 신호다(OD-054). 관측된 반환 경로는
+Adapter reply tool 왕복이며 유일한 로컬 반환 경로라고 규정하지 않는다(OD-059). Orca 효과는 대상 Gate의
+`pending`→`resolved` 전이로 정의한다(OD-055).
 
 복구는 두 경로를 가진다.
 
-- daemon은 durable outbox의 pending notification을 Adapter 재연결 시 다시 시도한다.
-- coordinator는 Fresh/Resume와 확정할 turn/reconciliation trigger에서 resolved됐지만 미처리된 Gate를 다시 확인한다.
+- daemon은 durable outbox의 pending/receipted notification을 Adapter 재연결 시 다시 시도한다.
+- daemon은 startup dead window를 피한 end-to-end probe receipt만으로 session opt-in을 판정한다. argv·env·MCP
+  initialize·parent process command line은 판정 계약으로 쓰지 않는다(OD-058).
+- coordinator는 notification의 `gate_id`로 Orca를 항상 다시 읽고 이미 resolved이며 효과가 반영됐으면 no-op으로 처리한다.
+- delivery는 `receipted`→`consumed` 두 단계다. receipt는 retry backoff를 늦출 뿐 재조회를 막지 않고,
+  Orca 효과를 확인한 `consumed`에서만 재조회를 억제한다(OD-057, OD-066).
 
-Channel reply tool 또는 localhost IPC를 통해 coordinator가 application receipt/status를 daemon에 돌려주는 양방향 경로도 목표 구조에 포함한다. 이 receipt는 실제 후속 Task 재개 증거와 동일하지 않으며 payload·멱등성은 TBD다.
+이 D3 계약의 구현은 이번 Run 범위가 아니며 development flag의 매 기동 확인과 research preview 변동성 때문에
+별도 Run에서 다시 산정한다. allowlist plugin 등재는 이번 결정에 포함하지 않는다(OD-056).
 
 ## 9. Durability와 멱등성
 
@@ -296,7 +332,7 @@ Channel reply tool 또는 localhost IPC를 통해 coordinator가 application rec
 - 이미 기록한 thread transition
 - Gate와 Slack action correlation
 - Orca resolution 결과
-- coordinator notification pending/attempt 상태
+- coordinator notification pending/transport-attempted/receipted/consumed 상태
 - 마지막 성공 관찰 cursor 또는 snapshot
 
 C1 durable store는 `node:sqlite`다. 기본 경로는 Windows에서 `%APPDATA%\\orca-slack-bridge\\state.db`이며 명시적 경로 또는 환경변수로 override할 수 있다. `--state`는 cwd 기준 상대경로를 허용하고, cwd가 다른 프로세스에 상속될 수 있는 `ORCA_SLACK_BRIDGE_STATE`만 대상 platform의 절대경로를 요구한다. WAL과 `schema_version` 테이블을 사용하고, C1은 daemon이나 동시 writer가 없다는 단일 프로세스 가정으로 파일 lock을 만들지 않는다.

@@ -143,7 +143,10 @@ PR
 #185 🟢 ready
 #186 ⚠️ changes requested
 
-현재 Blocker
+Open Gates
+1
+
+Blocked Tasks
 1
 
 [상세 보기]
@@ -156,8 +159,15 @@ PR
 - 실행 상태
 - 정의된 규칙에 따른 Task 진행률
 - 관련 PR의 핵심 상태
-- 확정된 taxonomy에 따른 blocker와 open Gate 수
+- 원천별 blocker badge와 open Gate 수
 - 현재 owner 개입 필요 여부
+
+진행 표시는 `현재 Task 상태별 수 / 현재 task-list.count`이며 실행 중 추가된 Task를 즉시 반영한다.
+Dispatch retry는 `Dispatch attempts` 이력으로 따로 보이고 완료율·성공률 퍼센트는 만들지 않는다(OD-069).
+
+blocker는 open Gate, blocked Task, waiting dependency, worker ask, CI failure, interaction 대기 등 원천별 badge와
+연결 ID로 표시한다. 고유 blocker 총합은 dedup 정책 전에는 표시하지 않고 `agentWait`는 provider별 근거 없이
+permission으로 단정하지 않는다(OD-067).
 
 그래픽 progress bar 사용 여부는 Block Kit layout을 확정할 때 결정한다.
 
@@ -192,7 +202,8 @@ B
 [A 즉시 종료] [B 기간 종료] [직접 입력]
 ```
 
-버튼 label은 짧아야 하지만 resolution에는 선택지의 안정적인 ID와 전체 의미가 연결돼야 한다.
+버튼 label은 짧게 유지한다. 사람이 읽는 question/options 요약과 별도로 안정적 option ID·설명·recommendation·impact를
+Bridge sidecar에 저장해 Gate ID와 연결하고, action은 이 metadata로 판정한다(OD-050).
 
 ### 3.3 자유형 결정 modal
 
@@ -210,6 +221,8 @@ B
 ```
 
 modal 제출 text는 해당 Gate의 `resolution`으로 저장한다. 일반 Slack message 입력으로 대체하지 않는다.
+필수값·형식 오류는 3초 안에 해당 input block에 `response_action=errors`로 표시해 modal을 유지한다.
+원격 Orca 작업이 끝나기를 ACK 전에 기다리지 않는다(OD-071).
 
 ### 3.4 결정 기록과 작업 재개
 
@@ -236,6 +249,8 @@ coordinator notification 이후 실제 후속 상태를 관찰한 뒤:
 ```
 
 Channel write만 성공했으면 `작업 재개`라고 쓰지 않는다. 그때는 `Coordinator 통지 대기` 또는 확정될 pending 표현을 사용한다.
+application receipt가 전달 신호이고, 대상 Gate의 `pending`→`resolved` 전이가 Orca 효과다. receipt 뒤에도
+실제 Task 재개는 별도 상태로 계속 구분한다(OD-054, OD-055).
 
 ## 4. 다중 repository 예시
 
@@ -284,7 +299,9 @@ repository마다 채널을 새로 만들지 않고 identity와 thread로 구분�
 - coordinator 세션이 닫혀 있음
 - Channel delivery는 시도했지만 처리 여부를 모름
 
-구체적인 오류 문구와 D1/D2 owner notification 정책은 `OD-072`의 후속 범위에서 확정한다.
+카드에는 모든 degraded 상태를 표시한다. owner 개입 없이는 진행되지 않는 Channel pending, 미해결 Gate,
+correlation 실패만 thread에 알린다. summarizer 실패와 source stale처럼 자가 복구되는 상태는 badge만 표시하고
+thread 알림을 보내지 않는다(OD-072).
 
 C1 카드에서만 확정한 degraded 표시:
 
@@ -293,7 +310,7 @@ C1 카드에서만 확정한 degraded 표시:
 - 연결된 `worker_done`이 없으면 `worker 보고 없음`을 표시한다.
 - correlation 실패 PR은 카드를 만들지 않으므로 Slack에 degraded 표시도 없다.
 
-D1/D2의 owner 알림 정책은 계속 미정이다.
+D1/D2에서 thread 알림 여부와 무관하게 degraded badge 자체는 항상 유지한다.
 
 ## 7. 초기 비허용 UI
 

@@ -35,7 +35,7 @@
 | OD-017 | `sol high fast`의 실제 model/effort/tier mapping | reviewer dispatch 전 | DECIDED |
 | OD-074 | supervised worker 경로에서 service tier를 지정할 수단 | reviewer dispatch 전 | OPEN |
 | OD-018 | handoff redaction과 transcript 포함 범위 | AB-1 전 | OPEN |
-| OD-019 | worker ask/escalation↔coordinator reply↔사람용 Gate correlation | AB-1/D1 전 | OPEN |
+| OD-019 | worker ask/escalation↔coordinator reply↔사람용 Gate correlation | AB-1/D1 전 | DECIDED |
 
 ## Orca·GitHub 관찰과 correlation
 
@@ -51,7 +51,7 @@
 | OD-027 | Project↔Repository cardinality, 등록 주체, 설정/DB mapping과 routing | S0 전 | DECIDED |
 | OD-028 | reviewer verdict를 GitHub formal review와 Orca 중 어디에 durable하게 남길지 | C1/C2 전 | DECIDED |
 | OD-029 | PR 생성과 `worker_done` 전송의 ordering 및 PR identity 포함 방식 | AB-1/S0 전 | DECIDED |
-| OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | OPEN |
+| OD-069 | Run 진행률 분모와 dynamic/cancelled/failed/retried Task·multiple Dispatch 집계 | D1 전 | DECIDED |
 | OD-070 | `worker_done` 누락·중복·불완전 payload의 상태와 recovery | S0/C1 전 | DECIDED |
 | OD-073 | Orca reviewer-result의 필드·enum·작성 주체와 task status 전이 규칙 | AB-1/C1 전 | DECIDED |
 | OD-075 | `task.result`가 덮어쓴 `worker_report`의 durable 조회·pagination 계약 | C2 전 | DECIDED |
@@ -76,8 +76,8 @@
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
 | OD-040 | Slack App manifest, scopes, 채널 ID 설정 | C1/D2 전 | DECIDED |
-| OD-041 | Socket Mode 최종 채택과 reconnect 정책 | 실제 Slack 통합 전 | OPEN |
-| OD-042 | owner/workspace allowlist 관리 | D2 전 | OPEN |
+| OD-041 | Socket Mode 최종 채택과 reconnect 정책 | 실제 Slack 통합 전 | DECIDED |
+| OD-042 | owner/workspace allowlist 관리 | D2 전 | DECIDED |
 | OD-043 | durable store 기술·경로·migration·locking | C1 전 | DECIDED |
 | OD-044 | event idempotency와 out-of-order 우선순위 | C2 전 | DECIDED |
 | OD-045 | retention, backup, corruption recovery | 운영 자동화 전 | OPEN |
@@ -85,25 +85,25 @@
 | OD-047 | Slack identity 영역에서 Project와 Repository를 둘 다 표시할지와 fallback | C1/D1 전 | DECIDED |
 | OD-048 | 공통 channel topology의 최종 채택 여부 | 첫 Slack 설정 전 | OPEN |
 | OD-049 | GitHub 공식 Slack App 설치와 repo별 review/workflow 구독 범위 | 운영 환경 준비 전 | OPEN |
-| OD-071 | modal submission validation error를 modal에 유지·표시하는 UX | D2 전 | OPEN |
-| OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED (C1 범위만. D1/D2 알림 정책은 계속 열려 있음) |
+| OD-071 | modal submission validation error를 modal에 유지·표시하는 UX | D2 전 | DECIDED |
+| OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED |
 
 ## Gate와 Channel
 
 | ID | 결정 | 필요한 시점 | 상태 |
 |---|---|---|---|
-| OD-050 | Gate option·recommendation·impact metadata | D1/D2 전 | OPEN |
-| OD-051 | Gate 처리 crash window와 outbox atomicity | D2 전 | OPEN |
-| OD-052 | daemon↔Channel Adapter IPC | D3 전 | OPEN |
-| OD-053 | Run↔현재 coordinator Channel routing | D3 전 | OPEN |
-| OD-054 | pending/attempted/delivered/processed/resumed 정의 | D3 전 | OPEN |
-| OD-055 | coordinator 처리 ACK 또는 효과 관찰 기준 | D3 전 | OPEN |
-| OD-056 | Channel custom 개발·allowlist·배포 경로 | D3 전 | OPEN |
-| OD-057 | notification 중복 시 coordinator 멱등성 | D3 전 | OPEN |
-| OD-058 | Fresh/Resume에서 Adapter 등록·session opt-in을 자동 검증하는 책임 | D3 전 | OPEN |
-| OD-059 | coordinator application receipt/status를 daemon에 반환하는 reply/IPC 계약 | D3 전 | OPEN |
-| OD-066 | Channel 유실 시 coordinator Gate 재조회의 trigger와 consumed marker | D3 전 | OPEN |
-| OD-067 | blocker/open Gate/blocked Task/ask/CI/permission pause 집계 taxonomy | D1 전 | OPEN |
+| OD-050 | Gate option·recommendation·impact metadata | D1/D2 전 | DECIDED |
+| OD-051 | Gate 처리 crash window와 outbox atomicity | D2 전 | DECIDED |
+| OD-052 | daemon↔Channel Adapter IPC | D3 전 | DECIDED |
+| OD-053 | Run↔현재 coordinator Channel routing | D3 전 | DECIDED |
+| OD-054 | pending/attempted/delivered/processed/resumed 정의 | D3 전 | DECIDED |
+| OD-055 | coordinator 처리 ACK 또는 효과 관찰 기준 | D3 전 | DECIDED |
+| OD-056 | Channel custom 개발·allowlist·배포 경로 | D3 전 | DECIDED |
+| OD-057 | notification 중복 시 coordinator 멱등성 | D3 전 | DECIDED |
+| OD-058 | Fresh/Resume에서 Adapter 등록·session opt-in을 자동 검증하는 책임 | D3 전 | DECIDED |
+| OD-059 | coordinator application receipt/status를 daemon에 반환하는 reply/IPC 계약 | D3 전 | DECIDED |
+| OD-066 | Channel 유실 시 coordinator Gate 재조회의 trigger와 consumed marker | D3 전 | DECIDED |
+| OD-067 | blocker/open Gate/blocked Task/ask/CI/permission pause 집계 taxonomy | D1 전 | DECIDED |
 
 ## 운영과 검증
 
@@ -115,7 +115,7 @@
 | OD-063 | daemon 자동 시작 방식 | O1 전 | OPEN |
 | OD-064 | health/log/audit format과 secret 마스킹 | 실제 통합 전 | OPEN |
 | OD-065 | 초기 동시 repository/Run 규모 | S0 전 | OPEN |
-| OD-068 | D1의 수동 등록 다중 repo 범위와 O1 자동 발견/routing 경계 | D1/O1 전 | OPEN |
+| OD-068 | D1의 수동 등록 다중 repo 범위와 O1 자동 발견/routing 경계 | D1/O1 전 | DECIDED |
 
 ## 결정 기록 형식
 
@@ -176,11 +176,11 @@ ID: OD-003
 
 ## 2026-08-21 관측이 바꾼 항목
 
-아직 닫지 않았지만 제약이 좁혀졌다. 근거는 [플랫폼 검증 §2.4](platform-capabilities.md#24-gate).
+이 관측에서 제약이 좁혀졌고 후속 실측과 사용자 결정으로 아래 항목의 현재 계약이 확정됐다. 당시 근거는 [플랫폼 검증 §2.4](platform-capabilities.md#24-gate), 최종 근거는 각 확정 기록을 따른다.
 
-- **OD-050** (Gate option/recommendation/impact metadata): 실측 결과 Orca Gate schema에 권장안·이유·영향·선택지 설명·선택지 ID·임의 metadata 필드가 **전혀 없다**. "제공되는지 확인"이 아니라 "Bridge 또는 coordinator가 반드시 만들어야 한다"로 성격이 바뀌었다. 남은 선택지는 `question`/`options` 문자열 인코딩, Bridge sidecar store, 카드 축소 셋 중 하나다.
-- **OD-051** (crash window와 outbox atomicity): `--retry-request`가 같은 요청의 재시도를 멱등화하고 `mutation.replayed`로 재생을 판정할 수 있다. 그러나 **이미 resolved된 Gate를 다른 요청이 조용히 덮어쓴다.** 따라서 (1) resolve 직전 status 재확인은 필수이고, (2) status 확인과 resolve 사이 TOCTOU를 막을 Gate 단위 직렬화가 Bridge 측에 필요하다.
-- **OD-067** (blocker taxonomy): `gate-create`가 task를 `blocked`로, `gate-resolve`가 `ready`로 자동 전이시키는 것을 관측했다. `blocked Task`는 Bridge가 계산하지 않고 Orca status를 그대로 쓸 수 있다. `permission pause`는 `worker-show`의 `observation.agentWait`가 source 후보다.
+- **OD-050** (Gate option/recommendation/impact metadata): Orca Gate schema에 권장안·이유·영향·선택지 설명·선택지 ID·임의 metadata 필드가 없으므로, 사람용 요약은 Gate에 두고 기계 판정용 metadata는 Bridge sidecar에 둔다.
+- **OD-051** (crash window와 outbox atomicity): `--retry-request` 재생 처리만으로는 다른 요청의 overwrite를 막지 못하므로 Gate별 직렬화, retry ID 재사용, 전후 재조회, durable outbox reconciliation을 함께 둔다. Orca 내부 원자성은 보장하지 않는다.
+- **OD-067** (blocker taxonomy): 원천별 badge와 correlation ID를 보존하고 고유 총합은 dedup 정책 뒤로 미룬다. `agentWait`는 넓은 interaction 대기로 표시한다.
 - **OD-023** (ingestion 방식): Gate 생성·해결이 `inbox`에 메시지를 만들지 않는다. Gate 변화는 push로 오지 않으므로 polling 또는 재조회가 필요하다. 또한 Observer는 `check --ack`를 호출하면 coordinator의 배치를 소비하므로 `inbox` 또는 `check --peek/--all`로 제한해야 한다.
 - **OD-020** (Run↔repository↔coordinator identity): Task row의 `created_by_process_incarnation`에 작업 디렉터리(`D:/dev-infra`)가 포함되고, `run-create` 시 `coordinator_handle`·`coordinator_pane_key`가 자동으로 채워진다. 두 경로 모두 후보이며 파싱 안정성은 미검증이다.
 
@@ -188,12 +188,12 @@ ID: OD-003
 
 근거는 [플랫폼 검증 §3.4](platform-capabilities.md#34-검증된-동작과-운영-제약).
 
-- **OD-056** (Channel custom 개발·allowlist·배포 경로): 로컬 2.1.238에서 `--dangerously-load-development-channels server:<name>` + `--mcp-config` 절대경로 조합으로 custom channel이 실제 등록·전달됨을 확인했다. preview 동안은 이 경로가 유일하며 `--channels`는 Anthropic allowlist plugin만 받는다. plugin 패키징으로 옮기는 시점은 여전히 OPEN이다.
-- **OD-059** (coordinator application receipt 반환 계약): reply tool이 실제 receipt 경로로 동작함을 관측했다. 서버가 이벤트 상태를 추적하고 Claude가 tool을 호출해 수신을 보고하는 구조가 성립한다. payload와 멱등성 설계는 여전히 OPEN이다.
-- **OD-054** (pending/attempted/delivered/processed/resumed 정의): `TRANSPORT_WRITE_ATTEMPTED`(서버의 `PUSHED` 기록)와 `APPLICATION_RECEIPT_RECEIVED`(reply tool 호출)를 실제로 구분해 관측했다. 두 상태의 물리적 근거가 확보됐다.
+- **OD-056** (Channel custom 개발·allowlist·배포 경로): 2.1.238과 2.1.241에서 development flag가 유일한 경로이고 매 기동 확인이 필요했다. D3는 이번 Run에서 분리해 별도 Run으로 다루며 allowlist plugin 등재는 이 결정에 포함하지 않는다.
+- **OD-059** (coordinator application receipt 반환 계약): reply tool이 실제 receipt 경로로 동작했으므로 관측된 반환 경로로 채택하되 다른 로컬 경로를 배제하지 않는다.
+- **OD-054** (pending/attempted/delivered/processed/resumed 정의): `TRANSPORT_WRITE_ATTEMPTED`와 `APPLICATION_RECEIPT_RECEIVED`가 실제로 갈렸으므로 transport write는 신호가 아니며 application receipt만 전달 신호로 쓴다.
 - **OD-062** (허용 지연): push부터 Claude가 receipt를 호출하기까지 약 7~10초를 관측했다. 유휴 세션·단일 이벤트 조건의 값이며 모델 턴 시간을 포함한다.
 - **OD-063** (daemon 자동 시작 방식): **channel 이벤트는 대화형 세션에만 도달한다.** `-p` 비대화형 세션에서는 같은 구성으로 4회 모두 미도달이었다. 따라서 wake-up 대상 coordinator 세션은 대화형으로 유지돼야 하며, daemon 자동 시작 설계는 coordinator를 headless로 대체하는 방향을 취할 수 없다.
-- **OD-057** (notification 중복 시 coordinator 멱등성): 이번 관측에서는 유실 0·중복 0이었고 큐 순서도 보존됐다. 다만 세션 재시작과 장시간 운용은 검증하지 않았으므로 항목은 OPEN을 유지한다.
+- **OD-057** (notification 중복 시 coordinator 멱등성): coordinator는 `gate_id`로 Orca 상태를 다시 읽고 이미 효과가 반영됐으면 no-op으로 처리한다. 별도 dedup 저장소는 두지 않는다.
 
 ## 2026-08-22 GitHub 실측이 바꾼 항목
 
@@ -839,14 +839,22 @@ ID: OD-061
 
 ```text
 ID: OD-072
-상태: DECIDED (C1 범위만. D1/D2 알림 정책은 계속 열려 있음)
+상태: DECIDED
 결정: C1은 summarizer 실패 시 축소 카드와 요약 실패, 입력 상한 초과 시 잘림, worker_done 없음 시 worker 보고 없음을 표시한다.
       correlation 실패는 카드를 만들지 않으므로 Slack에 표시하지 않는다.
-근거: C1은 degraded 사실을 숨기지 않는 UX §6을 따른다.
-대안과 기각 이유: C1에서 owner 알림까지 정함 — D1/D2의 owner·Channel 정책을 선결한다. 기각.
-영향 문서/파일: docs/ux/slack-surfaces.md §6, apps/orca-slack-bridge/src/digest/render.ts
-검증 방법: renderer·project·digest 테스트가 각 C1 degraded 표현 또는 skip을 확인한다.
-결정일: 2026-08-22
+      D1/D2 카드는 degraded 상태를 항상 표시하되 owner 개입 없이는 진행되지 않는 Channel pending,
+      미해결 Gate, correlation 실패만 thread에 알린다. summarizer 실패나 source stale처럼 자가 복구되는
+      상태는 badge만 표시하고 thread 알림을 보내지 않는다.
+근거: D1/D2 부분은 실측 증거가 없는 순수 제품 판단이며, 사용자가 owner 개입 필요 여부를 알림 경계로 확정했다.
+      C1의 기존 결정은 그대로 유지한다.
+대안과 기각 이유:
+  - 모든 degraded 상태를 thread에 알림: 자가 복구 상태도 owner action 대상으로 만들므로 사용자 결정으로 기각.
+  - 모든 degraded 상태를 badge로만 표시: owner 개입 없이는 진행되지 않는 상태를 놓치므로 사용자 결정으로 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §6, docs/ux/slack-surfaces.md §6,
+                docs/traceability.md, apps/orca-slack-bridge/src/digest/render.ts
+검증 방법: D1/D2 renderer fixture에서 세 owner-action-required 상태만 thread transition을 만들고,
+           summarizer failure/source stale는 badge만 만드는지 확인한다. C1 기존 테스트는 그대로 유지한다.
+결정일: 2026-08-23
 ```
 
 ```text
@@ -1003,5 +1011,353 @@ ID: OD-077
 영향 문서/파일: docs/contracts/observation-and-correlation.md §2, docs/specs/orca-slack-bridge.md §5.4,
                 docs/traceability.md
 검증 방법: run-only fixture가 invalid/degraded로 명시되고 Task 카드를 만들지 않으며 추측 보완하지 않는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-019
+상태: DECIDED
+결정: Bridge sidecar에 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}` mapping을 저장하고
+      이것을 권위 correlation으로 삼는다. Gate question 문자열은 표시용으로만 쓴다.
+근거:
+  - docs/evidence/t3-orca-gate-and-aggregation.md §(d)에서 question은 self-thread와 Task·Dispatch payload를,
+    reply는 원 question thread와 별도 message ID를 가졌지만 Gate에는 message/thread/dispatch 필드가 없었다.
+  - 같은 절에서 한 Task에 ask가 반복될 수 있어 Task ID만으로 ask 한 건을 식별할 수 없음을 관측했다.
+대안과 기각 이유:
+  - Task ID만으로 연결: 한 Task의 복수 ask와 retry를 구분하지 못해 기각.
+  - ask ID를 Gate question에 직렬화: 사람용 자유 텍스트 parsing에 의존해 기각.
+영향 문서/파일: docs/contracts/observation-and-correlation.md §4, docs/specs/orca-slack-bridge.md §6·§9,
+                docs/architecture/orca-slack-bridge.md §2·§7, docs/traceability.md
+검증 방법: 한 Task의 복수 ask·reply·Gate fixture에서 sidecar mapping으로 정확한 ask와 Gate가 연결되는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-050
+상태: DECIDED
+결정: 사람이 읽는 `question`/`options`에는 짧은 요약만 두고, 기계 판정용 metadata인 안정적 option ID,
+      설명, recommendation, impact는 Bridge sidecar에 저장해 Orca Gate ID와 연결한다. 자유 텍스트를 parsing하지 않는다.
+근거:
+  - docs/evidence/t3-orca-gate-and-aggregation.md §(a)에서 `--options`는 `string[]`만 받았고 객체 배열은
+    `runtime_error`였으며, Gate row에는 option metadata 필드가 없었다.
+  - 같은 절에서 resolution은 option membership 검증 없이 임의 문자열을 저장했다.
+대안과 기각 이유:
+  - option 객체를 Orca에 저장: 실제 validator가 요청을 거부해 기각.
+  - question/options 문자열에 metadata를 인코딩: 기계 판정이 자유 텍스트 parsing에 의존해 기각.
+  - Orca 원천 필드만으로 카드 축소: 확정된 Gate UX의 설명·권장·영향을 잃어 기각.
+영향 문서/파일: docs/contracts/observation-and-correlation.md §4, docs/specs/orca-slack-bridge.md §6·§7·§9,
+                docs/architecture/orca-slack-bridge.md §2·§7, docs/ux/slack-surfaces.md §3, docs/traceability.md
+검증 방법: 객체 options 요청이 실패하는 표본을 유지하고, sidecar option ID로 button value와 Orca resolution이 연결되는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-051
+상태: DECIDED
+결정: Gate별 직렬화(durable lock 또는 CAS), 동일 논리 요청에 같은 retry request ID 재사용과
+      `mutation.replayed` 처리, resolve 전후 재조회, durable outbox reconciliation을 함께 둔다.
+      Orca 내부 transaction 원자성은 보장으로 문서화하지 않는다.
+근거:
+  - docs/evidence/t3-orca-gate-and-aggregation.md §(e)에서 같은 retry request 재생은
+    `mutation.replayed:true`였지만, 다른 request ID는 이미 resolved인 Gate의 resolution을 덮어썼다.
+  - 같은 절에서 Gate 응답에는 version/CAS/outbox 필드가 없었고 내부 fault injection은 실행하지 않아
+    Gate↔Task transaction 원자성을 관측하지 못했다.
+대안과 기각 이유:
+  - Gate ID만으로 멱등 처리: 다른 request ID의 overwrite가 실제 성공해 기각.
+  - status 선확인만 사용: check와 resolve 사이 경합을 막지 못해 기각.
+  - Orca resolve와 외부 outbox가 원자적이라고 가정: 관측 근거가 없어 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §7·§9, docs/architecture/orca-slack-bridge.md §4·§7,
+                docs/contracts/observation-and-correlation.md §8, docs/traceability.md
+검증 방법: 동일 retry ID 재생, 다른 resolver 경합, resolve 전후 process interruption fixture에서 단일 resolution과 outbox 수렴을 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-067
+상태: DECIDED
+결정: 원천별 수치를 별도 badge로 표시하고 같은 `taskId`·`dispatchId`·Gate ID·message ID를 함께 노출한다.
+      고유 blocker 총합은 dedup 정책이 확정된 뒤에 추가한다. permission은 `agentWait`를 넓은
+      "interaction 대기"로 표시하고 provider별 근거가 더 있을 때만 세분화한다.
+근거:
+  - docs/evidence/t3-orca-gate-and-aggregation.md §(b)에서 pending Gate와 blocked Task가 같은 사건을,
+    question·escalation·dispatched Task가 같은 Task/Dispatch를 중복 표현했다.
+  - 같은 절에서 permission 화면은 `agentWait.reason:"codex-interactive-prompt"`로만 관측돼 permission 전용 enum이 아니었다.
+대안과 기각 이유:
+  - 모든 원천 수 단순 합산: 동일 원인을 중복 계산해 기각.
+  - 모든 blocker를 blocked Task 하나로 환원: question·escalation·Dispatch failure의 서로 다른 상태를 잃어 기각.
+  - `agentWait`를 모두 permission으로 표시: 관측 필드가 일반 interaction prompt여서 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §6, docs/contracts/observation-and-correlation.md §7,
+                docs/ux/slack-surfaces.md §3, docs/traceability.md
+검증 방법: 겹치는 Gate/Task와 question/escalation fixture에서 원천 badge는 보존되고 고유 총합은 표시되지 않는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-069
+상태: DECIDED
+결정: `현재 Task 상태별 수 / 현재 task-list.count`와 "Dispatch attempts"를 분리해 표시한다.
+      완료율·성공률 공식은 만들지 않는다. Task를 분모 단위로 삼고 Dispatch는 attempt 이력으로 분리하며,
+      실행 중 추가된 Task를 즉시 분모에 반영한다. Orca에 `cancelled` 상태는 없다.
+근거:
+  - docs/evidence/t3-orca-gate-and-aggregation.md §(c)에서 실행 중 Task 추가로 count가 1→3이 됐고,
+    한 Task의 네 실패와 한 성공 retry는 Task 한 행과 Dispatch 다섯 행으로 남았다.
+  - 같은 절에서 `cancelled` update는 허용 enum 검증에서 거부됐고 failed와 blocked는 별도 상태로 관측됐다.
+대안과 기각 이유:
+  - Run 시작 시 분모 고정: 실행 중 추가 Task를 반영하지 못해 기각.
+  - Dispatch를 분모에 합산: 같은 Task의 retry를 중복 계산해 기각.
+  - 완료율·성공률 계산: failed/blocked를 어느 분자에 넣을지 원천이 정하지 않으므로 만들지 않는다.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §6, docs/contracts/observation-and-correlation.md §7,
+                docs/ux/slack-surfaces.md §3, docs/traceability.md
+검증 방법: 실행 중 Task 추가와 한 Task의 다중 Dispatch fixture에서 current count와 attempt 이력이 분리되는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-068
+상태: DECIDED
+결정: 설정 파일에 수동으로 등록한 repository만 D1이 관찰한다. 자동 발견, Git remote 기반 자동 등록,
+      자동 발견된 다중 repository routing은 docs/roadmap.md §10의 O1 범위로 남긴다.
+근거: 실측 증거가 없는 순수 제품 판단이며, 사용자가 D1과 O1의 범위 경계로 확정했다.
+대안과 기각 이유:
+  - D1에서 자동 발견·자동 등록·자동 routing까지 구현: 사용자가 O1 범위로 분리해 기각.
+  - D1을 단일 repository로 제한: 수동 등록한 여러 repository 관찰 요구를 충족하지 못해 기각.
+영향 문서/파일: docs/roadmap.md §7·§10, docs/specs/orca-slack-bridge.md §6,
+                docs/architecture/orca-slack-bridge.md §2, docs/contracts/observation-and-correlation.md §5,
+                docs/traceability.md
+검증 방법: 설정에 등록한 repository만 D1 대상이 되고 미등록 Git remote는 자동 추가되지 않는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-041
+상태: DECIDED
+결정: Socket Mode를 채택하고 `@slack/socket-mode`를 쓴다. daemon은 연결 직전 URL을 발급받고,
+      `hello.connection_info.app_id`를 확인하며, `warning`/`refresh_requested` 때 연결을 overlap하고
+      exponential backoff을 쓴다. ACK 처리와 업무 처리를 분리한다. reconnect 시 놓친 event replay는 보장하지 않는다.
+근거:
+  - docs/evidence/t4-slack-inbound.md §(a)는 Socket Mode가 로컬 daemon에서 공개 inbound endpoint 없이
+    성립하고, `@slack/socket-mode`가 envelope와 ACK를 직접 다루는 공식 Node SDK임을 확인했다.
+  - 같은 절의 공식 문서 조사에서 URL은 동적·임시였고 `hello`의 App ID, warning/refresh overlap,
+    3초 ACK, 연결 단절 중 event replay 비보장이 확인됐다.
+대안과 기각 이유:
+  - HTTP Request URL: 공개 relay/tunnel/host와 HTTP 인증 운영이 추가돼 현재 topology에서 기각.
+  - `@slack/bolt`: 공식 대안이지만 현재 작은 Bridge에 listener/middleware framework 전체를 도입하지 않기로 결정.
+  - reconnect backlog replay 가정: 공식 Socket Mode 문서가 보장하지 않아 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §7, docs/architecture/orca-slack-bridge.md §1·§2,
+                docs/traceability.md, 향후 apps/orca-slack-bridge Slack inbound
+검증 방법: 실제 Socket smoke에서 hello App ID, button 3초 ACK, forced warning/refresh overlap, reconnect backoff을 관찰한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-042
+상태: DECIDED
+결정: `team.id`와 exact `user.id`를 모두 검사하고, `api_app_id`도 설정 가능한 추가 고정값으로 검사한다.
+      실패 이유는 token·payload 원문 없이 기록한다. 사전 인증된 Socket 위에서는 signing secret 검증이 불필요하다.
+근거:
+  - docs/evidence/t4-slack-inbound.md §(b)의 공식 payload 조사에서 `team.id`는 설치 workspace,
+    `user.id`는 interaction 사용자, `api_app_id`는 수신 App을 나타냈다.
+  - 같은 절에서 Socket Mode의 인증 사슬은 xapp token으로 연 TLS WebSocket이고 envelope별 signing secret은
+    요구되지 않으며, username/channel/deprecated token은 권한 근거가 아님을 확인했다.
+대안과 기각 이유:
+  - username/display name/channel allowlist: 안정적 owner identity가 아니어서 기각.
+  - `team.id` 또는 `api_app_id` 하나만 검사: owner 권한을 증명하지 못해 기각.
+  - Socket envelope에 HTTP signing-secret HMAC 적용: 해당 transport 계약에 없는 검증이라 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §7·§10, docs/architecture/orca-slack-bridge.md §2·§8,
+                docs/traceability.md, 향후 apps/orca-slack-bridge Slack inbound
+검증 방법: 허용/비허용 team·user·api_app_id payload fixture와 redacted audit log를 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-071
+상태: DECIDED
+결정: 로컬 형식·필수값 검증은 3초 안에 `response_action=errors`로 돌려 modal을 유지한다.
+      원격 Orca 작업은 ACK 전에 기다리지 않는다.
+근거:
+  - docs/evidence/t4-slack-inbound.md §(c)의 공식 문서 조사에서 `view_submission` ACK의
+    `response_action:"errors"`와 input `block_id`별 오류가 modal을 열린 채 유지함을 확인했다.
+  - 같은 절에서 이 응답은 Socket Mode ACK payload로 3초 안에 보내야 하고, 빈 ACK는 view를 닫으며
+    느린 Orca resolve를 기다리는 것은 허용되지 않음을 확인했다.
+대안과 기각 이유:
+  - 빈 ACK 후 별도 오류 표시: 수정할 modal을 닫아 기각.
+  - 원격 Orca resolve 완료까지 ACK 지연: Slack의 3초 제한을 넘길 수 있어 기각.
+  - error key로 action ID 사용: 공식 계약은 input block ID여서 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §7, docs/architecture/orca-slack-bridge.md §2,
+                docs/ux/slack-surfaces.md §3, docs/traceability.md
+검증 방법: invalid submission이 3초 안에 block별 error를 표시하고 Orca 호출 없이 modal을 유지하는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-052
+상태: DECIDED
+결정: named pipe를 쓰고 Adapter가 재시도 client가 된다. Windows 네이티브이고 포트 충돌·포트 파일이 없으며
+      이름 하나가 고정 주소가 된다. daemon 기동 순서에 무관하다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(b)에서 Windows named pipe와 TCP loopback이 모두 동작했고,
+    Adapter가 ENOENT 뒤 재시도해 daemon이 나중에 떠도 18번째 시도에 연결됐다.
+  - 같은 절에서 Adapter는 세션마다 생성·종료됐고 named pipe는 고정 이름 하나로 daemon에 연결됐다.
+대안과 기각 이유:
+  - TCP loopback client: 동작하지만 포트 선점과 포트 파일 관리가 붙어 기각.
+  - Adapter가 고정 포트를 listen: 다중 세션의 포트 발견 경로가 필요하고 실측하지 않아 기각.
+  - 파일 큐: 실측하지 않았고 named pipe보다 나은 근거가 없어 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8, docs/architecture/orca-slack-bridge.md §2·§3,
+                docs/roadmap.md §9, docs/traceability.md
+검증 방법: daemon-first와 Adapter-first 순서에서 동일 pipe 이름으로 연결되고 재연결되는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-053
+상태: DECIDED
+결정: binding을 인증하지 않는 대신 payload를 무해하게 만든다. channel에는 `gate_id`만 싣고 내용은
+      coordinator가 Orca에서 자기 권한으로 다시 읽는다. 잘못 라우팅돼도 새는 것은 ID뿐이고 위조된 Adapter는
+      Orca 권한이 없어 내용을 읽지 못한다. `CLAUDE_CODE_SESSION_ID`만으로 신뢰하지 않는다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(c) 근거 5에서 `.mcp.json` env override와 평범한 TCP client의
+    fake hello 두 방향으로 `CLAUDE_CODE_SESSION_ID` 위조와 pending payload 유출이 재현됐다.
+  - 같은 절에서 session ID는 resume에서 보존되고 per-session routing에는 쓸 수 있지만 인증은 아니었다.
+대안과 기각 이유:
+  - session ID 단독 인증: 두 방향 위조가 재현돼 기각.
+  - session ID+pane key: 둘 다 환경 주장이라 위조 저항이 아니라 오배송 방지에만 해당해 기각.
+  - Gate 내용을 channel payload에 포함: 위조 binding에 내용이 유출되고 본문은 prompt injection 표면이어서 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8, docs/architecture/orca-slack-bridge.md §2·§8,
+                docs/contracts/observation-and-correlation.md §9, docs/roadmap.md §9, docs/traceability.md
+검증 방법: 위조 hello가 `gate_id` 외 내용을 받지 못하고 Orca 조회 권한 없이는 resolution을 읽지 못하는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-054
+상태: DECIDED
+결정: transport write 성공은 아무것도 증명하지 않는다. application receipt만이 전달 신호다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(d)에서 flag 없음, 거부된 channel, 비대화형 세션, startup dead window에도
+    `mcp.notification()` write는 성공했지만 receipt는 없었고, flag 있는 대화형 세션에서만 receipt가 왔다.
+  - 같은 절의 공식 문서도 notification await는 transport write일 뿐 Claude 처리 ACK가 아니라고 명시했다.
+대안과 기각 이유:
+  - notification promise 반환을 delivered/processed로 기록: 다섯 실패 조건에서도 성공해 기각.
+  - 연결 직후 즉시 outbox flush: 통제 재측정 3회와 재현 1회에서 early write가 모두 유실돼 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8, docs/architecture/orca-slack-bridge.md §4·§5,
+                docs/ux/slack-surfaces.md §3·§6, docs/roadmap.md §9, docs/traceability.md
+검증 방법: transport 성공/receipt 부재와 receipt 수신을 별도 상태로 기록하는 dead-window fixture를 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-055
+상태: DECIDED
+결정: 해당 Gate가 `pending`에서 `resolved`로 전이한 것을 Orca 효과로 본다.
+근거:
+  - docs/evidence/t3-orca-gate-and-aggregation.md §(a)에서 Gate 생성 직후 pending, resolve 직후 resolved를
+    실제 재조회했고 Gate 상태 전이가 목적과 직접 연결됐다.
+  - docs/evidence/t5-channel-adapter.md §(d)는 receipt가 모델의 tool 호출만 증명하며 Orca 효과와 구별돼야 하고,
+    Gate status는 단일 `gate-list` 조회로 관측할 수 있음을 확인했다.
+대안과 기각 이유:
+  - application receipt를 효과로 사용: Orca 상태 변화를 증명하지 못해 기각.
+  - Task ready/dispatched 또는 새 Dispatch를 효과로 사용: 다른 원인으로도 전이할 수 있고 Gate resolution보다 늦어 기각.
+  - Task completed를 효과로 사용: 재개가 아니라 완료를 기다려야 해 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §6·§8, docs/architecture/orca-slack-bridge.md §4·§5,
+                docs/ux/slack-surfaces.md §3, docs/roadmap.md §9, docs/traceability.md
+검증 방법: 대상 Gate 한 건의 status가 pending→resolved로 바뀐 뒤에만 effect-observed/재개 표시에 진입하는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-056
+상태: DECIDED
+결정: development flag가 유일한 경로이고 매 기동 확인 대화상자를 요구하므로 D3를 이번 Run에서 분리해
+      별도 Run으로 다룬다. allowlist plugin 등재는 이번 결정에 포함하지 않는다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(f)에서 Claude Code 2.1.241의 `--channels server:*`는 거부됐고,
+    동작하는 development flag는 세션 기동마다 기억되지 않는 확인 대화상자를 표시했다.
+  - 같은 문서 §「D3이 지금 구현 가능한가」는 이 배포 제약이 재시도 같은 설계로 흡수되지 않는 외부 조건이고,
+    Channels가 research preview라 flag syntax와 protocol contract가 바뀔 수 있음을 확인했다.
+대안과 기각 이유:
+  - 이번 Run에서 development flag로 D3 구현: 매 기동 사람 확인이 필요한 외부 조건을 운영 계약으로 흡수하지 못해 기각.
+  - bare server를 `--channels`로 운영: 2.1.241에서 명시적으로 거부돼 기각.
+  - allowlist plugin 등재: 이번 결정 범위에 포함하지 않는다.
+영향 문서/파일: docs/roadmap.md §9, docs/specs/orca-slack-bridge.md §8,
+                docs/architecture/orca-slack-bridge.md §3, docs/traceability.md
+검증 방법: 별도 D3 Run 착수 전 대상 Claude Code 버전에서 배포 경로와 확인 UX를 재검증하고 별도 size gate를 기록한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-057
+상태: DECIDED
+결정: payload가 `gate_id`뿐이므로 coordinator는 항상 Orca에서 Gate를 다시 읽는다. 이미 `resolved`이고
+      효과가 반영된 상태면 no-op이다. 상태를 Orca가 가지므로 별도 dedup 저장소를 두지 않는다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(e)에서 동일 notification은 플랫폼 dedup 없이 그대로 반복됐고,
+    모델의 컨텍스트 기억에 의한 중복 판단은 플랫폼 보장이 아니었다.
+  - 같은 절에서 `gate_id`만 보내고 Orca 상태를 진리로 재확인하는 방식이 본문과 별도 저장소 의존을 줄이는 선택지로 남았다.
+대안과 기각 이유:
+  - 플랫폼 dedup 또는 coordinator 기억에 의존: 중복이 그대로 도착하고 세션 재시작/압축 뒤 보장이 없어 기각.
+  - 별도 dedup 저장소: authoritative Gate 상태와 중복 상태를 이중 관리하므로 두지 않는다.
+  - Channel 본문으로 완료 여부 판단: 본문은 prompt injection 표면이고 source of truth가 아니어서 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8·§9, docs/architecture/orca-slack-bridge.md §4·§5·§7,
+                docs/roadmap.md §9, docs/traceability.md
+검증 방법: 같은 `gate_id` notification을 반복해 resolved/effect-applied Gate에서 두 번째 처리가 no-op인지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-058
+상태: DECIDED
+결정: daemon의 end-to-end probe만으로 session opt-in을 판정한다. probe는 startup dead window를 피해야 한다.
+      parent `claude.exe` command line은 판정 수단으로 채택하지 않는다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(c) 근거 4에서 Adapter argv·env 값·MCP initialize payload는
+    flag/no-flag가 동일했고 notification write도 양쪽에서 성공해 opt-in을 구분하지 못했다.
+  - 같은 절 근거 6의 parent command line은 flag를 구분했지만 문서화되지 않았고 프로세스 트리·권한·버전에 의존했다.
+  - 같은 문서 §(d)에서 startup 직후 probe write가 유실되는 dead window가 통제 재측정으로 확인됐다.
+대안과 기각 이유:
+  - argv/env/initialize 또는 notification write 성공 사용: flag/no-flag를 구분하지 못해 기각.
+  - parent process command line parsing: 관측은 됐지만 문서화된 계약이 아니고 프로세스 트리 의존이라 기각.
+  - 세션 자기 보고: 모델 컨텍스트가 launch flag를 알 수 없다고 관측돼 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8, docs/architecture/orca-slack-bridge.md §2·§5,
+                docs/roadmap.md §9, docs/traceability.md
+검증 방법: dead-window-safe retry를 적용한 probe에서 flag 세션만 receipt를 반환하고 no-flag 세션은 unverified로 남는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-059
+상태: DECIDED
+결정: reply tool 왕복을 관측된 세션→daemon 반환 경로로 채택한다. 다른 로컬 IPC·CLI 경로를 배제하지
+      못했으므로 "유일한"이라고 규정하지 않는다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(d)에서 세션이 Adapter의 `orca_report_receipt` tool을 호출하고
+    daemon이 event를 `APPLICATION_RECEIPT_RECEIVED`로 바꾸는 왕복이 실제 동작했다.
+  - 같은 절은 agent hook, messaging socket, 파일·CLI 경로를 시도하지 않았으므로 유일성을 관측하지 못했다고 명시했다.
+대안과 기각 이유:
+  - reply tool을 유일한 반환 경로로 규정: 다른 로컬 경로를 배제한 실측이 없어 기각.
+  - 문서화되지 않은 messaging socket 사용: 프로토콜을 조사·검증하지 않아 기각.
+  - transport write를 반환 신호로 사용: application receipt와 실제로 갈려 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8, docs/architecture/orca-slack-bridge.md §2·§5,
+                docs/roadmap.md §9, docs/traceability.md
+검증 방법: notification 뒤 reply tool 호출이 같은 event ID의 receipt 상태로 왕복하는지 확인한다.
+결정일: 2026-08-23
+```
+
+```text
+ID: OD-066
+상태: DECIDED
+결정: `receipted` → `consumed` 두 단계를 둔다. receipt는 재시도 backoff를 늦추는 데만 쓰고 재조회 억제는
+      `consumed`에서만 한다. `receipted`에서 멈춘 event는 재조회 대상으로 남기며, 재전송 중복은 세션의
+      Orca-state 기반 멱등 처리로 무해하게 만든다.
+근거:
+  - docs/evidence/t5-channel-adapter.md §(e)에서 receipt 순간 pending에서 제거한 하니스는 receipt 뒤 Orca 효과 전
+    crash 시 event가 어떤 재조회에도 나오지 않는 영구 유실 창을 가졌다.
+  - 같은 절에서 세션 tool 재조회와 daemon 재연결 재전송이 동작했고, 동일 notification은 중복 표시 없이 그대로 도착했다.
+대안과 기각 이유:
+  - receipt 시 consumed 처리: receipt와 Orca 효과 사이 crash에서 영구 유실돼 기각.
+  - receipt 상태 없이 효과 관측까지 동일 backoff로 재전송: 불필요한 빠른 중복을 줄일 신호를 버려 기각.
+  - 중복을 플랫폼이나 모델 기억에 맡김: 플랫폼 보장이 아니어서 기각.
+영향 문서/파일: docs/specs/orca-slack-bridge.md §8·§9, docs/architecture/orca-slack-bridge.md §4·§5·§7,
+                docs/roadmap.md §9, docs/traceability.md
+검증 방법: receipt 직후 중단 fixture에서 event가 재조회 대상으로 남고, Orca 효과 뒤 consumed에서만 억제되는지 확인한다.
 결정일: 2026-08-23
 ```

@@ -24,7 +24,7 @@
 │                          ├→ Slack renderer       │
 │                          └→ durable store        │
 └──────────────────┬───────────────────────────────┘
-                   │ localhost IPC / pending events
+                   │ named pipe / pending events
                    ▼
 ┌──────────────────────────────────────────────────┐
 │ Claude Channel Adapter                           │
@@ -34,18 +34,20 @@
           기존 coordinator session
 ```
 
-Slack은 daemon과 Socket Mode WebSocket으로 연결하는 방향이다. 공개 inbound HTTP endpoint를 운영하지 않는 것이 개인 PC 환경의 목표다.
+Slack은 daemon과 `@slack/socket-mode` WebSocket으로 연결한다. 공개 inbound HTTP endpoint는 운영하지 않는다.
+URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refresh 때 연결을 overlap하고 exponential backoff을
+적용한다. ACK와 업무 처리를 분리하고 단절 구간 event replay는 보장하지 않는다(OD-041).
 
 ## 2. 논리 컴포넌트
 
 ### Discovery
 
-- Orca Run 후보를 찾는다.
+- D1에서는 설정 파일에 수동 등록한 repository와 그 Run 후보만 찾는다.
 - Run과 live coordinator terminal/worktree/repository를 연결한다.
 - global worker list의 Run↔worktree 정보는 repository 후보 복구에 사용할 수 있지만 historical/released worker를 liveness로 사용하지 않는다.
-- Git remote에서 canonical GitHub repository를 식별한다.
+- Git remote 기반 자동 repository 등록은 O1에서 다룬다.
 - 설정 또는 durable store의 Project↔Repository mapping을 적용한다.
-- 수동 등록과 자동 발견의 우선순위를 적용한다.
+- 자동 발견된 다중 repository routing도 O1에서 다룬다(OD-068).
 
 현재 로컬 Orca의 `run-list`만으로 repository와 coordinator liveness를 알 수 없으므로 terminal/worktree 상관관계 또는 추가 등록 계약이 필요하다.
 
@@ -89,12 +91,17 @@ Slack은 daemon과 Socket Mode WebSocket으로 연결하는 방향이다. 공개
 - 중요한 transition을 thread에 한 번 기록한다.
 - 고정 선택지 action은 제한 시간 안에 ACK한 뒤 Gate 검증·resolve를 비동기로 이어간다.
 - 직접 입력 action은 sender/action을 빠르게 검증하고 ACK와 `views.open`을 같은 3초 유효 창 안에 끝낸다. 비-owner에게 modal을 열지 않는다.
-- modal submission은 3초 안에 ACK하고 Gate 검증·resolve를 비동기로 이어간다. modal validation error UX는 `OD-071`에서 확정한다.
+- modal submission의 로컬 형식·필수값 오류는 3초 안에 input block ID별 `response_action=errors`로 ACK해
+  modal을 유지한다. 유효한 제출은 ACK한 뒤 Gate 검증·resolve를 비동기로 이어간다(OD-071).
+- 인증된 Socket의 `team.id`와 exact `user.id`, 설정된 경우 `api_app_id`를 대조한다. HTTP signing secret은
+  Socket envelope에 적용하지 않고 실패 로그에는 token·payload 원문을 남기지 않는다(OD-042).
 
 ### Gate Resolution Adapter
 
 - owner·workspace·action·Gate 최신 상태를 재검증한다.
 - Orca `gate-resolve`만 수행한다.
+- Gate별 durable lock 또는 CAS, 동일 논리 요청의 retry request ID 재사용, `mutation.replayed` 처리,
+  resolve 전후 재조회, durable outbox reconciliation을 함께 적용한다(OD-051).
 - 일반 Slack 텍스트나 임의 명령을 Orca/Claude에 전달하지 않는다.
 
 ### Durable Store
@@ -102,18 +109,19 @@ Slack은 daemon과 Socket Mode WebSocket으로 연결하는 방향이다. 공개
 - entity↔Slack message mapping을 보존한다.
 - projection과 transition deduplication 상태를 보존한다.
 - Gate resolution 이후 coordinator notification outbox를 보존한다.
+- ask↔Gate 권위 mapping과 Gate option ID·설명·recommendation·impact를 Orca Gate ID에 연결해 보존한다(OD-019, OD-050).
 - Orca/GitHub source of truth를 복제해 대체하지 않는다.
 
 ### Channel Adapter
 
-- daemon과 localhost로 통신한다.
+- daemon이 listen하는 Windows named pipe에 재시도 client로 연결한다(OD-052).
 - Claude Code가 coordinator session별 subprocess로 spawn하고 stdio MCP로 통신하는 custom Channel server다.
 - `.mcp.json` 또는 plugin 등록만으로 충분하지 않으며 session opt-in과 조직 policy를 통과해야 한다.
 - 여러 coordinator session이 열리면 Adapter instance도 여러 개일 수 있다.
-- 각 Adapter는 daemon에 자신이 어느 Run/coordinator session에 binding됐는지 증명해야 한다.
-- pending Gate event를 열린 세션에 push한다.
-- transport write와 coordinator 처리 완료를 구분한다.
-- coordinator의 명시적 application receipt 또는 status reply를 daemon에 되돌리는 양방향 경로를 제공할 수 있어야 한다. reply tool/IPC의 정확한 계약은 TBD다.
+- binding을 인증하지 않으며 Channel payload에는 `gate_id`만 싣는다. `CLAUDE_CODE_SESSION_ID`는 신뢰 근거가 아니다(OD-053).
+- startup dead window를 피한 daemon end-to-end probe receipt만으로 session opt-in을 판정한다(OD-058).
+- transport write와 application receipt를 구분하고, reply tool 왕복으로 receipt를 daemon에 돌려준다. 이 경로를 유일하다고 규정하지 않는다(OD-054, OD-059).
+- coordinator는 `gate_id`로 Orca를 다시 읽고 이미 효과가 반영됐으면 no-op으로 처리한다(OD-057).
 
 ## 3. 프로세스 경계
 
@@ -122,9 +130,11 @@ Slack은 daemon과 Socket Mode WebSocket으로 연결하는 방향이다. 공개
 | 프로세스 | 수명 | 책임 |
 |---|---|---|
 | daemon | PC에서 상시 실행 | Slack, Orca/GitHub 관찰, DB, Slack projection |
-| Channel Adapter | coordinator 세션별 subprocess | pending decision push, 선택적 application receipt/status 반환 |
+| Channel Adapter | coordinator 세션별 subprocess | pending Gate ID push, reply tool application receipt 반환 |
 
-첫 구현부터 물리적으로 분리할지는 size 조사 후 결정한다. 다만 코드 구조와 데이터 계약은 다음 장애가 서로 다른 failure domain임을 보존해야 한다.
+D3 구현은 development flag의 매 기동 확인과 research preview 변동성 때문에 이번 Run에서 분리해 별도 Run으로
+산정한다. allowlist plugin 등재는 이번 결정에 포함하지 않는다(OD-056). 별도 Run에서도 다음 장애가 서로 다른
+failure domain임을 보존한다.
 
 - daemon이 살아 있고 coordinator가 닫힘
 - coordinator가 살아 있고 Slack 연결이 끊김
@@ -147,7 +157,8 @@ Slack action ACK 또는 modal open fast path
   → Slack에 실제 재개 표시
 ```
 
-구현 전에 다음 crash window의 복구 규칙을 각각 결정하고 테스트해야 한다.
+다음 crash window를 Gate별 직렬화, retry request replay, resolve 전후 재조회, durable outbox reconciliation로
+복구하고 각각 테스트한다. Orca 내부 transaction 원자성은 보장하지 않는다(OD-051).
 
 1. Slack ACK 후 검증 전
 2. Orca resolve 직전/직후
@@ -168,15 +179,15 @@ OPEN_IN_ORCA
   → RESOLVED_IN_ORCA
   → NOTIFICATION_PENDING
   → TRANSPORT_WRITE_ATTEMPTED
-  → APPLICATION_RECEIPT_RECEIVED (optional)
-  → COORDINATOR_EFFECT_OBSERVED
+  → RECEIPTED
+  → CONSUMED
 ```
 
-- `TRANSPORT_WRITE_ATTEMPTED`는 Claude가 읽거나 처리했다는 뜻이 아니다.
-- `APPLICATION_RECEIPT_RECEIVED`는 별도 reply/IPC 계약이 실제로 구현된 경우에만 존재한다.
-- `COORDINATOR_EFFECT_OBSERVED`는 어떤 Orca 변화가 충분한 증거인지 TBD다.
-- 세션이 다시 연결되면 `NOTIFICATION_PENDING` 또는 재시도 가능한 event를 복구할 수 있어야 한다.
-- daemon의 outbox 재시도와 coordinator의 Fresh/Resume/turn-boundary Gate reconciliation은 독립 복구 경로다. 정확한 trigger와 consumed marker는 TBD다.
+- `TRANSPORT_WRITE_ATTEMPTED`는 전달을 증명하지 않고 application receipt만 전달 신호다(OD-054).
+- `RECEIPTED`는 reply tool 왕복으로 관측하며 재시도 backoff만 늦춘다(OD-059, OD-066).
+- Orca 효과는 대상 Gate의 `pending`→`resolved` 전이고, 이를 관찰한 뒤 `CONSUMED`로 바꾼다(OD-055).
+- `RECEIPTED`에서 멈춘 event는 재조회 대상으로 남고 `CONSUMED`에서만 재조회를 억제한다(OD-066).
+- coordinator는 항상 Orca 상태를 다시 읽어 중복을 no-op으로 만들며 별도 dedup 저장소를 두지 않는다(OD-057).
 
 ## 6. PR projection의 일관성
 
@@ -210,7 +221,7 @@ Orca Run
   └─ Slack Run root + Gate thread
 
 Resolved Gate
-  └─ coordinator delivery/outbox state
+  └─ coordinator delivery/outbox pending → receipted → consumed
 ```
 
 PR body는 primary/latest Task 하나만 가리키고, PR↔Task N 연관은 Bridge durable store에 별도로 보존한다.
@@ -225,6 +236,9 @@ C1 durable store는 `node:sqlite`이고 platform별 기본 위치와 override �
 - Orca가 발행한 Run/Task/Dispatch/Gate ID
 - GitHub가 반환한 repository/PR identity
 - Slack interactive payload의 검증된 workspace/team와 sender user ID
+
+Socket Mode 권한은 인증된 연결의 `team.id`와 exact `user.id` 교집합으로 판정하고 설정된 `api_app_id`도
+대조한다. Channel Adapter binding은 신뢰하지 않으며 payload를 `gate_id`로 제한한다(OD-042, OD-053).
 
 신뢰하지 않는 content:
 

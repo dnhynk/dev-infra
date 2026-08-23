@@ -283,3 +283,80 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - `orca-run`은 있고 필수 `orca-task`가 없는 PR은 invalid/degraded input이다. 별도 `run_correlated` kind는 Run-level 제품 의미가 필요해질 때만 도입한다(OD-077).
 - 근거: current body는 다중 Task 이력을 보존하지 못하고 key 누적은 conflict가 되며, run-only 입력은 Task 목적과 `worker_done`을 제공하지 못한다.
 - 각 결정의 실측 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-030, OD-031, OD-032, OD-044, OD-046, OD-075, OD-076, OD-077 확정 기록에 있다.
+
+## 2026-08-23 · D1/D2 공통 계약 확정
+
+### DL-040 · ask/reply/Gate correlation과 Gate metadata는 sidecar가 보존한다
+
+- Bridge sidecar의 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}` mapping을 권위 correlation으로 쓰고 Gate question은 표시용으로만 쓴다(OD-019).
+- 사람이 읽는 Gate question/options에는 짧은 요약만 두고 안정적 option ID·설명·recommendation·impact는 Orca Gate ID에 연결한 sidecar metadata로 보존한다(OD-050).
+- 근거: ask/reply에는 message·thread·dispatch 관계가 있지만 Gate row에는 그 필드가 없고, `--options` 객체 배열은 `runtime_error`로 거부됐다.
+
+### DL-041 · Gate resolve는 Bridge가 직렬화하고 outbox와 reconcile한다
+
+- Gate별 durable lock 또는 CAS, 동일 논리 요청의 retry request ID 재사용과 `mutation.replayed` 처리, resolve 전후 재조회, durable outbox reconciliation을 함께 둔다(OD-051).
+- Orca 내부 Gate↔Task transaction 원자성은 보장으로 문서화하지 않는다.
+- 근거: 같은 retry ID는 replay됐지만 다른 ID는 resolved Gate를 덮어썼고, Orca 응답에는 version/CAS/outbox 필드가 없었다.
+
+## 2026-08-23 · D1 계약 확정
+
+### DL-042 · Run 집계는 현재 Task와 Dispatch attempt를 분리한다
+
+- `현재 Task 상태별 수 / 현재 task-list.count`와 Dispatch attempts를 분리하고 완료율·성공률 공식은 만들지 않는다. 실행 중 추가 Task는 즉시 분모에 반영하며 Orca에는 `cancelled` 상태가 없다(OD-069).
+- blocker는 원천별 badge와 correlation ID로 표시하고 고유 총합은 dedup 정책 뒤로 미룬다. `agentWait`는 interaction 대기로 표시한다(OD-067).
+- 모든 degraded 상태는 카드에 표시하되 Channel pending·미해결 Gate·correlation 실패만 thread에 알리고, summarizer failure·source stale은 badge만 표시한다(OD-072).
+- 근거: 한 Task의 여러 retry는 한 Task 행과 여러 Dispatch 행으로 남았고, Gate/blocked Task와 question/escalation/Task가 같은 원인을 겹쳐 표현했다. degraded 알림 경계는 실측 없는 제품 판단이다.
+
+### DL-043 · D1은 수동 등록 repository만 관찰한다
+
+- D1은 설정 파일에 수동 등록한 repository만 관찰한다(OD-068).
+- 자동 발견, Git remote 기반 자동 등록, 자동 발견된 다중 repository routing은 O1에 남긴다.
+- 근거: D1/O1 범위를 나눈 실측 없는 제품 판단이다.
+
+- 각 결정의 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-019, OD-050, OD-051, OD-067, OD-068, OD-069, OD-072 확정 기록에 있다.
+
+## 2026-08-23 · D2 Slack 계약 확정
+
+### DL-044 · Slack inbound는 Socket Mode와 세 겹 identity 검증을 쓴다
+
+- Socket Mode와 `@slack/socket-mode`를 채택한다. 연결 직전 URL 발급, hello App ID 확인, warning/refresh overlap, exponential backoff, ACK/업무 분리를 적용하며 reconnect backlog replay는 보장하지 않는다(OD-041).
+- 인증된 Socket에서 `team.id`와 exact `user.id`를 모두 검사하고 설정된 `api_app_id`도 대조한다. 실패 로그에는 token·payload 원문을 남기지 않고 HTTP signing secret 검증은 적용하지 않는다(OD-042).
+- 근거: Socket Mode는 현재 로컬 topology에서 공개 endpoint 없이 성립하고, 공식 문서는 3초 ACK·연결 교체 overlap·단절 구간 replay 비보장을 명시한다.
+
+### DL-045 · modal의 로컬 validation은 동기 errors로 돌려준다
+
+- 형식·필수값 오류는 3초 안에 `response_action=errors`로 ACK해 modal을 유지한다(OD-071).
+- 원격 Orca resolve는 ACK 전에 기다리지 않는다.
+- 근거: Slack의 view submission 계약은 input block ID별 errors를 ACK payload로 받으면 modal을 유지하고, 빈 ACK는 view를 닫는다.
+
+- 각 결정의 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-041, OD-042, OD-071 확정 기록에 있다.
+
+## 2026-08-23 · D3 계약 확정과 별도 Run 분리
+
+### DL-046 · Adapter는 named pipe client이고 Channel payload는 Gate ID뿐이다
+
+- daemon이 named pipe를 listen하고 session별 Adapter가 재시도 client로 연결한다(OD-052).
+- binding 자체를 인증하지 않는 대신 Channel payload를 `gate_id`로 제한하고 coordinator가 Orca에서 내용을 다시 읽는다. `CLAUDE_CODE_SESSION_ID`는 routing 식별자일 수 있지만 인증 근거가 아니다(OD-053).
+- 근거: Windows named pipe는 daemon 기동 순서 양쪽에서 동작했고, session ID는 env override와 fake hello 두 방향으로 위조됐다.
+
+### DL-047 · application receipt와 Orca 효과를 분리한다
+
+- transport write는 어떤 전달도 증명하지 않고 application receipt만 전달 신호로 쓴다(OD-054).
+- Orca 효과는 대상 Gate의 `pending`→`resolved` 전이다(OD-055).
+- 세션→daemon 반환은 실제 동작한 reply tool 왕복을 채택하되 이를 유일한 경로라고 규정하지 않는다(OD-059).
+- 근거: 다섯 실패 조건에서 notification write 성공과 receipt가 갈렸고, reply tool receipt와 Gate 상태는 각각 독립 조회됐다.
+
+### DL-048 · opt-in과 중복 처리는 probe와 Orca 상태로 판정한다
+
+- session opt-in은 startup dead window를 피한 daemon end-to-end probe만으로 판정한다. parent process command line parsing은 계약으로 채택하지 않는다(OD-058).
+- notification마다 `gate_id`로 Orca를 다시 읽고 이미 resolved이며 효과가 반영됐으면 no-op으로 처리한다. 별도 dedup 저장소는 두지 않는다(OD-057).
+- delivery는 `receipted`→`consumed` 두 단계로 두고 receipt는 backoff에만 쓰며, consumed 전 event는 재조회 대상으로 남긴다(OD-066).
+- 근거: argv/env/initialize는 flag 여부를 구분하지 못했고 startup dead window가 관측됐으며, 플랫폼은 중복을 제거하지 않고 receipt 직후 제거는 효과 전 crash 유실 창을 만들었다.
+
+### DL-049 · D3 구현은 별도 Run으로 분리한다
+
+- development flag가 유일한 배포 경로이고 매 세션 기동 확인이 필요하므로 D3 구현을 이번 Run에서 제외하고 별도 Run으로 산정한다(OD-056).
+- allowlist plugin 등재는 이번 결정에 포함하지 않는다.
+- 근거: Claude Code 2.1.241에서도 bare server의 `--channels` 등록은 거부됐고 development flag 확인은 기억되지 않았다. Channels는 research preview이며 2.1.238→2.1.241 사이에도 재검증이 필요했다.
+
+- 각 결정의 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-052~OD-059, OD-066 확정 기록에 있다.

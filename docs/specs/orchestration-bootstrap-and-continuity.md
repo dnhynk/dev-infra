@@ -108,7 +108,8 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 - coordinator도 사용자 제품 판단 없이는 결정할 수 없을 때만 해당 Task에 연결된 Orca Gate를 만든다.
 - Gate가 열린 뒤에는 그 결정에 의존하는 Task만 blocked/waiting 상태가 되고 독립 Task는 계속된다.
 - Bridge는 worker↔coordinator의 일반 ask/reply를 Slack에 중계하지 않고 사람용 open Gate만 `#agent-runs`에 투영한다.
-- ask/escalation과 생성된 Gate의 correlation 형식은 구현 전에 확정한다.
+- ask를 Gate로 승격할 때 Bridge는 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}` mapping을
+  durable하게 저장하고 이를 권위 correlation으로 쓴다. Gate question은 표시용이다(OD-019).
 
 ### 4.2 Agent 배치 정책
 
@@ -280,7 +281,8 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - trigger → checkpoint → successor 시작 → reconciliation → 권한 인수 → 작업 재개의 end-to-end 흐름이 재현된다.
 - predecessor가 fenced/반납됐다는 증거 없이 successor가 mutation하지 않는다.
 - successor 시작 실패, 알림 유실, 프로세스 재시작 뒤에도 handoff가 남고 안전하게 재시도할 수 있다.
-- D3이 설치된 환경에서는 successor Channel Adapter가 올바른 Run/session에 binding되고 session별 opt-in을 통과했음을 확인한다.
+- 별도 D3 Run에서 Adapter를 설치한 뒤에는 daemon의 end-to-end probe로 successor session의 opt-in을 확인하고,
+  `gate_id`만 받은 coordinator가 Orca를 다시 읽는지 확인한다(OD-053, OD-058).
 - 실제 자동 전환까지 검증되지 않았다면 B 해결 완료를 선언하지 않는다.
 
 모든 수용 테스트는 실행 명령과 출력을 남긴다. 실행하지 않은 테스트는 미검증으로 기록한다.
@@ -298,9 +300,7 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - 여러 Run이 같은 repository에 있을 때 선택 규칙
 - Run↔repository↔coordinator session identity
 - service tier를 supervised worker 경로에서 지정할 수단
-- ask/escalation↔Gate correlation
 - PR correlation metadata 형식
-- Fresh/Resume 시 Channel Adapter 자동 등록·session opt-in 검증 책임
 - handoff redaction과 transcript 포함 범위
 - 자동 rollover 실패의 알림 경로
 
