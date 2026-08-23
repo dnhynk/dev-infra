@@ -101,7 +101,9 @@ Worker ask/escalation
 - worker의 모든 질문이 Gate가 되는 것은 아니다.
 - 사람에게 올릴 Gate는 coordinator가 생성한다.
 - Bridge는 일반 ask/reply를 Slack에 표시하지 않고 open Gate만 관찰한다.
-- ask/escalation과 Gate의 correlation, Gate 생성 command/payload는 실제 Orca sample을 확인한 뒤 확정한다.
+- ask를 Gate로 승격할 때 Bridge는 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}` mapping을
+  durable하게 저장하고 권위 correlation으로 쓴다. Gate question 문자열은 표시용이다(OD-019).
+- escalation은 payload의 Task·Dispatch까지만 연결하고 별도 명시 mapping이 있을 때만 특정 ask/Gate에 귀속한다.
 
 Slack Gate 카드에는 다음 의미가 필요하다.
 
@@ -113,12 +115,9 @@ Slack Gate 카드에는 다음 의미가 필요하다.
 - 이 Gate에 의존해 대기하는 Task
 - 독립적으로 계속할 수 있는 Task
 
-현재 Orca Gate schema가 이 의미를 모두 직접 제공하는지는 검증되지 않았다. 부족한 정보가 있다면 다음 중 어떤 방식으로 표현할지 빌드 중 확정한다.
-
-- Gate 필드 확장
-- 구조화된 Gate metadata
-- Task/Run 상태에서 파생
-- Bridge가 표시 가능한 축소 UI
+Orca Gate의 `question`/`options`에는 사람이 읽는 짧은 요약만 둔다. 안정적 option ID, 설명,
+recommendation, impact는 Bridge sidecar에 저장해 Orca Gate ID와 연결하고 기계 판정에 사용한다.
+`--options`는 `string[]`만 받으므로 객체 배열이나 자유 텍스트 parsing에 의존하지 않는다(OD-050).
 
 Bridge가 coordinator의 장문 reasoning을 수집해 임의로 권장안이나 영향을 만들어내서는 안 된다.
 
@@ -135,7 +134,12 @@ Orca Run
   → GitHub repository
 ```
 
-Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator inbox다. Bridge가 Run 하나를 repository 하나에 제한할지, 여러 repository를 허용할지는 지원 정책으로 정해야 한다. 로컬 Orca 1.4.179 관측상 `run-list` row만으로 repository/worktree와 실제 coordinator liveness를 판정할 수 없다. global `worker-list`의 `runId`와 `resource.worktreeId`를 통해 일부 Run의 repository 후보를 복구할 수 있지만 historical/released worker도 포함되므로 liveness 증거는 아니며 worker가 없는 Run에는 적용되지 않는다. 따라서 다음이 TBD다.
+Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator inbox다. D1은 설정 파일에 수동 등록한
+repository만 관찰한다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된 다중 repository routing은 O1 범위다(OD-068).
+로컬 Orca 1.4.179 관측상 `run-list` row만으로 repository/worktree와 실제 coordinator liveness를 판정할 수 없다.
+global `worker-list`의 `runId`와 `resource.worktreeId`를 통해 일부 Run의 repository 후보를 복구할 수 있지만
+historical/released worker도 포함되므로 liveness 증거는 아니며 worker가 없는 Run에는 적용되지 않는다.
+수동 등록한 범위 안에서도 다음 session/liveness 항목은 TBD다.
 
 - live terminal을 authoritative하게 판정하는 방법
 - coordinator 재시작 후 같은 Run과 새 session을 연결하는 방법
@@ -206,22 +210,19 @@ resolution은 C2 범위 밖이다(OD-032).
 
 ## 7. Run progress
 
-Run 카드의 `완료/전체` 진행률에 포함할 Task 집합이 필요하다.
-
-미결정 항목:
-
-- 동적으로 추가된 Task
-- cancelled/failed Task
-- retry된 Task
-- 한 Task의 여러 Dispatch
-- Gate에 blocked된 Task와 dependency waiting Task
-- 완료 뒤 다시 열린 Task
-
-숫자가 Orca source와 어떤 규칙으로 일치하는지 `OD-069`에서 확정하기 전에는 진행률을 “정확하다”고 주장하지 않는다.
+Run 카드는 `현재 Task 상태별 수 / 현재 task-list.count`와 Dispatch attempts를 분리한다. Task가 분모 단위이고
+실행 중 추가된 Task를 즉시 반영한다. retry Dispatch는 새 Task로 세지 않는다. 완료율·성공률 공식은 만들지
+않으며 Orca Task 상태에는 `cancelled`가 없다(OD-069).
 
 ### Blocker taxonomy
 
-`blocker`, `open Gate`, `blocked Task`, `waiting dependency`, `worker ask`, `CI failure`, `permission pause`는 같은 개념이 아니다. `#agent-runs`의 blocker 수에 무엇을 포함하고 각각을 어떻게 표시할지는 TBD다. 최소한 사람 결정용 open Gate와 그 Gate 때문에 대기하는 Task 수를 서로 다른 값으로 구분할 수 있어야 한다.
+`blocker`, `open Gate`, `blocked Task`, `waiting dependency`, `worker ask`, `CI failure`, interaction 대기는
+같은 개념이 아니다. 각 원천 수를 별도 badge로 표시하고 `taskId`·`dispatchId`·Gate ID·message ID를 함께
+노출한다. 고유 blocker 총합은 dedup 정책이 확정된 뒤에만 추가한다. `agentWait`는 interaction 대기로 표시하고
+provider별 근거가 더 있을 때만 permission 등으로 세분화한다(OD-067).
+
+degraded 상태는 카드에 항상 표시한다. owner 개입 없이는 진행되지 않는 Channel pending·미해결 Gate·correlation
+실패만 thread transition을 만들고, summarizer failure·source stale은 badge만 갱신한다(OD-072).
 
 ## 8. 중요한 transition과 중복 제거
 
@@ -244,6 +245,10 @@ Run/Gate 후보:
 - coordinator notification pending/attempted
 - dependent Task 재개 관찰
 - Run 완료
+
+Gate resolution write는 Gate별 durable lock 또는 CAS로 직렬화한다. 같은 논리 요청은 같은 retry request ID를
+재사용하고 `mutation.replayed`를 처리하며, resolve 전후 재조회와 durable outbox reconciliation으로 수렴시킨다.
+Orca 내부 transaction 원자성은 이 계약의 보장이 아니다(OD-051).
 
 같은 snapshot을 반복 관찰해도 동일 transition을 다시 만들지 않아야 한다. PR identity는
 `(repository databaseId, PR number)`, terminal latch는 `mergedAt`, review/check scope는 `headSha`다.

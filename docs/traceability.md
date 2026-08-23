@@ -35,29 +35,33 @@
 | repo+PR와 Slack message ts, PR↔Task N, Run/Task 상태를 durable store에 보관 | C1은 node:sqlite; C2 association·reconciliation 확정 (OD-043, OD-044, OD-046, OD-076) | [Durability](specs/orca-slack-bridge.md#9-durability와-멱등성), [PR projection 일관성](architecture/orca-slack-bridge.md#6-pr-projection의-일관성) |
 | Root=current, thread=중요 상태 변화 이력 | 확정 | [공통 UX](ux/slack-surfaces.md#1-공통-원칙) |
 | D: Orca Run 하나=Slack root 하나 | 확정 | [Run Observer](specs/orca-slack-bridge.md#6-d--run-observer), [Run UX](ux/slack-surfaces.md#3-agent-runs) |
-| Task/PR/blocker 현재 상태와 사람 개입 필요 여부 표시 | 확정 의미, 집계 TBD | [Run Observer](specs/orca-slack-bridge.md#61-기본-단위), [Run progress 계약](contracts/observation-and-correlation.md#7-run-progress) |
+| Task/PR/blocker 현재 상태와 사람 개입 필요 여부 표시 | current Task 상태/분모와 Dispatch attempts 분리, 원천별 blocker badge 확정 (OD-067, OD-069) | [Run Observer](specs/orca-slack-bridge.md#61-기본-단위), [Run progress 계약](contracts/observation-and-correlation.md#7-run-progress) |
 | Worker ask와 사람 결정용 Orca Gate를 구분 | 확정 운영 방향 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약), [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
 | Worker `ask`/coordinator `reply`, coordinator만 사람용 Gate 생성 | 확정 | [질문과 Gate](specs/orchestration-bootstrap-and-continuity.md#41-worker-질문과-사람용-gate), [Gate 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
-| Gate question/options/recommendation/reason/impact 표시 | 확정 의미, source fields TBD | [Gate 표시](specs/orca-slack-bridge.md#62-gate-표시), [Gate UX](ux/slack-surfaces.md#32-gate-결정-카드) |
-| 버튼 클릭 시 owner/open/duplicate 검증 후 `gate-resolve` | 확정 | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
+| Gate question/options/recommendation/reason/impact 표시 | 사람용 요약은 Gate, 기계 판정 metadata는 Gate ID 연결 sidecar (OD-050) | [Gate 표시](specs/orca-slack-bridge.md#62-gate-표시), [Gate UX](ux/slack-surfaces.md#32-gate-결정-카드) |
+| ask/reply와 사람용 Gate correlation | sidecar의 message/thread/dispatch/task/gate mapping이 권위 (OD-019) | [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
+| 버튼 클릭 시 owner/open/duplicate 검증 후 `gate-resolve` | Gate별 직렬화·retry replay·전후 재조회·durable outbox 확정 (OD-051) | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
 | Slack 결정을 Claude prompt로 바로 보내지 않고 Orca Gate에 먼저 기록 | 확정 | [처리 순서](specs/orca-slack-bridge.md#72-처리-순서) |
-| 기존 로컬 coordinator를 Channel로 깨움 | 확정 목표, 현재 local E2E 미검증 | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter), [플랫폼 검증](platform-capabilities.md#33-channels-계약) |
+| 기존 로컬 coordinator를 Channel로 깨움 | 기본 E2E 재검증, 구현은 별도 D3 Run으로 분리 (OD-056) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter), [D3 로드맵](roadmap.md#9-bridge-slice-d3--channel-adapter와-재개-관찰) |
 | `@Claude`의 새 cloud session/clone과 기존 coordinator push를 구분 | 확정 | [플랫폼 비교](platform-capabilities.md#35-claude와의-차이) |
 | Standard Slack MCP는 외부→현재 session push 해결책이 아님 | 확정 일반 원리, 특정 plugin 명령 미검증 | [Channels 검증](platform-capabilities.md#33-channels-계약) |
-| Slack Socket Mode로 공개 endpoint 없이 개인 PC 연결 | 확정 방향, 최종 채택 TBD | [Socket Mode](platform-capabilities.md#socket-mode), [시스템 컨텍스트](architecture/orca-slack-bridge.md#1-시스템-컨텍스트) |
-| Gate resolve→durable storage→Channel wake-up | 확정 아키텍처 | [Gate 순서](architecture/orca-slack-bridge.md#4-gate-처리-순서와-crash-경계) |
-| daemon과 Channel Adapter 분리 | 목표 구조, 최초 분리 시점 TBD | [프로세스 경계](architecture/orca-slack-bridge.md#3-프로세스-경계) |
-| coordinator reply/status가 Adapter를 통해 daemon으로 돌아오는 경로 | 목표 구조, 계약 TBD | [Channel Adapter](architecture/orca-slack-bridge.md#channel-adapter), [OD-059](open-decisions.md#gate와-channel) |
-| Channel은 preview, 열린 session만 수신, 강한 처리 ACK 없음 | 확인된 제약 | [Channels 검증](platform-capabilities.md#33-channels-계약) |
-| custom Slack Channel 필요 | 확인된 방향, local smoke test 필요 | [Channels 검증](platform-capabilities.md#33-channels-계약) |
+| Slack Socket Mode로 공개 endpoint 없이 개인 PC 연결 | `@slack/socket-mode`, reconnect/ACK 계약 확정 (OD-041) | [시스템 컨텍스트](architecture/orca-slack-bridge.md#1-시스템-컨텍스트) |
+| Slack owner/workspace/App authorization | team+exact user+optional api_app_id, Socket signing secret 불필요 (OD-042) | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
+| Gate resolve→durable storage→Channel wake-up | 직렬화·retry replay·outbox reconciliation 확정 (OD-051) | [Gate 순서](architecture/orca-slack-bridge.md#4-gate-처리-순서와-crash-경계) |
+| daemon과 Channel Adapter 분리 | named pipe client 계약 확정, 구현은 별도 D3 Run (OD-052, OD-056) | [프로세스 경계](architecture/orca-slack-bridge.md#3-프로세스-경계) |
+| coordinator reply/status가 Adapter를 통해 daemon으로 돌아오는 경로 | reply tool을 관측된 반환 경로로 채택, 유일성은 규정하지 않음 (OD-059) | [Channel Adapter](architecture/orca-slack-bridge.md#channel-adapter) |
+| Channel delivery 단계 | transport write는 신호 아님, application receipt와 Gate pending→resolved 효과를 분리 (OD-054, OD-055) | [Delivery 상태](architecture/orca-slack-bridge.md#5-개념-delivery-상태) |
+| Channel opt-in·중복·재조회 | dead-window-safe probe, Orca-state no-op, receipted→consumed 경계 확정 (OD-057, OD-058, OD-066) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter) |
+| custom Channel 배포 | development flag만 가능하고 매 기동 확인 필요; 별도 D3 Run (OD-056) | [D3 로드맵](roadmap.md#9-bridge-slice-d3--channel-adapter와-재개-관찰) |
 | Gate가 있어도 독립 Task 계속 실행 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
-| Gate 선택지 button과 직접 입력 modal | 확정 초기 UI | [Gate UX](ux/slack-surfaces.md#32-gate-결정-카드), [Modal UX](ux/slack-surfaces.md#33-자유형-결정-modal) |
+| Gate 선택지 button과 직접 입력 modal | 로컬 validation은 3초 내 errors, 원격 Orca 작업은 post-ACK (OD-071) | [Gate UX](ux/slack-surfaces.md#32-gate-결정-카드), [Modal UX](ux/slack-surfaces.md#33-자유형-결정-modal) |
 | 일반 thread text는 coordinator로 전달하지 않음 | 확정 | [초기 허용 입력](specs/orca-slack-bridge.md#71-초기-허용-입력) |
 | `Slack USER_ID == OWNER_SLACK_USER_ID` 성격의 sender allowlist | 확정 | [Control Plane](specs/orca-slack-bridge.md#72-처리-순서), [공식 검증](platform-capabilities.md#block-kit과-interaction) |
 | merge·production DB·secret·force push·rollback 등 위험 action 제한 | 확정 초기 제외 | [보안 경계](specs/orca-slack-bridge.md#10-보안-경계) |
 | 고위험 action은 후속 이중 확인 | 후속 | [Slack UX 비허용](ux/slack-surfaces.md#7-초기-비허용-ui) |
 | Claude tool permission relay는 가능하지만 V1 비활성화 | 확정 후속 | [Channels 검증](platform-capabilities.md#33-channels-계약), [Out of Scope](specs/orca-slack-bridge.md#14-명시적-out-of-scope) |
-| 새 Run 자동 발견→Git remote→Slack thread | 최종 목표 | [최종 운영 UX](specs/orca-slack-bridge.md#12-전체-제품의-최종-운영-ux), [O1](roadmap.md#10-bridge-slice-o1--운영-자동화) |
+| 새 Run 자동 발견→Git remote→Slack thread | O1 범위; D1은 설정에 수동 등록한 repository만 관찰 (OD-068) | [최종 운영 UX](specs/orca-slack-bridge.md#12-전체-제품의-최종-운영-ux), [O1](roadmap.md#10-bridge-slice-o1--운영-자동화) |
+| degraded owner 알림 | 카드는 항상 표시, owner action 필수 상태만 thread 알림 (OD-072) | [Degraded UX](ux/slack-surfaces.md#6-error와-degraded-ux) |
 | Windows startup/systemd/PM2 등 상시 실행 | 최종 목표, 방식 TBD | [최종 운영 UX](specs/orca-slack-bridge.md#12-전체-제품의-최종-운영-ux) |
 | 하나의 workspace, 통합 `#github/#pr-digest/#agent-runs/#deploys/#prod-alerts` | 권장 목표, 최종 topology TBD | [제안된 Slack 구조](product-vision.md#5-제안된-slack-정보-구조), [OD-048](open-decisions.md#slack과-durable-store) |
 | 모든 메시지에 repository/project identity | 확정 | [공통 UX](ux/slack-surfaces.md#1-공통-원칙) |

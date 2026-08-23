@@ -4,7 +4,8 @@
 
 이 문서는 세부 기술을 미리 고정하지 않고, 각 단계에서 실제 Orca·Claude Code·Slack·GitHub 계약을 관측한 뒤 작업 크기를 산정하고 쪼개기 위한 순서를 정의한다.
 
-아래 S0/C1/C2/D1/D2/D3 이름과 경계는 확정 구현 계획이 아니다. Bridge 사전 Size Gate 결과를 보고 사용자가 합의한 뒤 유지·병합·재분할한다.
+아래 S0/C1/C2/D1/D2 이름과 경계는 Bridge 사전 Size Gate 결과에 따라 유지·병합·재분할할 수 있다.
+D3는 배포 경로 제약과 research preview 변동성 때문에 이번 Run에서 분리해 별도 Run으로 산정하기로 확정했다(OD-056, DL-049).
 
 ## 1. 공통 진행 규칙
 
@@ -147,6 +148,9 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 - 수동으로 등록한 여러 repository/Run identity 표시
 - 현재 owner 개입 필요 여부
 
+D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견·Git remote 기반 자동 등록·자동 발견된
+다중 repository routing은 O1 범위다(OD-068).
+
 출구 조건:
 
 - Slack 표시가 확정된 Orca 집계 규칙과 일치함
@@ -173,6 +177,16 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 
 ## 9. Bridge Slice D3 · Channel Adapter와 재개 관찰
 
+**이번 Run 범위 밖이다.** D3 구현은 별도 Run에서 다시 size를 산정하고 착수한다(OD-056, DL-049).
+
+분리 근거:
+
+- Claude Code 2.1.241에서도 bare MCP server는 `--channels`에 등록되지 않고 development flag가 유일한 동작 경로다.
+- development flag는 매 세션 기동마다 기억되지 않는 확인 대화상자를 요구하므로 무인 운영 조건을 설계로 흡수할 수 없다.
+- Channels는 research preview이고 flag syntax와 protocol contract가 바뀔 수 있다. 2.1.238에서 2.1.241로
+  올라간 뒤에도 계약 재검증이 필요했으므로 별도 Run 착수 직전에 다시 검증한다.
+- allowlist plugin 등재는 이번 분리 결정에 포함하지 않는다.
+
 범위:
 
 - daemon↔Channel Adapter localhost 계약
@@ -190,9 +204,9 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 - 재연결 뒤 pending event를 다시 시도할 수 있음
 - transport write와 coordinator 처리 완료를 구분함
 - 실제 Orca 변화가 관찰된 뒤에만 Slack에 재개를 표시함
-- Fresh/Resume coordinator가 올바른 Adapter를 활성화했고 pending Gate를 재조회함
+- Fresh/Resume coordinator session의 opt-in이 end-to-end probe로 확인되고 pending Gate를 재조회함
 
-Claude Channels가 research preview이므로 이 slice는 구현 직전 로컬 smoke test를 다시 통과해야 한다.
+별도 D3 Run은 구현 직전 대상 Claude Code 버전의 배포 경로와 로컬 smoke test를 다시 통과해야 한다.
 
 ## 10. Bridge Slice O1 · 운영 자동화
 
@@ -203,6 +217,8 @@ Claude Channels가 research preview이므로 이 slice는 구현 직전 로컬 s
 - Git remote 기반 repository 자동 등록
 - 자동 발견된 다중 repository routing
 - health/status/log와 pending delivery 관측
+
+OD-068로 위 자동 발견·Git remote 기반 등록·자동 발견된 다중 repository routing이 D1이 아니라 O1 범위임을 확인했다.
 
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
