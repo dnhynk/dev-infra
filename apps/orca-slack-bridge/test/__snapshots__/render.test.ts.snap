@@ -18,6 +18,7 @@ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
 reviewer_result가 관찰되지 않았다
 ---
 *CI*
+required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
 • typecheck: SUCCESS
 ---
 *worker 보고*
@@ -49,6 +50,7 @@ reviewer가 본 commit이 현재 head와 다르다
 낮음 (reviewer findings severity 기준)
 ---
 *CI*
+required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
 • typecheck: SUCCESS
 ---
 *worker 보고*
@@ -84,6 +86,7 @@ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
 높음 (reviewer findings severity 기준)
 ---
 *CI*
+required check: 아직 결론 나지 않은 것이 있다
 • typecheck: SUCCESS
 • test: IN_PROGRESS
 ---
@@ -111,6 +114,7 @@ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
 reviewer_result가 관찰되지 않았다
 ---
 *CI*
+required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
 • typecheck: SUCCESS
 ---
 *worker 보고*
@@ -135,6 +139,7 @@ exports[`renderCard > 스냅샷: 요약 실패 1`] = `
 reviewer_result가 관찰되지 않았다
 ---
 *CI*
+required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
 • typecheck: SUCCESS
 ---
 *worker 보고*

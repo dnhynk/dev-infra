@@ -63,21 +63,56 @@ export type CorrelatedOrigin = Extract<Correlation, { readonly kind: 'correlated
 export type PrTerminal = 'open' | 'closed' | 'merged';
 
 /**
- * mergePolicy 축.
+ * mergePolicy 축 — **required check 축 하나**다.
  *
- * **자리만 있고 아직 값이 없다.** merge-ready는 base branch의 effective required rule과 current
- * head rollup을 조인해 `missing | pending | failing | passing`을 파생하고, optional check 실패는
- * merge를 막지 않는다(OD-032). 그 조인은 C2-2가 채운다.
+ * base branch의 effective required rule(`PullRequestFacts.requiredRules`)과 current head rollup을
+ * 조인한 결과(`PullRequestFacts.requiredChecks`)를 축 값 하나로 접는다. 파생은
+ * `digest/state.ts`의 `deriveMergePolicy` 하나만 하고 접는 규칙도 거기 있다.
  *
- * 여기서 추측으로 채우지 않는다. 실측에서 required 여부는 rollup row가 아니라 base protection에
- * 있었고, 미보고 required context는 rollup에도 `gh pr checks --required`에도 나타나지 않았다.
- * 그래서 지금 가진 `checks` 축만으로는 이 축의 값을 만들 수 없다.
+ * **"merge 가능 여부"의 최종 답이 아니다.** merge queue·required reviews·up-to-date(strict)·
+ * conversation resolution은 C2 범위 밖이고(OD-032) 이 축은 그것들을 보지 않는다. 이 축이 막지
+ * 않는다는 것은 required check가 막지 않는다는 뜻이지 병합해도 된다는 뜻이 아니다.
  *
- * merge queue·required reviews·up-to-date(strict)·conversation resolution은 C2 범위 밖이다.
+ * optional check 실패는 merge를 막지 않으므로(OD-032, T1이 optional failure 상태의 실제 merge
+ * 200으로 재현) 집계는 `requiredChecks`만 쓰고 `checks` 축 전체를 쓰지 않는다.
  */
 export type MergePolicy =
-  /** base branch의 required rule을 아직 조회하지 않았다. C2-2 전에는 항상 이 값이다. */
-  'unobserved';
+  /**
+   * base branch에 required rule이 하나도 없다. degraded가 아니라 정상이며 이 축이 merge를
+   * 막지 않는다. `rules_unreadable`과 다르다 — 저쪽은 rule 집합 자체를 모른다.
+   */
+  | 'no_required_rules'
+  /**
+   * base branch의 required rule을 읽지 못했다. 판정 불가이며 degraded다.
+   *
+   * `BranchRequiredRules`의 두 source 중 하나라도 `forbidden`(403)이면 여기다. rule 집합이
+   * 불완전하므로 관측된 context가 전부 통과해도 충족을 단정할 수 없다.
+   */
+  | 'rules_unreadable'
+  /**
+   * required context 전부가 `passing`이다. `docs/contracts/observation-and-correlation.md`
+   * §6의 `CI 통과`·`병합 준비 완료`가 이 값이다 — §6은 `Merge Ready`를 required check만으로
+   * 판정하는 derived state로 정의했다. 나머지 merge 조건은 여전히 판정되지 않았으므로 카드는
+   * 그 범위를 함께 표시한다(`digest/render.ts`).
+   */
+  | 'passing'
+  /** required context 하나 이상이 아직 결론 나지 않았다. */
+  | 'pending'
+  /** required context 하나 이상이 실패했다. */
+  | 'failing'
+  /**
+   * required context 하나 이상이 current head rollup에 아예 없다. 실측에서 이 상태의 merge는
+   * `405 Required status check "…" is expected`로 거절됐다(OD-032).
+   */
+  | 'missing'
+  /**
+   * required context 하나 이상이 판정 불가다. 동명 row는 있으나 보고 주체를 관측할 수 없어
+   * 충족도 불충족도 단정할 수 없다(`github/required-checks.ts`의 `RequiredCheckState`).
+   *
+   * `missing`과 구분한다. 접으면 한쪽은 실측된 false positive(PAT가 만든 동명 status, merge
+   * 405)를 통과로, 다른 쪽은 Expected-App의 정상 보고를 미보고로 그린다.
+   */
+  | 'indeterminate';
 
 /**
  * reviewer가 본 commit과 현재 head의 관계.
@@ -265,7 +300,7 @@ export type ProjectedPr = {
   readonly review: ReviewerResult | null;
   /** checks 축. head commit의 check 결론이다. 집계도 required 판정도 하지 않는다(OD-032). */
   readonly checks: readonly CheckFact[];
-  /** mergePolicy 축. C2-2가 required rule 조인으로 채울 때까지 `unobserved`다. */
+  /** mergePolicy 축. required rule 조인을 접은 값이며 required check만 본다(OD-032). */
   readonly mergePolicy: MergePolicy;
   /** 없으면 null(OD-070). */
   readonly workerReport: WorkerReport | null;

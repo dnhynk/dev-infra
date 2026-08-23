@@ -204,9 +204,42 @@ canonical PR state는 terminal `open | closed | merged`와 직교 축 `draft`, `
 | 병합 완료 | `mergedAt != null` |
 
 `Merge Ready`는 GitHub 단일 필드가 아니라 required check만으로 판정하는 derived state다. base branch의
-effective required rule과 current head rollup을 조인해 `missing | pending | failing | passing`을 파생한다.
-optional check 실패는 merge를 막지 않는다. merge queue, required reviews, up-to-date(strict), conversation
-resolution은 C2 범위 밖이다(OD-032).
+effective required rule과 current head rollup을 조인해 `mergePolicy` 축 하나를 만든다. optional check
+실패는 merge를 막지 않는다(OD-032).
+
+**이 축은 required check 축 하나이지 merge 가능 여부의 최종 답이 아니다.** merge queue, required reviews,
+up-to-date(strict), conversation resolution은 C2 범위 밖이고 이 축이 판정하지 않는다(OD-032). 축이 막지
+않는다는 것은 required check가 막지 않는다는 뜻이다.
+
+축 값은 성격이 다른 두 갈래에서 온다.
+
+**조인 결과** — rule을 읽었고 required context가 하나 이상일 때, context별 상태 중 가장 무거운 것이다.
+
+| 값 | 뜻 |
+|---|---|
+| `failing` | required context 하나 이상이 실패했다 |
+| `missing` | required context 하나 이상이 current head rollup에 아예 없다. 이 상태의 merge는 405로 거절된다 |
+| `indeterminate` | 동명 row는 있으나 보고 주체를 관측할 수 없어 충족도 불충족도 단정할 수 없다 |
+| `pending` | required context 하나 이상이 아직 결론 나지 않았다 |
+| `passing` | required context 전부가 충족됐다. `CI 통과`·`병합 준비 완료`가 이 값이다 |
+
+`indeterminate`를 어느 쪽으로도 접지 않는다. `passing`으로 접으면 실측된 false positive(PAT가 만든 동명
+status에도 merge는 405였다)를 통과로 그리고, `missing`으로 접으면 Expected-App의 정상 보고가 false
+negative가 된다. commit status에는 app을 식별할 field가 GraphQL에 없다는 것이 그 관측의 근거다.
+
+**rule source의 상태** — 조인 결과가 아니라 base branch 정책을 읽은 결과다. 위 다섯 값을 만들 전제가
+서지 않는 두 경우이며 조인 결과보다 앞선다.
+
+| 값 | 뜻 |
+|---|---|
+| `no_required_rules` | required rule이 하나도 없다. degraded가 아니라 정상이고 이 축이 merge를 막지 않는다. 통과한 check가 없으므로 `CI 통과`도 `병합 준비 완료`도 아니다 |
+| `rules_unreadable` | 정책 조회가 403이었다. rule 집합 자체를 모르므로 관측된 context가 전부 통과해도 충족을 단정할 수 없다. degraded다 |
+
+404는 `rules_unreadable`이 아니다. GitHub이 미보호와 권한 부족에 같은 404를 주어 구분할 사실이 없다.
+
+이 축은 headline 한 줄로 접히지 않는다. headline은 PR 전체에 대한 한 줄이므로 거기에 `병합 준비 완료`를
+두면 판정하지 않은 다른 merge 조건까지 충족했다는 읽기를 준다. 카드는 축을 자기 자리에서 표시하고 판정하지
+않은 조건을 같은 자리에서 밝힌다.
 
 ## 7. Run progress
 

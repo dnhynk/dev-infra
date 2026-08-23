@@ -8,6 +8,7 @@ import {
 import { deriveDigestStatus } from '../src/digest/state.js';
 import type {
   DigestStatus,
+  MergePolicy,
   ProjectedPr,
   RenderInput,
   ReviewedHeadMatch,
@@ -38,7 +39,7 @@ const basePr: ProjectedPr = {
   isDraft: false,
   review: null,
   checks: [{ kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }],
-  mergePolicy: 'unobserved',
+  mergePolicy: 'passing',
   workerReport: {
     outcome: 'succeeded',
     body: 'renderer를 구현했다. layout이 코드에만 있음을 확인했다. 게시는 T5가 남았다.',
@@ -154,6 +155,8 @@ const cases: Readonly<Record<string, RenderInput>> = {
         { kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS', state: null },
         { kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'test', status: 'IN_PROGRESS', conclusion: null, state: null },
       ],
+      // 진행 중인 required check가 있는 상태. 스냅샷이 축의 두 번째 값도 덮는다.
+      mergePolicy: 'pending',
     },
     summary: {
       ...okSummary,
@@ -391,21 +394,107 @@ describe('renderCard · 의미 요구', () => {
     expect(contains(card, PR_URL)).toBe(true);
   });
 
-  it('review_approved가 병합 준비 완료를 주장하지 않는다', () => {
+  it('mergePolicy 축을 카드가 표시한다', () => {
+    // 축이 카드에 닿지 않으면 required rule 조인이 출력에 아무 효과가 없다(OD-032).
+    const lines: Readonly<Record<MergePolicy, string>> = {
+      passing: 'required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다',
+      pending: 'required check: 아직 결론 나지 않은 것이 있다',
+      failing: 'required check: 실패한 것이 있다',
+      missing: 'required check: 보고되지 않은 required context가 있다',
+      indeterminate: 'required check: 보고 주체를 관측할 수 없어 충족을 판정할 수 없다',
+      no_required_rules: 'required check: base branch에 required rule이 없다 — 통과할 CI가 지정되지 않았다',
+      rules_unreadable: 'required check: base branch의 required rule을 읽지 못해 판정할 수 없다',
+    };
+    for (const [mergePolicy, line] of Object.entries(lines)) {
+      const card = renderCard({
+        pr: { ...basePr, mergePolicy: mergePolicy as MergePolicy },
+        summary: okSummary,
+      });
+      expect(contains(card, line)).toBe(true);
+    }
+  });
+
+  it('일곱 축 값이 서로 다른 카드를 만든다', () => {
+    // 두 값을 같은 문구로 합치면 여기서 깨진다. 특히 missing↔indeterminate와
+    // passing↔no_required_rules는 서로 다른 사실이다(OD-032, required-checks.ts).
+    const all: readonly MergePolicy[] = [
+      'passing',
+      'pending',
+      'failing',
+      'missing',
+      'indeterminate',
+      'no_required_rules',
+      'rules_unreadable',
+    ];
+    const fingerprints = all.map((mergePolicy) =>
+      renderFingerprint(renderCard({ pr: { ...basePr, mergePolicy }, summary: okSummary })),
+    );
+    expect(new Set(fingerprints).size).toBe(all.length);
+  });
+
+  it('병합 준비 완료는 축이 passing일 때만 나오고 판정하지 않은 조건을 함께 밝힌다', () => {
+    // §6은 Merge Ready를 required check만으로 판정하는 derived state로 정의했다(OD-032).
+    // 그래서 문구는 나오되 같은 줄이 판정하지 않은 조건을 말해야 한다.
+    const card = renderCard({ pr: { ...basePr, mergePolicy: 'passing' }, summary: okSummary });
+    expect(contains(card, 'CI 통과이며 required check 기준 병합 준비 완료다')).toBe(true);
+    expect(
+      contains(card, 'merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다'),
+    ).toBe(true);
+    // headline은 여전히 review 축이다. 축을 headline으로 접지 않는다.
+    expect(withoutEmoji(card.text)).toContain(STATUS_TEXT_LABEL.awaiting_review);
+    expect(withoutEmoji(card.text)).not.toContain('병합 준비');
+  });
+
+  it('required rule이 0개면 CI 통과도 병합 준비 완료도 주장하지 않는다', () => {
+    // §6의 병합 준비 완료는 "required checks가 모두 passing"이다. 0개는 그것이 아니고
+    // 아무것도 돌지 않은 PR을 통과로 그리지 않는다.
+    const card = renderCard({ pr: { ...basePr, mergePolicy: 'no_required_rules' }, summary: okSummary });
+    const all = [card.text, JSON.stringify(card.blocks)].join('\n');
+    for (const claim of ['병합 준비', 'CI 통과', 'merge_ready', 'merge-ready', '병합 가능']) {
+      expect(all).not.toContain(claim);
+    }
+    expect(contains(card, '이 축은 merge를 막지 않는다')).toBe(true);
+  });
+
+  it('축 표시는 CI 절의 head 결속 문구 아래에 있다', () => {
+    // 축은 checks와 같은 commit의 사실이다. 절을 나누면 그 결속이 축에서 떨어진다.
+    const card = renderCard({
+      pr: { ...basePr, checksHeadSha: 'zzz9999', mergePolicy: 'failing' },
+      summary: okSummary,
+    });
+    const ci = sectionTexts(card).find((t) => t.startsWith('*CI*'));
+    expect(ci).toBeDefined();
+    expect(ci).toContain('check 관측은 현재 head가 아니라 commit zzz9999의 것이다');
+    expect(ci?.indexOf('required check: 실패한 것이 있다')).toBeGreaterThan(
+      ci?.indexOf('check 관측은 현재 head가 아니라') ?? -1,
+    );
+  });
+
+  it('review_approved만으로는 병합 준비 완료를 주장하지 않는다', () => {
     const approved = withReview('approve', 'same', basePr.headSha);
     expect(deriveDigestStatus(approved)).toBe('review_approved');
 
-    // CI가 실패해도 상태 라벨은 review verdict만 옮긴다. 둘을 결합한 판정은 C2다(OD-032).
-    for (const pr of [
-      approved,
-      { ...approved, checks: [{ kind: 'checkRun' as const, id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', state: null }] },
-      { ...approved, isDraft: true },
-    ]) {
-      const card = renderCard({ pr, summary: okSummary });
-      const all = [card.text, JSON.stringify(card.blocks)].join('\n');
-      expect(all).toContain(STATUS_TEXT_LABEL.review_approved);
-      for (const claim of ['병합 준비', 'merge_ready', 'merge-ready', '병합 가능', '병합해도']) {
-        expect(all).not.toContain(claim);
+    // 병합 준비 완료는 review 축이 아니라 required check 축에서만 나온다(OD-032).
+    // 축이 passing이 아니면 approve여도, optional check가 실패해도 그 문구는 카드에 없다.
+    const optionalFailure = {
+      kind: 'checkRun' as const, id: 'CR_x', appId: null, startedAt: null, completedAt: null,
+      name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', state: null,
+    };
+    const notPassing = [
+      'pending', 'failing', 'missing', 'indeterminate', 'no_required_rules', 'rules_unreadable',
+    ] as const;
+    for (const mergePolicy of notPassing) {
+      for (const pr of [
+        { ...approved, mergePolicy },
+        { ...approved, mergePolicy, checks: [optionalFailure] },
+        { ...approved, mergePolicy, isDraft: true },
+      ]) {
+        const card = renderCard({ pr, summary: okSummary });
+        const all = [card.text, JSON.stringify(card.blocks)].join('\n');
+        expect(all).toContain(STATUS_TEXT_LABEL.review_approved);
+        for (const claim of ['병합 준비', 'merge_ready', 'merge-ready', '병합 가능', '병합해도']) {
+          expect(all).not.toContain(claim);
+        }
       }
     }
   });
