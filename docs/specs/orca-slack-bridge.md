@@ -108,8 +108,14 @@ canonical PR state는 terminal `open | closed | merged`와 직교 축 `draft`, `
 재리뷰를 강제하지 않고 GitHub repository의 stale-review 설정도 따라가지 않는다.
 
 merge-ready는 required check만으로 판정한다. base branch의 effective required rule과 current head rollup을
-조인해 `missing | pending | failing | passing`을 파생하며 optional check 실패는 merge를 막지 않는다.
-merge queue, required reviews, up-to-date(strict), conversation resolution은 C2 범위 밖이다(OD-030~032).
+조인해 `mergePolicy` 축 하나를 만들며 optional check 실패는 merge를 막지 않는다. 조인 결과는 context별 상태
+중 가장 무거운 `failing | missing | indeterminate | pending | passing` 다섯이고, rule source의 상태인
+`no_required_rules`(정상이며 이 축이 merge를 막지 않지만 `병합 준비 완료`도 아니다)와
+`rules_unreadable`(degraded)이 조인 결과보다 앞선다. 값별 뜻과 `indeterminate`를 어느 쪽으로도 접지 않는
+근거는 [관찰·상관관계 계약](../contracts/observation-and-correlation.md) §6과 DL-051에 있다.
+
+이 축은 required check 축 하나이지 merge 가능 여부의 최종 답이 아니다. merge queue, required reviews,
+up-to-date(strict), conversation resolution은 C2 범위 밖이고 이 축이 판정하지 않는다(OD-030~032).
 
 ### 5.2 입력 사실
 
