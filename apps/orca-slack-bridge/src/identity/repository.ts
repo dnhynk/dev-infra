@@ -23,3 +23,17 @@ export function repositoryIdentity(githubId: number, nameWithOwner: string): Rep
 export function sameRepository(a: RepositoryIdentity, b: RepositoryIdentity): boolean {
   return a.githubId === b.githubId;
 }
+
+/**
+ * GraphQL 질의의 `$owner`/`$name` 변수로 쓸 두 조각.
+ *
+ * GraphQL은 `nameWithOwner` 통짜 주소를 받지 않으므로 여기서 한 번 가른다. 형태가 어긋난
+ * 이름으로 질의하면 GitHub이 "repository 없음"으로 답해 원인이 숨으므로 조회 전에 던진다.
+ */
+export function ownerAndName(repo: RepositoryIdentity): { owner: string; name: string } {
+  const slash = repo.nameWithOwner.indexOf('/');
+  if (slash <= 0 || slash === repo.nameWithOwner.length - 1) {
+    throw new TypeError(`GraphQL 조회에 쓸 owner/name을 읽을 수 없다: ${repo.nameWithOwner}`);
+  }
+  return { owner: repo.nameWithOwner.slice(0, slash), name: repo.nameWithOwner.slice(slash + 1) };
+}

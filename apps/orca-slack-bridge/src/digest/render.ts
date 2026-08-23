@@ -162,7 +162,8 @@ function findingLine(f: FindingFacts): string {
 
 function checkLine(c: CheckFact): string {
   // 집계하지 않고 required/optional을 판정하지도 않는다(OD-032). 결론을 그대로 옮긴다.
-  const conclusion = c.conclusion ?? (c.status !== '' ? c.status : 'unknown');
+  // StatusContext row에는 conclusion도 status도 없고 state만 있다.
+  const conclusion = c.conclusion ?? c.state ?? (c.status !== '' ? c.status : 'unknown');
   return `• ${esc(c.name === '' ? '(이름 없음)' : c.name)}: ${esc(conclusion)}`;
 }
 
@@ -241,9 +242,17 @@ export function renderCard(input: RenderInput): RenderedCard {
     );
   }
 
-  blocks.push(
-    labelled('CI', pr.checks.length === 0 ? ['관찰된 check 없음'] : pr.checks.map(checkLine)),
-  );
+  const ci: string[] = [];
+  if (pr.checksHeadSha !== pr.headSha) {
+    // 사실 진술이다. 조회 계층의 bounded 재관측(OD-044) 뒤에도 남은 불일치이며, 이 줄 없이
+    // check를 나열하면 다른 commit의 결론이 현재 head의 것으로 읽힌다.
+    ci.push(
+      `check 관측은 현재 head가 아니라 commit ${esc(pr.checksHeadSha.slice(0, 7))}의 것이다` +
+        ` (현재 head ${esc(pr.headSha.slice(0, 7))})`,
+    );
+  }
+  ci.push(...(pr.checks.length === 0 ? ['관찰된 check 없음'] : pr.checks.map(checkLine)));
+  blocks.push(labelled('CI', ci));
 
   const worker: string[] = [];
   if (pr.workerReport === null) {

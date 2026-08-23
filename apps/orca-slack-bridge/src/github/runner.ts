@@ -51,3 +51,18 @@ export async function ghJson<T>(runner: GhRunner, args: readonly string[]): Prom
     throw new SyntaxError(`gh ${args.join(' ')} 출력이 JSON이 아니다: ${out.slice(0, 200)}`);
   }
 }
+
+/**
+ * `gh api` 실패에서 HTTP status를 뽑는다.
+ *
+ * `gh api`는 실패해도 응답 body를 stdout에 쓰고 stderr에는 `gh: <message> (HTTP <code>)`만 남긴다.
+ * `GhCommandError`가 stdout을 보존하지 않으므로 status는 이 stderr 형식에서 읽는다.
+ *
+ * 실측(2026-08-23): `gh api repos/cli/cli/branches/trunk/protection/required_status_checks`가
+ * exit 1, stderr `gh: Not Found (HTTP 404)`였다.
+ */
+export function httpStatusOf(e: unknown): number | null {
+  if (!(e instanceof GhCommandError)) return null;
+  const m = /\(HTTP (\d{3})\)/.exec(e.stderr);
+  return m === null ? null : Number(m[1]);
+}

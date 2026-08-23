@@ -208,6 +208,7 @@ export function projectPullRequest(
       title: pr.title,
       url: pr.url,
       headSha,
+      checksHeadSha: pr.checksHeadOid,
       // terminal 축. `mergedAt` latch가 `state` 문자열을 이긴다(`digest/state.ts`).
       terminal: deriveTerminal(pr.state, pr.mergedAt),
       isDraft: pr.isDraft,

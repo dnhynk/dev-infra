@@ -249,6 +249,14 @@ export type ProjectedPr = {
    * 관찰한 check 결론과 reviewer_result가 어느 commit의 사실인지 고정한다.
    */
   readonly headSha: string;
+  /**
+   * `checks`를 매단 commit sha. `PullRequestFacts.checksHeadOid`에서 온다.
+   *
+   * `headSha`와 다르면 checks는 현재 head의 사실이 아니다(OD-044). 조회 계층이 bounded
+   * 재관측으로 수렴을 시도한 뒤에도 남은 불일치이므로, renderer는 CI 절에 이 사실을 표시한다.
+   * 두 값을 접으면 stale check가 current로 보인다 — `PullRequestFacts.checksHeadOid`와 같은 근거다.
+   */
+  readonly checksHeadSha: string;
   /** terminal 축. `mergedAt` latch가 `state` 문자열을 이긴다(`digest/state.ts`). */
   readonly terminal: PrTerminal;
   /** draft 축. draft PR에 리뷰 결과가 없는 것은 정상이므로 카드가 그 이유를 표시할 수 있어야 한다. */

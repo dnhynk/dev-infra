@@ -4,15 +4,31 @@ import {
   deriveTerminal,
   reconcileTerminal,
 } from '../src/digest/state.js';
+import type { CheckFact } from '../src/github/pull-request.js';
 import type { PrAxes, PrTerminal } from '../src/digest/types.js';
 
 const MERGED_AT = '2026-08-23T05:10:18Z';
+
+/** check row 하나. 이 파일은 축 판정만 보므로 조인용 필드는 비워 둔다. */
+function check(name: string, conclusion: string): CheckFact {
+  return {
+    kind: 'checkRun',
+    id: `CR_${name}_${conclusion}`,
+    name,
+    status: 'COMPLETED',
+    conclusion,
+    state: null,
+    appId: null,
+    startedAt: null,
+    completedAt: null,
+  };
+}
 
 const axes: PrAxes = {
   terminal: 'open',
   isDraft: false,
   review: null,
-  checks: [{ name: 'required-ci', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+  checks: [check('required-ci', 'SUCCESS')],
   mergePolicy: 'unobserved',
 };
 
@@ -104,14 +120,14 @@ describe('deriveDigestStatus', () => {
 
   it('mergePolicy가 unobserved인 동안 merge-ready 계열 값을 만들지 않는다', () => {
     // required rule 조인은 C2-2다(OD-032). check가 전부 통과해도 headline은 review 축을 따른다.
-    const passing = [{ name: 'required-ci', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+    const passing = [check('required-ci', 'SUCCESS')];
     expect(deriveDigestStatus({ ...axes, checks: passing })).toBe('awaiting_review');
   });
 });
 
 describe('직교성 · draft·review·checks가 서로를 가리지 않는다', () => {
   const review = { verdict: 'request_changes' } as const;
-  const failing = [{ name: 'required-ci', status: 'COMPLETED', conclusion: 'FAILURE' }];
+  const failing = [check('required-ci', 'FAILURE')];
 
   it('draft가 review 축을 가리지 않는다', () => {
     const drafted: PrAxes = { ...axes, isDraft: true, review };
