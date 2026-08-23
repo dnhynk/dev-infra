@@ -252,6 +252,7 @@ describe('joinRequiredChecks', () => {
       state: 'missing',
       observed: null,
       unmatchedByApp: [],
+      unattributed: [],
     });
   });
 
@@ -273,6 +274,7 @@ describe('joinRequiredChecks', () => {
     expect(ci?.appId).toBeNull();
     expect(ci?.state).toBe('passing');
     expect(ci?.unmatchedByApp).toEqual([]);
+    expect(ci?.unattributed).toEqual([]);
   });
 
   it('app-bound rule은 그 app이 보고한 row만 충족시킨다', () => {
@@ -294,14 +296,50 @@ describe('joinRequiredChecks', () => {
     expect(ci?.state).toBe('missing');
     expect(ci?.observed).toBeNull();
     expect(ci?.unmatchedByApp).toEqual([other]);
+    expect(ci?.unattributed).toEqual([]);
   });
 
-  it('동명 commit status도 app-bound rule을 충족시키지 않는다', () => {
-    // commit status에는 app을 식별할 field가 없다. 확정할 수 없는 것을 통과로 올리지 않는다.
+  it('동명 commit status만 있는 app-bound rule은 충족도 불충족도 단정하지 않는다', () => {
+    // StatusContext에는 app을 식별할 field가 없다(rollup.ts introspection 실측). PAT가 만든
+    // 동명 status는 실측에서 merge 405였지만, Expected-App이 만든 status도 rollup에서는 똑같이
+    // 보인다. 이것을 missing으로 단정하면 app이 만든 status가 조용한 false negative가 되고,
+    // 충족으로 올리면 PAT status가 false positive다. 판정 불가로 남긴다.
     const row = statusRow('classic-appbound', 'SUCCESS');
     const [ci] = joinRequiredChecks(rules([{ context: 'classic-appbound', appId: 15368 }]), [row]);
-    expect(ci?.state).toBe('missing');
-    expect(ci?.unmatchedByApp).toEqual([row]);
+    expect(ci?.state).toBe('indeterminate');
+    expect(ci?.observed).toBeNull();
+    expect(ci?.unattributed).toEqual([row]);
+    expect(ci?.unmatchedByApp).toEqual([]);
+  });
+
+  it('checkSuite.app이 null인 check run도 주체 미상으로 남긴다', () => {
+    // appId null은 "다른 app"이 아니라 "주체를 관측하지 못했다"다(CheckFact.appId).
+    const row = checkRunRow('ci', 'SUCCESS', null);
+    const [ci] = joinRequiredChecks(rules([{ context: 'ci', appId: 15368 }]), [row]);
+    expect(ci?.state).toBe('indeterminate');
+    expect(ci?.unattributed).toEqual([row]);
+    expect(ci?.unmatchedByApp).toEqual([]);
+  });
+
+  it('다른 app의 row와 주체 미상 row가 함께 있으면 각각의 bucket에 남는다', () => {
+    const otherApp = checkRunRow('ci', 'SUCCESS', 99999);
+    const unattributed = statusRow('ci', 'SUCCESS');
+    const [ci] = joinRequiredChecks(
+      rules([{ context: 'ci', appId: 15368 }]),
+      [otherApp, unattributed],
+    );
+    expect(ci?.state).toBe('indeterminate');
+    expect(ci?.unmatchedByApp).toEqual([otherApp]);
+    expect(ci?.unattributed).toEqual([unattributed]);
+  });
+
+  it('기대한 app의 row가 있으면 주체 미상 row와 무관하게 그 row로 판정한다', () => {
+    const matched = checkRunRow('ci', 'SUCCESS', 15368);
+    const unattributed = statusRow('ci', 'FAILURE');
+    const [ci] = joinRequiredChecks(rules([{ context: 'ci', appId: 15368 }]), [matched, unattributed]);
+    expect(ci?.state).toBe('passing');
+    expect(ci?.observed).toEqual(matched);
+    expect(ci?.unattributed).toEqual([unattributed]);
   });
 
   it('app-bound rule과 바인딩 없는 rule이 같은 이름이면 각각 판정한다', () => {

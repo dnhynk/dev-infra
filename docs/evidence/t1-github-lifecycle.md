@@ -600,6 +600,21 @@ gh api --include --method PUT repos/$repo/pulls/1/merge -f merge_method=squash -
 gh api --method PATCH repos/$repo -F archived=true --jq '{full_name,archived,html_url}'
 ```
 
+위 block을 기계 추출해 실행하는 명령이다(repo 최상위에서). 줄 번호가 아니라 절 제목과 첫
+`powershell` fence를 기준으로 추출하므로 문서의 다른 부분이 바뀌어도 범위가 어긋나지 않고,
+첫 줄 검사가 어긋난 추출을 실행 전에 막는다. 추출 결과는 fence 안쪽 전체이며 마지막 줄이
+repository를 archive한다.
+
+```powershell
+$md = Get-Content docs/evidence/t1-github-lifecycle.md
+$section = [array]::IndexOf($md, '### [추가 관측] ruleset·app 바인딩·rules pagination (2026-08-23, C2-2 구현 중)')
+$open = [array]::IndexOf($md, '``' + '`powershell', $section)
+$close = [array]::IndexOf($md, '``' + '`', $open + 1)
+if ($md[$open + 1] -cne '$ErrorActionPreference = ''Stop''') { throw "추출 범위가 어긋났다: $($md[$open + 1])" }
+$md[($open + 1)..($close - 1)] | Set-Content harness.ps1
+pwsh -NoProfile -File harness.ps1
+```
+
 [관측] 아래 두 명령은 위 절차와 독립이고 공개 repository만 읽는다. 같은 시각 두 정책 API의 권한
 경계를 대조한다.
 

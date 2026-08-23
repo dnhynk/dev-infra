@@ -396,9 +396,24 @@ describe('ProjectedPr 조립', () => {
     expect(p.pr.number).toBe(1);
     expect(p.pr.url).toBe('https://github.com/dnhynk/dev-infra/pull/1');
     expect(p.pr.headSha).toBe('7e9479ebdebe35fc9956b65c0f851ff096c56130');
+    expect(p.pr.checksHeadSha).toBe('7e9479ebdebe35fc9956b65c0f851ff096c56130');
     expect(p.pr.terminal).toBe('open');
     expect(p.pr.checks).toEqual([{ kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }]);
     expect(p.pr.truncation).toEqual({ prBody: false, changedFiles: false });
+  });
+
+  it('checks가 매달린 commit을 head와 접지 않고 그대로 싣는다', async () => {
+    // 접으면 stale check가 current head의 사실로 보인다(OD-044). renderer가 이 값으로 표시한다.
+    const p = projectPullRequest(
+      REPO,
+      pr({ checksHeadOid: '8ea532ad63f3e8c25c20310180cac79a9a809b36' }),
+      CORRELATED,
+      await facts(),
+      CONFIG,
+    );
+    if (p.kind !== 'card') throw new Error('card가 아니다');
+    expect(p.pr.headSha).toBe('7e9479ebdebe35fc9956b65c0f851ff096c56130');
+    expect(p.pr.checksHeadSha).toBe('8ea532ad63f3e8c25c20310180cac79a9a809b36');
   });
 
   it('설정에 없는 repository는 project가 null이다 (OD-047)', async () => {

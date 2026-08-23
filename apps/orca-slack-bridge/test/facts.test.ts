@@ -56,6 +56,7 @@ function card(over: Partial<ProjectedPr> = {}): ProjectedPr {
     title: 'feat(c1): PR projection',
     url: 'https://github.com/dnhynk/dev-infra/pull/3',
     headSha: 'a7fc54af57ab755c6d0d9b8d5a02f45bd1bfe8a8',
+    checksHeadSha: 'a7fc54af57ab755c6d0d9b8d5a02f45bd1bfe8a8',
     terminal: 'open',
     isDraft: false,
     review: null,

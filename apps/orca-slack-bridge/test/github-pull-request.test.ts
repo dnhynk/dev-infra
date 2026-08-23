@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  fetchPullRequest,
-  listPullRequests,
-  observePullRequest,
-} from '../src/github/pull-request.js';
+import { listPullRequests, observePullRequest } from '../src/github/pull-request.js';
 import { fetchStatusCheckRollup } from '../src/github/rollup.js';
 import { GhCommandError, type GhRunner } from '../src/github/runner.js';
 import { repositoryIdentity } from '../src/identity/repository.js';
@@ -68,7 +64,7 @@ const ROLLUP_NODES: readonly unknown[] = [
   statusNode('SC_kwDOUBdGbs8AAAAMR1EFj3', 'classic-passing', 'SUCCESS', '2026-08-23T10:59:41Z'),
 ];
 
-/** rollup GraphQL 응답 한 page. */
+/** 첫 page 질의(`HEAD_ROLLUP_QUERY`)의 응답 한 장. PR 경유로 head commit을 함께 준다. */
 function rollupPage(
   commitOid: string,
   nodes: readonly unknown[],
@@ -99,6 +95,57 @@ function rollupPage(
   });
 }
 
+/** 이어읽기 질의(`PINNED_ROLLUP_QUERY`)의 응답 한 장. commit은 `object(oid:)`로 온다. */
+function pinnedPage(nodes: readonly unknown[], next: string | null = null): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        object: {
+          statusCheckRollup: {
+            contexts: {
+              pageInfo: { hasNextPage: next !== null, endCursor: next },
+              nodes,
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+/** review GraphQL 응답 한 page. node는 `gh --json reviews`의 row와 같은 모양이다. */
+function reviewsPage(count: number, offset: number, next: string | null = null): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        pullRequest: {
+          reviews: {
+            pageInfo: { hasNextPage: next !== null, endCursor: next },
+            nodes: Array.from({ length: count }, (_, i) => ({
+              id: `PRR_${offset + i}`,
+              state: 'COMMENTED',
+              commit: { oid: HEAD },
+              author: { login: 'reviewer' },
+              submittedAt: '2026-08-23T00:00:00Z',
+            })),
+          },
+        },
+      },
+    },
+  });
+}
+
+/** nested `reviews` row `count`개. 상한 fixture용이다. */
+function nestedReviews(count: number): readonly unknown[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `PRR_nested_${i}`,
+    state: 'COMMENTED',
+    commit: { oid: HEAD },
+    author: { login: 'reviewer' },
+    submittedAt: '2026-08-23T00:00:00Z',
+  }));
+}
+
 type Snapshot = { readonly row: Record<string, unknown>; readonly rollupOid: string };
 
 /**
@@ -106,14 +153,18 @@ type Snapshot = { readonly row: Record<string, unknown>; readonly rollupOid: str
  *
  * `snapshots`는 재조회할 때마다 순서대로 나오고 마지막 것이 이후에도 반복된다. PR row의 head와
  * rollup의 commit이 어긋난 응답을 만들 수 있어야 OD-044의 stale 조합을 재현할 수 있다.
+ * rollup 이어읽기(`object(oid:)`)와 review 전량 조회는 그것을 검증하는 테스트가 fixture를 직접
+ * 주고, 여기서는 `reviewsPages`가 없으면 예상치 못한 호출로 던진다.
  */
 class FakeGh implements GhRunner {
   readonly calls: string[][] = [];
   private views = 0;
   private rollups = 0;
+  private reviewsCalls = 0;
   constructor(
     private readonly snapshots: readonly Snapshot[],
     private readonly listRows: readonly unknown[] = [],
+    private readonly reviewsPages: readonly string[] = [],
   ) {}
 
   private snapshot(i: number): Snapshot {
@@ -130,9 +181,18 @@ class FakeGh implements GhRunner {
     }
     if (args[0] === 'api' && joined.includes('/rules/branches/')) return RULES_JSON;
     if (args[0] === 'api' && args[1] === 'graphql') {
-      const s = this.snapshot(this.rollups);
-      this.rollups += 1;
-      return rollupPage(s.rollupOid, ROLLUP_NODES);
+      if (joined.includes('statusCheckRollup') && !joined.includes('object(oid:')) {
+        const s = this.snapshot(this.rollups);
+        this.rollups += 1;
+        return rollupPage(s.rollupOid, ROLLUP_NODES);
+      }
+      if (joined.includes('reviews(first:100')) {
+        const page = this.reviewsPages[this.reviewsCalls];
+        if (page === undefined) throw new Error('예상치 못한 review 전량 조회: ' + joined);
+        this.reviewsCalls += 1;
+        return page;
+      }
+      throw new Error('예상치 못한 graphql 호출: ' + joined);
     }
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(this.listRows);
     if (args[0] === 'pr' && args[1] === 'view') {
@@ -148,6 +208,10 @@ class FakeGh implements GhRunner {
 function at(head: string, over: Record<string, unknown> = {}): Snapshot {
   return { row: prRow({ headRefOid: head, ...over }), rollupOid: head };
 }
+
+const sleep = async (): Promise<void> => {};
+const OLD = '8ea532ad63f3e8c25c20310180cac79a9a809b36';
+const NEW = '0fd0c73b04c17ec3be8958f60c517ba4af7db2cf';
 
 describe('fetchStatusCheckRollup', () => {
   it('StatusContext row의 id/context/state/createdAt을 잃지 않는다', async () => {
@@ -197,11 +261,13 @@ describe('fetchStatusCheckRollup', () => {
     ]);
   });
 
-  it('contexts가 여러 page면 cursor를 따라 끝까지 읽는다', async () => {
+  it('contexts가 여러 page면 첫 page에서 고정한 commit을 oid로 지정해 끝까지 읽는다', async () => {
     // 첫 page만 읽으면 뒤의 required가 요청 성공인 채로 사라지고 missing 판정에도 나타나지 않는다.
+    // 이어읽기가 PR의 head를 다시 고르면 page 사이에 head가 움직였을 때 서로 다른 commit의
+    // row가 한 결과에 섞인다. 그래서 이어읽기는 첫 page의 commit을 oid로 직접 지정해야 한다.
     const pages = [
       rollupPage(HEAD, [statusNode('SC_1', 'page1', 'SUCCESS', '2026-08-23T10:59:41Z')], 'Mg'),
-      rollupPage(HEAD, [statusNode('SC_2', 'page2', 'SUCCESS', '2026-08-23T10:59:42Z')]),
+      pinnedPage([statusNode('SC_2', 'page2', 'SUCCESS', '2026-08-23T10:59:42Z')]),
     ];
     const calls: string[][] = [];
     let i = 0;
@@ -215,9 +281,25 @@ describe('fetchStatusCheckRollup', () => {
     };
     const rollup = await fetchStatusCheckRollup(gh, REPO, 1);
     expect(rollup.pages).toBe(2);
+    expect(rollup.commitOid).toBe(HEAD);
     expect(rollup.checks.map((c) => c.name)).toEqual(['page1', 'page2']);
     expect(calls[0]?.join(' ')).not.toContain('cursor=');
-    expect(calls[1]?.join(' ')).toContain('cursor=Mg');
+    const second = calls[1]?.join(' ') ?? '';
+    expect(second).toContain('cursor=Mg');
+    expect(second).toContain(`oid=${HEAD}`);
+    // 이어읽기는 PR을 다시 보지 않는다. PR 번호로 head를 재선택하면 고정이 깨진다.
+    expect(second).not.toContain('number=');
+  });
+
+  it('고정한 commit을 이어읽지 못하면 던진다', async () => {
+    // 첫 page가 있다고 말한 rollup이 이어읽기에서 사라졌다면 응답이 모순이다. 빈 결과로 위장하지 않는다.
+    const pages = [
+      rollupPage(HEAD, [statusNode('SC_1', 'page1', 'SUCCESS', '2026-08-23T10:59:41Z')], 'Mg'),
+      JSON.stringify({ data: { repository: { object: null } } }),
+    ];
+    let i = 0;
+    const gh: GhRunner = { async run() { const p = pages[Math.min(i, pages.length - 1)]; i += 1; return p ?? ''; } };
+    await expect(fetchStatusCheckRollup(gh, REPO, 1)).rejects.toThrow(TypeError);
   });
 
   it('rollup이 없는 head는 빈 목록이고 던지지 않는다', async () => {
@@ -232,6 +314,51 @@ describe('fetchStatusCheckRollup', () => {
     expect(await fetchStatusCheckRollup(gh, REPO, 1)).toEqual({
       commitOid: HEAD, checks: [], pages: 1,
     });
+  });
+
+  it('repository가 null인 응답은 조회 실패다. 빈 checks로 바꾸지 않는다', async () => {
+    const gh: GhRunner = { async run() { return JSON.stringify({ data: { repository: null } }); } };
+    await expect(fetchStatusCheckRollup(gh, REPO, 1)).rejects.toThrow(/repository/);
+  });
+
+  it('pullRequest가 null인 응답은 조회 실패다', async () => {
+    const gh: GhRunner = {
+      async run() { return JSON.stringify({ data: { repository: { pullRequest: null } } }); },
+    };
+    await expect(fetchStatusCheckRollup(gh, REPO, 1)).rejects.toThrow(/pullRequest/);
+  });
+
+  it('head commit이 없는 응답은 조회 실패다', async () => {
+    const gh: GhRunner = {
+      async run() {
+        return JSON.stringify({ data: { repository: { pullRequest: { commits: { nodes: [] } } } } });
+      },
+    };
+    await expect(fetchStatusCheckRollup(gh, REPO, 1)).rejects.toThrow(/head commit/);
+  });
+
+  it('hasNextPage=true인데 endCursor가 없으면 던진다', async () => {
+    // 여기서 멈추고 반환하면 남은 page가 요청 성공인 채로 사라진다. 조용한 절단을 만들지 않는다.
+    const broken = JSON.stringify({
+      data: {
+        repository: {
+          pullRequest: {
+            commits: {
+              nodes: [{
+                commit: {
+                  oid: HEAD,
+                  statusCheckRollup: {
+                    contexts: { pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] },
+                  },
+                },
+              }],
+            },
+          },
+        },
+      },
+    });
+    const gh: GhRunner = { async run() { return broken; } };
+    await expect(fetchStatusCheckRollup(gh, REPO, 1)).rejects.toThrow(/endCursor/);
   });
 
   it('알 수 없는 rollup type은 이름을 지어내지 않는다', async () => {
@@ -289,6 +416,38 @@ describe('listPullRequests', () => {
     expect(gh.calls.filter((c) => c[0] === 'api' && c[1] !== 'graphql')).toHaveLength(4);
   });
 
+  it('PR row와 rollup의 head가 일치하면 재관측하지 않는다', async () => {
+    const gh = new FakeGh([at(HEAD)], [prRow()]);
+    await listPullRequests(gh, REPO);
+    expect(gh.calls.filter((c) => c[0] === 'pr' && c[1] === 'view')).toHaveLength(0);
+  });
+
+  it('PR row와 rollup의 head가 어긋나면 재관측해 한 head의 snapshot으로 수렴시킨다', async () => {
+    // 이 배선이 없으면 old head의 rollup이 current head의 checks로 실려 내려간다(OD-044).
+    // list 응답의 head는 NEW인데 첫 rollup은 OLD를 줬다 — T1 §OD-044의 stale 조합이다.
+    const gh = new FakeGh(
+      [{ row: prRow({ headRefOid: NEW }), rollupOid: OLD }, at(NEW)],
+      [prRow({ headRefOid: NEW })],
+    );
+    const [pr] = await listPullRequests(gh, REPO, 50, { sleep });
+    expect(pr?.headRefOid).toBe(NEW);
+    expect(pr?.checksHeadOid).toBe(NEW);
+    // 재관측이 실제로 일어났다. bulk 경로는 pr view를 쓰지 않으므로 이 호출이 그 증거다.
+    expect(gh.calls.filter((c) => c[0] === 'pr' && c[1] === 'view').length).toBeGreaterThan(0);
+  });
+
+  it('상한까지 재관측해도 어긋나면 두 head를 그대로 실어 숨기지 않는다', async () => {
+    // 접어 버리면 old head의 check가 current head의 사실로 보인다(OD-044). 던지지도 않는다 —
+    // 관측된 사실이고, projection과 renderer가 카드에 표시한다.
+    const gh = new FakeGh(
+      [{ row: prRow({ headRefOid: NEW }), rollupOid: OLD }],
+      [prRow({ headRefOid: NEW })],
+    );
+    const [pr] = await listPullRequests(gh, REPO, 50, { maxAttempts: 2, sleep });
+    expect(pr?.headRefOid).toBe(NEW);
+    expect(pr?.checksHeadOid).toBe(OLD);
+  });
+
   it('review를 개수가 아니라 건별 사실로 싣는다', async () => {
     // 2026-08-23 `gh pr view 14215 --repo cli/cli --json reviews` 응답 형태.
     const row = prRow({
@@ -323,35 +482,33 @@ describe('listPullRequests', () => {
       id: 'PRR_x', state: 'APPROVED', commit: null, author: null, submittedAt: null,
     });
   });
-});
 
-describe('fetchPullRequest', () => {
-  it('한 PR만 다시 읽고 같은 조인 결과를 만든다', async () => {
-    const gh = new FakeGh([at(HEAD)]);
-    const pr = await fetchPullRequest(gh, REPO, 1);
-    expect(pr.headRefOid).toBe(HEAD);
-    expect(pr.checksHeadOid).toBe(HEAD);
-    expect(pr.requiredChecks.find((r) => r.context === 'ruleset-missing')?.state).toBe('missing');
-    expect(gh.calls[0]).toEqual([
-      'pr', 'view', '1', '--repo', REPO.nameWithOwner, '--json', expect.any(String),
-    ]);
+  it('nested review가 상한 미만이면 전량 재조회를 하지 않는다', async () => {
+    const gh = new FakeGh([at(HEAD)], [prRow({ reviews: nestedReviews(99) })]);
+    const [pr] = await listPullRequests(gh, REPO);
+    expect(pr?.reviews).toHaveLength(99);
+    expect(gh.calls.some((c) => c.join(' ').includes('reviews(first:100'))).toBe(false);
   });
 
-  it('PR row와 rollup의 head가 어긋나면 두 값을 그대로 남긴다', async () => {
-    // 접어 버리면 old head의 check가 current head의 사실로 보인다(OD-044).
-    const stale = '8ea532ad63f3e8c25c20310180cac79a9a809b36';
-    const gh = new FakeGh([{ row: prRow({ headRefOid: HEAD }), rollupOid: stale }]);
-    const pr = await fetchPullRequest(gh, REPO, 1);
-    expect(pr.headRefOid).toBe(HEAD);
-    expect(pr.checksHeadOid).toBe(stale);
+  it('nested review가 상한에 닿으면 cursor로 전량을 다시 읽는다', async () => {
+    // `gh 2.98`의 nested `reviews`는 `first: 100`이고 list 경로는 pageInfo를 후속 조회하지
+    // 않는다. 응답은 totalCount 없는 bare 배열이라(실측) 100건이 전부인지 잘림인지 row만으로
+    // 가를 수 없다 — 상한에 닿은 PR만 전량을 다시 읽는다.
+    const gh = new FakeGh(
+      [at(HEAD)],
+      [prRow({ reviews: nestedReviews(100) })],
+      [reviewsPage(100, 0, 'R2'), reviewsPage(50, 100)],
+    );
+    const [pr] = await listPullRequests(gh, REPO);
+    expect(pr?.reviews).toHaveLength(150);
+    expect(pr?.reviews[149]?.id).toBe('PRR_149');
+    const reviewCalls = gh.calls.filter((c) => c.join(' ').includes('reviews(first:100'));
+    expect(reviewCalls).toHaveLength(2);
+    expect(reviewCalls[1]?.join(' ')).toContain('cursor=R2');
   });
 });
 
 describe('observePullRequest', () => {
-  const sleep = async (): Promise<void> => {};
-  const OLD = '8ea532ad63f3e8c25c20310180cac79a9a809b36';
-  const NEW = '0fd0c73b04c17ec3be8958f60c517ba4af7db2cf';
-
   it('기대 head가 없으면 row와 rollup의 head 일치만 본다', async () => {
     const gh = new FakeGh([at(HEAD)]);
     const obs = await observePullRequest(gh, REPO, 1, { sleep });
@@ -401,6 +558,17 @@ describe('observePullRequest', () => {
     });
     expect(obs.attempts).toBe(1);
     expect(gh.calls.filter((c) => c[0] === 'pr' && c[1] === 'view')).toHaveLength(1);
+  });
+
+  it('maxAttempts가 유한한 정수가 아니면 조회 전에 던진다', async () => {
+    // `Math.max`는 Infinity를 보존한다. 그대로 두면 비수렴 PR에서 폴링이 끝나지 않는다.
+    const gh = new FakeGh([at(OLD)]);
+    for (const bad of [Infinity, Number.NaN, 2.5]) {
+      await expect(
+        observePullRequest(gh, REPO, 1, { expectedHeadOid: NEW, maxAttempts: bad, sleep }),
+      ).rejects.toThrow(TypeError);
+    }
+    expect(gh.calls).toHaveLength(0);
   });
 
   it('마지막 시도 뒤에는 기다리지 않는다', async () => {

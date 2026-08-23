@@ -33,6 +33,7 @@ const basePr: ProjectedPr = {
   title: 'feat(c1): deterministic renderer',
   url: PR_URL,
   headSha: 'abc1234',
+  checksHeadSha: 'abc1234',
   terminal: 'open',
   isDraft: false,
   review: null,
@@ -254,6 +255,34 @@ describe('renderCard', () => {
   it('findings 상한으로 가려진 건수를 숨기지 않는다', () => {
     const card = renderCard(cases['review request_changes']!);
     expect(contains(card, '외 10건은 카드에 싣지 않았다')).toBe(true);
+  });
+
+  it('checks가 다른 commit의 관측이면 CI 절이 그 사실을 표시한다', () => {
+    // 조회 계층이 bounded 재관측 뒤에도 수렴시키지 못한 불일치다. 이 줄 없이 check를 나열하면
+    // stale head의 결론이 현재 head의 사실로 읽힌다(OD-044).
+    const card = renderCard({
+      pr: { ...basePr, headSha: 'abc1234', checksHeadSha: 'zzz9999' },
+      summary: okSummary,
+    });
+    expect(contains(card, 'check 관측은 현재 head가 아니라 commit zzz9999의 것이다')).toBe(true);
+    expect(contains(card, '(현재 head abc1234)')).toBe(true);
+    // check 자체는 그대로 나열된다. 사실을 숨기지 않고 결속만 밝힌다.
+    expect(contains(card, 'typecheck')).toBe(true);
+  });
+
+  it('checks가 현재 head의 관측이면 결속 문구를 만들지 않는다', () => {
+    const card = renderCard({ pr: basePr, summary: okSummary });
+    expect(contains(card, 'check 관측은 현재 head가 아니라')).toBe(false);
+  });
+
+  it('check가 없어도 다른 commit의 관측이면 그 사실은 남는다', () => {
+    // 빈 checks를 현재 head의 "check 없음"으로 읽으면 안 된다. 관측한 commit이 다르다.
+    const card = renderCard({
+      pr: { ...basePr, checks: [], checksHeadSha: 'zzz9999' },
+      summary: okSummary,
+    });
+    expect(contains(card, 'check 관측은 현재 head가 아니라 commit zzz9999의 것이다')).toBe(true);
+    expect(contains(card, '관찰된 check 없음')).toBe(true);
   });
 
   it('mrkdwn 예약 문자를 이스케이프한다', () => {
@@ -603,6 +632,8 @@ describe('renderFingerprint', () => {
       { ...basePr, truncation: { prBody: true, changedFiles: false } },
       { ...basePr, project: null },
       { ...basePr, url: `${PR_URL}9` },
+      // checks가 다른 commit의 관측이라는 사실이 카드에 실린다(OD-044).
+      { ...basePr, checksHeadSha: 'zzz9999' },
     ];
     for (const pr of changed) {
       expect(renderFingerprint(renderCard({ pr, summary: okSummary }))).not.toBe(base);
@@ -612,9 +643,10 @@ describe('renderFingerprint', () => {
 
   it('카드에 나타나지 않는 값은 지문을 바꾸지 않는다', () => {
     const base = renderFingerprint(renderCard({ pr: basePr, summary: okSummary }));
-    // headSha 자체는 카드에 없다. 카드에 있는 것은 headMatch가 만든 문장이다.
+    // 일치하는 sha 값 자체는 카드에 없다. 카드에 있는 것은 headMatch·checks head 결속이 만든
+    // 문장이므로, 두 sha가 함께 움직여 일치가 유지되면 카드도 지문도 그대로다.
     const other = renderFingerprint(
-      renderCard({ pr: { ...basePr, headSha: 'zzz9999' }, summary: okSummary }),
+      renderCard({ pr: { ...basePr, headSha: 'zzz9999', checksHeadSha: 'zzz9999' }, summary: okSummary }),
     );
     expect(other).toBe(base);
     // summarizer 사실 지문도 카드에 없다.
