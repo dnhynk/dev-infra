@@ -34,7 +34,7 @@
 | transcript 50,000자를 기본 입력으로 보내지 않음 | 확정 | [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
 | repo+PR와 Slack message ts, PR↔Task N, Run/Task 상태를 durable store에 보관 | C1은 node:sqlite; C2 association·reconciliation 확정 (OD-043, OD-044, OD-046, OD-076) | [Durability](specs/orca-slack-bridge.md#9-durability와-멱등성), [PR projection 일관성](architecture/orca-slack-bridge.md#6-pr-projection의-일관성) |
 | Root=current, thread=중요 상태 변화 이력 | 확정 | [공통 UX](ux/slack-surfaces.md#1-공통-원칙) |
-| D: Orca Run 하나=Slack root 하나 | 확정 | [Run Observer](specs/orca-slack-bridge.md#6-d--run-observer), [Run UX](ux/slack-surfaces.md#3-agent-runs) |
+| D: Orca Run 하나=Slack root 하나 | 확정; Run row identity와 `consumer_generation`이 권위 (OD-020) | [Run Observer](specs/orca-slack-bridge.md#6-d--run-observer), [Run identity 계약](contracts/observation-and-correlation.md#5-runrepositorycoordinator-연결), [Run UX](ux/slack-surfaces.md#3-agent-runs) |
 | Task/PR/blocker 현재 상태와 사람 개입 필요 여부 표시 | current Task 상태/분모와 Dispatch attempts 분리, 원천별 blocker badge 확정 (OD-067, OD-069) | [Run Observer](specs/orca-slack-bridge.md#61-기본-단위), [Run progress 계약](contracts/observation-and-correlation.md#7-run-progress) |
 | Worker ask와 사람 결정용 Orca Gate를 구분 | 확정 운영 방향 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약), [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
 | Worker `ask`/coordinator `reply`, coordinator만 사람용 Gate 생성 | 확정 | [질문과 Gate](specs/orchestration-bootstrap-and-continuity.md#41-worker-질문과-사람용-gate), [Gate 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |

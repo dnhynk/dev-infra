@@ -580,16 +580,29 @@ PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의�
 
 ## 7. 미검증 항목
 
+### 7.1 구현 완료 전 검증할 항목
+
 - Slack App manifest와 실제 workspace/channel/owner ID
 - 실제 `worker_done` body 품질과 transcript fallback 필요 조건
 - open PR에서의 `mergeable`/`mergeStateStatus` 값
 - GitHub target repository의 branch protection과 merge-ready 정책
 - `ORCA_WORKTREE_ID`의 `<uuid>::<path>` 파싱 안정성
-- coordinator 재시작 후 terminal/pane handle 유지 여부
 - Gate resolve 후 task status가 직전 값으로 복원되는지 아니면 항상 `ready`가 되는지
 - 장시간 세션에서의 Channel 안정성과 재시작 시 pending 이벤트 처리
 - `terminal create`로 띄운 `claude` 프로세스가 부팅 프롬프트를 실제로 받는지
-- `run-use`가 `consumer_generation`을 증가시켜 predecessor의 fencing token이 되는지
 - `worker-start --agent claude`가 등록된 Orca 계정을 요구하는지 (`orca account list`의 `claude.accounts`가 비어 있음)
 
-이 항목을 검증하기 전에는 관련 adapter의 구현 완료를 선언하지 않는다.
+§7.1 항목을 검증하기 전에는 관련 adapter의 구현 완료를 선언하지 않는다.
+
+### 7.2 플랫폼 계약 미검증 상태에서 채택한 D1 운영 가정
+
+- coordinator 재시작 후 terminal/pane handle 유지 여부: Orca 플랫폼 계약으로는 여전히 미검증이다.
+  OD-020은 최초 handle의 유지를 가정하지 않고 Run row를 권위로 삼기로 했다.
+- `run-use`가 `consumer_generation`을 증가시켜 predecessor의 fencing token이 되는지: Orca 플랫폼은
+  이 동작을 문서화하지 않았다. 프로젝트의 `~/.claude/skills/init-orchestrate/SKILL.md` §5 서술과,
+  승계를 반복한 Run만 generation이 `4`이고 나머지 일반 Run은 모두 `1`인 `run-list` 분포를 연결한
+  추론이다. OD-020은 이 불확실성 위에서 `consumer_generation`으로 live/stale을 구분하기로 했다.
+
+이 두 항목은 검증 완료로 보지 않는다. 다만 OD-020이 위험을 명시적으로 감수하고 D1 진행을 결정했으므로
+§7.1의 구현 완료 차단 조건에는 포함하지 않는다. Orca 플랫폼 동작이 바뀌면 live/stale 판정이 깨지므로
+재검증해야 한다.

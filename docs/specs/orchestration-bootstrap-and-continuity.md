@@ -247,6 +247,7 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 |---|---|
 | 제품 요구사항과 작업 규약 | 확정 spec, `AGENTS.md` |
 | orchestration 상태 | Orca live Run/Task/Worker/Gate |
+| Run/coordinator identity | `run-list` Run row의 `coordinator_handle`·`coordinator_pane_key`·`consumer_generation`; 환경변수는 보조 단서 |
 | 코드·worktree 상태 | Git working tree/worktree |
 | PR·CI·merge 상태 | GitHub 원본 |
 | reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` |
@@ -298,10 +299,12 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - coordinator single-writer 보장 방식
 - active worker가 있는 동안 권한을 이관하는 절차
 - 여러 Run이 같은 repository에 있을 때 선택 규칙
-- Run↔repository↔coordinator session identity
 - service tier를 supervised worker 경로에서 지정할 수단
 - PR correlation metadata 형식
 - handoff redaction과 transcript 포함 범위
 - 자동 rollover 실패의 알림 경로
 
 이 항목은 [미결정 사항](../open-decisions.md)에서 추적한다.
+
+Run↔repository↔coordinator session identity는 OD-020으로 확정됐다. repository는 수동 등록 설정(OD-068)과
+연결하고, live/stale은 Run row의 `consumer_generation`으로 구분하며 coordinator 환경변수는 보조 단서로만 쓴다.

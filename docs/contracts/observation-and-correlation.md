@@ -123,29 +123,29 @@ Bridge가 coordinator의 장문 reasoning을 수집해 임의로 권장안이나
 
 ## 5. Run↔repository↔coordinator 연결
 
-자동 발견에는 최소한 다음 연결이 필요하다.
+D1의 연결은 다음 권위 경계를 따른다.
 
 ```text
-Orca Run
-  → coordinator handle/session
-  → live terminal 또는 Run에 속한 Worker resource
-  → worktree/folder/repository
-  → Git remote
-  → GitHub repository
+설정 파일에 수동 등록한 Repository (OD-068)
+  ↔ Orca Run row
+      ├─ coordinator_handle
+      ├─ coordinator_pane_key
+      └─ consumer_generation
 ```
 
 Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator inbox다. D1은 설정 파일에 수동 등록한
-repository만 관찰한다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된 다중 repository routing은 O1 범위다(OD-068).
-로컬 Orca 1.4.179 관측상 `run-list` row만으로 repository/worktree와 실제 coordinator liveness를 판정할 수 없다.
-global `worker-list`의 `runId`와 `resource.worktreeId`를 통해 일부 Run의 repository 후보를 복구할 수 있지만
-historical/released worker도 포함되므로 liveness 증거는 아니며 worker가 없는 Run에는 적용되지 않는다.
-수동 등록한 범위 안에서도 다음 session/liveness 항목은 TBD다.
+repository만 관찰하며, repository 연결은 그 설정을 따른다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된
+다중 repository routing은 O1 범위다(OD-068).
 
-- live terminal을 authoritative하게 판정하는 방법
-- coordinator 재시작 후 같은 Run과 새 session을 연결하는 방법
-- 여러 live Run이 같은 repository를 사용할 때 routing
-- stale run/coordinator handle 처리
-- 자동 발견 실패 시 수동 등록 형식
+Run/coordinator identity는 Orca Run row가 권위다. `run-list`가 반환하는 `coordinator_handle`·
+`coordinator_pane_key`·`consumer_generation`을 사용하고, coordinator 세션의 `ORCA_TERMINAL_HANDLE`·
+`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID` 같은 환경변수는 보조 단서로만 쓴다. `run-use` 인수는 두 coordinator
+필드를 인수한 터미널 값으로 바꾸고 `consumer_generation`을 올리므로 handle은 재시작·인수를 거쳐 유지되지
+않는다. live/stale Run은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
+
+global `worker-list`의 `runId`와 `resource.worktreeId`는 repository 후보를 보조할 수 있지만 historical/released
+worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree id의 `<uuid>::<path>` 형식을 반복 사용해
+모두 동작한 것은 관측일 뿐이며, 그 형식의 안정성은 계약으로 보장되지 않았다.
 
 ## 6. PR canonical state
 
