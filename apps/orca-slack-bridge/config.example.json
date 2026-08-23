@@ -14,12 +14,18 @@
       "name": "dev-infra",
       "repositories": [
         "dnhynk/dev-infra"
+      ],
+      "orcaRepositoryIds": [
+        "ccb3c8ee-6d9e-42af-af36-9fdac6566fcc"
       ]
     },
     {
       "name": "Vertical Live",
       "repositories": [
         "dnhynk/vertical-live"
+      ],
+      "orcaRepositoryIds": [
+        "0409601c-4119-4b29-ae29-e814b8853e11"
       ]
     }
   ],

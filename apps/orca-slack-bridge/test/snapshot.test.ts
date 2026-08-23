@@ -13,12 +13,13 @@ class FakeOrca implements OrcaRunner {
         runs: [
           {
             id: 'run_legacy_local', objective: 'Legacy orchestration state (inspect only)',
-            coordinator_handle: null, coordinator_pane_key: null, legacy: 1,
+            coordinator_handle: null, coordinator_pane_key: null, consumer_generation: 0, legacy: 1,
             created_at: '2026-08-21T11:34:41Z', updated_at: '2026-08-21T11:34:41Z',
           },
           {
             id: 'run_a48566be983b', objective: 'demo',
-            coordinator_handle: 'term_720b6c26', coordinator_pane_key: 'f39db44b:8c71884b', legacy: 0,
+            coordinator_handle: 'term_720b6c26', coordinator_pane_key: 'f39db44b:8c71884b',
+            consumer_generation: 1, legacy: 0,
             created_at: '2026-08-21T14:32:45Z', updated_at: '2026-08-21T14:32:45Z',
           },
         ],
@@ -31,6 +32,8 @@ class FakeOrca implements OrcaRunner {
           task_title: 'demo task', display_name: 'demo task', status: 'ready',
           deps: '[]', result: '{"kind":"reviewer_result","verdict":"approve"}',
           created_by_process_incarnation: 'ccb3c8ee::D:/dev-infra@@8c25bfec:f126ab2a',
+          created_by_terminal_handle: 'term_720b6c26', created_by_pane_key: 'f39db44b:8c71884b',
+          created_by_run_generation: 1,
           created_at: '2026-08-21 14:32:57',
         }],
       });
@@ -103,7 +106,7 @@ describe('summarize', () => {
       runs: [{
         run: {
           id: 'run_59bccb319e7f', objective: 'probe', coordinatorHandle: null,
-          coordinatorPaneKey: null, legacy: false,
+          coordinatorPaneKey: null, consumerGeneration: { kind: 'value', value: 1 }, legacy: false,
           createdAt: new Date('2026-08-23T04:50:00Z'), updatedAt: new Date('2026-08-23T04:52:36Z'),
         },
         tasks: [
@@ -111,13 +114,17 @@ describe('summarize', () => {
             id: 'task_5694362d24f8', runId: 'run_59bccb319e7f', title: 'probe', status: 'completed',
             deps: { kind: 'value', value: [] },
             result: { kind: 'unreadable', reason: 'JSON 필드를 파싱할 수 없다: {kind:reviewer_result' },
-            worktreePath: null, createdAt: new Date('2026-08-23T04:50:32Z'), completedAt: null,
+            worktreePath: null, repositoryId: null,
+            createdBy: { kind: 'value', value: { handle: null, paneKey: null, generation: 1 } },
+            createdAt: new Date('2026-08-23T04:50:32Z'), completedAt: null,
           },
           {
             id: 'task_ok0000000001', runId: 'run_59bccb319e7f', title: 'ok', status: 'completed',
             deps: { kind: 'value', value: [] },
             result: { kind: 'value', value: null },
-            worktreePath: null, createdAt: new Date('2026-08-23T04:55:00Z'), completedAt: null,
+            worktreePath: null, repositoryId: null,
+            createdBy: { kind: 'value', value: { handle: null, paneKey: null, generation: 1 } },
+            createdAt: new Date('2026-08-23T04:55:00Z'), completedAt: null,
           },
         ],
         gates: [{

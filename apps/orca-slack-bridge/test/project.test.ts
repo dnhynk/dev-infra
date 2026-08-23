@@ -35,7 +35,7 @@ const REPO = repositoryIdentity(1042577813, 'dnhynk/dev-infra');
 
 const CONFIG: BridgeConfig = {
   slack: null,
-  projects: [{ name: 'dev-infra', repositories: ['dnhynk/dev-infra'] }],
+  projects: [{ name: 'dev-infra', repositories: ['dnhynk/dev-infra'], orcaRepositoryIds: [] }],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
 
@@ -474,7 +474,7 @@ describe('ProjectedPr 조립', () => {
 
   it('설정에 없는 repository는 project가 null이다 (OD-047)', async () => {
     const p = projectPullRequest(REPO, pr(), CORRELATED, await facts(), {
-      ...CONFIG, projects: [{ name: '다른', repositories: ['someone/else'] }],
+      ...CONFIG, projects: [{ name: '다른', repositories: ['someone/else'], orcaRepositoryIds: [] }],
     });
     expect(p.kind === 'card' && p.pr.project).toBeNull();
   });
@@ -936,6 +936,8 @@ describe('깨진 task result 봉쇄', () => {
               display_name: 'THROWAWAY PR10 reviewer probe',
               status: 'completed', deps: '[]', result: BROKEN_RESULT,
               created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+              created_by_terminal_handle: 'term_1235a5d1', created_by_pane_key: 'e119e82a:ed65e315',
+              created_by_run_generation: 1,
               created_at: '2026-08-23 04:50:32', completed_at: '2026-08-23T04:52:36.700Z',
             },
             {
@@ -949,6 +951,8 @@ describe('깨진 task result 봉쇄', () => {
                 findings: [],
               }),
               created_by_process_incarnation: 'ccb3c8ee::D:/dev-infra@@2798f0da:87e85235',
+              created_by_terminal_handle: 'term_6354ef22', created_by_pane_key: 'pane:1',
+              created_by_run_generation: 1,
               created_at: '2026-08-23 04:55:00', completed_at: '2026-08-23T04:56:00.000Z',
             },
           ],
@@ -1013,6 +1017,8 @@ describe('깨진 task result 봉쇄', () => {
       id: 'task_ok', run_id: RUN_ID, task_title: 't', display_name: 't',
       status: 'completed', deps: '[]', result: null,
       created_by_process_incarnation: 'ccb3c8ee::D:/dev-infra@@2798f0da:87e85235',
+      created_by_terminal_handle: 'term_6354ef22', created_by_pane_key: 'pane:1',
+      created_by_run_generation: 2,
       created_at: '2026-08-23 04:55:00', completed_at: null,
       ...over,
     };

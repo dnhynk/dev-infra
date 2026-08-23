@@ -127,6 +127,12 @@ D1의 연결은 다음 권위 경계를 따른다.
 
 ```text
 설정 파일에 수동 등록한 Repository (OD-068)
+  ├─ repositories: owner/name        — GitHub 축이 쓴다
+  └─ orcaRepositoryIds: <id>         — Orca 축이 쓴다 (OD-078)
+        ↕ exact 문자열 비교
+     Task.created_by_process_incarnation  = <id>::<path>@@<hash>:<uuid>
+     worker.resource.worktreeId           = <id>::<path>
+        ↓
   ↔ Orca Run row
       ├─ coordinator_handle
       ├─ coordinator_pane_key
@@ -137,11 +143,24 @@ Orca Run은 repository-bound entity가 아니라 durable namespace/coordinator i
 repository만 관찰하며, repository 연결은 그 설정을 따른다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된
 다중 repository routing은 O1 범위다(OD-068).
 
+Run을 등록된 repository에 잇는 열쇠는 설정의 `orcaRepositoryIds`다. Run row에는 repository 필드가 없고 경로에서
+`owner/name`을 얻을 수단도 조회 표면에 없으므로, 관측 가능한 연결점은 `<id>::<path>`의 앞부분 하나뿐이다.
+이 앞부분은 worktree가 아니라 repository의 id이며 id 하나가 여러 worktree 경로를 덮는다. 경로가 아니라 id로
+등록하고 exact 문자열로 비교한다. 등록에 맞지 않는 Run은 버리지 않고 수와 관측된 id를 함께 노출한다 —
+id 형식이나 발급이 바뀌었을 때 카드가 조용히 비는 대신 그 사실이 드러나야 한다(OD-078, OD-072).
+
 Run/coordinator identity는 Orca Run row가 권위다. `run-list`가 반환하는 `coordinator_handle`·
 `coordinator_pane_key`·`consumer_generation`을 사용하고, coordinator 세션의 `ORCA_TERMINAL_HANDLE`·
 `ORCA_PANE_KEY`·`ORCA_WORKTREE_ID` 같은 환경변수는 보조 단서로만 쓴다. `run-use` 인수는 두 coordinator
 필드를 인수한 터미널 값으로 바꾸고 `consumer_generation`을 올리므로 handle은 재시작·인수를 거쳐 유지되지
-않는다. live/stale Run은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
+않는다. binding 하나의 live/stale은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
+
+**Run 수준 rollup은 `live`와 `unknown` 둘뿐이다.** `stale`은 binding 하나에만 쓴다. "관측된 binding이 전부
+낮은 세대다"는 Run이 버려졌다는 근거가 되지 못한다 — `run-use` 인수 직후 새 coordinator가 기존 ready task만
+dispatch하면 새 세대가 만든 Task가 하나도 없고, 그 정상 handoff 구간 내내 살아 있는 Run이 죽은 것으로 그려진다.
+게다가 `run-use`가 `consumer_generation`을 올린다는 것 자체가 `platform-capabilities.md` §7.2에 미검증
+가정으로 기록돼 있다. 관측하지 못한 것을 단정하지 않는다 — required check 축의 `indeterminate`가 같은 판단이다.
+세대 분포는 관측된 binding 목록이 그대로 보여준다.
 
 global `worker-list`의 `runId`와 `resource.worktreeId`는 repository 후보를 보조할 수 있지만 historical/released
 worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree id의 `<uuid>::<path>` 형식을 반복 사용해
