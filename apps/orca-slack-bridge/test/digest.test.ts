@@ -273,6 +273,13 @@ class FakeThread implements ThreadPoster {
   }
 }
 
+/** 게시가 실패하는 대역. 실패한 게시가 ledger에 행을 남기지 않는지 본다. */
+class FailingThread implements ThreadPoster {
+  async reply(): Promise<PostedMessage> {
+    throw new Error('thread reply가 실패했다');
+  }
+}
+
 /** 결정적 대역. 같은 사실이 같은 카드를 내는지 보려면 모델 출력이 흔들리면 안 된다. */
 class StubProvider implements SummaryProvider {
   readonly calls: SummaryFacts[] = [];
@@ -947,6 +954,27 @@ describe('runDigest 전이', () => {
     const withThread = await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
     expect(card(withThread).transitions.map((t) => t.outcome)).toEqual(['posted']);
     expect(thread.replies).toHaveLength(1);
+  });
+
+  // **행은 게시가 성공한 뒤에 쓴다.** 실패한 게시에 행을 남기면 그 전이는 이미 말한 것으로
+  // 걸러져 영영 나가지 않는다. `settle`의 순서를 뒤집으면 이 테스트가 걸린다.
+  it('게시가 던지면 행을 남기지 않고 다음 관측의 후보로 돌아온다', async () => {
+    await digestOnce({ verdict: null, prs: [prRow(OPEN_ROW)] });
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    await expect(
+      digestOnce({ thread: new FailingThread(), verdict: 'approve', prs: [prRow(OPEN_ROW)] }),
+    ).rejects.toThrow('thread reply가 실패했다');
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const thread = new FakeThread();
+    const recovered = await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+
+    expect(card(recovered).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['review_approved', 'posted'],
+    ]);
+    expect(thread.replies).toHaveLength(1);
+    expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000001.000001']);
   });
 });
 
