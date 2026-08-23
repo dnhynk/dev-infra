@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import { loadConfig, defaultConfigPath, type BridgeConfig } from './project/config.js';
 import { GhCli } from './github/runner.js';
-import { OrcaCli } from './orca/client.js';
+import { OrcaCli, type OrcaRunner } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
-import { collectRunFacts, formatRunCollection } from './run/collect.js';
+import { formatRunCollection } from './run/collect.js';
+import {
+  formatRunObserveReport,
+  runRunObserver,
+  type RunObserveOptions,
+} from './run/publish.js';
 import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import {
@@ -13,7 +18,7 @@ import {
   type ThreadPoster,
 } from './slack/post.js';
 import { ReadOnlyDigestStore, SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
-import type { DigestStore } from './store/schema.js';
+import type { DigestStore, RunStore } from './store/schema.js';
 import {
   MemorySummaryCache,
   OpenAiSummaryProvider,
@@ -67,6 +72,13 @@ const VALUE_FLAGS: readonly string[] = ['--config', '--orca', '--pr-limit', '--p
 const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
 
 /**
+ * 되돌릴 수 없는 외부 write를 하는 명령.
+ *
+ * 이 목록의 명령만 모르는 플래그를 거부한다. 근거는 `unknownWriteFlag`에 있다.
+ */
+const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs'];
+
+/**
  * 값 플래그가 값을 실제로 받았는지 본다. 위반이 없으면 null.
  *
  * `arg()`는 `argv[i + 1]`을 무조건 값으로 쓰므로, 이 검사가 없으면 값이 없거나 값 자리에 다른
@@ -97,18 +109,21 @@ function missingFlagValue(argv: readonly string[]): string | null {
 }
 
 /**
- * `digest`가 모르는 플래그를 찾는다. 없으면 null.
+ * write하는 명령이 모르는 플래그를 찾는다. 없으면 null.
  *
  * 이 파서는 `indexOf`로 아는 이름만 찾으므로 모르는 플래그를 조용히 무시한다. `snapshot`과
- * `verify-slack`에서는 무시가 무해하지만 `digest`는 되돌릴 수 없는 외부 write를 한다.
+ * `verify-slack`에서는 무시가 무해하지만 `digest`와 `runs`는 되돌릴 수 없는 외부 write를 한다.
  * `--dry-run`을 한 글자 틀리면 확인 없이 실제 채널에 게시된다. 그래서 write하는 명령에만
  * 검사를 건다. 다른 명령의 기존 동작은 바꾸지 않는다.
+ *
+ * **write하는 명령이 늘면 `WRITE_COMMANDS`에 넣는다.** 넣지 않으면 그 명령에서 `--dry-run`
+ * 오타가 확인 없이 실제 게시로 간다.
  *
  * 값 자리를 따로 건너뛰지 않는다. `missingFlagValue`가 먼저 돌아 `--`로 시작하는 값을 이미
  * 거부하므로, `--`로 시작하는 토큰은 값일 수 없다. 건너뛰던 예전 코드가 `--state --dry-runn`의
  * 오타를 값으로 보아 통과시켰다.
  */
-function unknownDigestFlag(argv: readonly string[]): string | null {
+function unknownWriteFlag(argv: readonly string[]): string | null {
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === undefined || !token.startsWith('--')) continue;
@@ -126,10 +141,10 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   }
   const missing = missingFlagValue(argv);
   if (missing !== null) return { kind: 'error', message: missing };
-  if (command === 'digest') {
-    const unknown = unknownDigestFlag(argv);
+  if ((WRITE_COMMANDS as readonly string[]).includes(command)) {
+    const unknown = unknownWriteFlag(argv);
     if (unknown !== null) {
-      return { kind: 'error', message: `digest가 모르는 플래그다: ${unknown}` };
+      return { kind: 'error', message: `${command}가 모르는 플래그다: ${unknown}` };
     }
   }
   const prLimitRaw = arg(argv, '--pr-limit');
@@ -160,22 +175,25 @@ const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs>
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (메시지를 게시하지 않는다)
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
-runs          Orca를 read-only로 1회 읽어 Run 진행 사실을 출력한다 (게시하지 않는다)
+runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
   --pr-limit <n>    repository당 조회할 PR 수 (기본 50)
   --json            요약 대신 결과 전체를 JSON으로 출력
 
-digest 전용:
+digest·runs 전용:
 
   --state <path>    durable store 경로 (기본: ORCA_SLACK_BRIDGE_STATE 또는 OS state 경로)
-  --pr <number>     이 번호의 PR만 처리한다
   --dry-run         Slack에도 store에도 쓰지 않고 만들 blocks와 결정을 출력한다
 
-digest 외의 명령은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만
-게시하며 채널을 코드에서 만들지 않는다. runs는 Slack에 게시하지 않는다 — Run 카드 게시는
-D1-C 범위다.`;
+digest 전용:
+
+  --pr <number>     이 번호의 PR만 처리한다
+
+snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
+runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
+하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080).`;
 
 /**
  * summarizer provider를 만든다.
@@ -207,7 +225,11 @@ export function openDigestStore(statePath: string, dryRun: boolean): DigestStore
 }
 
 /**
- * digest 실패를 사람이 읽는 한 줄로 만든다. 대상 채널 ID를 지운다.
+ * 게시 명령의 실패를 사람이 읽는 한 줄로 만든다. 대상 채널 ID를 지운다.
+ *
+ * `digest`와 `runs`가 함께 쓴다. 두 경로의 store 오류가 같은 모양으로 채널 ID를 싣기 때문이다
+ * (`insertPrMessage`, `insertRunMessage`, `insertRunCollectionMessage`). 경로마다 따로 만들면
+ * 한쪽만 고쳐진다.
  *
  * `store/sqlite.ts`의 `insertPrMessage`는 실패 원인을 좁히려고 오류 message에 `channelId`와
  * `messageTs`를 싣는다. disk full이나 제약 위반이면 그 message가 그대로 stderr로 나가, 설정에서만
@@ -224,7 +246,7 @@ export function openDigestStore(statePath: string, dryRun: boolean): DigestStore
  *
  * **구현자에게**: store 오류를 사람에게 내보내는 경로를 새로 만들면 여기서 하는 것을 함께 한다.
  */
-export function formatDigestError(e: unknown, channel: string): string {
+export function formatChannelError(e: unknown, channel: string): string {
   const message = e instanceof Error ? e.message : String(e);
   // 빈 문자열로 replaceAll하면 문자 사이마다 끼워 넣는다. 지울 것도 없다.
   if (channel === '') return message;
@@ -250,6 +272,106 @@ export function digestPosters(
   if (dryRun) return { slack: null, thread: null };
   const poster = new SlackWebApiPoster({ token: botToken(env) });
   return { slack: poster, thread: poster };
+}
+
+/**
+ * runs가 쓸 store를 연다.
+ *
+ * `openDigestStore`와 같은 판정을 같은 이유로 한다 — dry-run은 읽기 전용 store를 쓴다.
+ * `SqliteDigestStore`는 여는 것만으로 부모 디렉터리와 DB 파일을 만들고 WAL과 스키마를 쓰므로,
+ * 도움말이 말하는 "store에 쓰지 않는다"가 거짓이 된다.
+ *
+ * 반환 타입만 다르다. `runs`는 `DigestStore`가 아니라 `RunStore`를 쓴다. 두 인터페이스를 나눈
+ * 이유는 `store/schema.ts`에 있고, 여기서 다시 합치면 그 경계가 CLI에서 무너진다.
+ */
+export function openRunStore(statePath: string, dryRun: boolean): RunStore & { close(): void } {
+  return dryRun ? new ReadOnlyDigestStore(statePath) : new SqliteDigestStore(statePath);
+}
+
+/**
+ * runs의 Slack write 경계를 만든다.
+ *
+ * **dry-run은 poster를 아예 만들지 않는다.** 토큰도 읽지 않으므로 write 경로 자체가 없다.
+ * `digestPosters`와 같은 규율이고, 그 함수와 같은 이유로 `runRunsCommand`에서 떼어 export한다 —
+ * 이 배선을 다시 `null`로 되돌리면 실패하는 테스트가 필요한데, `runRunsCommand`는 실제 `orca`
+ * 프로세스를 만들어 그 자리에서 볼 수 없기 때문이다.
+ *
+ * **`digestPosters`와 달리 thread 경계를 돌려주지 않는다.** D1 Run 카드에는 thread 표면이 없다.
+ * OD-072가 정한 owner 개입 알림은 D2 범위이고, 지금 여기서 `ThreadPoster`를 넘기면 아무도 쓰지
+ * 않는 write 경계가 생긴다.
+ */
+export function runsPoster(dryRun: boolean, env: NodeJS.ProcessEnv): SlackPoster | null {
+  if (dryRun) return null;
+  return new SlackWebApiPoster({ token: botToken(env) });
+}
+
+/**
+ * runs가 쓸 관찰 옵션을 만든다. **대상 채널과 write 경계가 여기서 정해진다.**
+ *
+ * 채널은 `slack.channels.agentRuns`다. **`prDigest`가 아니다** — 잘못 쓰면 PR 카드 채널에 Run
+ * 카드가 섞이고, 그 뒤 매핑 행의 채널이 굳어 되돌리려면 `channel_mismatch`를 지나야 한다.
+ *
+ * `runRunsCommand`에서 떼어 export한다. 채널과 poster 두 배선이 다 이 함수 안에 있으므로 어느
+ * 하나를 되돌리면 이 함수의 테스트가 실패한다. 실제 `orca`·Slack 프로세스가 없어도 본다.
+ */
+export function runsObserveOptions(
+  parsed: RunArgs,
+  config: BridgeConfig,
+  store: RunStore,
+  env: NodeJS.ProcessEnv,
+): RunObserveOptions {
+  if (config.slack === null) {
+    throw new Error('runs는 설정의 slack 섹션이 필요하다. 게시 채널은 설정에서만 읽는다');
+  }
+  return {
+    config,
+    channel: config.slack.channels.agentRuns,
+    store,
+    slack: runsPoster(parsed.dryRun, env),
+    now: () => new Date(),
+  };
+}
+
+/**
+ * runs 명령 1회.
+ *
+ * `runDigestCommand`와 같은 모양이다. store를 열고, 옵션을 만들고, 관찰을 한 번 돌리고, 보고를
+ * 출력한다. 판정은 전부 `run/` 아래에 있고 여기서 다시 하지 않는다.
+ *
+ * `orca`를 인자로 받는 이유는 하나다. 이 함수가 `publishRunCollection`까지 실제로 잇는지는
+ * 대역 runner 없이 볼 수 없고, 그 배선이 끊긴 채 타입만 맞는 상태가 이 Run에서 반복된 실패
+ * 모드다. 기본값은 실제 CLI이므로 프로덕션 경로는 달라지지 않는다.
+ */
+export async function runRunsCommand(
+  parsed: RunArgs,
+  config: BridgeConfig,
+  orca?: OrcaRunner,
+): Promise<number> {
+  if (config.slack === null) {
+    process.stderr.write('runs는 설정의 slack 섹션이 필요하다. 게시 채널은 설정에서만 읽는다\n');
+    return 2;
+  }
+  const channel = config.slack.channels.agentRuns;
+  const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
+  const store = openRunStore(resolveStatePath(parsed.statePath), parsed.dryRun);
+  try {
+    const report = await runRunObserver(
+      orca ?? new OrcaCli(orcaBin),
+      runsObserveOptions(parsed, config, store, process.env),
+    );
+    process.stdout.write(
+      (parsed.json
+        ? JSON.stringify(report, null, 2)
+        : `${formatRunCollection(report.facts)}\n\n${formatRunObserveReport(report)}`) + '\n',
+    );
+    return 0;
+  } catch (e) {
+    // main의 최상위 handler로 올리지 않는다. 그쪽은 채널 ID를 지울 근거를 갖고 있지 않다.
+    process.stderr.write(formatChannelError(e, channel) + '\n');
+    return 1;
+  } finally {
+    store.close();
+  }
 }
 
 async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<number> {
@@ -279,7 +401,7 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
     return 0;
   } catch (e) {
     // main의 최상위 handler로 올리지 않는다. 그쪽은 채널 ID를 지울 근거를 갖고 있지 않다.
-    process.stderr.write(formatDigestError(e, channel) + '\n');
+    process.stderr.write(formatChannelError(e, channel) + '\n');
     return 1;
   } finally {
     store.close();
@@ -310,13 +432,7 @@ async function main(): Promise<number> {
   }
 
   if (parsed.command === 'runs') {
-    const bin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
-    const collection = await collectRunFacts(new OrcaCli(bin), config);
-    process.stdout.write(
-      (parsed.json ? JSON.stringify(collection, null, 2) : formatRunCollection(collection)) +
-        '\n',
-    );
-    return 0;
+    return await runRunsCommand(parsed, config);
   }
 
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';

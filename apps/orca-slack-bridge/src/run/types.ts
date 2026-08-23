@@ -19,7 +19,8 @@ import type { RunBindingFacts } from '../orca/client.js';
  * 실측에서 open Gate와 blocked Task가, 그리고 ask와 escalation과 dispatched Task가 같은 원인을
  * 두 번 표현했다. 합치면 한 blocker가 여러 번 셈된다.
  *
- * D1-A 범위: Orca 사실을 카드가 쓸 수 있는 값까지 만든다. Slack 렌더링은 D1-B, 게시는 D1-C다.
+ * 이 파일의 범위: Orca 사실을 카드가 쓸 수 있는 값까지 만든다. Slack 렌더링은 `run/render.ts`,
+ * 게시는 `run/publish.ts`, CLI 배선은 `cli.ts`의 `runs` 명령이다.
  */
 
 /**

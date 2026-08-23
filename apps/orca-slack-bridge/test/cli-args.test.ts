@@ -21,8 +21,14 @@ describe('명령 분기', () => {
     if (p.kind === 'run') expect(p.command).toBe('digest');
   });
 
+  it('runs를 인식한다', () => {
+    const p = parseArgs(['runs']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') expect(p.command).toBe('runs');
+  });
+
   it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack', 'digest']) {
+    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs']) {
       expect(parseArgs([c]).kind).toBe('run');
     }
   });
@@ -95,7 +101,7 @@ describe('digest 옵션', () => {
     expect(parseArgs(['digest', '--pr', '-1']).kind).toBe('error');
   });
 
-  // digest만 외부 write를 한다. --dry-run 오타를 무시하면 확인 없이 실제 채널에 게시된다.
+  // digest와 runs가 외부 write를 한다. --dry-run 오타를 무시하면 확인 없이 실제 채널에 게시된다.
   it('digest는 모르는 플래그를 무시하지 않고 오류로 만든다', () => {
     const p = parseArgs(['digest', '--dry-runn']);
     expect(p.kind).toBe('error');
@@ -104,6 +110,51 @@ describe('digest 옵션', () => {
 
   it('write하지 않는 명령의 기존 동작은 바꾸지 않는다', () => {
     expect(parseArgs(['snapshot', '--dry-runn']).kind).toBe('run');
+  });
+});
+
+describe('runs 옵션', () => {
+  it('기본값은 실제 게시다', () => {
+    const p = parseArgs(['runs']);
+    if (p.kind === 'run') {
+      expect(p.dryRun).toBe(false);
+      expect(p.statePath).toBeNull();
+    }
+  });
+
+  it('--dry-run과 --state를 읽는다', () => {
+    const p = parseArgs(['runs', '--dry-run', '--state', 'D:/state.db']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.dryRun).toBe(true);
+      expect(p.statePath).toBe('D:/state.db');
+    }
+  });
+
+  /*
+   * runs도 되돌릴 수 없는 외부 write를 한다. digest와 같은 검사를 건다.
+   *
+   * 회귀 방지: 이 검사가 runs에 걸리지 않으면 `runs --dry-runn`이 dryRun=false로 내려가
+   * 확인 없이 #agent-runs에 실제 게시된다.
+   */
+  it('runs는 모르는 플래그를 무시하지 않고 오류로 만든다', () => {
+    const p = parseArgs(['runs', '--dry-runn']);
+    expect(p.kind).toBe('error');
+    if (p.kind === 'error') {
+      expect(p.message).toContain('runs');
+      expect(p.message).toContain('--dry-runn');
+    }
+  });
+
+  // 회귀 방지: --dry-runn을 --state의 값으로 삼으면 dryRun=false로 실제 게시하면서
+  // '--dry-runn'이라는 이름의 DB를 열어 기존 매핑을 못 찾고 루트를 하나 더 만든다.
+  it('runs의 값 자리에 플래그가 오면 오류다', () => {
+    const p = parseArgs(['runs', '--state', '--dry-runn']);
+    expect(p.kind).toBe('error');
+    if (p.kind === 'error') {
+      expect(p.message).toContain('--state');
+      expect(p.message).toContain('--dry-runn');
+    }
   });
 });
 
