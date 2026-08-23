@@ -130,62 +130,90 @@ thread 요구:
 ### 3.1 Run 현재 카드
 
 ```text
-🟢 [toneandmove] toneandmove/web · run_36d28e6e947a · Subscription Billing Refactor
+🟢 *[dev-infra] dnhynk/dev-infra* · run_36d28e6e947a · Slack Bridge D1 Run Observer
 
-Run identity
+*Run identity*
 Run ID run_36d28e6e947a
 소유자 binding 🟢 live — Run row의 현재 소유자 binding으로 만들어진 Task를 관측했다
 Run row의 현재 소유자 generation 2 · term_6354ef22
 • ⚫ stale · generation 1 · term_29548394 · 이 binding이 만든 Task 39
 • 🟢 live · generation 2 · term_6354ef22 · 이 binding이 만든 Task 24
 
-진행
+*진행*
 task-list.count 10
 completed 6
 dispatched 2
 blocked 1
 ready 1
 
-Dispatch attempts
-attempts 12
-completed 10
-failed 1
+*Dispatch attempts*
+attempts 71
+completed 57
+failed 13
 dispatched 1
-재시도가 있었던 Task 1
+재시도가 있었던 Task 4
+attempt 이력이다. retry는 Task 수를 늘리지 않으므로 진행 절과 더하지 않는다
 
-PR
-• #184 ✅ 병합 완료 · 리뷰 통과
-• #185 🟡 열림 · 리뷰 결과 없음
-• #186 🟡 열림 · 리뷰에서 수정 요청
+*PR*
+• #9 🟡 열림 · 리뷰에서 수정 요청
+• #10 ⛔ 병합 없이 닫힘 · 리뷰 결과 없음
+• #25 ✅ 병합 완료 · 리뷰 통과
+digest가 관측하고 correlation에 성공한 PR만 여기 있다. 그 밖의 PR은 이 Run이 만들었더라도 카드에 나타나지 않는다
 
-blocker · 현재 상태
-• open Gate 1
-    ↳ gate gate_5c1 · task task_9f2 — 구독 취소 시 권한 종료 시점
-• blocked Task 1
-    ↳ task task_9f2 — 결제 재시도 정책 확정
+*blocker · 현재 상태*
+• open Gate 2
+    ↳ gate gate_a1 · task task_t1 — 구독 취소 시 권한 종료 시점
+    ↳ gate gate_a2 — 두 번째 Gate
+• blocked Task 3
+    ↳ task task_b1 — b1
+    ↳ task task_b2 — b2
+    ↳ task task_b3 — b3
+• interaction 대기 1
+    ↳ task task_w1 · dispatch ctx_w1 — agent: codex-interactive-prompt
 
-blocker · 관찰 창 안에서만 판정
+*blocker · 관찰 창 안에서만 판정*
 • worker ask 1
-    ↳ task task_7a0 · dispatch ctx_31b · message msg_88c — 환불 한도를 어디서 읽나
+    ↳ task task_q1 · dispatch ctx_q1 · message msg_q1 — 계약을 확인해 달라
+미답 여부를 inbox 조회 창 안에서만 판정했다. degraded에 inbox_saturated가 있으면 이 수를 확정으로 읽지 않는다
 
-blocker · 누적 이력 (현재 blocker가 아니다)
+*blocker · 누적 이력 (현재 blocker가 아니다)*
+• escalation 1
+    ↳ task task_e1 · dispatch ctx_e1 · message msg_e1 — Blocked: gh 인증
 • failed Dispatch 13
-    ↳ task task_1d4 · dispatch ctx_002 — failed
+    ↳ task task_f0 · dispatch ctx_f0 — failed
+    ↳ task task_f1 · dispatch ctx_f1 — failed
+    ↳ task task_f2 · dispatch ctx_f2 — failed
+    ↳ task task_f3 · dispatch ctx_f3 — failed
+    ↳ task task_f4 · dispatch ctx_f4 — failed
+    ↳ 외 8건은 카드에 싣지 않았다
+만료가 없는 수다. 이미 retry로 완료된 Task의 과거 실패와 이미 해소된 escalation도 계속 셈된다. 지금 막혀 있다는 뜻이 아니다
 
-blocker · 이 관측 표면에서 만들 수 없음
+*blocker · 이 관측 표면에서 만들 수 없음*
 • ciFailure — Orca schema에 CI 전용 상태가 없다
 
-degraded
+*degraded*
 이 Run
-• [unreadable_field] task task_1d4의 deps를 읽지 못했다: JSON 파싱 실패
+• [liveness_unknown] Task가 없어 Run row와 대조할 binding이 없다
 관찰 전체
-• 없음
+• [unverified_platform_assumption] live/stale 판정은 run-use가 consumer_generation을 올린다는 미검증 가정 위에 있다
 
-등록되지 않은 Run
+*등록되지 않은 Run*
 1
-• run_7804be5a654f — 관측된 Orca repository id: 3f1e…
-    ↳ [unregistered_repository] 관측된 Orca repository id가 설정에 없다: 3f1e…
+• run_aaa — 관측된 Orca repository id: other-id
+    ↳ [unregistered_repository] 관측된 Orca repository id가 설정에 없다: other-id
+각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의 projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해 등록 여부를 아직 판정하지 못한 것이다
 ```
+
+위 블록은 `apps/orca-slack-bridge/test/run-render.test.ts`의 fixture로 `renderRunCard`를 돌린
+출력을 손대지 않고 옮긴 것이다 — 그 파일의 `facts()` 기본값에, 같은 파일이 쓰는 PR 3행(`#9`
+open·request_changes, `#10` closed·verdict 없음, `#25` merged·approve)과 미등록 Run 1건
+(`run_aaa`, `unregistered_repository`)을 넣었다. fixture 자체는 실측 Run `run_36d28e6e947a`
+(2026-08-24 관측)의 수에 맞춰 만든 것이다. 블록 사이 빈 줄은 Slack section block 경계이고
+`*…*`는 mrkdwn 굵게 표기다. Slack 알림용 fallback `text`는 이 블록에 없다.
+
+렌더러가 무조건 찍는 설명 줄(Dispatch attempts의 retry 주석, PR 절의 관측 경계, worker ask의
+관찰 창 한정, 누적 이력의 만료 없음, 미등록 절의 판정 근거)을 예시에서 빼지 않는다. 그 줄들이
+카드가 자기 경계를 말하는 자리이고, 빼면 예시가 계약을 축소해 보여준다.
 
 표시할 의미:
 
