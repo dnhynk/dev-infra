@@ -255,7 +255,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 ### DL-035 · approval은 사실만 표시하고 merge-ready는 required check만 본다
 
 - `headMatch`를 계속 표시하되 이전 approval의 유효·무효는 Bridge가 판정하지 않는다. 새 head마다 재리뷰를 강제하지 않고 repository의 stale-review 설정도 따라가지 않는다(OD-031).
-- merge-ready는 base branch의 effective required rule과 current head rollup을 조인해 `missing | pending | failing | passing`을 파생한다. optional check 실패는 merge를 막지 않는다(OD-032).
+- merge-ready는 base branch의 effective required rule과 current head rollup을 조인해 `missing | pending | failing | passing`을 파생한다. optional check 실패는 merge를 막지 않는다(OD-032). → DL-051에서 열거 보완
 - merge queue, required reviews, up-to-date(strict), conversation resolution은 C2 범위 밖이다.
 - 근거: stale approval 유지와 dismissal이 모두 관측됐고, 미보고 required는 merge를 막았지만 optional failure가 남은 PR은 실제 merge됐다.
 
@@ -379,3 +379,29 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 이 Run에서 `<uuid>::<path>` worktree id가 반복 동작한 것은 관측일 뿐 형식 안정성 보장은 아니며 남은 위험이다.
 
 - 상세 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-020 확정 기록에 있다.
+
+## 2026-08-23 · mergePolicy 축 배선
+
+### DL-051 · mergePolicy 축은 조인 결과 다섯 값과 rule source 상태 두 값을 가진다
+
+- OD-032의 결정은 유지된다. required check만으로 판정하고 optional check 실패는 merge를 막지 않는다.
+  바뀐 것은 결정이 아니라 **열거**다. DL-035가 적은 네 값은 구현에서 일곱 값이 됐다.
+- 조인 결과는 다섯이다. `failing`·`missing`·`indeterminate`·`pending`·`passing`이며 context별 상태 중
+  가장 무거운 것이 축이 된다. `indeterminate`가 DL-035에 없던 값이다.
+- rule source의 상태 둘이 조인 결과보다 앞선다. `rules_unreadable`(정책 조회 403)과
+  `no_required_rules`(required rule 0개)다. 성격이 달라 조인 결과와 같은 목록에 두지 않는다.
+- `indeterminate`의 근거: rule이 GitHub App에 바인딩돼 있고 동명 row는 있으나 보고 주체를 관측할 수 없는
+  상태다. `StatusContext`에는 app을 식별하는 field가 GraphQL에 없고 `CheckRun`도 `checkSuite.app`이 null일
+  수 있다. `passing`으로 접으면 실측된 false positive(PAT가 만든 동명 status에도 merge는 405)를 통과로
+  그리고, `missing`으로 접으면 Expected-App의 정상 보고가 false negative가 된다. 어느 쪽으로도 접지 않는다.
+- `no_required_rules`와 `rules_unreadable`을 나누는 근거: 앞은 정상이고 이 축이 merge를 막지 않는다.
+  뒤는 rule 집합 자체를 모르므로 관측된 context가 전부 통과해도 충족을 단정할 수 없는 degraded다.
+  404는 `rules_unreadable`이 아니다. GitHub이 미보호와 권한 부족에 같은 404를 주어 구분할 사실이 없다.
+- `no_required_rules`는 `CI 통과`도 `병합 준비 완료`도 아니다. 통과한 check가 없다. 아무것도 돌지 않은 PR을
+  통과로 그리지 않는다.
+- 이 축을 headline 다섯 값에 접지 않는다. headline은 PR 전체에 대한 한 줄이고, 거기에 `병합 준비 완료`를
+  두면 이 축이 판정하지 않은 merge 조건까지 충족했다는 읽기를 준다. 카드는 축을 자기 자리에서 표시하고
+  판정하지 않은 조건을 같은 자리에서 밝힌다.
+- 근거는 새로 만들지 않았다. `src/github/required-checks.ts`의 `RequiredCheckState` 주석과
+  `src/github/branch-rules.ts`의 `RuleSourceStatus` 주석에 실측과 함께 있고 그 코드는 merge됐다.
+- 상세 계약은 [관찰·상관관계 계약](contracts/observation-and-correlation.md) §6에 있다.

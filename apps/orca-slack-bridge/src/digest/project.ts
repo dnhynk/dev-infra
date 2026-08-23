@@ -11,7 +11,7 @@ import {
 import { projectForRepository, type BridgeConfig } from '../project/config.js';
 import { CAPS, type FindingFacts } from '../summarize/contract.js';
 import { prepareSummaryBody } from './facts.js';
-import { deriveTerminal } from './state.js';
+import { deriveMergePolicy, deriveTerminal } from './state.js';
 import type {
   CorrelatedOrigin,
   PrProjection,
@@ -214,8 +214,9 @@ export function projectPullRequest(
       isDraft: pr.isDraft,
       review,
       checks: pr.checks,
-      // required rule 조인 전이므로 값이 없다. C2-2가 채운다(OD-032).
-      mergePolicy: 'unobserved',
+      // mergePolicy 축. base branch required rule과 head rollup의 조인을 접은 값이다.
+      // 파생은 `digest/state.ts` 하나만 하고 여기서 다시 판정하지 않는다(OD-032).
+      mergePolicy: deriveMergePolicy(pr.requiredRules, pr.requiredChecks),
       workerReport,
       truncation: {
         // summarizer 입력과 같은 계산을 쓴다. 두 값을 따로 계산하지 않는다.

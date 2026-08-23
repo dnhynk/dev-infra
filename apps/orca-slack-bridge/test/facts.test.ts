@@ -61,7 +61,7 @@ function card(over: Partial<ProjectedPr> = {}): ProjectedPr {
     isDraft: false,
     review: null,
     checks: [{ kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }],
-    mergePolicy: 'unobserved',
+    mergePolicy: 'no_required_rules',
     workerReport: null,
     truncation: { prBody: false, changedFiles: false },
     ...over,

@@ -20,6 +20,9 @@ import {
 import { repositoryIdentity } from '../src/identity/repository.js';
 import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { PullRequestFacts } from '../src/github/pull-request.js';
+import type { BranchRequiredRules } from '../src/github/branch-rules.js';
+import { joinRequiredChecks } from '../src/github/required-checks.js';
+import type { CheckFact } from '../src/github/rollup.js';
 import type { Correlation } from '../src/correlate/resolve.js';
 import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
 
@@ -481,6 +484,121 @@ describe('ProjectedPr 조립', () => {
       /PR state/,
     );
     expect(deriveTerminal('MERGED', null)).toBe('merged');
+  });
+});
+
+/**
+ * mergePolicy 축 배선.
+ *
+ * 집계 규칙 자체는 `state.test.ts`가 고정한다. 여기서 고정하는 것은 **projection이 그 함수를
+ * 실제로 부르고 그 결과를 카드 입력에 싣는가**다. 타입에만 있고 배선이 없으면 required rule
+ * 조인이 출력에 아무 효과가 없다(OD-032).
+ */
+describe('mergePolicy 축 배선', () => {
+  /** required rule과 head rollup row로 `PullRequestFacts`의 두 필드를 함께 만든다. */
+  function withRequired(
+    contexts: readonly { context: string; appId: number | null }[],
+    rows: readonly CheckFact[],
+    over: Partial<BranchRequiredRules> = {},
+  ): Partial<PullRequestFacts> {
+    const rules: BranchRequiredRules = {
+      branch: 'main',
+      contexts: contexts.map((c) => ({
+        context: c.context,
+        sources: ['branchProtection'],
+        appId: c.appId,
+      })),
+      branchProtection: 'present',
+      repositoryRuleset: 'absent',
+      ...over,
+    };
+    return { requiredRules: rules, requiredChecks: joinRequiredChecks(rules, rows), checks: rows };
+  }
+
+  function statusRow(name: string, state: string): CheckFact {
+    return {
+      kind: 'statusContext', id: `SC_${name}`, name, status: '',
+      conclusion: null, state, appId: null, startedAt: null, completedAt: null,
+    };
+  }
+
+  async function policyOf(over: Partial<PullRequestFacts>): Promise<string> {
+    const p = projectPullRequest(REPO, pr(over), CORRELATED, await facts(), CONFIG);
+    if (p.kind !== 'card') throw new Error('card가 아니다');
+    return p.pr.mergePolicy;
+  }
+
+  it('required가 실패면 축이 failing이다', async () => {
+    expect(
+      await policyOf(
+        withRequired([{ context: 'ci', appId: null }], [statusRow('ci', 'FAILURE')]),
+      ),
+    ).toBe('failing');
+  });
+
+  it('required가 미보고면 축이 missing이다', async () => {
+    expect(await policyOf(withRequired([{ context: 'ci', appId: null }], []))).toBe('missing');
+  });
+
+  it('required가 전부 통과면 축이 passing이다', async () => {
+    expect(
+      await policyOf(
+        withRequired([{ context: 'ci', appId: null }], [statusRow('ci', 'SUCCESS')]),
+      ),
+    ).toBe('passing');
+  });
+
+  it('app-bound rule에 주체 미상 row만 있으면 축이 indeterminate다', async () => {
+    // commit status에는 app을 식별할 field가 없다(rollup.ts). 충족도 불충족도 단정하지 않는다.
+    expect(
+      await policyOf(
+        withRequired([{ context: 'ci', appId: 15368 }], [statusRow('ci', 'SUCCESS')]),
+      ),
+    ).toBe('indeterminate');
+  });
+
+  it('required rule이 없으면 축이 no_required_rules다', async () => {
+    // `pr()` 기본 fixture가 이미 rule 0개다.
+    expect(await policyOf({})).toBe('no_required_rules');
+  });
+
+  it('rule 조회가 403이면 축이 rules_unreadable이다', async () => {
+    expect(
+      await policyOf(
+        withRequired([], [], { branchProtection: 'forbidden', repositoryRuleset: 'absent' }),
+      ),
+    ).toBe('rules_unreadable');
+  });
+
+  it('optional check 실패는 축을 바꾸지 않는다 (OD-032)', async () => {
+    // required는 통과했고 rule에 없는 row만 실패했다. 실측에서 그 상태의 merge는 200이었다.
+    const over = withRequired(
+      [{ context: 'ci', appId: null }],
+      [statusRow('ci', 'SUCCESS'), statusRow('optional-lint', 'FAILURE')],
+    );
+    expect(await policyOf(over)).toBe('passing');
+    // checks 축에는 optional 실패가 그대로 남는다. 축이 사실을 지우지 않는다.
+    const p = projectPullRequest(REPO, pr(over), CORRELATED, await facts(), CONFIG);
+    if (p.kind !== 'card') throw new Error('card가 아니다');
+    expect(p.pr.checks.map((c) => c.name)).toEqual(['ci', 'optional-lint']);
+  });
+
+  it('같은 사실이면 축도 같다 — 상수로 고정된 값이 아니다', async () => {
+    // 입력을 바꾸면 축이 따라 바뀐다. 상수로 되돌리면 이 단언들이 한 번에 깨진다.
+    const observed = await Promise.all([
+      policyOf({}),
+      policyOf(withRequired([{ context: 'ci', appId: null }], [])),
+      policyOf(withRequired([{ context: 'ci', appId: null }], [statusRow('ci', 'PENDING')])),
+      policyOf(withRequired([{ context: 'ci', appId: null }], [statusRow('ci', 'SUCCESS')])),
+      policyOf(withRequired([], [], { branchProtection: 'forbidden' })),
+    ]);
+    expect(observed).toEqual([
+      'no_required_rules',
+      'missing',
+      'pending',
+      'passing',
+      'rules_unreadable',
+    ]);
   });
 });
 

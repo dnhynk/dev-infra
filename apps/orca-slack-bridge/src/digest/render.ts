@@ -4,7 +4,7 @@ import type { Risk } from '../summarize/validate.js';
 import type { CheckFact } from '../github/pull-request.js';
 import type { FindingFacts } from '../summarize/contract.js';
 import { deriveDigestStatus } from './state.js';
-import type { DigestStatus, ProjectedPr, RenderInput } from './types.js';
+import type { DigestStatus, MergePolicy, ProjectedPr, RenderInput } from './types.js';
 
 /**
  * PR digest 카드 renderer.
@@ -18,7 +18,8 @@ import type { DigestStatus, ProjectedPr, RenderInput } from './types.js';
  * 가진다.
  *
  * 주장하지 않는 것: 성공·안전성·검증·테스트 통과. source fact에 있는 값만 옮긴다.
- * `병합 준비 완료`도 만들지 않는다. review·CI·merge 조건의 결합 판정은 C2다.
+ * `병합 준비 완료`는 `mergePolicy` 축이 `passing`일 때만 나오고, 같은 줄이 판정하지 않은
+ * 조건(merge queue·required review·up-to-date·conversation resolution)을 함께 밝힌다(OD-032).
  */
 
 /** 게시할 카드 한 장. `SlackPoster`의 `text`/`blocks`에 그대로 넘긴다. */
@@ -39,7 +40,7 @@ export type RenderedCard = {
  *
  * 문구는 관찰된 사실을 넘지 않는다. `awaiting_review`는 "리뷰 진행 중"이 아니라
  * "reviewer_result가 없다"는 뜻이고, `review_approved`는 병합 준비 완료라는 주장이 아니다.
- * draft와 checks는 headline에 접히지 않으므로 여기 없다. 각각 `현재`와 `CI` 절이 표시한다.
+ * draft·checks·mergePolicy는 headline에 접히지 않으므로 여기 없다. `현재` 절과 `CI` 절이 표시한다.
  */
 const STATUS_LABEL: Readonly<
   Record<DigestStatus, { readonly emoji: string; readonly label: string }>
@@ -49,6 +50,43 @@ const STATUS_LABEL: Readonly<
   changes_requested: { emoji: '⚠️', label: '리뷰에서 수정 요청' },
   review_approved: { emoji: '🟢', label: '리뷰 통과' },
   awaiting_review: { emoji: '🟡', label: '리뷰 결과 없음' },
+};
+
+/**
+ * required check 축 한 줄.
+ *
+ * `mergePolicy`는 base branch의 effective required rule과 head rollup의 조인을 접은 값이고
+ * 파생은 `digest/state.ts`의 `deriveMergePolicy`가 한다. renderer는 그 값을 문구로 옮기기만
+ * 한다. 여기서 다시 판정하면 두 곳이 어긋난다.
+ *
+ * `passing` 문구가 `docs/contracts/observation-and-correlation.md` §6의 두 파생 의미
+ * (`CI 통과`, `병합 준비 완료`)를 카드에 내는 자리다. §6은 `Merge Ready`를 GitHub 단일 필드가
+ * 아니라 **required check만으로 판정하는 derived state**로 정의했고 OD-032가 그렇게 확정했다.
+ * 그래서 이 문구는 그 두 의미를 말하되 **같은 줄에서 판정하지 않은 조건을 명시한다.** 범위를
+ * 밝히지 않으면 required review로 막힌 PR을 병합 가능으로 읽게 된다.
+ *
+ * 다른 값에는 그 문구를 붙이지 않는다.
+ *
+ * - `no_required_rules`: §6의 `병합 준비 완료`는 "required checks가 **모두 passing**"이다.
+ *   required가 0개면 통과한 check가 없고 `CI 통과`는 그대로 거짓이다. 아무것도 돌지 않은 PR을
+ *   통과로 그리지 않는다. 이 축이 막지 않는다는 사실만 적는다.
+ * - `rules_unreadable`: rule 집합을 모르므로 어떤 충족 주장도 관측을 넘는다.
+ * - `missing`과 `indeterminate`도 같은 문구로 합치지 않는다. 앞은 아무도 보고하지 않았다는
+ *   확정이고 뒤는 보고 주체를 관측할 수 없어 판정 자체가 불가능한 상태다
+ *   (`github/required-checks.ts`).
+ */
+const MERGE_POLICY_LINE: Readonly<Record<MergePolicy, string>> = {
+  no_required_rules:
+    'required check: base branch에 required rule이 없다 — 통과할 CI가 지정되지 않았다.' +
+    ' 이 축은 merge를 막지 않는다',
+  rules_unreadable: 'required check: base branch의 required rule을 읽지 못해 판정할 수 없다',
+  passing:
+    'required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다.' +
+    ' merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다',
+  pending: 'required check: 아직 결론 나지 않은 것이 있다',
+  failing: 'required check: 실패한 것이 있다',
+  missing: 'required check: 보고되지 않은 required context가 있다',
+  indeterminate: 'required check: 보고 주체를 관측할 수 없어 충족을 판정할 수 없다',
 };
 
 const RISK_LABEL: Readonly<Record<Risk, string>> = {
@@ -251,6 +289,9 @@ export function renderCard(input: RenderInput): RenderedCard {
         ` (현재 head ${esc(pr.headSha.slice(0, 7))})`,
     );
   }
+  // required check 축을 CI 절에 둔다. 이 축은 `checks`와 같은 commit(`checksHeadSha`)의 사실이라
+  // 위의 head 결속 문구가 축에도 그대로 걸린다. 절을 나누면 그 결속이 축에서 떨어진다.
+  ci.push(MERGE_POLICY_LINE[pr.mergePolicy]);
   ci.push(...(pr.checks.length === 0 ? ['관찰된 check 없음'] : pr.checks.map(checkLine)));
   blocks.push(labelled('CI', ci));
 
