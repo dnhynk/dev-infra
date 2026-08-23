@@ -153,7 +153,14 @@ Run/coordinator identity는 Orca Run row가 권위다. `run-list`가 반환하�
 `coordinator_pane_key`·`consumer_generation`을 사용하고, coordinator 세션의 `ORCA_TERMINAL_HANDLE`·
 `ORCA_PANE_KEY`·`ORCA_WORKTREE_ID` 같은 환경변수는 보조 단서로만 쓴다. `run-use` 인수는 두 coordinator
 필드를 인수한 터미널 값으로 바꾸고 `consumer_generation`을 올리므로 handle은 재시작·인수를 거쳐 유지되지
-않는다. live/stale Run은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
+않는다. binding 하나의 live/stale은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
+
+**Run 수준 rollup은 `live`와 `unknown` 둘뿐이다.** `stale`은 binding 하나에만 쓴다. "관측된 binding이 전부
+낮은 세대다"는 Run이 버려졌다는 근거가 되지 못한다 — `run-use` 인수 직후 새 coordinator가 기존 ready task만
+dispatch하면 새 세대가 만든 Task가 하나도 없고, 그 정상 handoff 구간 내내 살아 있는 Run이 죽은 것으로 그려진다.
+게다가 `run-use`가 `consumer_generation`을 올린다는 것 자체가 `platform-capabilities.md` §7.2에 미검증
+가정으로 기록돼 있다. 관측하지 못한 것을 단정하지 않는다 — required check 축의 `indeterminate`가 같은 판단이다.
+세대 분포는 관측된 binding 목록이 그대로 보여준다.
 
 global `worker-list`의 `runId`와 `resource.worktreeId`는 repository 후보를 보조할 수 있지만 historical/released
 worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree id의 `<uuid>::<path>` 형식을 반복 사용해

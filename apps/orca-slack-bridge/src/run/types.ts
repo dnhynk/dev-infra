@@ -53,16 +53,27 @@ export type RunIdentityFacts = {
   readonly runId: string;
   readonly objective: string;
   readonly legacy: boolean;
-  /** Run row가 말하는 현재 소유자. **이 값이 권위다**(OD-020). */
-  readonly current: RunBindingFacts;
-  /** Task row에서 관측된 binding 전부. generation 오름차순. */
+  /**
+   * Run row가 말하는 현재 소유자. **이 값이 권위다**(OD-020).
+   *
+   * `consumer_generation`을 읽지 못하면 null이다. 세대 없이 binding을 만들면 없는 세대가
+   * 생기고 판정이 그 위에 선다(OD-079).
+   */
+  readonly current: RunBindingFacts | null;
+  /** Task row에서 관측된 binding 전부. generation 오름차순. binding을 읽지 못한 Task는 빠진다. */
   readonly observed: readonly ObservedBinding[];
   /**
-   * Run 수준 판정.
+   * Run 수준 판정. **두 값뿐이다.**
    *
-   * - `live`: 현재 소유자 binding으로 만들어진 Task를 관측했다.
-   * - `stale`: Task는 있는데 전부 더 낮은 generation의 binding이 만들었다.
-   * - `unknown`: 비교할 Task가 없다(legacy Run, 빈 Run, 조회 실패).
+   * - `live`: 현재 소유자 binding으로 만들어진 Task를 관측했다. 이것만이 적극적 사실이다.
+   * - `unknown`: 그 외 전부 — 비교할 Task가 없다(legacy Run, 빈 Run, 조회 실패), 관측된
+   *   binding이 전부 더 낮은 generation이다, Run row와 어긋난다, `consumer_generation`을 읽지
+   *   못했다.
+   * - `stale`: **run 수준에서는 나오지 않는다.** binding 하나에만 쓴다.
+   *
+   * run 수준 `stale`을 만들지 않는 이유는 `liveness.ts`의 `runIdentity` 주석에 있다. 요약하면
+   * "관측된 binding이 전부 낮은 세대다"는 정상 handoff 구간에서도 참이므로 "이 Run은
+   * 버려졌다"의 근거가 되지 못한다. 세대 분포는 `observed`가 그대로 보여준다.
    */
   readonly liveness: BindingLiveness;
 };
@@ -112,6 +123,23 @@ export type DispatchAttempts = {
  *
  * 각 값이 **별도 badge**다. 서로 배타적이지 않으며 같은 Task/Dispatch가 여러 원천에 나타난다.
  * 그래서 고유 총합을 만들지 않는다.
+ *
+ * ## 현재 상태와 누적 이력을 구분한다
+ *
+ * 일곱 원천이 같은 시제를 말하지 않는다. **소비자가 이 구분을 지워서는 안 된다.**
+ *
+ * - **현재 상태** — `openGate`·`blockedTask`·`waitingDependency`·`interactionWait`. 원천 행의
+ *   현재 status에서 나오므로 해소되면 다음 관찰에서 사라진다.
+ * - **누적 이력** — `failedDispatch`·`escalation`. **만료가 없다.** 원천이 과거 행을 지우지
+ *   않으므로 이미 retry로 완료된 Task의 실패도, 이미 해소된 escalation도 계속 셈된다.
+ *   실측(2026-08-24, `run_36d28e6e947a`): 활성 Dispatch가 1건뿐인 Run에서
+ *   `failedDispatch = 13`이었고 13건 전부 retry로 완료된 Task의 과거 실패 행이었다.
+ *   **이 수를 "지금 막혀 있다"로 그리면 완주한 Run이 막힌 것으로 읽힌다.**
+ * - **판정 시점이 관찰 창에 걸림** — `workerAsk`. 미답 여부를 inbox 조회 창 안에서만 판정한다.
+ *   `inbox_saturated` degraded가 붙은 관찰에서는 이 수를 확정으로 읽지 않는다.
+ *
+ * 집계에서 누적 이력을 잘라내지 않는다. 값은 사실이고, 자르려면 만료 기준이 필요한데 원천이
+ * 그 기준을 주지 않는다. 구분은 여기 계약으로 전달하고 표현은 소비자가 정한다.
  */
 export type BlockerSource =
   /** `gate-list.status === 'pending'`. */
@@ -122,9 +150,18 @@ export type BlockerSource =
   | 'waitingDependency'
   /** 답변이 관측되지 않은 `question` 메시지. */
   | 'workerAsk'
-  /** `escalation` 메시지. ask와 별개다 — 같은 Dispatch에 둘이 동시에 존재했다. */
+  /**
+   * `escalation` 메시지. ask와 별개다 — 같은 Dispatch에 둘이 동시에 존재했다.
+   *
+   * **누적 이력이다.** 메시지에는 해소 표시가 없으므로 이미 해결된 escalation도 계속 셈된다.
+   */
   | 'escalation'
-  /** `worker-list.dispatchStatus`가 `completed`·`dispatched`가 아닌 행. */
+  /**
+   * `worker-list.dispatchStatus`가 `completed`·`dispatched`가 아닌 행.
+   *
+   * **누적 이력이다.** retry로 이미 완료된 Task의 과거 실패 행이 그대로 남는다. 현재 blocker가
+   * 아니다.
+   */
   | 'failedDispatch'
   /**
    * `worker-show.observation.agentWait`가 있는 활성 Dispatch.
@@ -195,8 +232,28 @@ export type DegradedKind =
   | 'query_failed'
   /** 관측된 Orca repository id가 설정 어디에도 등록되지 않았다(OD-078). */
   | 'unregistered_repository'
-  /** Task도 worker도 없어 repository id 자체를 관측하지 못했다. */
+  /**
+   * repository id 자체를 관측하지 못했다.
+   *
+   * **원인이 둘이다.** Task도 worker도 없는 빈 Run이거나, 그 축의 조회가 실패했거나다. 어느
+   * 쪽인지는 `detail`이 말하고, 후자면 같은 목록에 `query_failed`가 함께 있다.
+   */
   | 'repository_unobservable'
+  /**
+   * 관측된 repository id가 서로 다른 두 등록 Project에 걸쳐 있다(OD-078).
+   *
+   * 등록은 Project 하나를 고르는 열쇠인데 열쇠가 둘을 가리킨다. 지금은 사전순 첫 매치가
+   * 이기므로 다른 Project 쪽 카드에서 이 Run이 빠진다. 어느 쪽이 맞는지 원천이 정하지 않으므로
+   * 고르지 않고 사실을 드러낸다.
+   */
+  | 'multiple_project_match'
+  /**
+   * Orca row의 한 칸을 읽지 못했다(OD-079).
+   *
+   * 그 칸이 만들던 사실이 이 관찰에 없다는 뜻이다. `client.ts`의 `UnreadableField`가 어느
+   * row의 어느 칸이 왜 실패했는지를 싣고 여기 `detail`이 그것을 한 줄로 옮긴다.
+   */
+  | 'unreadable_field'
   /** live/stale을 판정할 binding이 없거나 Run row와 어긋난다. */
   | 'liveness_unknown'
   /** inbox가 요청 상한에 닿아 ask 답변 부재를 증명할 수 없다. */
@@ -235,6 +292,25 @@ export type RunCollection = {
 
 export type UnregisteredRuns = {
   readonly count: number;
-  /** Run ID와 관측된 repository id. 사용자가 설정에 무엇을 넣어야 하는지 그대로 보여준다. */
-  readonly runs: readonly { readonly runId: string; readonly repositoryIds: readonly string[] }[];
+  readonly runs: readonly UnregisteredRun[];
+};
+
+/**
+ * 등록 Project를 찾지 못한 Run 하나.
+ *
+ * **`degraded`를 함께 싣는다.** 이것이 없으면 "조회했더니 등록에 없다"와 "조회가 실패해서
+ * 판정할 수 없다"가 같은 출력이 된다. 후자는 `repositoryIds`가 비고 `degraded`에
+ * `query_failed`가 있는 모습이고, 전자는 `repositoryIds`에 값이 있고 `unregistered_repository`가
+ * 있는 모습이다.
+ *
+ * 구분이 없으면 OD-078의 완화 장치가 거짓을 말한다. 그 결정이 "id 재생성으로 Run이 조용히
+ * 사라진다"는 위험을 감수한 근거가 **"등록에 맞지 않는 Run을 세어 노출하므로 조용한 실패가
+ * 관측 가능해진다"**인데, 조회에 실패한 Run이 미등록으로 둔갑하면 그 수가 다른 사건을 센다.
+ */
+export type UnregisteredRun = {
+  readonly runId: string;
+  /** 관측된 repository id. 사용자가 설정에 무엇을 넣어야 하는지 그대로 보여준다. */
+  readonly repositoryIds: readonly string[];
+  /** 이 Run의 degraded 전부. 등록 판정을 신뢰할 수 있는지가 여기 있다. */
+  readonly degraded: readonly RunDegraded[];
 };

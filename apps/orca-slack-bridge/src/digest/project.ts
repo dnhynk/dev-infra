@@ -3,7 +3,7 @@ import type { PullRequestFacts } from '../github/pull-request.js';
 import { runKey, taskKey } from '../identity/keys.js';
 import type { RepositoryIdentity } from '../identity/repository.js';
 import {
-  parseReviewerResult,
+  readReviewerResult,
   type OrcaReviewerResult,
   type OrcaTask,
   type WorkerDoneInbox,
@@ -104,7 +104,12 @@ export function pickReviewerResult(
   const needle = repository.nameWithOwner.trim().toLowerCase();
   const matches: { task: OrcaTask; result: OrcaReviewerResult }[] = [];
   for (const task of tasks) {
-    const result = parseReviewerResult(task.result, task.id);
+    // 읽지 못한 result와 shape가 어긋난 reviewer_result는 여기서 판정하지 않는다. 어느 Run의
+    // 어느 task가 왜 실패했는지는 `unreadableTaskFields`가 관측 결과로 싣는다(OD-079).
+    // 여기서 던지면 row 하나가 이 카드뿐 아니라 관측 전체를 없앤다.
+    const parsed = readReviewerResult(task);
+    if (parsed.kind === 'unreadable') continue;
+    const result = parsed.value;
     if (result === null) continue;
     if (result.prNumber !== prNumber) continue;
     if (result.repo.toLowerCase() !== needle) continue;
@@ -131,8 +136,10 @@ export function pickReviewerResult(
  * 결과가 세 가지다.
  *
  * - **찾음** → 그 보고. inbox가 포화됐어도 찾은 것은 사실이므로 정상이다.
- * - **못 찾음 + 포화 아님** → null. 상한 안에 전부 있었는데 없었으므로 정말 없다.
- *   카드는 "worker 보고 없음"을 표시한다(OD-070).
+ * - **못 찾음 + 포화 아님** → null. 상한 안에서 **읽은** 메시지에 없었다는 뜻이다. 카드는
+ *   "worker 보고 없음"을 표시한다(OD-070). `payload`를 읽지 못한 row는 taskId를 알 수 없어
+ *   `WorkerDoneInbox.unreadable`에 있으므로, 그런 row가 있는 관측에서 이 null은 "읽은 범위에는
+ *   없었다"까지만 뜻한다. 그 사실은 보고의 관찰 단위 `degraded`가 싣는다(OD-079).
  * - **못 찾음 + 포화** → 던진다. OD-070의 "없음"은 정말로 없을 때의 규칙이고, 충분히 멀리
  *   보지 못한 것을 없음으로 표시하면 카드가 거짓을 말한다. 판정 불가는 `workerReport: null`로
  *   내려보내지 않는다.

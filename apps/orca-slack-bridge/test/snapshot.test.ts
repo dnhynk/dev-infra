@@ -66,9 +66,10 @@ describe('collectRuns', () => {
   it('JSON 문자열 필드를 파싱해 넘긴다', async () => {
     const runs = await collectRuns(new FakeOrca());
     const live = runs.find((r) => r.run.id === 'run_a48566be983b');
-    expect(live?.tasks[0]?.deps).toEqual([]);
-    expect((live?.tasks[0]?.result as { verdict: string }).verdict).toBe('approve');
-    expect(live?.gates[0]?.options).toEqual(['A', 'B']);
+    expect(live?.tasks[0]?.deps).toEqual({ kind: 'value', value: [] });
+    const result = live?.tasks[0]?.result;
+    expect(result?.kind === 'value' && (result.value as { verdict: string }).verdict).toBe('approve');
+    expect(live?.gates[0]?.options).toEqual({ kind: 'value', value: ['A', 'B'] });
   });
 
   it('task에서 worktree 경로를 모은다', async () => {
@@ -93,6 +94,55 @@ describe('buildCorrelationView', () => {
 });
 
 describe('summarize', () => {
+  /**
+   * Run 줄이 읽지 못한 칸을 드러낸다(OD-079).
+   *
+   * `snapshot`은 inbox를 읽지 않으므로 여기 나오는 것은 task와 gate의 칸이다. 읽지 못한 것을
+   * 없는 것처럼 세면 관측이 조용히 관대해진다.
+   */
+  it('읽지 못한 task·gate 칸을 Run 줄에 드러낸다', () => {
+    const s: Snapshot = {
+      observedAt: '2026-08-24T00:00:00.000Z',
+      runs: [{
+        run: {
+          id: 'run_59bccb319e7f', objective: 'probe', coordinatorHandle: null,
+          coordinatorPaneKey: null, consumerGeneration: { kind: 'value', value: 1 }, legacy: false,
+          createdAt: new Date('2026-08-23T04:50:00Z'), updatedAt: new Date('2026-08-23T04:52:36Z'),
+        },
+        tasks: [
+          {
+            id: 'task_5694362d24f8', runId: 'run_59bccb319e7f', title: 'probe', status: 'completed',
+            deps: { kind: 'value', value: [] },
+            result: { kind: 'unreadable', reason: 'JSON 필드를 파싱할 수 없다: {kind:reviewer_result' },
+            worktreePath: null, repositoryId: null,
+            createdBy: { kind: 'value', value: { handle: null, paneKey: null, generation: 1 } },
+            createdAt: new Date('2026-08-23T04:50:32Z'), completedAt: null,
+          },
+          {
+            id: 'task_ok0000000001', runId: 'run_59bccb319e7f', title: 'ok', status: 'completed',
+            deps: { kind: 'value', value: [] },
+            result: { kind: 'value', value: null },
+            worktreePath: null, repositoryId: null,
+            createdBy: { kind: 'value', value: { handle: null, paneKey: null, generation: 1 } },
+            createdAt: new Date('2026-08-23T04:55:00Z'), completedAt: null,
+          },
+        ],
+        gates: [{
+          id: 'gate_badoptions1', runId: 'run_59bccb319e7f', taskId: 'task_5694362d24f8',
+          question: 'q', options: { kind: 'unreadable', reason: 'JSON 필드를 파싱할 수 없다: [A,B]' },
+          status: 'pending', resolution: null,
+          createdAt: new Date('2026-08-23T04:51:00Z'), resolvedAt: null,
+        }],
+        worktreePaths: [],
+      }],
+      repositories: [],
+    };
+    const out = summarize(s);
+    expect(out).toContain('unreadable=task_5694362d24f8.result,gate_badoptions1.options');
+    // 읽은 row는 그대로 세어진다. 봉쇄가 관측을 줄이지 않는다.
+    expect(out).toContain('tasks=2 gates=1 open=1');
+  });
+
   it('미매핑 repository를 숨기지 않고 드러낸다', () => {
     const s: Snapshot = {
       observedAt: '2026-08-22T00:00:00.000Z',

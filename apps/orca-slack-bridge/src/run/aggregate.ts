@@ -20,7 +20,7 @@ import type {
  * Task·Dispatch 집계와 blocker taxonomy(OD-069, OD-067).
  *
  * 이 파일에 나눗셈이 없다. 확인 방법: `/` 연산자와 `percent`·`rate`·`ratio`·`progress`를 검색해
- * 하나도 나오지 않아야 한다. `test/run-aggregate.test.ts`가 그 성질을 고정한다.
+ * 하나도 나오지 않아야 한다. `test/run-facts.test.ts`가 그 성질을 고정한다.
  */
 
 function countByStatus(rows: readonly { readonly status: string }[]): StatusCount[] {
@@ -134,10 +134,11 @@ export function aggregateBlockers(input: BlockerInput): BlockerFacts {
       push('blockedTask', entry({ taskId: t.id, detail: t.title }));
     } else if (t.status === 'pending') {
       // 의존성이 남아 아직 ready가 아닌 상태다. 실측에서 root 완료 뒤 자동으로 ready가 됐다.
-      push(
-        'waitingDependency',
-        entry({ taskId: t.id, detail: `${t.title} (deps: ${t.deps.join(', ') || '없음'})` }),
-      );
+      // `deps`를 읽지 못한 row도 badge에서 빼지 않는다. pending이라는 사실은 `status` 칸에서
+      // 왔고 그 칸은 읽혔다. 읽지 못한 것은 detail에 그렇게 적는다(OD-079).
+      const deps =
+        t.deps.kind === 'unreadable' ? '읽지 못함' : t.deps.value.join(', ') || '없음';
+      push('waitingDependency', entry({ taskId: t.id, detail: `${t.title} (deps: ${deps})` }));
     }
   }
   for (const a of input.asks) {

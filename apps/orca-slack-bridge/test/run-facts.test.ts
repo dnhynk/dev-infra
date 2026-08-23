@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { collectRunFacts, formatRunCollection } from '../src/run/collect.js';
 import { aggregateBlockers, aggregateDispatches, aggregateTasks } from '../src/run/aggregate.js';
 import { classifyBinding, runIdentity } from '../src/run/liveness.js';
-import type { OrcaRun, OrcaRunner, OrcaTask, OrcaWorker } from '../src/orca/client.js';
+import type { OrcaRun, OrcaRunner, OrcaTask, OrcaWorker, Read } from '../src/orca/client.js';
 import { askThreadsFrom, listWorkers, readInbox } from '../src/orca/client.js';
 import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
 import type { RunCollection } from '../src/run/types.js';
@@ -17,6 +17,11 @@ import type { RunCollection } from '../src/run/types.js';
  * - OD-020 live/stale은 `consumer_generation`으로 갈린다.
  * - OD-078 등록되지 않은 repository의 Run은 표시 대상이 아니고, 조용히 사라지지도 않는다.
  */
+
+/** 읽은 칸 하나로 감싼다. OD-079 이후 봉쇄 대상 칸이 `Read<T>`다. */
+function ok<T>(value: T): Read<T> {
+  return { kind: 'value', value };
+}
 
 const REPO_ID = 'ccb3c8ee-6d9e-42af-af36-9fdac6566fcc';
 const OTHER_REPO_ID = '0409601c-4119-4b29-ae29-e814b8853e11';
@@ -35,7 +40,7 @@ function run(over: Partial<OrcaRun> = {}): OrcaRun {
     objective: 'demo',
     coordinatorHandle: 'term_now',
     coordinatorPaneKey: 'pane:now',
-    consumerGeneration: 2,
+    consumerGeneration: ok(2),
     legacy: false,
     createdAt: new Date('2026-08-23T00:00:00Z'),
     updatedAt: new Date('2026-08-23T00:00:00Z'),
@@ -49,11 +54,11 @@ function task(over: Partial<OrcaTask> = {}): OrcaTask {
     runId: 'run_1',
     title: 't',
     status: 'ready',
-    deps: [],
-    result: null,
+    deps: ok([]),
+    result: ok(null),
     worktreePath: 'D:/dev-infra',
     repositoryId: REPO_ID,
-    createdBy: { handle: 'term_now', paneKey: 'pane:now', generation: 2 },
+    createdBy: ok({ handle: 'term_now', paneKey: 'pane:now', generation: 2 }),
     createdAt: new Date('2026-08-23T00:00:00Z'),
     completedAt: null,
     ...over,
@@ -142,7 +147,7 @@ describe('blocker taxonomy (OD-067)', () => {
     runId: 'run_1',
     taskId: 'task_blocked',
     question: 'q',
-    options: [],
+    options: ok([]),
     status: 'pending',
     resolution: null,
     createdAt: new Date('2026-08-23T00:00:00Z'),
@@ -152,7 +157,7 @@ describe('blocker taxonomy (OD-067)', () => {
   const facts = aggregateBlockers({
     tasks: [
       task({ id: 'task_blocked', status: 'blocked' }),
-      task({ id: 'task_pending', status: 'pending', deps: ['task_blocked'] }),
+      task({ id: 'task_pending', status: 'pending', deps: ok(['task_blocked']) }),
       task({ id: 'task_dispatched', status: 'dispatched' }),
     ],
     gates: [gate],
@@ -273,7 +278,7 @@ describe('blocker taxonomy (OD-067)', () => {
 });
 
 describe('live/stale (OD-020)', () => {
-  it('consumer_generation이 다른 두 Run이 live와 stale로 갈린다', () => {
+  it('binding 수준에서는 consumer_generation이 live와 stale을 가른다', () => {
     const binding = { handle: 'term_first', paneKey: 'pane:first', generation: 1 };
 
     // 아직 인수되지 않은 Run. Run row가 이 binding을 현재 소유자로 말한다.
@@ -281,28 +286,63 @@ describe('live/stale (OD-020)', () => {
       id: 'run_live',
       coordinatorHandle: 'term_first',
       coordinatorPaneKey: 'pane:first',
-      consumerGeneration: 1,
+      consumerGeneration: ok(1),
     });
     // 같은 binding이 만든 Task가 있지만 Run row는 이미 generation 2로 인수됐다.
     const handedOver = run({
-      id: 'run_stale',
+      id: 'run_handed',
       coordinatorHandle: 'term_second',
       coordinatorPaneKey: 'pane:second',
-      consumerGeneration: 2,
+      consumerGeneration: ok(2),
     });
 
-    const tasks = [task({ createdBy: binding })];
-    expect(runIdentity(notHandedOver, tasks).liveness).toBe('live');
-    expect(runIdentity(handedOver, tasks).liveness).toBe('stale');
+    expect(classifyBinding(notHandedOver, binding)).toBe('live');
+    expect(classifyBinding(handedOver, binding)).toBe('stale');
+  });
+
+  /**
+   * run 수준 `stale`을 만들지 않는다.
+   *
+   * 이 상태를 만드는 것은 고장이 아니라 **정상 handoff**다. `run-use` 인수가
+   * `consumer_generation`을 올린 직후 새 coordinator가 기존 ready task만 dispatch하면 새 세대가
+   * 만든 task가 하나도 없다. 그 구간 내내 살아 있는 Run이 죽은 것으로 그려진다.
+   */
+  it('관측된 binding이 전부 낮은 세대여도 Run을 stale로 부르지 않는다', () => {
+    const handedOver = run({
+      coordinatorHandle: 'term_second',
+      coordinatorPaneKey: 'pane:second',
+      consumerGeneration: ok(2),
+    });
+    const tasks = [task({ createdBy: ok({ handle: 'term_first', paneKey: 'pane:first', generation: 1 }) })];
+
+    const identity = runIdentity(handedOver, tasks);
+    expect(identity.liveness).toBe('unknown');
+    // binding 하나의 stale은 그대로 남는다. 세대 분포는 소비자가 그대로 본다.
+    expect(identity.observed.map((o) => o.liveness)).toEqual(['stale']);
+  });
+
+  it('Run 수준 판정은 live 아니면 unknown 둘뿐이다', () => {
+    const r = run({ coordinatorHandle: 'term_new', coordinatorPaneKey: 'pane:new', consumerGeneration: ok(2) });
+    const cases: OrcaTask[][] = [
+      [],
+      [task({ createdBy: ok({ handle: 'term_old', paneKey: 'pane:old', generation: 1 }) })],
+      [task({ createdBy: ok({ handle: 'term_x', paneKey: 'pane:new', generation: 2 }) })],
+      [task({ createdBy: ok({ handle: 'term_new', paneKey: 'pane:new', generation: 9 }) })],
+    ];
+    for (const tasks of cases) expect(runIdentity(r, tasks).liveness).toBe('unknown');
+    expect(
+      runIdentity(r, [task({ createdBy: ok({ handle: 'term_new', paneKey: 'pane:new', generation: 2 }) })])
+        .liveness,
+    ).toBe('live');
   });
 
   it('한 Run 안의 두 세대 binding을 각각 판정한다', () => {
     // 실측(2026-08-24, run_36d28e6e947a): generation 1 binding 39건 + generation 2 binding 24건.
-    const r = run({ coordinatorHandle: 'term_new', coordinatorPaneKey: 'pane:new', consumerGeneration: 2 });
+    const r = run({ coordinatorHandle: 'term_new', coordinatorPaneKey: 'pane:new', consumerGeneration: ok(2) });
     const tasks = [
-      task({ id: 'a', createdBy: { handle: 'term_old', paneKey: 'pane:old', generation: 1 } }),
-      task({ id: 'b', createdBy: { handle: 'term_old', paneKey: 'pane:old', generation: 1 } }),
-      task({ id: 'c', createdBy: { handle: 'term_new', paneKey: 'pane:new', generation: 2 } }),
+      task({ id: 'a', createdBy: ok({ handle: 'term_old', paneKey: 'pane:old', generation: 1 }) }),
+      task({ id: 'b', createdBy: ok({ handle: 'term_old', paneKey: 'pane:old', generation: 1 }) }),
+      task({ id: 'c', createdBy: ok({ handle: 'term_new', paneKey: 'pane:new', generation: 2 }) }),
     ];
     const identity = runIdentity(r, tasks);
     expect(identity.observed).toEqual([
@@ -326,18 +366,42 @@ describe('live/stale (OD-020)', () => {
   });
 
   it('generation이 같아도 handle이 다르면 판정하지 않는다', () => {
-    const r = run({ coordinatorHandle: 'term_a', coordinatorPaneKey: 'pane:a', consumerGeneration: 3 });
+    const r = run({ coordinatorHandle: 'term_a', coordinatorPaneKey: 'pane:a', consumerGeneration: ok(3) });
     expect(classifyBinding(r, { handle: 'term_b', paneKey: 'pane:a', generation: 3 })).toBe('unknown');
     expect(classifyBinding(r, { handle: 'term_a', paneKey: 'pane:z', generation: 3 })).toBe('unknown');
   });
 
   it('Run row보다 앞선 generation을 live로 부르지 않는다', () => {
-    const r = run({ consumerGeneration: 1 });
+    const r = run({ consumerGeneration: ok(1) });
     expect(classifyBinding(r, { handle: 'term_now', paneKey: 'pane:now', generation: 5 })).toBe('unknown');
   });
 
   it('비교할 Task가 없으면 stale이 아니라 unknown이다', () => {
     expect(runIdentity(run(), []).liveness).toBe('unknown');
+  });
+
+  /** 권위인 Run row의 세대를 읽지 못하면 대조할 것이 없다. stale로 접지 않는다(OD-079). */
+  it('consumer_generation을 읽지 못한 Run은 stale이 아니라 unknown이다', () => {
+    const unreadable = run({ consumerGeneration: { kind: 'unreadable', reason: '정수가 아니다: null' } });
+    const tasks = [task({ createdBy: ok({ handle: 'term_old', paneKey: 'pane:old', generation: 1 }) })];
+
+    const identity = runIdentity(unreadable, tasks);
+    expect(identity.liveness).toBe('unknown');
+    expect(identity.current).toBeNull();
+    expect(identity.observed.map((o) => o.liveness)).toEqual(['unknown']);
+  });
+
+  /** binding을 읽지 못한 Task를 기본값으로 메우면 없는 세대가 생긴다(OD-079). */
+  it('created_by를 읽지 못한 Task는 binding 관측에서 뺀다', () => {
+    const r = run({ coordinatorHandle: 'term_now', coordinatorPaneKey: 'pane:now', consumerGeneration: ok(2) });
+    const identity = runIdentity(r, [
+      task({ id: 'a', createdBy: { kind: 'unreadable', reason: '정수가 아니다: undefined' } }),
+      task({ id: 'b', createdBy: ok({ handle: 'term_now', paneKey: 'pane:now', generation: 2 }) }),
+    ]);
+    expect(identity.observed).toEqual([
+      { binding: { handle: 'term_now', paneKey: 'pane:now', generation: 2 }, liveness: 'live', tasks: 1 },
+    ]);
+    expect(identity.liveness).toBe('live');
   });
 });
 
@@ -433,10 +497,12 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
       },
       'worker-list': { workers: [workerRow({ resource: { worktreeId: `${OTHER_REPO_ID}::D:/other` } })] },
     });
-    expect(c.unregistered).toEqual({
-      count: 1,
-      runs: [{ runId: 'run_1', repositoryIds: [OTHER_REPO_ID] }],
-    });
+    expect(c.unregistered.count).toBe(1);
+    expect(c.unregistered.runs[0]?.runId).toBe('run_1');
+    expect(c.unregistered.runs[0]?.repositoryIds).toEqual([OTHER_REPO_ID]);
+    // 관측은 성공했고 등록에 없었다. 조회 실패와 구분되는 모습이다.
+    expect(c.unregistered.runs[0]?.degraded.map((d) => d.kind)).toContain('unregistered_repository');
+    expect(c.unregistered.runs[0]?.degraded.map((d) => d.kind)).not.toContain('query_failed');
   });
 
   it('repository id를 exact 비교한다. 경로가 아니라 id다', async () => {
@@ -497,7 +563,188 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
     });
     const c = await collectRunFacts(orca, CONFIG, { now: () => new Date('2026-08-24T00:00:00Z') });
     expect(orca.calls.map((a) => a[1])).toEqual(['run-list', 'inbox']);
-    expect(c.unregistered.runs).toEqual([{ runId: 'run_legacy', repositoryIds: [] }]);
+    expect(c.unregistered.runs[0]?.runId).toBe('run_legacy');
+    expect(c.unregistered.runs[0]?.repositoryIds).toEqual([]);
+  });
+
+
+  /**
+   * 실증(2026-08-24, `run_59bccb319e7f`): task 행에는 등록된 repository id가 있는데 `result` 칸의
+   * poison 때문에 `task-list` 전체가 던졌고, worker 행에 `worktreeId`가 없어 repoIds가 비었다.
+   * 그 결과 **등록된 Run이 "미등록"으로 출력됐고 `query_failed`가 흔적 없이 사라졌다.**
+   *
+   * 그러면 OD-078이 위험을 감수한 근거가 무너진다. 그 결정은 "등록에 맞지 않는 Run을 세어
+   * 노출하므로 조용한 실패가 관측 가능해진다"를 완화책으로 삼았는데, 조회에 실패한 Run이
+   * 미등록으로 둔갑하면 그 수가 다른 사건을 센다.
+   */
+  it('조회 실패로 판정하지 못한 Run을 진짜 미등록 Run과 같게 출력하지 않는다', async () => {
+    // task-list 응답을 주지 않아 그 축의 조회가 던지게 한다. worker 행에는 worktreeId가 없어
+    // repository id를 하나도 관측하지 못한다 — 실측 run_59bccb319e7f과 같은 모습이다.
+    const orca = new FakeOrca({
+      'run-list': { runs: [{ ...RUN_ROW, id: 'run_failed' }] },
+      'gate-list': { gates: [] },
+      'worker-list': { workers: [workerRow({ resource: {} })] },
+      inbox: { messages: [] },
+    });
+    const c = await collectRunFacts(orca, CONFIG, { now: () => new Date('2026-08-24T00:00:00Z') });
+
+    const failed = c.unregistered.runs.find((u) => u.runId === 'run_failed');
+    expect(failed?.repositoryIds).toEqual([]);
+    // 조회가 실패했다는 사실이 미등록 항목에 그대로 남는다.
+    expect(failed?.degraded.map((d) => d.kind)).toContain('query_failed');
+    expect(failed?.degraded.find((d) => d.kind === 'repository_unobservable')?.detail).toContain(
+      '등록 여부를 판정할 수 없다',
+    );
+
+    // 사람이 읽는 출력에서도 두 줄이 구분된다.
+    const text = formatRunCollection(c);
+    expect(text).toContain('task-list 실패');
+    expect(text).toContain('등록 여부를 판정할 수 없다');
+  });
+
+  it('진짜 빈 Run은 조회 실패로 읽히지 않는다', async () => {
+    const orca = new FakeOrca({
+      'run-list': { runs: [{ ...RUN_ROW, id: 'run_empty' }] },
+      'task-list': { tasks: [], count: 0 },
+      'gate-list': { gates: [] },
+      'worker-list': { workers: [] },
+      inbox: { messages: [] },
+    });
+    const c = await collectRunFacts(orca, CONFIG, { now: () => new Date('2026-08-24T00:00:00Z') });
+    const empty = c.unregistered.runs[0];
+    expect(empty?.degraded.map((d) => d.kind)).not.toContain('query_failed');
+    expect(empty?.degraded.find((d) => d.kind === 'repository_unobservable')?.detail).toContain(
+      'Task도 worker도 없어',
+    );
+  });
+
+  /**
+   * 관측된 id가 두 등록 Project에 걸치면 사전순 첫 매치가 이긴다. 그것을 조용히 하지 않는다 —
+   * 다른 Project 쪽 카드에서는 이 Run이 아무 표시 없이 빠지기 때문이다.
+   */
+  it('여러 Project에 걸친 Run을 조용히 한쪽으로 접지 않는다', async () => {
+    const c = await collect(
+      {
+        'worker-list': {
+          workers: [workerRow({ resource: { worktreeId: `${OTHER_REPO_ID}::D:/other` } })],
+        },
+      },
+      {
+        ...CONFIG,
+        projects: [
+          { name: 'alpha', repositories: ['a/a'], orcaRepositoryIds: [REPO_ID] },
+          { name: 'beta', repositories: ['b/b'], orcaRepositoryIds: [OTHER_REPO_ID] },
+        ],
+      },
+    );
+    expect(c.runs[0]?.project).toBe('alpha');
+    const multi = c.runs[0]?.degraded.find((d) => d.kind === 'multiple_project_match');
+    expect(multi?.detail).toContain('alpha, beta');
+    expect(multi?.detail).toContain('나머지 Project의 카드에서 이 Run이 빠진다');
+  });
+
+  /**
+   * 포화의 더 나쁜 방향은 ask 행 자체가 조회 창 밖으로 밀린 경우다. 그때는 이 Run에 미답 ask가
+   * **보이지 않으므로** Run 수준 조건으로는 아무 흔적이 남지 않는다. 컬렉션 수준에서 무조건 낸다.
+   */
+  it('보이는 미답 ask가 없어도 inbox 포화를 컬렉션 수준으로 드러낸다', async () => {
+    const orca = new FakeOrca({
+      'run-list': { runs: [RUN_ROW] },
+      'task-list': { tasks: [taskRow()], count: 1 },
+      'gate-list': { gates: [] },
+      'worker-list': { workers: [workerRow()] },
+      inbox: {
+        messages: [
+          {
+            id: 'msg_other',
+            run_id: 'run_other',
+            type: 'question',
+            subject: 'Question',
+            thread_id: 'msg_other',
+            payload: '{"taskId":"task_x","dispatchId":"ctx_x"}',
+            created_at: '2026-08-23T00:00:00Z',
+          },
+        ],
+      },
+    });
+    const c = await collectRunFacts(orca, CONFIG, {
+      now: () => new Date('2026-08-24T00:00:00Z'),
+      inboxLimit: 1,
+    });
+    // 이 Run에는 보이는 미답 ask가 없다.
+    expect(c.runs[0]?.blockers.badges).toEqual([]);
+    expect(c.runs[0]?.degraded.map((d) => d.kind)).not.toContain('inbox_saturated');
+    // 그래도 포화 사실은 남는다.
+    expect(c.degraded.find((d) => d.kind === 'inbox_saturated')?.detail).toContain('조회 창');
+  });
+
+  /** OD-079 봉쇄를 이 PR이 새로 넣은 세 parser에도 적용한다. */
+  it('consumer_generation이 깨진 Run 하나가 run-list 전체를 죽이지 않는다', async () => {
+    const orca = new FakeOrca({
+      'run-list': { runs: [{ ...RUN_ROW, id: 'run_bad', consumer_generation: null }, RUN_ROW] },
+      'task-list': { tasks: [taskRow()], count: 1 },
+      'gate-list': { gates: [] },
+      'worker-list': { workers: [workerRow()] },
+      inbox: { messages: [] },
+    });
+    const c = await collectRunFacts(orca, CONFIG, { now: () => new Date('2026-08-24T00:00:00Z') });
+    // 두 Run 모두 관측됐다. 깨진 행 하나가 나머지를 없애지 않는다.
+    expect(c.runs.map((r) => r.identity.runId)).toEqual(['run_bad', 'run_1']);
+    // 읽지 못한 Run은 stale이 아니라 unknown이다.
+    expect(c.runs.find((r) => r.identity.runId === 'run_bad')?.identity.liveness).toBe('unknown');
+    expect(c.degraded.find((x) => x.kind === 'unreadable_field')?.detail).toContain(
+      'run run_bad의 consumer_generation',
+    );
+  });
+
+  it('created_by_run_generation이 깨진 task 하나가 그 Run의 task 축을 죽이지 않는다', async () => {
+    const c = await collect({
+      'task-list': {
+        tasks: [
+          taskRow({ id: 'task_bad', created_by_run_generation: null }),
+          taskRow({ id: 'task_ok' }),
+        ],
+        count: 2,
+      },
+    });
+    expect(c.runs[0]?.tasks.total).toBe(2);
+    // 읽지 못한 binding은 관측에서 빠지고 그 사실이 degraded로 남는다.
+    expect(c.runs[0]?.identity.observed).toHaveLength(1);
+    expect(
+      c.runs[0]?.degraded.find((x) => x.kind === 'unreadable_field')?.detail,
+    ).toContain('task task_bad의 created_by');
+  });
+
+  it('payload가 깨진 inbox row 하나가 ask·escalation 축을 죽이지 않는다', async () => {
+    const c = await collect({
+      inbox: {
+        messages: [
+          {
+            id: 'msg_bad',
+            run_id: 'run_1',
+            type: 'question',
+            subject: 'Question',
+            thread_id: 'msg_bad',
+            payload: '{taskId:task_1}',
+            created_at: '2026-08-23T00:00:00Z',
+          },
+          {
+            id: 'msg_ok',
+            run_id: 'run_1',
+            type: 'question',
+            subject: 'Question',
+            thread_id: 'msg_ok',
+            payload: '{"taskId":"task_1","dispatchId":"ctx_1"}',
+            created_at: '2026-08-23T00:01:00Z',
+          },
+        ],
+      },
+    });
+    // 정상 row는 그대로 badge가 된다.
+    expect(c.runs[0]?.blockers.badges.find((b) => b.source === 'workerAsk')?.count).toBe(1);
+    expect(c.degraded.find((x) => x.kind === 'unreadable_field')?.detail).toContain(
+      'question msg_bad의 payload',
+    );
   });
 
   it('사람이 읽는 요약도 Run 사실을 그대로 옮긴다', async () => {

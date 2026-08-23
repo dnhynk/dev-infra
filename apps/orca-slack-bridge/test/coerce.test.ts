@@ -42,6 +42,20 @@ describe('parseJsonField', () => {
   it('깨진 JSON을 fallback으로 덮지 않는다', () => {
     expect(() => parseJsonField<string[]>('[1,', [])).toThrow(SyntaxError);
   });
+
+  /**
+   * OD-079가 이 계약을 바꾸지 않는다는 것을 고정한다.
+   *
+   * 실측된 깨진 row다(`task-list --run run_59bccb319e7f --json`, 2026-08-24). 봉쇄는 호출부가
+   * 하고 이 함수는 그대로 던진다. 여기서 fallback으로 덮으면 데이터 손실이 조용히 넘어간다.
+   */
+  it('실측된 따옴표 없는 task result도 던진다', () => {
+    const broken =
+      '{kind:reviewer_result,schemaVersion:1,verdict:approve,pr:{repo:THROWAWAY/none,number:10},' +
+      'reviewedHeadSha:deadbeef,findings:[],gates:{evidence_discipline:pass},note:two words}';
+    expect(() => parseJsonField<unknown>(broken, null)).toThrow(SyntaxError);
+    expect(() => parseJsonField<unknown>(broken, null)).toThrow(/JSON 필드를 파싱할 수 없다/);
+  });
 });
 
 describe('parseOrcaTimestamp', () => {

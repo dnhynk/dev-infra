@@ -35,9 +35,12 @@ import type { BindingLiveness, ObservedBinding, RunIdentityFacts } from './types
  * 보조 단서 이상으로 쓰지 않는다(OD-020).
  */
 export function classifyBinding(run: OrcaRun, binding: RunBindingFacts): BindingLiveness {
-  if (binding.generation < run.consumerGeneration) return 'stale';
+  // 권위인 Run row의 세대를 읽지 못했으면 대조할 것이 없다. 판정하지 않는다(OD-079).
+  if (run.consumerGeneration.kind === 'unreadable') return 'unknown';
+  const current = run.consumerGeneration.value;
+  if (binding.generation < current) return 'stale';
   // Run row보다 높은 세대는 설명할 수 없다. 앞선 것을 live로 부르지 않는다.
-  if (binding.generation > run.consumerGeneration) return 'unknown';
+  if (binding.generation > current) return 'unknown';
   const handleMatches =
     binding.handle === run.coordinatorHandle && binding.paneKey === run.coordinatorPaneKey;
   return handleMatches ? 'live' : 'unknown';
@@ -51,37 +54,52 @@ function bindingKey(b: RunBindingFacts): string {
 /**
  * Run row와 Task binding을 대조해 Run identity 사실을 만든다.
  *
- * Run 수준 판정은 관측된 binding 중 하나라도 `live`면 `live`, 관측된 binding이 있는데 하나도
- * live가 아니면 `stale`, 관측된 binding이 없으면 `unknown`이다.
+ * Run 수준 판정은 관측된 binding 중 하나라도 `live`면 `live`이고, **그 외에는 전부**
+ * `unknown`이다. run 수준 `stale`은 만들지 않는다.
  *
- * 마지막 경우를 stale로 접지 않는다. legacy Run과 갓 만들어진 빈 Run은 "인수됐다"가 아니라
- * "비교할 사실이 없다"이고, 둘을 접으면 카드가 없는 사실을 말한다.
+ * ## run 수준에서 stale로 접지 않는 이유
+ *
+ * `stale`은 "이 Run은 버려졌다"는 **적극적 주장**이고, 관측된 binding이 전부 낮은 세대라는 것은
+ * 그 주장의 근거가 되지 못한다. 정상 handoff가 그 상태를 만든다 — `run-use` 인수가
+ * `consumer_generation`을 올린 직후 새 coordinator가 기존 ready task만 dispatch하면 **새 세대가
+ * 만든 task가 하나도 없고** 관측된 binding은 전부 이전 세대다. 그 구간 내내 살아 있는 Run이
+ * 죽은 것으로 그려진다.
+ *
+ * 게다가 그 판정이 서는 근거 자체가 미검증이다. `run-use`가 `consumer_generation`을 올린다는
+ * 것은 `docs/platform-capabilities.md` §7.2에 **미검증 가정**으로 기록돼 있다. 미검증 가정 위에서
+ * 적극적 주장을 하지 않는다 — `github/required-checks.ts`의 `indeterminate`가 같은 판단이다.
+ *
+ * binding **하나**의 `stale`은 그대로 둔다. "이 binding은 더 높은 세대에 대체됐다"는 Run row와
+ * 직접 대조한 사실이고, Run 전체가 버려졌다는 주장이 아니다. 소비자는 `observed`에서 그 분포를
+ * 그대로 본다.
  */
 export function runIdentity(run: OrcaRun, tasks: readonly OrcaTask[]): RunIdentityFacts {
-  const current: RunBindingFacts = {
-    handle: run.coordinatorHandle,
-    paneKey: run.coordinatorPaneKey,
-    generation: run.consumerGeneration,
-  };
+  const current: RunBindingFacts | null =
+    run.consumerGeneration.kind === 'unreadable'
+      ? null
+      : {
+          handle: run.coordinatorHandle,
+          paneKey: run.coordinatorPaneKey,
+          generation: run.consumerGeneration.value,
+        };
   const grouped = new Map<string, { binding: RunBindingFacts; tasks: number }>();
   for (const t of tasks) {
-    const key = bindingKey(t.createdBy);
+    // binding을 읽지 못한 task는 관측에서 뺀다. 기본값으로 메우면 없는 세대가 생기고 Run 판정이
+    // 그 위에 선다. 그 사실은 `unreadableTaskFields`가 degraded로 싣는다(OD-079).
+    if (t.createdBy.kind === 'unreadable') continue;
+    const binding = t.createdBy.value;
+    const key = bindingKey(binding);
     const found = grouped.get(key);
-    if (found === undefined) grouped.set(key, { binding: t.createdBy, tasks: 1 });
+    if (found === undefined) grouped.set(key, { binding, tasks: 1 });
     else found.tasks += 1;
   }
   const observed: ObservedBinding[] = [...grouped.values()]
     .map((g) => ({ ...g, liveness: classifyBinding(run, g.binding) }))
     .sort((a, b) => a.binding.generation - b.binding.generation);
 
-  const liveness: BindingLiveness =
-    observed.length === 0
-      ? 'unknown'
-      : observed.some((o) => o.liveness === 'live')
-        ? 'live'
-        : observed.every((o) => o.liveness === 'stale')
-          ? 'stale'
-          : 'unknown';
+  const liveness: BindingLiveness = observed.some((o) => o.liveness === 'live')
+    ? 'live'
+    : 'unknown';
 
   return {
     key: runKey(run.id),

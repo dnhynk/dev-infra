@@ -17,7 +17,12 @@ export type BridgeConfig = {
 
 /**
  * Slack 식별자. **토큰은 여기 두지 않는다.**
- * 토큰은 환경변수 SLACK_BOT_TOKEN / SLACK_APP_TOKEN로만 주입한다.
+ *
+ * 토큰은 환경변수 `ORCA_SLACK_BRIDGE_BOT_TOKEN` / `ORCA_SLACK_BRIDGE_APP_TOKEN`로만 주입한다.
+ * 관례 이름 `SLACK_BOT_TOKEN`·`SLACK_APP_TOKEN`은 **읽지 않는다**(OD-005). 사용자 환경변수는
+ * 같은 사용자의 모든 프로세스가 상속하므로, 관례 이름을 쓰면 나중에 만든 다른 Slack 앱이 이
+ * Bridge의 토큰을 조용히 집어간다. 이름은 `slack/verify.ts`가 권위이고, 관례 이름만 설정된
+ * 경우는 `verify-slack`이 옮기라고 알려준다.
  */
 export type SlackConfig = {
   readonly teamId: string;
