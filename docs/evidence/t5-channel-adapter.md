@@ -32,7 +32,7 @@ APPLICATION_RECEIPT_RECEIVED    세션이 reply tool 을 호출
 
 이 문서의 §(a)·§(c)·§(d)·§(e) 관측은 아래 네 소스로 재현된다. secret은 없다. 소스는 `<!-- extract: FILE -->` 마커가 붙은 코드 블록으로 실려 있고, §[재현 확인]이 이 블록들을 기계적으로 추출해 변수 0개의 새 셸에서 돌려 재현됨을 증명한다.
 
-**Adapter** (`adapter.mjs`) — `.mcp.json`에 등록돼 Claude Code가 stdio로 spawn한다. 채널 인정 조건은 `capabilities.experimental['claude/channel']` 하나뿐이고 나머지는 표준 MCP다. daemon에 재시도 client로 붙어 push를 `notifications/claude/channel`로 중계하고, reply tool 3종(`orca_report_receipt`/`orca_list_pending`/`orca_whoami`) 호출을 daemon에 `receipt`로 되돌린다. 모든 write에 T0 기준 offset을 남기고, boot 시 identity(env 값 포함, parent chain은 `T5_PARENTPROBE=1`일 때만)를 시스템 temp의 boot dump로 쓴다 — boot dump는 커밋하지 않는다.
+**Adapter** (`adapter.mjs`) — `.mcp.json`에 등록돼 Claude Code가 stdio로 spawn한다. 채널 인정 조건은 `capabilities.experimental['claude/channel']` 하나뿐이고 나머지는 표준 MCP다. daemon에 재시도 client로 붙어 push를 `notifications/claude/channel`로 중계하고, reply tool 3종(`orca_report_receipt`/`orca_list_pending`/`orca_whoami`) 호출을 daemon에 `receipt`로 되돌린다. 모든 write에 T0 기준 offset을 남기고, boot 시 identity를 시스템 temp의 boot dump로 쓴다 — env는 값 대신 변수별 {길이, salted HMAC digest}만 남기고(§(c) 근거 4-1), parent chain은 `T5_PARENTPROBE=1`일 때만이며, boot dump는 커밋하지 않는다.
 
 <!-- extract: adapter.mjs -->
 ```js
@@ -49,6 +49,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
 const T0 = Date.now();
@@ -64,12 +65,19 @@ function log(kind, data) {
   try { fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), off_ms: Date.now() - T0, pid: process.pid, tag: TAG, kind, ...data }) + '\n'); } catch {}
 }
 
-// Boot identity dump (system temp, never committed). env VALUES are recorded so a
-// flag vs no-flag comparison can be made on values, not just key names. The parent
+// Boot identity dump (system temp, never committed). Env VALUES are never
+// persisted: each matched var is stored as {len, digest}, digest = 16-hex
+// HMAC-SHA256 of the value. The salt comes from T5_ENV_SALT (set it once in
+// the launching shell for a flag/no-flag batch so digests compare across that
+// batch's dumps; never written to disk) or is random per process. Equal digest
+// = equal value, so "which vars differ between flag and no-flag" (OD-058)
+// stays answerable while the dump alone cannot reproduce any value. The parent
 // claude.exe command line is probed only when T5_PARENTPROBE=1 (it costs a
 // synchronous WMI call, which would perturb the dead-window timing runs).
+const ENV_SALT = process.env.T5_ENV_SALT || crypto.randomBytes(16).toString('hex');
+const hideEnv = (v) => ({ len: v.length, digest: crypto.createHmac('sha256', ENV_SALT).update(v).digest('hex').slice(0, 16) });
 const envAll = {};
-for (const k of Object.keys(process.env).sort()) if (/CLAUDE|MCP|CHANNEL|ANTHROPIC|ORCA/i.test(k)) envAll[k] = process.env[k];
+for (const k of Object.keys(process.env).sort()) if (/CLAUDE|MCP|CHANNEL|ANTHROPIC|ORCA/i.test(k)) envAll[k] = hideEnv(process.env[k]);
 let parentChain = null;
 if (process.env.T5_PARENTPROBE === '1') {
   try {
@@ -81,8 +89,8 @@ const identity = {
   tag: TAG, pid: process.pid, ppid: process.ppid, cwd: process.cwd(),
   argv: process.argv, exec_argv: process.execArgv, adapter_start_iso: new Date(T0).toISOString(),
   CLAUDE_CODE_SESSION_ID: process.env.CLAUDE_CODE_SESSION_ID ?? null,
-  ORCA_PANE_KEY: process.env.ORCA_PANE_KEY ?? null,
-  parent_chain: parentChain, env_values: envAll, env_all_keys: Object.keys(process.env).sort(),
+  ORCA_PANE_KEY: process.env.ORCA_PANE_KEY ? hideEnv(process.env.ORCA_PANE_KEY) : null,
+  parent_chain: parentChain, env_digests: envAll, env_all_keys: Object.keys(process.env).sort(),
 };
 fs.writeFileSync(path.join(DIR, `boot-${TAG}-${process.pid}.json`), JSON.stringify(identity, null, 2));
 log('adapter_start', { pid: process.pid, tag: TAG, gate: GATE, parentprobe: process.env.T5_PARENTPROBE === '1' });
@@ -172,7 +180,7 @@ function connect() {
   attempt++;
   const s = IPC_MODE === 'tcp' ? net.createConnection({ port: TCP_PORT, host: '127.0.0.1' }) : net.createConnection(PIPE);
   let buf = '';
-  s.on('connect', () => { connected = true; sock = s; log('daemon_connected', { attempt, IPC_MODE }); toDaemon({ type: 'hello', identity: { ...identity, env_values: undefined } }); });
+  s.on('connect', () => { connected = true; sock = s; log('daemon_connected', { attempt, IPC_MODE }); toDaemon({ type: 'hello', identity: { ...identity, env_digests: undefined } }); });
   s.on('data', (chunk) => { buf += chunk.toString('utf8'); let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) { try { onDaemonMessage(JSON.parse(line)); } catch { log('bad_daemon_line', { line }); } } } });
   s.on('error', (err) => log('daemon_connect_error', { attempt, err: String(err) }));
   s.on('close', () => { if (connected) log('daemon_disconnected', {}); connected = false; sock = null; setTimeout(connect, 2000); });
@@ -330,7 +338,7 @@ setTimeout(() => {
 }, 2500);
 ```
 
-**Driver** (`run.ps1`) — 자기 파일 위치(`$PSScriptRoot`)를 하니스 디렉터리로 삼아 SDK 설치·`.mcp.json` 생성·daemon 기동·Orca 터미널 생성·flag 세션 기동·기동 대화상자 처리(렌더 화면 감시)·dead-window 1회 구동·판정·정리를 모두 스스로 한다. id는 파일과 HTTP control plane으로만 오가고 사람이 값을 옮기는 단계가 없다.
+**Driver** (`run.ps1`) — 자기 파일 위치(`$PSScriptRoot`)를 하니스 디렉터리로 삼아 SDK 설치·`.mcp.json` 생성·daemon 기동·Orca 터미널 생성·flag 세션 기동·기동 대화상자 처리(렌더 화면 감시)·dead-window 1회 구동·판정·정리를 모두 스스로 한다. id는 파일과 HTTP control plane으로만 오가고 사람이 값을 옮기는 단계가 없다. daemon은 포트(8791·8792)가 비어 있을 때만 띄우고 — 점유 시 아무것도 죽이지 않고 중단한다 — 종료도 자기가 띄운 PID(`daemon.pid`에 기록)만 한다.
 
 <!-- extract: run.ps1 -->
 ```powershell
@@ -363,13 +371,20 @@ if (-not (Test-Path (Join-Path $DIR 'node_modules/@modelcontextprotocol/sdk'))) 
 $mcp = '{ "mcpServers": { "orca-t5": { "command": "node", "args": ["' + (& $esc (Join-Path $DIR 'adapter.mjs')) + '"], "env": { "T5_IPC": "tcp", "T5_PORT": "8792", "T5_DIR": "' + (& $esc $DIR) + '", "T5_TAG": "flag" } } } }'
 Set-Content -Path (Join-Path $DIR '.mcp.json') -Value $mcp -Encoding utf8
 
-# --- (re)start the daemon with empty state ---
-Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*daemon.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-Start-Sleep 1
+# --- start the daemon with empty state (this script never touches processes it did not start) ---
+# If the ports are already taken the daemon could not bind anyway: report and abort
+# instead of killing whatever owns them.
+$busy = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in @($PORT, $HTTP) }
+if ($busy) {
+  $who = ($busy | ForEach-Object { "port $($_.LocalPort) pid $($_.OwningProcess)" } | Sort-Object -Unique) -join ', '
+  throw "daemon ports in use ($who) - this script kills nothing it did not start; free the ports or change T5_PORT/T5_HTTP"
+}
 Remove-Item (Join-Path $DIR 'daemon.log'), (Join-Path $DIR 'adapter.log') -ErrorAction SilentlyContinue
 $env:T5_DIR = $DIR; $env:T5_PORT = "$PORT"; $env:T5_HTTP = "$HTTP"
-Start-Process -FilePath 'node' -ArgumentList 'daemon.mjs' -WorkingDirectory $DIR -WindowStyle Hidden `
-  -RedirectStandardOutput (Join-Path $DIR 'daemon.out') -RedirectStandardError (Join-Path $DIR 'daemon.err')
+$daemon = Start-Process -FilePath 'node' -ArgumentList 'daemon.mjs' -WorkingDirectory $DIR -WindowStyle Hidden `
+  -RedirectStandardOutput (Join-Path $DIR 'daemon.out') -RedirectStandardError (Join-Path $DIR 'daemon.err') -PassThru
+Set-Content -Path (Join-Path $DIR 'daemon.pid') -Value $daemon.Id -Encoding ascii
+"[2] daemon pid: $($daemon.Id)"
 Start-Sleep 3
 
 # --- enqueue the dw event while NO adapter is connected ---
@@ -419,7 +434,11 @@ else { "[verdict] NOT reproduced (booted=$booted) — inspect state-repro.json" 
 & $ORCA terminal send --terminal $t --text '/quit' --enter | Out-Null
 Start-Sleep 3
 & $ORCA terminal close --terminal $t --tab | Out-Null
-Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*daemon.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+# Stop ONLY the daemon started above. $daemon tracks that exact process object, so a
+# reused PID cannot be hit. On failure: report the PID for manual cleanup and touch
+# nothing else - pre-existing node/daemon.mjs processes are never this script's to kill.
+try { if (-not $daemon.HasExited) { Stop-Process -Id $daemon.Id -Force -ErrorAction Stop } }
+catch { "[warn] daemon pid $($daemon.Id) not stopped ($_) - kill it manually; no other process is touched" }
 "[done] harness dir retained: $DIR"
 ```
 
@@ -448,7 +467,7 @@ POST http://127.0.0.1:8791/enqueue
 
 **binding 위조 #2 (fake hello).** daemon 기동 → 미receipt event enqueue → `node fakeclient.mjs`. daemon이 hello를 인증하지 않으면 pending event를 그 client에 즉시 밀어 준다. 실행 절차와 로그는 §(c) 근거 5.
 
-**parent command line (OD-058).** `.mcp.json`의 `env`에 `"T5_PARENTPROBE":"1"`을 주면 Adapter가 boot 시 자기 parent 프로세스 체인의 command line을 `Get-CimInstance Win32_Process`로 조회해 boot dump에 남긴다. flag/no-flag 세션에서 각각 기동해 대조한다. 실행 절차와 로그는 §(c) 근거 6.
+**parent command line (OD-058).** `.mcp.json`의 `env`에 `"T5_PARENTPROBE":"1"`을 주면 Adapter가 boot 시 자기 parent 프로세스 체인의 command line을 `Get-CimInstance Win32_Process`로 조회해 boot dump에 남긴다. flag/no-flag 세션에서 각각 기동해 대조한다. env 값 대조까지 필요하면 세션을 띄우는 셸에 `T5_ENV_SALT`를 한 번 설정해 두 dump의 digest를 비교 가능하게 한다 — salt는 파일로 남기지 않는다. 실행 절차와 로그는 §(c) 근거 6.
 
 **session prompt.** 재현은 사용자 턴을 **주지 않는 쪽이 기본**이다 — MCP `instructions` 문자열만으로 세션이 매 event에 `orca_report_receipt`를 부른다. 초기 관측 한 세션에는 첫 event 뒤에 아래 사용자 턴을 줬고, 이 지시는 §(e)의 본문-거부 판정에 교란으로 작용하므로 재현 시 넣지 않는다:
 
@@ -463,11 +482,12 @@ or write files, never run bash. Confirm you understand.
 
 **[관측]** 위 하니스가 **이 문서 텍스트만으로** 재현됨을 다음 조건에서 확인했다. Claude Code `2.1.241`, Orca `1.4.187`, Node `v26.7.0`.
 
-- **추출**: 이 문서의 `<!-- extract: FILE -->` 블록을 기계적으로 뽑아 빈 디렉터리에 쓰는 스크립트로 네 파일을 만들었다. 추출본을 하니스 개발본과 줄 단위로 대조했다 — `adapter.mjs` 142줄, `daemon.mjs` 102줄, `fakeclient.mjs` 36줄, `run.ps1` 87줄, 네 파일 모두 **차이 0줄**.
+- **추출**: 이 문서의 `<!-- extract: FILE -->` 블록을 기계적으로 뽑아 빈 디렉터리에 쓰는 스크립트로 네 파일을 만들었다. 추출본을 하니스 개발본과 줄 단위로 대조했다 — `adapter.mjs` 142줄, `daemon.mjs` 102줄, `fakeclient.mjs` 36줄, `run.ps1` 87줄(모두 당시 소스 기준), 네 파일 모두 **차이 0줄**.
 - **셸 조건**: `pwsh -NoProfile -File run.ps1`로 실행한 새 셸. 스크립트의 `[0]` 출력이 transcript 안에서 증명한다 — `RUN`·`T`·`ORCA_TERMINAL_HANDLE` 전부 빈 값(하니스 셸은 Orca 터미널이 아니다). `-File` 실행이므로 하니스가 실행한 명령은 스크립트 본문이 전부다.
 - **빈 상태**: 추출한 네 파일만 있는 fresh 디렉터리. driver가 SDK를 설치하고 `.mcp.json`을 생성하고, folder trust·`New MCP server`·development-channels 세 대화상자를 렌더 화면을 보고 Enter로 통과시켰다(`session booted: True`).
 - **결과**: `dw` early write(+13ms) 유실, late re-push(+25028ms) 도달 → 판정 "dead window REPRODUCED", exit 0. 이 세션은 사다리를 +172ms부터 도달시켜 runs 1·2와 또 다른 경계를 보였다 — fresh 세션에서 경계 불안정이 한 번 더 확인된다.
 - **생성 리소스**: Orca 터미널 `term_73efa487-…`(driver가 `terminal close --tab`으로 닫음), 하니스 디렉터리 `%TEMP%\orca-THROWAWAY-t5-repro`(원시 로그 보존, 레포 밖).
+- **보안 정정 이후**: 위 end-to-end 실행은 당시 소스 기준이다. 이후 정정 2건 — boot dump의 env 값 제거({길이, digest}로 대체), daemon 종료를 자기가 띄운 PID로 한정하고 포트 점유 시 중단 — 으로 `adapter.mjs`(150줄)·`run.ps1`(98줄)이 바뀌었다. [관측] 정정본을 재추출해 `node --check` 통과·PowerShell 파서 오류 0을 확인하고, 변경 로직만 단독 실행으로 검증했다 — dump에 원값 문자열이 남지 않고 digest가 배치 salt로 비교 가능함(9/9 판정 통과), 무관한 `node daemon.mjs` 프로세스는 살아남고 자기 PID만 종료되며 포트 점유 시 아무것도 죽이지 않고 중단함(4/4 판정 통과). end-to-end 재실행은 하지 않았다. [추론] 변경 줄은 dump 기록 형식과 daemon 기동·종료 절차이며 notification 타이밍 경로를 건드리지 않는다.
 
 즉 "내가 재현했다"가 아니라 "문서 텍스트가 재현된다"를 보인다 — 추출본이 개발본과 0줄 차이이고, 그 추출본이 변수 없는 셸에서 dead window를 다시 냈다.
 
@@ -690,6 +710,8 @@ claude --resume 6601fead-619d-4ff6-95ca-46e1eaa7b51b --dangerously-load-...
 핵심은 **flag 세션 두 개끼리도 이 셋이 서로 다르다**는 것이다. 형식은 셋 다 같다 — session id는 UUID, socket은 `\\.\pipe\LOCAL\cc-msg-` + 32 hex, token은 32 hex. 즉 이 셋은 세션마다 새로 생기는 식별자이지 flag의 표지가 아니다. 값·형식·유무 어느 축으로도 flag 세션과 no-flag 세션을 가를 수 없다.
 
 나머지는 전부 값까지 동일했다: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_PROJECT_DIR`, `ORCA_TERMINAL_HANDLE`, `ORCA_PANE_KEY`, `ORCA_WORKTREE_ID`, `ORCA_TAB_ID`, `ORCA_AGENT_HOOK_*`, `ORCA_APP_VERSION` 등. `ORCA_*`가 같은 것은 세 세션을 **같은 Orca terminal에서 차례로 띄웠기 때문**이다. 다른 terminal이면 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_TAB_ID`가 달라진다(round 1의 2세션 동시 관측). flag와는 무관하다.
+
+이 대조는 관측 시점의 라이브 값으로 했다. 값을 평문으로 디스크에 남기는 것은 credential 유출이므로 하니스를 고쳤다 — boot dump에는 변수별 {길이, salted HMAC digest}만 남고(배치 공용 salt는 `T5_ENV_SALT`로 셸 환경으로만 전달, 미보존), 기존 라운드의 dump도 같은 형태로 소급 마스킹했다. digest 동등/상이가 값 동등/상이를 그대로 보존하므로 위 표의 OD-058 음성 증거("값이 다른 변수는 셋뿐")는 유지되고, dump만으로는 원값을 복원할 수 없다.
 
 [관측 안 함] `CLAUDE_CODE_MESSAGING_SOCKET`에 접속해 무엇이 오가는지는 조사하지 않았다. 그 소켓이 세션 상태(opt-in 포함)를 노출하는지는 열려 있다. 다만 문서화되지 않은 내부 IPC이고 버전 계약이 없다.
 
@@ -1259,7 +1281,7 @@ roadmap §9의 출구 조건 대비:
 | Orca terminal `term_e219f93a-…`(driver 자체 테스트)·`term_73efa487-…`(재현 확인) | driver가 스스로 close |
 | Orca terminal `term_df8bf929-…`·`term_07ecc0b1-…`·`term_6ffb561b-…` (초기 관측) | 종료·close |
 | daemon 프로세스, named pipe `\\.\pipe\orca-t5`(재측정)·`\\.\pipe\orca-t5-throwaway`·`\\.\pipe\orca-t5-dw`(초기), TCP 8791·8792 | 종료·해제 (listen 0건 확인) |
-| 하니스 디렉터리 `%TEMP%\orca-THROWAWAY-t5-r4`(재측정)·`%TEMP%\orca-THROWAWAY-t5-repro`(재현 확인)·`%TEMP%\orca-THROWAWAY-t5-channel`(초기) | 원시 로그 보존을 위해 남김. 레포 밖 |
+| 하니스 디렉터리 `%TEMP%\orca-THROWAWAY-t5-r4`(재측정)·`%TEMP%\orca-THROWAWAY-t5-repro`(재현 확인)·`%TEMP%\orca-THROWAWAY-t5-channel`(초기) | 원시 로그 보존을 위해 남김(credential 값은 `<masked len=… hmac16=…>`로 소급 마스킹, salt 폐기). 레포 밖 |
 
 새 Orca Run·Task·Gate·Dispatch를 만들지 않았다. gate-list 의미 확인(§(d))은 기존 Run `run_f039af831871`에 **읽기 전용**으로만 했고 변경하지 않았다. 이 Run(`run_36d28e6e947a`)과 기존 Run을 변경하지 않았다. Slack·GitHub 설정을 변경하지 않았다.
 
