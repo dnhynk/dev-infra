@@ -747,6 +747,34 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
     );
   });
 
+  /**
+   * liveness_unknown 문구는 OD-078의 실패 모드를 사람이 읽는 유일한 자리다. 여기에 객체가
+   * 보간되면 장치가 있어도 읽을 것이 없다.
+   */
+  it('handoff 직후 all-stale 구간의 문구에 Run row의 generation 수가 들어간다', async () => {
+    // Run row는 generation 2인데 관측된 binding은 전부 1이다 — 정상 handoff가 만드는 구간이다.
+    const c = await collect({
+      'task-list': { tasks: [taskRow({ created_by_run_generation: 1 })], count: 1 },
+    });
+    const detail = c.runs[0]?.degraded.find((d) => d.kind === 'liveness_unknown')?.detail;
+    expect(detail).toBe('관측된 binding이 Run row(generation 2)와 어긋난다');
+    expect(detail).not.toContain('[object Object]');
+  });
+
+  it('consumer_generation을 읽지 못한 Run의 문구는 대조하지 못했다는 사실을 적는다', async () => {
+    const orca = new FakeOrca({
+      'run-list': { runs: [{ ...RUN_ROW, consumer_generation: null }] },
+      'task-list': { tasks: [taskRow()], count: 1 },
+      'gate-list': { gates: [] },
+      'worker-list': { workers: [workerRow()] },
+      inbox: { messages: [] },
+    });
+    const c = await collectRunFacts(orca, CONFIG, { now: () => new Date('2026-08-24T00:00:00Z') });
+    const detail = c.runs[0]?.degraded.find((d) => d.kind === 'liveness_unknown')?.detail;
+    expect(detail).toBe('Run row의 generation을 읽지 못해 관측된 binding과 대조할 수 없다');
+    expect(detail).not.toContain('[object Object]');
+  });
+
   it('사람이 읽는 요약도 Run 사실을 그대로 옮긴다', async () => {
     const text = formatRunCollection(await collect());
     expect(text).toContain('run_1');

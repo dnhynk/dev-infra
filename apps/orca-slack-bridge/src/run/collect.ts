@@ -203,7 +203,9 @@ export function projectRun(
       detail:
         identity.observed.length === 0
           ? 'Task가 없어 Run row와 대조할 binding이 없다'
-          : `관측된 binding이 Run row(generation ${run.consumerGeneration})와 어긋난다`,
+          : run.consumerGeneration.kind === 'unreadable'
+            ? 'Run row의 generation을 읽지 못해 관측된 binding과 대조할 수 없다'
+            : `관측된 binding이 Run row(generation ${run.consumerGeneration.value})와 어긋난다`,
     });
   }
 
