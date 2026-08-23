@@ -6,7 +6,7 @@ import type { GhRunner } from '../github/runner.js';
 import { runKey, taskKey, type PullRequestKey } from '../identity/keys.js';
 import { listWorkerDone, type OrcaRunner, type OrcaTask } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
-import type { SlackPoster } from '../slack/post.js';
+import type { SlackPoster, ThreadPoster } from '../slack/post.js';
 import { buildCorrelationView, collectRuns } from '../snapshot/snapshot.js';
 import type { DigestStore } from '../store/schema.js';
 import {
@@ -20,7 +20,14 @@ import {
 } from '../summarize/index.js';
 import { buildSummaryFacts } from './facts.js';
 import { projectPullRequest } from './project.js';
-import { identityLine, renderCard, renderFingerprint, type RenderedCard } from './render.js';
+import {
+  identityLine,
+  renderCard,
+  renderFingerprint,
+  renderThreadEvent,
+  type RenderedCard,
+} from './render.js';
+import { reconcileObservation, type PrTransition } from './transition.js';
 import type { PrSkipReason, ProjectedPr } from './types.js';
 
 /**
@@ -29,15 +36,24 @@ import type { PrSkipReason, ProjectedPr } from './types.js';
  * C1은 polling하지 않는다. 이 함수를 한 번 부르는 것이 관찰 한 번이다(OD-023).
  *
  * ```text
- * Orca/GitHub 관찰 → correlation → ProjectedPr → SummaryFacts → store 조회
+ * Orca/GitHub 관찰 → correlation → ProjectedPr
+ *   → 직전 관측 조회 → reconcile(terminal dominance, check resource) → SummaryFacts → store 조회
  *   → 게이트 A: 사실 지문이 같으면 저장된 요약 재사용, 다르면 summarize
  *   → renderCard
  *   → 게이트 B ─┬─ 매핑 없음        → chat.postMessage → insertPrMessage
  *               ├─ 렌더 지문 다름   → chat.update      → updateObservation
  *               └─ 렌더 지문 같음   → Slack 호출 없음
+ *   → 게이트 C ─┬─ 첫 관측          → 후보를 게시 없이 기준선으로 기록
+ *               ├─ 이미 기록한 전이 → 아무것도 하지 않음
+ *               └─ 그 밖           → thread reply → recordThreadEvent
+ *   → savePrState
  * ```
  *
- * **게이트가 둘이고 각각 다른 것을 막는다.**
+ * **reconcile이 요약·렌더보다 앞에 있는 것이 의도다.** 뒤에 두면 오래된 snapshot이 만든 카드가
+ * 이미 게시된 뒤에 사실이 정정된다. `merged`가 `open`으로 내려간 카드는 되돌려도 사람이 이미
+ * 본다(OD-044).
+ *
+ * **게이트가 셋이고 각각 다른 것을 막는다.**
  *
  * 게이트 A는 **LLM 호출**을 막는다. 기준은 `factsFingerprint`, 즉 요약의 입력이다. 입력이
  * 같으면 문구가 달라질 이유가 없으므로 저장된 문구를 그대로 쓴다(OD-035).
@@ -58,6 +74,11 @@ import type { PrSkipReason, ProjectedPr } from './types.js';
  * 파일·review·CI가 그대로인 채 head만 움직이면 요약 문구가 달라질 이유가 없고, 그때 다시
  * 부르는 것이 OD-035가 줄이려던 낭비다. head 이동이 카드에 반영돼야 하는 부분은 게이트 B가
  * 렌더 지문으로 잡는다.
+ *
+ * 게이트 C는 **thread 중복 reply**를 막는다. 기준은 durable dedupe key다. 후보를 만드는 규칙과
+ * key의 모양은 `digest/transition.ts`에 있고, 그 key가 보장하는 것과 보장하지 않는 것은
+ * `store/schema.ts`의 `PR_THREAD_EVENT_TABLE`에 있다. 프로세스 메모리에 아무것도 두지 않으므로
+ * Bridge를 재시작해도 판정이 같다.
  *
  * 이 파일은 위 순서만 담는다. 사실 수집·파생·렌더는 각 모듈에 있고 여기서 다시 판정하지 않는다.
  */
@@ -80,6 +101,33 @@ export type DigestAction =
    * 사실이고, 불일치가 풀릴 때까지 버리면 그 사이의 Task를 영영 잃는다(OD-076).
    */
   | 'channel_mismatch';
+
+/**
+ * 전이 하나에 대해 이번 관측이 내린 **결정**.
+ *
+ * 쓴 것이 아니라 정한 것을 적는다. dry-run은 store에도 Slack에도 쓰지 않지만 무엇을 하기로
+ * 했는지는 같으므로, 이 값이 두 모드에서 같은 뜻을 갖는다.
+ */
+export type PrTransitionOutcome =
+  /**
+   * 첫 관측이라 게시하지 않고 기준선으로만 둔다(OD-046).
+   *
+   * 이전 상태를 모르는 상태에서 지금 참인 사실을 전이로 쏟아내면 그것이 과거 재생이다.
+   * live 실행은 이때 `pr_thread_event`에 `message_ts` 없이 기록해 다시 후보가 되지 않게 한다.
+   */
+  | 'baseline'
+  /** thread에 게시하고 기록했다. */
+  | 'posted'
+  /**
+   * 게시하지 않았다. 기록도 하지 않았으므로 다음 관측에서 다시 후보가 된다.
+   *
+   * dry-run이거나 thread 게시 경계가 아직 없을 때다. 기록만 하고 게시를 건너뛰면 그 전이가
+   * 영영 사라지므로 그렇게 하지 않는다.
+   */
+  | 'unposted';
+
+/** 이번 관측이 만든 전이 하나와 그 결정. */
+export type PrTransitionResult = PrTransition & { readonly outcome: PrTransitionOutcome };
 
 /**
  * PR 하나에 대한 digest 결과.
@@ -112,6 +160,13 @@ export type DigestResult =
        * 오는 값이므로, 출력이 그 값을 다시 퍼뜨릴 이유가 없다.
        */
       readonly messageTs: string | null;
+      /**
+       * 이번 관측이 만든 전이와 그 결정.
+       *
+       * 이미 기록한 전이는 여기 없다. 사람이 읽는 보고에서 "이번에 무엇이 thread로 나갔는가"가
+       * 보이지 않으면 중복 여부를 확인할 방법이 없다.
+       */
+      readonly transitions: readonly PrTransitionResult[];
     }
   | { readonly kind: 'skipped'; readonly key: PullRequestKey; readonly reason: PrSkipReason };
 
@@ -134,6 +189,14 @@ export type DigestOptions = {
    * 존재하지 않는 메시지를 update하려 하고, 루트가 영영 만들어지지 않는다.
    */
   readonly slack: SlackPoster | null;
+  /**
+   * PR thread write 경계. **null이면 전이를 게시하지 않는다.**
+   *
+   * `slack`과 따로 받는다. 실제 thread 게시는 C2-4가 붙이고, 그때까지 전이 판정과 dedupe는
+   * 실행 경로에 그대로 있어야 한다. null이어도 후보를 버리지 않고 `unposted`로 남기므로,
+   * 아직 참인 전이는 게시 경계가 붙는 순간 나간다(`digest/transition.ts`).
+   */
+  readonly thread: ThreadPoster | null;
   readonly provider: SummaryProvider;
   readonly cache: SummaryCache;
   readonly prLimit: number;
@@ -209,11 +272,23 @@ function taskPurpose(tasks: readonly OrcaTask[], pr: ProjectedPr): string | null
  * 관찰이나 Slack 게시를 손상시키지 않는다.
  */
 async function digestOne(
-  pr: ProjectedPr,
+  observed: ProjectedPr,
   source: PullRequestFacts,
   tasks: readonly OrcaTask[],
   options: DigestOptions,
 ): Promise<DigestResult> {
+  // 직전 관측을 먼저 읽는다. 없으면 null이고 그것은 "이 PR을 처음 본다"는 정상 출력이다.
+  // 이 값이 `reconcileTerminal`의 `previous`이며, 그 함수의 프로덕션 호출자는 여기 하나다.
+  const previousState = options.store.findPrState(observed.key);
+  // reconcile을 요약·렌더보다 앞에 둔다. 뒤에 두면 오래된 snapshot이 만든 카드가 이미 게시된다.
+  const observation = reconcileObservation(
+    previousState,
+    observed,
+    source.requiredRules,
+    source.mergedAt,
+  );
+  const pr = observation.pr;
+
   const facts = buildSummaryFacts(
     pr,
     source,
@@ -246,7 +321,9 @@ async function digestOne(
 
   const card = renderCard({ pr, summary });
   const fingerprint = renderFingerprint(card);
-  const observation = {
+  // 이름이 `observation`이 아닌 것이 의도다. 위의 `observation`은 reconcile 결과이고 이것은
+  // `pr_message` 한 행에 남길 지문 둘과 요약이다. 두 값의 수명과 용도가 다르다.
+  const record = {
     renderFingerprint: fingerprint,
     factsFingerprint: factsFp,
     summaryJson: serializeSummary(summary),
@@ -262,8 +339,74 @@ async function digestOne(
     summaryReused: reused !== null,
   } as const;
 
+  /**
+   * 게이트 C와 상태 저장. 이 관측이 durable store에 남기는 것 전부다.
+   *
+   * `threadTs`가 null이면 매달 루트를 확정할 수 없다는 뜻이므로 게시하지 않는다. 그래도 후보는
+   * 버리지 않는다 — 아직 참인 사실이면 다음 관측에서 다시 후보가 된다.
+   *
+   * 순서가 중요하다. **게시한 뒤에 기록한다.** 먼저 기록하면 게시에 실패한 전이가 기록된
+   * 것으로 남아 영영 나가지 않는다. 반대 순서의 대가(게시 뒤 기록 전에 죽으면 다음 관측이
+   * 다시 게시한다)는 `pr_message`가 이미 안고 있는 창과 같은 것이고, 그 창을 여기서 닫지
+   * 않는다(스펙 §9, OD-051).
+   *
+   * dry-run은 아무것도 쓰지 않는다. 결정만 돌려준다.
+   */
+  const settle = async (threadTs: string | null): Promise<readonly PrTransitionResult[]> => {
+    const recorded = new Set(options.store.listThreadEvents(pr.key).map((e) => e.dedupeKey));
+    const fresh = observation.candidates.filter((t) => !recorded.has(t.dedupeKey));
+    const at = options.now().toISOString();
+    const live = options.slack !== null;
+
+    // 첫 관측이다. 이전 상태를 모르므로 지금 참인 사실을 전이로 내지 않는다(OD-046).
+    if (previousState === null) {
+      if (live) {
+        for (const t of fresh) {
+          options.store.recordThreadEvent({
+            prKey: pr.key,
+            dedupeKey: t.dedupeKey,
+            kind: t.kind,
+            // 게시하지 않았다는 사실을 행에 남긴다.
+            messageTs: null,
+            at,
+          });
+        }
+        options.store.savePrState(pr.key, observation.state, at);
+      }
+      return fresh.map((t): PrTransitionResult => ({ ...t, outcome: 'baseline' }));
+    }
+
+    const out: PrTransitionResult[] = [];
+    for (const t of fresh) {
+      if (!live || options.thread === null || threadTs === null) {
+        out.push({ ...t, outcome: 'unposted' });
+        continue;
+      }
+      const event = renderThreadEvent({ pr, transition: t, observedAt: at });
+      const posted = await options.thread.reply({
+        channel: options.channel,
+        threadTs,
+        text: event.text,
+        blocks: event.blocks,
+      });
+      options.store.recordThreadEvent({
+        prKey: pr.key,
+        dedupeKey: t.dedupeKey,
+        kind: t.kind,
+        messageTs: posted.ts,
+        at,
+      });
+      out.push({ ...t, outcome: 'posted' });
+    }
+    if (live) options.store.savePrState(pr.key, observation.state, at);
+    return out;
+  };
+
   if (existing !== null && existing.channelId !== options.channel) {
-    return { ...base, action: 'channel_mismatch', messageTs: existing.messageTs };
+    // 채널이 어긋난 동안에도 관측한 사실은 남긴다(`recordPrTask`와 같은 근거). thread에는
+    // 쓰지 않는다 — 어느 채널의 어느 루트에 매달지 확정할 수 없다.
+    const transitions = await settle(null);
+    return { ...base, action: 'channel_mismatch', messageTs: existing.messageTs, transitions };
   }
 
   // 게이트 B. 게시 여부는 렌더 지문이 정한다. 사실이 그대로여도 카드에만 있는 사실(PR state,
@@ -272,9 +415,10 @@ async function digestOne(
     // 카드는 그대로다. Slack은 부르지 않는다. 다만 이번에 새로 요약했다면 그 결과는 남긴다.
     // 남기지 않으면 이 사실 조합이 관찰마다 다시 요약된다. dry-run은 아무것도 쓰지 않는다.
     if (options.slack !== null && reused === null) {
-      options.store.updateObservation(pr.key, observation, options.now().toISOString());
+      options.store.updateObservation(pr.key, record, options.now().toISOString());
     }
-    return { ...base, action: 'skip', messageTs: existing.messageTs };
+    const transitions = await settle(existing.messageTs);
+    return { ...base, action: 'skip', messageTs: existing.messageTs, transitions };
   }
 
   if (options.slack === null) {
@@ -282,6 +426,7 @@ async function digestOne(
       ...base,
       action: existing === null ? 'create' : 'update',
       messageTs: existing?.messageTs ?? null,
+      transitions: await settle(existing?.messageTs ?? null),
     };
   }
 
@@ -297,10 +442,11 @@ async function digestOne(
       prKey: pr.key,
       channelId: posted.channel,
       messageTs: posted.ts,
-      ...observation,
+      ...record,
       at,
     });
-    return { ...base, action: 'create', messageTs: posted.ts };
+    const transitions = await settle(posted.ts);
+    return { ...base, action: 'create', messageTs: posted.ts, transitions };
   }
 
   const updated = await options.slack.update({
@@ -309,8 +455,13 @@ async function digestOne(
     text: card.text,
     blocks: card.blocks,
   });
-  options.store.updateObservation(pr.key, observation, at);
-  return { ...base, action: 'update', messageTs: updated.ts };
+  options.store.updateObservation(pr.key, record, at);
+  return {
+    ...base,
+    action: 'update',
+    messageTs: updated.ts,
+    transitions: await settle(updated.ts),
+  };
 }
 
 /** 요약 실패 사유가 길어질 수 있어 사람이 읽는 줄에서만 자른다. `--json`은 전문을 싣는다. */
@@ -358,6 +509,9 @@ export function formatReport(report: DigestReport): string {
       }`,
     );
     lines.push(`  ts ${r.messageTs ?? '(없음)'}`);
+    // 이번 관측이 thread에 무엇을 냈는지 보이지 않으면 중복 여부를 확인할 방법이 없다.
+    // 이미 기록한 전이는 여기 나오지 않는다. 그것이 게이트 C가 일하고 있다는 뜻이다.
+    for (const t of r.transitions) lines.push(`  transition ${t.kind} ${t.outcome} ${t.dedupeKey}`);
     lines.push(`  text ${r.card.text}`);
     if (report.dryRun) {
       lines.push('  blocks');

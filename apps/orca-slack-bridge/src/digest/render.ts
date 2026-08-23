@@ -4,6 +4,7 @@ import type { Risk } from '../summarize/validate.js';
 import type { CheckFact } from '../github/pull-request.js';
 import type { FindingFacts } from '../summarize/contract.js';
 import { deriveDigestStatus } from './state.js';
+import type { PrTransition, PrTransitionKind } from './transition.js';
 import type { DigestStatus, MergePolicy, ProjectedPr, RenderInput } from './types.js';
 
 /**
@@ -346,4 +347,88 @@ export function renderCard(input: RenderInput): RenderedCard {
 export function renderFingerprint(card: RenderedCard): string {
   const canonical = JSON.stringify({ text: card.text, blocks: card.blocks });
   return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
+
+/**
+ * thread 전이 한 줄의 라벨과 설명.
+ *
+ * `docs/ux/slack-surfaces.md` §5가 정한 thread event 최소 필드는 transition type, occurred/observed
+ * time, 짧은 설명 셋이다. type은 emoji + 라벨이 내고, 설명이 여기 있고, 시각은
+ * `renderThreadEvent`가 붙인다.
+ *
+ * 카드와 같은 규율이다. emoji만으로 상태를 구분하지 않고(UX §1), 관찰된 사실을 넘는 문구를
+ * 쓰지 않는다. `checks_passing` 문구가 카드의 `passing` 줄과 같은 범위 단서를 다는 이유도
+ * 같다 — required check 축은 merge 가능 여부의 최종 답이 아니다(OD-032).
+ */
+type TransitionLine = {
+  readonly emoji: string;
+  readonly label: string;
+  readonly detail: string;
+};
+
+const TRANSITION_LINE: Readonly<Record<PrTransitionKind, TransitionLine>> = {
+  review_changes_requested: {
+    emoji: '⚠️',
+    label: '리뷰에서 수정 요청',
+    detail: 'reviewer 판정이 request_changes다',
+  },
+  review_approved: {
+    emoji: '🟢',
+    label: '리뷰 통과',
+    detail: 'reviewer 판정이 approve다. 병합 준비 완료라는 주장이 아니다',
+  },
+  checks_failing: {
+    emoji: '⚠️',
+    label: 'required check 실패',
+    detail: 'required context 중 실패한 것이 있다',
+  },
+  checks_passing: {
+    emoji: '🟢',
+    label: 'required check 통과',
+    detail:
+      'required context 전부가 충족됐다.' +
+      ' merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다',
+  },
+  merged: { emoji: '✅', label: '병합 완료', detail: '이 PR이 병합됐다' },
+};
+
+/** `renderThreadEvent` 입력. 카드와 같은 규율로 여기 없는 값은 thread에 나타나지 않는다. */
+export type ThreadEventInput = {
+  readonly pr: ProjectedPr;
+  readonly transition: PrTransition;
+  /** 이 전이를 관측한 시각. ISO8601이다. */
+  readonly observedAt: string;
+};
+
+/**
+ * thread reply 하나를 그린다.
+ *
+ * 카드 renderer와 같은 파일에 둔다. 둘 다 LLM을 부르지 않고 입력에서 결정적으로 나오는
+ * Slack 렌더링이며, 이스케이프와 section 상한 판정을 나눠 두면 한쪽만 고쳐지고 새는 쪽이 생긴다.
+ *
+ * **발생 시각과 관측 시각을 구분해 적는다.** `occurredAt`이 null이면 그 사실이 시각을 싣고
+ * 있지 않다는 뜻이고, 그때 관측 시각을 발생 시각인 척하지 않는다(UX §5).
+ */
+export function renderThreadEvent(input: ThreadEventInput): RenderedCard {
+  const { pr, transition, observedAt } = input;
+  const { emoji, label, detail } = TRANSITION_LINE[transition.kind];
+  const escapedIdentity = esc(identityLine(pr));
+
+  const lines = [`${emoji} *${esc(label)}*`, esc(detail)];
+  if (transition.kind === 'review_changes_requested' && pr.review !== null) {
+    lines.push(
+      pr.review.findingsTotal === 0
+        ? '보고된 finding 없음'
+        : `보고된 finding ${pr.review.findingsTotal}건`,
+    );
+  }
+  lines.push(
+    transition.occurredAt === null
+      ? `관측 ${esc(observedAt)} (이 사실에는 발생 시각이 실려 있지 않다)`
+      : `발생 ${esc(transition.occurredAt)} · 관측 ${esc(observedAt)}`,
+  );
+
+  // thread reply는 루트 아래에 붙지만 알림 자리에는 그 맥락이 없다. identity를 함께 싣는다.
+  const text = `${emoji} ${escapedIdentity} · ${esc(label)} — ${esc(observedAt)}`;
+  return { text, blocks: [section(lines.join('\n'))] };
 }

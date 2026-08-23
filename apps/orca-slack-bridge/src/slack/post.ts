@@ -3,8 +3,9 @@ import { BOT_TOKEN_VAR, maskToken } from './verify.js';
 /**
  * Slack write 경계.
  *
- * digest가 Slack에 하는 일은 두 가지뿐이다. 루트 메시지를 만들고, 같은 메시지를 갱신한다.
- * `chat.postMessage`와 `chat.update`에 대응한다. 삭제·thread reply·reaction은 C1에 없다.
+ * digest가 Slack에 하는 일은 셋이다. 루트 메시지를 만들고, 같은 메시지를 갱신하고, 그 루트의
+ * thread에 전이를 남긴다. 앞의 둘은 `SlackPoster`(`chat.postMessage`, `chat.update`)이고 마지막이
+ * `ThreadPoster`다. 삭제와 reaction은 없다.
  *
  * 이 파일은 계약(`SlackPoster`)과 그 구현(`SlackWebApiPoster`)을 함께 담는다. Slack에 write하는
  * 코드는 여기 말고 없다.
@@ -22,6 +23,14 @@ export type PostMessageInput = {
   /** 채널 ID. 이름이 아니다. 설정의 `slack.channels.prDigest`에서 온다. */
   readonly channel: string;
   /** blocks를 그리지 못하는 자리(알림, 검색 결과)용 대체 텍스트. 비우지 않는다. */
+  readonly text: string;
+  readonly blocks: readonly SlackBlock[];
+};
+
+export type ThreadReplyInput = {
+  readonly channel: string;
+  /** 답을 매달 루트 메시지의 ts. `pr_message`가 기록해 둔 값이다. */
+  readonly threadTs: string;
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
 };
@@ -88,6 +97,25 @@ export type PostedMessage = {
 export interface SlackPoster {
   post(input: PostMessageInput): Promise<PostedMessage>;
   update(input: UpdateMessageInput): Promise<PostedMessage>;
+}
+
+/**
+ * PR thread에 전이를 남기는 write 경계.
+ *
+ * `SlackPoster`와 **따로 둔다.** 합치면 이 파일의 Web API 구현이 thread reply까지 하게 되는데,
+ * 실제 게시는 C2-4이고 C2-3의 범위가 아니다. 인터페이스를 먼저 두면 전이 판정과 dedupe 배선을
+ * 전부 실행 경로에 넣은 채로 게시 경계만 뒤에 붙일 수 있다.
+ *
+ * **재시도 정책은 `post`와 같다.** thread reply도 `chat.postMessage`이고, 같은 요청임을 Slack이
+ * 알아볼 identity가 없다. 게시 여부를 알 수 없는 실패를 재시도하면 thread에 같은 전이가 두 번
+ * 남고 되돌릴 수 없다. `update`처럼 대상이 이미 정해진 write가 아니다.
+ *
+ * **이 인터페이스는 중복 reply가 없다는 것을 보장하지 않는다.** 그 판정은 durable dedupe key가
+ * 하고, 그 key가 보장하는 것과 보장하지 않는 것은 `store/schema.ts`의 `PR_THREAD_EVENT_TABLE`에
+ * 적었다. 여기서 재시도로 그것을 대신하려 하지 마라.
+ */
+export interface ThreadPoster {
+  reply(input: ThreadReplyInput): Promise<PostedMessage>;
 }
 
 /**

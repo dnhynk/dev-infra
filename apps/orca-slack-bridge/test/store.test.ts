@@ -756,3 +756,289 @@ describe('pr_task 연관', () => {
     expect(rows.map((r) => r.taskKey)).toEqual([TASK_A, TASK_B]);
   });
 });
+
+/**
+ * v3 파일을 올려서 여는 경로.
+ *
+ * v1·v2와 같은 이유로 v3 DDL을 여기 그대로 적는다. 옛 스키마는 `schema.ts`에 남아 있지 않고,
+ * 여기 적힌 것이 migration이 실제로 만나는 모양이다. v1 → v4 경로는 위 describe들이 단계별로
+ * 검증하므로 여기서는 v3 → v4 한 단계만 본다.
+ */
+const V3_DDL = `
+CREATE TABLE schema_version (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  version    INTEGER NOT NULL,
+  applied_at TEXT    NOT NULL
+);
+
+CREATE TABLE pr_message (
+  pr_key             TEXT PRIMARY KEY,
+  channel_id         TEXT NOT NULL,
+  message_ts         TEXT NOT NULL,
+  render_fingerprint TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  facts_fingerprint  TEXT,
+  summary_json       TEXT
+);
+
+CREATE UNIQUE INDEX pr_message_slack_identity ON pr_message (channel_id, message_ts);
+
+CREATE TABLE pr_task (
+  pr_key        TEXT NOT NULL,
+  task_key      TEXT NOT NULL,
+  run_key       TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL,
+  PRIMARY KEY (pr_key, task_key)
+);
+`;
+
+/** 게시된 카드의 매핑과 PR↔Task 연관이 든 v3 파일을 만든다. */
+function writeV3(path: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const raw = new DatabaseSync(path);
+  raw.exec(V3_DDL);
+  raw
+    .prepare('INSERT INTO schema_version (id, version, applied_at) VALUES (1, 3, ?)')
+    .run('2026-08-22T12:58:31.014Z');
+  raw
+    .prepare(
+      `INSERT INTO pr_message
+         (pr_key, channel_id, message_ts, render_fingerprint, created_at, updated_at,
+          facts_fingerprint, summary_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      PR, 'C0PRDIGEST', '1787403740.833329', 'fp-v3',
+      '2026-08-22T13:02:19.373Z', '2026-08-22T13:02:37.520Z',
+      'facts-v3', '{"kind":"ok"}',
+    );
+  raw
+    .prepare(
+      `INSERT INTO pr_task (pr_key, task_key, run_key, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(PR, TASK_A, RUN, '2026-08-22T13:02:19.373Z', '2026-08-22T13:02:37.520Z');
+  raw.close();
+}
+
+describe('v3 → v4 migration', () => {
+  // 이 파일의 알려진 함정이다. SCHEMA_DDL에만 있고 MIGRATIONS에는 없는 테이블(또는 그 반대)이
+  // 생기면 새 파일과 기존 파일이 다른 스키마로 갈라진다. 컬럼 이름뿐 아니라
+  // type·notnull·default·PK와 인덱스까지 대조한다.
+  it('올린 v3 파일과 새로 만든 v4 파일의 스키마가 같다', () => {
+    writeV3(dbPath);
+    new SqliteDigestStore(dbPath).close();
+
+    const freshPath = join(dir, 'fresh', 'state.db');
+    new SqliteDigestStore(freshPath).close();
+    expect(readSchemaShape(dbPath)).toEqual(readSchemaShape(freshPath));
+  });
+
+  it('두 표를 붙이고 버전을 올리며 기존 매핑과 Task 연관을 그대로 둔다', () => {
+    writeV3(dbPath);
+
+    const store = new SqliteDigestStore(dbPath);
+    const found = store.findPrMessage(PR);
+    const tasks = store.listPrTasks(PR);
+    // 붙인 표는 비어 있다. 과거 상태도 과거 전이도 소급해 채우지 않는다(OD-046).
+    const state = store.findPrState(PR);
+    const events = store.listThreadEvents(PR);
+    store.close();
+
+    expect(found).toEqual({
+      prKey: PR,
+      channelId: 'C0PRDIGEST',
+      messageTs: '1787403740.833329',
+      renderFingerprint: 'fp-v3',
+      factsFingerprint: 'facts-v3',
+      summaryJson: '{"kind":"ok"}',
+      createdAt: '2026-08-22T13:02:19.373Z',
+      updatedAt: '2026-08-22T13:02:37.520Z',
+    });
+    expect(tasks).toEqual([
+      {
+        prKey: PR,
+        taskKey: TASK_A,
+        runKey: RUN,
+        firstSeenAt: '2026-08-22T13:02:19.373Z',
+        lastSeenAt: '2026-08-22T13:02:37.520Z',
+      },
+    ]);
+    expect(state).toBeNull();
+    expect(events).toEqual([]);
+
+    const raw = new DatabaseSync(dbPath);
+    const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    raw.close();
+    expect(version).toEqual({ version: SCHEMA_VERSION });
+  });
+
+  // 트랜잭션이 CREATE TABLE 둘을 함께 되돌리는지 본다. 되돌리지 않으면 표는 있는데 버전은 v3인
+  // 파일이 남고, 다음 실행이 같은 CREATE TABLE을 다시 걸어 영영 열리지 않는다.
+  it('migration이 실패하면 파일이 v3 그대로 남는다', () => {
+    writeV3(dbPath);
+    const seed = new DatabaseSync(dbPath);
+    // 두 번째 문장에서 실패시킨다. 첫 번째 문장이 되돌아가는지 함께 보기 위해서다.
+    seed.exec('CREATE TABLE pr_thread_event (x TEXT)');
+    seed.close();
+
+    expect(() => new SqliteDigestStore(dbPath)).toThrow(/pr_thread_event/);
+
+    const raw = new DatabaseSync(dbPath);
+    const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
+    const rows = raw.prepare('SELECT pr_key, message_ts FROM pr_message').all();
+    // 첫 문장이 만든 pr_state도 함께 되돌아가야 한다.
+    const leftover = raw
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pr_state'")
+      .all();
+    raw.close();
+    expect(version).toEqual({ version: 3 });
+    expect(rows).toEqual([{ pr_key: PR, message_ts: '1787403740.833329' }]);
+    expect(leftover).toEqual([]);
+  });
+});
+
+/**
+ * 직전 관측 상태(OD-044)와 thread 전이 기록(OD-046).
+ *
+ * 이 둘이 없으면 다음 관측이 무엇과 비교해야 하는지도, 무엇을 이미 말했는지도 알 수 없다.
+ */
+describe('pr_state와 pr_thread_event', () => {
+  const AT1 = '2026-08-23T01:00:00.000Z';
+  const AT2 = '2026-08-23T02:00:00.000Z';
+  const CHECK = {
+    kind: 'checkRun' as const,
+    id: 'CR_1',
+    name: 'build',
+    status: 'COMPLETED',
+    conclusion: 'SUCCESS',
+    state: null,
+    appId: 15368,
+    startedAt: '2026-08-23T00:50:00Z',
+    completedAt: '2026-08-23T00:55:00Z',
+  };
+  const STATE = {
+    terminal: 'open' as const,
+    mergedAt: null,
+    reviewVerdict: 'approve' as const,
+    reviewedHeadSha: 'a'.repeat(40),
+    headSha: 'a'.repeat(40),
+    checksHeadSha: 'a'.repeat(40),
+    checks: [CHECK],
+  };
+
+  it('없으면 null이다. 그것이 이 PR을 처음 본다는 뜻이다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    const found = store.findPrState(PR);
+    store.close();
+    expect(found).toBeNull();
+  });
+
+  it('저장한 상태를 그대로 되읽는다. checks도 잃지 않는다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.savePrState(PR, STATE, AT1);
+    const found = store.findPrState(PR);
+    store.close();
+    expect(found).toEqual({ prKey: PR, ...STATE, observedAt: AT1 });
+  });
+
+  // insertPrMessage와 반대다. 관측마다 덮어쓰는 것이 이 표의 정상 경로다.
+  it('다시 저장하면 던지지 않고 덮어쓴다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.savePrState(PR, STATE, AT1);
+    store.savePrState(PR, { ...STATE, terminal: 'merged', mergedAt: AT2 }, AT2);
+    const found = store.findPrState(PR);
+    store.close();
+    expect(found?.terminal).toBe('merged');
+    expect(found?.mergedAt).toBe(AT2);
+    expect(found?.observedAt).toBe(AT2);
+  });
+
+  it('재시작해도 같은 파일에서 직전 상태를 읽는다', () => {
+    const first = new SqliteDigestStore(dbPath);
+    first.savePrState(PR, STATE, AT1);
+    first.close();
+
+    const second = new SqliteDigestStore(dbPath);
+    const found = second.findPrState(PR);
+    second.close();
+    expect(found?.checks).toEqual([CHECK]);
+  });
+
+  it('PR마다 상태가 따로다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.savePrState(PR, STATE, AT1);
+    const other = store.findPrState(OTHER_PR);
+    store.close();
+    expect(other).toBeNull();
+  });
+
+  it('전이를 기록하고 되읽는다. seed 행은 messageTs가 null이다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordThreadEvent({
+      prKey: PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: null, at: AT1,
+    });
+    store.recordThreadEvent({
+      prKey: PR, dedupeKey: 'review:approve@abc', kind: 'review_approved',
+      messageTs: '1700000001.000001', at: AT2,
+    });
+    const rows = store.listThreadEvents(PR);
+    store.close();
+
+    expect(rows).toEqual([
+      { prKey: PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: null, recordedAt: AT1 },
+      {
+        prKey: PR, dedupeKey: 'review:approve@abc', kind: 'review_approved',
+        messageTs: '1700000001.000001', recordedAt: AT2,
+      },
+    ]);
+  });
+
+  // recordPrTask와 반대다. 같은 key로 두 번 들어온다는 것은 이미 기록한 전이를 다시 게시했다는
+  // 뜻이므로 조용히 덮으면 중복 reply가 남은 사실이 store에서 사라진다.
+  it('같은 dedupe key를 다시 기록하면 던진다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordThreadEvent({
+      prKey: PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: 'ts1', at: AT1,
+    });
+    expect(() =>
+      store.recordThreadEvent({
+        prKey: PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: 'ts2', at: AT2,
+      }),
+    ).toThrow(/terminal:merged/);
+    const rows = store.listThreadEvents(PR);
+    store.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.messageTs).toBe('ts1');
+  });
+
+  it('같은 dedupe key라도 PR이 다르면 서로를 막지 않는다', () => {
+    const store = new SqliteDigestStore(dbPath);
+    store.recordThreadEvent({
+      prKey: PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: null, at: AT1,
+    });
+    store.recordThreadEvent({
+      prKey: OTHER_PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: null, at: AT1,
+    });
+    const mine = store.listThreadEvents(PR);
+    const theirs = store.listThreadEvents(OTHER_PR);
+    store.close();
+    expect(mine).toHaveLength(1);
+    expect(theirs).toHaveLength(1);
+  });
+
+  it('재시작해도 이미 기록한 전이를 그대로 읽는다', () => {
+    const first = new SqliteDigestStore(dbPath);
+    first.recordThreadEvent({
+      prKey: PR, dedupeKey: 'terminal:merged', kind: 'merged', messageTs: 'ts1', at: AT1,
+    });
+    first.close();
+
+    const second = new SqliteDigestStore(dbPath);
+    const keys = second.listThreadEvents(PR).map((e) => e.dedupeKey);
+    second.close();
+    expect(keys).toEqual(['terminal:merged']);
+  });
+});

@@ -13,6 +13,8 @@ import type {
   PostMessageInput,
   PostedMessage,
   SlackPoster,
+  ThreadPoster,
+  ThreadReplyInput,
   UpdateMessageInput,
 } from '../src/slack/post.js';
 import { MemorySummaryCache, SummaryProviderError } from '../src/summarize/index.js';
@@ -51,6 +53,8 @@ afterEach(() => {
 /** 실측 형태를 그대로 흉내낸 합성 fixture (DL-023). */
 class FakeOrca implements OrcaRunner {
   readonly calls: string[][] = [];
+  /** null이면 reviewer task 자체가 없다. 리뷰 전 상태를 만든다. */
+  constructor(private readonly verdict: 'approve' | 'request_changes' | null = 'approve') {}
   async run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
     const wrap = (result: unknown): string => JSON.stringify({ id: 'x', ok: true, result });
@@ -96,27 +100,31 @@ class FakeOrca implements OrcaRunner {
             created_at: '2026-08-22 00:05:00',
             completed_at: '2026-08-22 01:05:00',
           },
-          {
-            id: REVIEW_TASK,
-            run_id: RUN,
-            task_title: 'review',
-            display_name: 'review',
-            status: 'completed',
-            deps: '[]',
-            result: JSON.stringify({
-              kind: 'reviewer_result',
-              schemaVersion: 1,
-              verdict: 'approve',
-              pr: { repo: REPO, number: 7 },
-              reviewedHeadSha: HEAD,
-              findings: [
-                { severity: 'minor', file: 'src/a.ts', line: 3, summary: '주석이 부족하다' },
-              ],
-            }),
-            created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
-            created_at: '2026-08-22 00:10:00',
-            completed_at: '2026-08-22 01:10:00',
-          },
+          ...(this.verdict === null
+            ? []
+            : [
+                {
+                  id: REVIEW_TASK,
+                  run_id: RUN,
+                  task_title: 'review',
+                  display_name: 'review',
+                  status: 'completed',
+                  deps: '[]',
+                  result: JSON.stringify({
+                    kind: 'reviewer_result',
+                    schemaVersion: 1,
+                    verdict: this.verdict,
+                    pr: { repo: REPO, number: 7 },
+                    reviewedHeadSha: HEAD,
+                    findings: [
+                      { severity: 'minor', file: 'src/a.ts', line: 3, summary: '주석이 부족하다' },
+                    ],
+                  }),
+                  created_by_process_incarnation: 'uuid::D:/dev-infra@@h:i',
+                  created_at: '2026-08-22 00:10:00',
+                  completed_at: '2026-08-22 01:10:00',
+                },
+              ]),
         ],
       });
     }
@@ -164,8 +172,11 @@ function prRow(over: PrRow = {}): PrRow {
   };
 }
 
+/** rollup row 하나를 덮어쓸 값. C2-3은 같은 resource의 진행/완료 두 snapshot을 만들어야 한다. */
+type CheckOver = Record<string, unknown>;
+
 /** head rollup GraphQL 응답. checks는 PR row가 아니라 이 응답에서 온다(`github/rollup.ts`). */
-function rollupJson(conclusion: string): string {
+function rollupJson(conclusion: string, over: CheckOver = {}): string {
   return JSON.stringify({
     data: {
       repository: {
@@ -186,6 +197,7 @@ function rollupJson(conclusion: string): string {
                       startedAt: '2026-08-22T01:00:00Z',
                       completedAt: '2026-08-22T01:05:00Z',
                       checkSuite: { app: { databaseId: 15368 } },
+                      ...over,
                     }],
                   },
                 },
@@ -198,19 +210,37 @@ function rollupJson(conclusion: string): string {
   });
 }
 
+/** GitHub 대역이 흉내낼 base branch 정책과 rollup row. 기본은 dev-infra 실측과 같은 미보호다. */
+type GhOver = {
+  /** classic protection이 요구하는 context 목록. 없으면 404(미보호)다. */
+  readonly requiredContexts?: readonly string[];
+  /** rollup row 덮어쓰기. 같은 head의 진행과 완료를 순서를 바꿔 관측할 때 쓴다. */
+  readonly checkOver?: CheckOver;
+};
+
 class FakeGh implements GhRunner {
   constructor(
     private readonly prs: readonly PrRow[],
     private readonly buildConclusion = 'SUCCESS',
+    private readonly over: GhOver = {},
   ) {}
   async run(args: readonly string[]): Promise<string> {
     const path = args[1] ?? '';
-    // required rule 조회. 이 fixture repo는 protection도 ruleset도 없다(dev-infra 실측과 같다).
+    // required rule 조회. 기본 fixture repo는 protection도 ruleset도 없다(dev-infra 실측과 같다).
     if (args[0] === 'api' && path.includes('/protection/required_status_checks')) {
-      throw new GhCommandError(args, 1, 'gh: Branch not protected (HTTP 404)');
+      const contexts = this.over.requiredContexts;
+      if (contexts === undefined) {
+        throw new GhCommandError(args, 1, 'gh: Branch not protected (HTTP 404)');
+      }
+      return JSON.stringify({
+        contexts,
+        checks: contexts.map((c) => ({ context: c, app_id: null })),
+      });
     }
     if (args[0] === 'api' && args.join(' ').includes('/rules/branches/')) return '[]';
-    if (args[0] === 'api' && args[1] === 'graphql') return rollupJson(this.buildConclusion);
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      return rollupJson(this.buildConclusion, this.over.checkOver);
+    }
     if (args[0] === 'api') return JSON.stringify({ id: REPO_ID, full_name: REPO });
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(this.prs);
     throw new Error('예상치 못한 gh 호출: ' + args.join(' '));
@@ -229,6 +259,24 @@ class FakeSlack implements SlackPoster {
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
     this.updates.push(input);
     return { channel: input.channel, ts: input.ts };
+  }
+}
+
+/** thread write 경계 대역. 실제 게시는 C2-4이므로 이 대역이 C2-3의 유일한 thread 경로다. */
+class FakeThread implements ThreadPoster {
+  readonly replies: ThreadReplyInput[] = [];
+  private seq = 0;
+  async reply(input: ThreadReplyInput): Promise<PostedMessage> {
+    this.replies.push(input);
+    this.seq += 1;
+    return { channel: input.channel, ts: `1700000001.00000${this.seq}` };
+  }
+}
+
+/** 게시가 실패하는 대역. 실패한 게시가 ledger에 행을 남기지 않는지 본다. */
+class FailingThread implements ThreadPoster {
+  async reply(): Promise<PostedMessage> {
+    throw new Error('thread reply가 실패했다');
   }
 }
 
@@ -267,23 +315,33 @@ type Once = {
   readonly provider?: SummaryProvider;
   readonly onlyPr?: number | null;
   readonly channel?: string;
+  /** thread 게시 경계. 넘기지 않으면 null이고 전이는 `unposted`로 남는다. */
+  readonly thread?: ThreadPoster | null;
+  /** reviewer verdict. null이면 reviewer task 자체가 없어 리뷰 전 상태가 된다. */
+  readonly verdict?: 'approve' | 'request_changes' | null;
+  readonly gh?: GhOver;
 };
 
 /** 매 실행이 store 파일을 새로 연다. 재시작 뒤에도 매핑을 찾는지 함께 본다. */
 async function digestOnce(opts: Once = {}): Promise<DigestReport> {
   const store = new SqliteDigestStore(dbPath);
   try {
-    return await runDigest(new FakeOrca(), new FakeGh(opts.prs ?? [prRow()], opts.buildConclusion), {
-      config: CONFIG,
-      channel: opts.channel ?? CHANNEL,
-      store,
-      slack: opts.slack === undefined ? new FakeSlack() : opts.slack,
-      provider: opts.provider ?? new StubProvider(),
-      cache: new MemorySummaryCache(),
-      prLimit: 50,
-      onlyPr: opts.onlyPr ?? null,
-      now: () => new Date('2026-08-22T02:00:00Z'),
-    });
+    return await runDigest(
+      new FakeOrca(opts.verdict === undefined ? 'approve' : opts.verdict),
+      new FakeGh(opts.prs ?? [prRow()], opts.buildConclusion, opts.gh),
+      {
+        config: CONFIG,
+        channel: opts.channel ?? CHANNEL,
+        store,
+        slack: opts.slack === undefined ? new FakeSlack() : opts.slack,
+        thread: opts.thread ?? null,
+        provider: opts.provider ?? new StubProvider(),
+        cache: new MemorySummaryCache(),
+        prLimit: 50,
+        onlyPr: opts.onlyPr ?? null,
+        now: () => new Date('2026-08-22T02:00:00Z'),
+      },
+    );
   } finally {
     store.close();
   }
@@ -633,6 +691,7 @@ describe('C1 출구 조건', () => {
         channel: CHANNEL,
         store,
         slack: new FakeSlack(),
+        thread: null,
         provider: new StubProvider(),
         cache: new MemorySummaryCache(),
         prLimit: 50,
@@ -772,5 +831,276 @@ describe('PR↔Task 연관과 degraded 입력', () => {
     );
     expect(out).toContain('uncorrelated — 실패가 아니라 정상 출력이다(OD-022)');
     expect(out).toContain('run_only_degraded — invalid/degraded input이다');
+  });
+});
+
+/** 리뷰 전 open PR. 전이가 아직 하나도 없는 상태를 만든다. */
+const OPEN_ROW = { state: 'OPEN', mergedAt: null };
+
+/** 같은 store 파일을 다시 열어 저장된 직전 관측 상태를 읽는다. store를 열지 않은 상태에서만 부른다. */
+function readPrState(prKey: `pr:${number}#${number}`) {
+  const store = new SqliteDigestStore(dbPath);
+  try {
+    return store.findPrState(prKey);
+  } finally {
+    store.close();
+  }
+}
+
+/** 같은 store 파일을 다시 열어 기록된 전이를 읽는다. store를 열지 않은 상태에서만 부른다. */
+function readThreadEvents(prKey: `pr:${number}#${number}`) {
+  const store = new SqliteDigestStore(dbPath);
+  try {
+    return store.listThreadEvents(prKey);
+  } finally {
+    store.close();
+  }
+}
+
+const PR_KEY = `pr:${REPO_ID}#7` as const;
+
+/**
+ * 전이 판정과 thread 1회 기록(OD-044, OD-046).
+ *
+ * 실제 sqlite 파일을 쓴다. store를 모킹하면 검증 대상인 "재시작해도 중복 reply가 없다"의 근거가
+ * 사라진다. 매 `digestOnce`가 store 파일을 새로 열므로 각 호출이 곧 재시작이다.
+ */
+describe('runDigest 전이', () => {
+  // OD-046: 이전 상태를 모르면 지금 참인 사실을 전이로 쏟아내지 않는다. 이 fixture PR은 이미
+  // merged이고 approve된 상태로 처음 관측되므로, 재생했다면 두 건이 thread에 나갔을 것이다.
+  it('첫 관측은 전이를 게시하지 않고 기준선으로만 남긴다', async () => {
+    const thread = new FakeThread();
+    const report = await digestOnce({ thread });
+
+    expect(thread.replies).toHaveLength(0);
+    expect(card(report).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['review_approved', 'baseline'],
+      ['merged', 'baseline'],
+    ]);
+    // 기준선은 durable하다. 게시하지 않았다는 사실이 행에 남는다.
+    expect(readThreadEvents(PR_KEY).map((e) => [e.kind, e.messageTs])).toEqual([
+      ['review_approved', null],
+      ['merged', null],
+    ]);
+  });
+
+  it('같은 snapshot을 다시 관측하면 전이가 0건이다', async () => {
+    const thread = new FakeThread();
+    await digestOnce({ thread });
+    const second = await digestOnce({ thread });
+
+    expect(card(second).transitions).toEqual([]);
+    expect(thread.replies).toHaveLength(0);
+  });
+
+  // 이 Task의 핵심 경로다. 리뷰 전 → approve로 바뀌면 thread에 한 줄이 나간다.
+  it('새 사실이 관측되면 thread에 한 번 나간다', async () => {
+    const thread = new FakeThread();
+    await digestOnce({ thread, verdict: null, prs: [prRow(OPEN_ROW)] });
+    // 첫 관측에는 후보 자체가 없다. 리뷰도 required rule도 없고 open이다.
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const second = await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+
+    expect(card(second).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['review_approved', 'posted'],
+    ]);
+    expect(thread.replies).toHaveLength(1);
+    expect(thread.replies[0]?.threadTs).toBe('1700000000.000001');
+    expect(thread.replies[0]?.channel).toBe(CHANNEL);
+    expect(JSON.stringify(thread.replies[0]?.blocks)).toContain('리뷰 통과');
+    // 게시한 reply의 ts가 행에 남는다. seed 행과 구분된다.
+    expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000001.000001']);
+  });
+
+  it('같은 전이를 다시 관측해도 두 번 나가지 않는다', async () => {
+    const thread = new FakeThread();
+    await digestOnce({ thread, verdict: null, prs: [prRow(OPEN_ROW)] });
+    await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+    const third = await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+
+    expect(card(third).transitions).toEqual([]);
+    expect(thread.replies).toHaveLength(1);
+  });
+
+  // **dedupe key가 load-bearing한 자리다.** 판정 근거가 프로세스 메모리가 아니라 store 파일이다.
+  // 별도의 poster 인스턴스 = 프로세스 재시작에 해당한다.
+  it('재시작해도 중복 reply를 만들지 않는다', async () => {
+    const first = new FakeThread();
+    await digestOnce({ thread: first, verdict: null, prs: [prRow(OPEN_ROW)] });
+    await digestOnce({ thread: first, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+    expect(first.replies).toHaveLength(1);
+
+    const restarted = new FakeThread();
+    const report = await digestOnce({
+      thread: restarted,
+      verdict: 'approve',
+      prs: [prRow(OPEN_ROW)],
+    });
+
+    expect(restarted.replies).toHaveLength(0);
+    expect(card(report).transitions).toEqual([]);
+    expect(readThreadEvents(PR_KEY)).toHaveLength(1);
+  });
+
+  // 게시 경계가 없으면 기록하지 않는다. 기록만 하면 그 전이가 영영 사라진다.
+  it('thread 경계가 없으면 unposted로 남고 다음 관측의 후보로 돌아온다', async () => {
+    await digestOnce({ verdict: null, prs: [prRow(OPEN_ROW)] });
+    const withoutThread = await digestOnce({ verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+    expect(card(withoutThread).transitions.map((t) => t.outcome)).toEqual(['unposted']);
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const thread = new FakeThread();
+    const withThread = await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+    expect(card(withThread).transitions.map((t) => t.outcome)).toEqual(['posted']);
+    expect(thread.replies).toHaveLength(1);
+  });
+
+  // **행은 게시가 성공한 뒤에 쓴다.** 실패한 게시에 행을 남기면 그 전이는 이미 말한 것으로
+  // 걸러져 영영 나가지 않는다. `settle`의 순서를 뒤집으면 이 테스트가 걸린다.
+  it('게시가 던지면 행을 남기지 않고 다음 관측의 후보로 돌아온다', async () => {
+    await digestOnce({ verdict: null, prs: [prRow(OPEN_ROW)] });
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    await expect(
+      digestOnce({ thread: new FailingThread(), verdict: 'approve', prs: [prRow(OPEN_ROW)] }),
+    ).rejects.toThrow('thread reply가 실패했다');
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const thread = new FakeThread();
+    const recovered = await digestOnce({ thread, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+
+    expect(card(recovered).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['review_approved', 'posted'],
+    ]);
+    expect(thread.replies).toHaveLength(1);
+    expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000001.000001']);
+  });
+});
+
+/**
+ * 오래된 상태가 merged를 되돌리지 않는다(로드맵 §6 출구 조건, OD-044).
+ *
+ * `reconcileTerminal`의 프로덕션 호출자는 `digest/digest.ts` 하나이며 여기서 그 배선을 본다.
+ * 순수 함수 자체는 `transition.test.ts`가 본다.
+ */
+describe('runDigest terminal dominance', () => {
+  it('merged 뒤에 도착한 open snapshot이 카드를 되돌리지 않는다', async () => {
+    const slack = new FakeSlack();
+    const merged = await digestOnce({ slack });
+    expect(card(merged).card.text).toContain('병합 완료');
+
+    // 같은 PR이 open으로 보이는 오래된 snapshot이다. mergedAt도 없다.
+    const stale = await digestOnce({ slack, prs: [prRow(OPEN_ROW)] });
+
+    expect(card(stale).card.text).toContain('병합 완료');
+    // 카드가 그대로이므로 chat.update조차 필요 없다.
+    expect(card(stale).action).toBe('skip');
+    expect(slack.updates).toHaveLength(0);
+    // 저장된 상태도 내려가지 않는다. latch의 발생 시각까지 유지한다.
+    expect(readPrState(PR_KEY)?.terminal).toBe('merged');
+    expect(readPrState(PR_KEY)?.mergedAt).toBe('2026-08-22T01:20:00Z');
+  });
+
+  it('되돌림을 전이로 만들지 않는다', async () => {
+    const thread = new FakeThread();
+    await digestOnce({ thread });
+    const stale = await digestOnce({ thread, prs: [prRow(OPEN_ROW)] });
+
+    expect(card(stale).transitions).toEqual([]);
+    expect(thread.replies).toHaveLength(0);
+  });
+});
+
+/**
+ * 역순 관측 복구(OD-044).
+ *
+ * 동일 head 안의 check는 각 resource의 timestamp와 id로 reconcile한다. 완료 snapshot 뒤에 늦게
+ * 도착한 진행 snapshot이 완료를 되돌리면 카드의 required check 축이 거짓을 말한다.
+ */
+describe('runDigest check 역순 관측', () => {
+  const REQUIRED = { requiredContexts: ['build'] } as const;
+  /** 같은 resource(`CR_build`)의 진행 중 snapshot. id는 같고 완료 시각만 없다. */
+  const RUNNING = {
+    checkOver: { status: 'IN_PROGRESS', conclusion: null, completedAt: null },
+    requiredContexts: ['build'],
+  } as const;
+
+  it('완료 뒤에 도착한 진행 snapshot이 카드의 축을 되돌리지 않는다', async () => {
+    const slack = new FakeSlack();
+    const done = await digestOnce({ slack, gh: REQUIRED });
+    expect(JSON.stringify(card(done).card.blocks)).toContain('required check: 모두 통과');
+
+    const late = await digestOnce({ slack, gh: RUNNING });
+
+    expect(JSON.stringify(card(late).card.blocks)).toContain('required check: 모두 통과');
+    expect(card(late).action).toBe('skip');
+    expect(slack.updates).toHaveLength(0);
+  });
+
+  it('진행 뒤에 도착한 완료 snapshot은 그대로 반영한다', async () => {
+    const slack = new FakeSlack();
+    const running = await digestOnce({ slack, gh: RUNNING });
+    expect(JSON.stringify(card(running).card.blocks)).toContain(
+      'required check: 아직 결론 나지 않은 것이 있다',
+    );
+
+    const done = await digestOnce({ slack, gh: REQUIRED });
+
+    expect(JSON.stringify(card(done).card.blocks)).toContain('required check: 모두 통과');
+    expect(card(done).action).toBe('update');
+  });
+
+  // 진행 → 완료는 실제 전이다. 위 역순 사례와 달리 thread에 나가야 한다.
+  it('진행에서 완료로 바뀌면 check 전이가 한 번 나간다', async () => {
+    const thread = new FakeThread();
+    await digestOnce({ thread, gh: RUNNING });
+    const done = await digestOnce({ thread, gh: REQUIRED });
+
+    expect(card(done).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['checks_passing', 'posted'],
+    ]);
+    expect(JSON.stringify(thread.replies[0]?.blocks)).toContain('required check 통과');
+  });
+});
+
+/**
+ * dry-run과 채널 불일치에서의 전이 처리.
+ *
+ * 둘 다 store에 대한 규율이 이미 정해져 있고, 전이도 그 규율을 따른다.
+ */
+describe('runDigest 전이 경계', () => {
+  it('dry-run은 상태도 전이도 저장하지 않고 결정만 보고한다', async () => {
+    const thread = new FakeThread();
+    const report = await digestOnce({ slack: null, thread });
+
+    // 게시하지 않은 카드의 기준선을 남기면 다음 실제 실행이 그 전이를 영영 내보내지 않는다.
+    expect(readPrState(PR_KEY)).toBeNull();
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+    expect(thread.replies).toHaveLength(0);
+    // 무엇을 하기로 했는지는 그대로 보고한다. 그것이 dry-run의 쓸모다.
+    expect(card(report).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['review_approved', 'baseline'],
+      ['merged', 'baseline'],
+    ]);
+  });
+
+  it('채널이 어긋나면 상태는 남기고 thread에는 쓰지 않는다', async () => {
+    const thread = new FakeThread();
+    await digestOnce({ thread, verdict: null, prs: [prRow(OPEN_ROW)] });
+
+    const mismatched = await digestOnce({
+      thread,
+      verdict: 'approve',
+      prs: [prRow(OPEN_ROW)],
+      channel: 'C_OTHER_CHANNEL',
+    });
+
+    expect(card(mismatched).action).toBe('channel_mismatch');
+    // 어느 채널의 어느 루트에 매달지 확정할 수 없으므로 게시하지 않는다.
+    expect(thread.replies).toHaveLength(0);
+    expect(card(mismatched).transitions.map((t) => t.outcome)).toEqual(['unposted']);
+    // 관측한 사실 자체는 남는다(`recordPrTask`와 같은 근거).
+    expect(readPrState(PR_KEY)?.reviewVerdict).toBe('approve');
   });
 });
