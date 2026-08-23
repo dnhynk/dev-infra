@@ -2,7 +2,10 @@ import { pullRequestKey, type PullRequestKey } from '../identity/keys.js';
 import type { RepositoryIdentity } from '../identity/repository.js';
 import { fetchBranchRequiredRules, type BranchRequiredRules } from './branch-rules.js';
 import { joinRequiredChecks, type RequiredCheckFact } from './required-checks.js';
+import { fetchStatusCheckRollup, type CheckFact, type RollupObservation } from './rollup.js';
 import { ghJson, type GhRunner } from './runner.js';
+
+export type { CheckFact } from './rollup.js';
 
 /** correlation과 상태 축약에 필요한 PR 사실. summarizer 입력은 C1에서 정한다. */
 export type PullRequestFacts = {
@@ -23,6 +26,14 @@ export type PullRequestFacts = {
   readonly reviews: readonly ReviewFact[];
   readonly checks: readonly CheckFact[];
   /**
+   * `checks`를 매단 commit sha.
+   *
+   * PR row와 rollup은 서로 다른 응답이고 T1 §OD-044에서 GitHub은 한 시점에 서로 다른 head를 주는
+   * 응답을 냈다. 그래서 이 값이 `headRefOid`와 다를 수 있고, 다르면 check는 그 head의 사실이 아니다.
+   * 두 값을 하나로 접으면 stale check를 current로 보이게 만든다. 접지 않고 둘 다 남긴다.
+   */
+  readonly checksHeadOid: string;
+  /**
    * base branch의 effective required rule. 미설정과 조회 불가를 사실로 구분해 담는다.
    * required 판정의 근거를 소비자가 확인할 수 있어야 하므로 rule 자체를 함께 싣는다(OD-032).
    */
@@ -42,27 +53,6 @@ export type PullRequestFacts = {
 };
 
 /**
- * rollup row 하나.
- *
- * `statusCheckRollup`은 두 종류를 섞어 준다. `CheckRun`은 `name`/`status`/`conclusion`을,
- * `StatusContext`는 `context`/`state`를 준다. 실측(2026-08-23, `kubernetes/kubernetes` open PR과
- * `dnhynk/THROWAWAY-orca-c2-ruleset-11c46c2b#1`): `StatusContext` row에는 `name`도 `status`도
- * `conclusion`도 없다. 이름 필드만 읽으면 commit status의 이름이 통째로 비어 required context와
- * 조인할 수 없다.
- */
-export type CheckFact = {
-  readonly kind: 'checkRun' | 'statusContext' | 'unknown';
-  /** `CheckRun.name` 또는 `StatusContext.context`. required rule의 context와 맞추는 키다. */
-  readonly name: string;
-  /** `CheckRun.status`. `StatusContext`에는 없어 ''다. */
-  readonly status: string;
-  /** `CheckRun.conclusion`. `StatusContext`에는 없어 null이다. */
-  readonly conclusion: string | null;
-  /** `StatusContext.state`. `CheckRun`에는 없어 null이다. */
-  readonly state: string | null;
-};
-
-/**
  * review 한 건.
  *
  * `id`는 GraphQL node ID다(`PRR_...`). T1 §OD-044에서 review id는 resource identity로 안정적이고
@@ -78,10 +68,16 @@ export type ReviewFact = {
   readonly submittedAt: string | null;
 };
 
+/**
+ * `gh pr view/list --json`으로 읽는 PR field.
+ *
+ * `statusCheckRollup`은 여기서 읽지 않는다. `gh`가 박아 둔 fragment에는 resource id도 app 바인딩도
+ * 없고 `contexts`를 cursor 없이 한 번만 읽는다. rollup은 `rollup.ts`가 직접 질의한다.
+ */
 const FIELDS = [
   'number', 'title', 'body', 'url', 'state', 'isDraft',
   'headRefName', 'headRefOid', 'baseRefName', 'mergedAt', 'reviewDecision', 'reviews',
-  'statusCheckRollup', 'files', 'changedFiles',
+  'files', 'changedFiles',
 ].join(',');
 
 function str(v: unknown): string {
@@ -89,28 +85,6 @@ function str(v: unknown): string {
 }
 function strOrNull(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
-}
-
-function toCheckFact(raw: unknown): CheckFact {
-  const o = (raw ?? {}) as Record<string, unknown>;
-  const typename = str(o['__typename']);
-  if (typename === 'StatusContext') {
-    return {
-      kind: 'statusContext',
-      name: str(o['context']),
-      status: '',
-      conclusion: null,
-      state: strOrNull(o['state']),
-    };
-  }
-  return {
-    // `__typename`이 없는 응답도 CheckRun 필드가 있으면 CheckRun으로 읽는다.
-    kind: typename === 'CheckRun' || 'name' in o ? 'checkRun' : 'unknown',
-    name: str(o['name']),
-    status: str(o['status']),
-    conclusion: strOrNull(o['conclusion']),
-    state: null,
-  };
 }
 
 function toReviewFact(raw: unknown): ReviewFact {
@@ -126,8 +100,11 @@ function toReviewFact(raw: unknown): ReviewFact {
   };
 }
 
-/** rule 조인 전 단계. base branch별 rule 조회를 묶기 위해 분리한다. */
-type PullRequestSource = Omit<PullRequestFacts, 'requiredRules' | 'requiredChecks'>;
+/** rollup 조회와 rule 조인 전 단계. PR row 응답만으로 만들 수 있는 사실이다. */
+type PullRequestSource = Omit<
+  PullRequestFacts,
+  'requiredRules' | 'requiredChecks' | 'checks' | 'checksHeadOid'
+>;
 
 function toPullRequestSource(raw: unknown, repo: RepositoryIdentity): PullRequestSource {
   const o = raw as Record<string, unknown>;
@@ -136,7 +113,6 @@ function toPullRequestSource(raw: unknown, repo: RepositoryIdentity): PullReques
     throw new TypeError(`${repo.nameWithOwner} PR 응답에 number가 없다`);
   }
   const reviews = Array.isArray(o['reviews']) ? o['reviews'] : [];
-  const rollup = Array.isArray(o['statusCheckRollup']) ? o['statusCheckRollup'] : [];
   const files = Array.isArray(o['files']) ? o['files'] : [];
   const changedFiles = o['changedFiles'];
   if (typeof changedFiles !== 'number') {
@@ -158,17 +134,17 @@ function toPullRequestSource(raw: unknown, repo: RepositoryIdentity): PullReques
     reviews: reviews.map(toReviewFact),
     changedPaths: files.map((f) => str((f as Record<string, unknown>)['path'])),
     changedFilesTotal: changedFiles,
-    checks: rollup.map(toCheckFact),
   };
 }
 
 /**
- * base branch별 required rule을 한 번씩만 조회해 조인한다.
+ * PR마다 head rollup을 읽고 base branch의 required rule과 조인한다.
  *
- * 같은 base를 쓰는 PR이 많으므로 branch 단위로 캐시한다. rule 조회는 PR 목록과 별개인 endpoint
- * 2개이고 404는 정상 응답이다(`branch-rules.ts`).
+ * rule은 base branch별로 한 번만 조회해 캐시한다. 같은 base를 쓰는 PR이 많고 rule은 head가 아니라
+ * branch의 사실이기 때문이다. rollup은 head마다 다르므로 PR마다 한 번씩 조회한다 —
+ * PR N개면 GraphQL 조회도 N회다.
  */
-async function attachRequiredChecks(
+async function attachChecksAndRules(
   runner: GhRunner,
   repo: RepositoryIdentity,
   sources: readonly PullRequestSource[],
@@ -181,13 +157,33 @@ async function attachRequiredChecks(
       rules = await fetchBranchRequiredRules(runner, repo, source.baseRefName);
       cache.set(source.baseRefName, rules);
     }
+    const rollup = await fetchStatusCheckRollup(runner, repo, source.number);
     out.push({
       ...source,
+      checks: rollup.checks,
+      checksHeadOid: rollup.commitOid,
       requiredRules: rules,
-      requiredChecks: joinRequiredChecks(rules, source.checks),
+      requiredChecks: joinRequiredChecks(rules, rollup.checks),
     });
   }
   return out;
+}
+
+/** 이미 읽은 rollup을 그대로 쓰는 조인. 재조회 loop가 rollup을 두 번 읽지 않게 한다. */
+async function attachRules(
+  runner: GhRunner,
+  repo: RepositoryIdentity,
+  source: PullRequestSource,
+  rollup: RollupObservation,
+): Promise<PullRequestFacts> {
+  const rules = await fetchBranchRequiredRules(runner, repo, source.baseRefName);
+  return {
+    ...source,
+    checks: rollup.checks,
+    checksHeadOid: rollup.commitOid,
+    requiredRules: rules,
+    requiredChecks: joinRequiredChecks(rules, rollup.checks),
+  };
 }
 
 export async function listPullRequests(
@@ -202,41 +198,63 @@ export async function listPullRequests(
     '--limit', String(limit),
     '--json', FIELDS,
   ]);
-  return attachRequiredChecks(runner, repo, rows.map((row) => toPullRequestSource(row, repo)));
+  return attachChecksAndRules(runner, repo, rows.map((row) => toPullRequestSource(row, repo)));
 }
 
-/** 한 PR만 다시 읽는다. head가 움직인 뒤 사실을 갱신하는 경로다(OD-044). */
-export async function fetchPullRequest(
+/** 한 PR의 row와 head rollup을 한 번씩 읽는다. */
+async function readOnce(
   runner: GhRunner,
   repo: RepositoryIdentity,
   number: number,
-): Promise<PullRequestFacts> {
+): Promise<{ source: PullRequestSource; rollup: RollupObservation }> {
   const row = await ghJson<unknown>(runner, [
     'pr', 'view', String(number),
     '--repo', repo.nameWithOwner,
     '--json', FIELDS,
   ]);
-  const [facts] = await attachRequiredChecks(runner, repo, [toPullRequestSource(row, repo)]);
-  if (facts === undefined) {
-    throw new TypeError(`${repo.nameWithOwner} PR #${number} 조회 결과가 비었다`);
-  }
-  return facts;
+  const source = toPullRequestSource(row, repo);
+  return { source, rollup: await fetchStatusCheckRollup(runner, repo, number) };
 }
 
-/** head 재조회 관측. 판정하지 않고 수렴 여부를 사실로 남긴다. */
-export type HeadObservation = {
-  readonly headRefOid: string;
-  /** 실제 수행한 조회 횟수. */
+/**
+ * 한 PR을 한 번만 다시 읽는다.
+ *
+ * 어느 head의 snapshot인지는 보장하지 않는다. `headRefOid`와 `checksHeadOid`가 다르면 PR row와
+ * rollup이 서로 다른 시점의 것이라는 사실이 그대로 남는다. 특정 head의 사실이 필요하면
+ * `observePullRequest`를 쓴다.
+ */
+export async function fetchPullRequest(
+  runner: GhRunner,
+  repo: RepositoryIdentity,
+  number: number,
+): Promise<PullRequestFacts> {
+  const { source, rollup } = await readOnce(runner, repo, number);
+  return attachRules(runner, repo, source, rollup);
+}
+
+/**
+ * head를 지정한 PR 재조회 관측.
+ *
+ * `facts`는 마지막으로 읽은 snapshot 그대로다. `converged`가 false면 그 snapshot은 기대한 head의
+ * 사실이 아니며, 그 사실을 숨기고 current인 척 반환하지 않는다. 무엇이 어긋났는지는
+ * `facts.headRefOid`와 `facts.checksHeadOid`를 `expectedHeadOid`와 대조해 볼 수 있다.
+ */
+export type PullRequestObservation = {
+  readonly facts: PullRequestFacts;
+  /** 실제 수행한 재조회 횟수. */
   readonly attempts: number;
+  /** 요청한 head. null이면 특정 head를 요구하지 않았다. */
+  readonly expectedHeadOid: string | null;
   /**
-   * `expectedHeadOid`와 일치한 채로 끝났는지. `expectedHeadOid`가 없으면 항상 true다.
-   * false는 상한까지 읽었는데도 기대 head를 못 봤다는 사실이며 오류가 아니다.
+   * `expectedHeadOid`가 있으면 `facts.headRefOid`와 `facts.checksHeadOid`가 모두 그 값일 때 true다.
+   * 없으면 두 값이 서로 같기만 하면 true다.
+   * false는 상한까지 읽고도 그 head를 못 봤다는 사실이며 오류가 아니다.
    */
   readonly converged: boolean;
 };
 
 export type HeadPollOptions = {
-  /** 이 sha가 보일 때까지 다시 읽는다. 없으면 1회만 읽는다. */
+  /** 이 sha의 snapshot이 보일 때까지 다시 읽는다. 없으면 row와 rollup의 head 일치만 본다. */
   readonly expectedHeadOid?: string | null;
   /** 조회 횟수 상한. 무한 재시도를 막는다. */
   readonly maxAttempts?: number;
@@ -248,38 +266,47 @@ const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_DELAY_MS = 2000;
 
 /**
- * head SHA를 bounded polling으로 다시 읽는다.
+ * 지정한 head의 PR 사실을 bounded polling으로 읽는다.
  *
  * T1 §OD-044에서 content PUT이 새 SHA를 반환한 직후의 첫 `gh pr view`가 이전 SHA를 줬고 2초 뒤
  * 두 번째 조회에서 새 SHA로 수렴했다. 같은 절에서 한 응답이 서로 다른 시점의 필드를 섞는 것도
  * 관측됐다. 그래서 head가 움직였을 것으로 아는 시점에는 단발 snapshot을 믿지 않는다.
  *
+ * head 수렴과 사실 조회를 나누지 않는다. 나누면 수렴을 확인한 뒤의 조회가 다시 stale일 수 있고,
+ * 그 결과는 old head의 check를 current로 반환한다. OD-044가 head SHA를 review/check의 version
+ * scope로 정한 이유가 이것이다. rule 조회는 head가 아니라 branch의 사실이라 loop 밖에서 한 번만 한다.
+ *
  * 수렴하지 않아도 던지지 않는다. `converged: false` 관측을 그대로 돌려주고 그 사실을 어떻게 쓸지는
  * 호출자가 정한다. 기본 상한은 5회 × 2초다.
  */
-export async function readHeadRefOid(
+export async function observePullRequest(
   runner: GhRunner,
   repo: RepositoryIdentity,
   number: number,
   options: HeadPollOptions = {},
-): Promise<HeadObservation> {
+): Promise<PullRequestObservation> {
   const expected = options.expectedHeadOid ?? null;
   const maxAttempts = Math.max(1, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
   const delayMs = options.delayMs ?? DEFAULT_DELAY_MS;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-  let headRefOid = '';
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const raw = await ghJson<{ headRefOid?: unknown }>(runner, [
-      'pr', 'view', String(number),
-      '--repo', repo.nameWithOwner,
-      '--json', 'headRefOid',
-    ]);
-    headRefOid = str(raw.headRefOid);
-    if (expected === null || headRefOid === expected) {
-      return { headRefOid, attempts: attempt, converged: true };
-    }
-    if (attempt < maxAttempts) await sleep(delayMs);
+  let last = await readOnce(runner, repo, number);
+  let attempts = 1;
+  const agrees = (r: { source: PullRequestSource; rollup: RollupObservation }): boolean =>
+    expected === null
+      ? r.source.headRefOid === r.rollup.commitOid
+      : r.source.headRefOid === expected && r.rollup.commitOid === expected;
+
+  while (!agrees(last) && attempts < maxAttempts) {
+    await sleep(delayMs);
+    last = await readOnce(runner, repo, number);
+    attempts += 1;
   }
-  return { headRefOid, attempts: maxAttempts, converged: false };
+
+  return {
+    facts: await attachRules(runner, repo, last.source, last.rollup),
+    attempts,
+    expectedHeadOid: expected,
+    converged: agrees(last),
+  };
 }

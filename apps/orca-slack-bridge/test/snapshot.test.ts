@@ -100,7 +100,7 @@ describe('summarize', () => {
         pullRequests: [
           { pr: { key: 'pr:1#1', number: 1, title: 't', body: '', url: '', state: 'OPEN', isDraft: false,
                   headRefName: 'h', headRefOid: 'sha', baseRefName: 'b', mergedAt: null,
-                  reviewDecision: null, reviews: [], checks: [],
+                  reviewDecision: null, reviews: [], checks: [], checksHeadOid: 'sha',
                   requiredRules: { branch: 'b', contexts: [], branchProtection: 'absent', repositoryRuleset: 'absent' },
                   requiredChecks: [],
                   changedPaths: [], changedFilesTotal: 0 },

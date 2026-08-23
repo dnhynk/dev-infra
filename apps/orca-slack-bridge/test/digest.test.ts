@@ -144,22 +144,59 @@ function prRow(over: PrRow = {}): PrRow {
     mergedAt: '2026-08-22T01:20:00Z',
     reviewDecision: null,
     reviews: [],
-    statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     files: [{ path: 'src/a.ts' }],
     changedFiles: 1,
     ...over,
   };
 }
 
+/** head rollup GraphQL 응답. checks는 PR row가 아니라 이 응답에서 온다(`github/rollup.ts`). */
+function rollupJson(conclusion: string): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        pullRequest: {
+          commits: {
+            nodes: [{
+              commit: {
+                oid: HEAD,
+                statusCheckRollup: {
+                  contexts: {
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                    nodes: [{
+                      __typename: 'CheckRun',
+                      id: 'CR_build',
+                      name: 'build',
+                      status: 'COMPLETED',
+                      conclusion,
+                      startedAt: '2026-08-22T01:00:00Z',
+                      completedAt: '2026-08-22T01:05:00Z',
+                      checkSuite: { app: { databaseId: 15368 } },
+                    }],
+                  },
+                },
+              },
+            }],
+          },
+        },
+      },
+    },
+  });
+}
+
 class FakeGh implements GhRunner {
-  constructor(private readonly prs: readonly PrRow[]) {}
+  constructor(
+    private readonly prs: readonly PrRow[],
+    private readonly buildConclusion = 'SUCCESS',
+  ) {}
   async run(args: readonly string[]): Promise<string> {
     const path = args[1] ?? '';
     // required rule 조회. 이 fixture repo는 protection도 ruleset도 없다(dev-infra 실측과 같다).
     if (args[0] === 'api' && path.includes('/protection/required_status_checks')) {
       throw new GhCommandError(args, 1, 'gh: Branch not protected (HTTP 404)');
     }
-    if (args[0] === 'api' && path.includes('/rules/branches/')) return '[]';
+    if (args[0] === 'api' && args.join(' ').includes('/rules/branches/')) return '[]';
+    if (args[0] === 'api' && args[1] === 'graphql') return rollupJson(this.buildConclusion);
     if (args[0] === 'api') return JSON.stringify({ id: REPO_ID, full_name: REPO });
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(this.prs);
     throw new Error('예상치 못한 gh 호출: ' + args.join(' '));
@@ -210,6 +247,8 @@ const CONFIG: BridgeConfig = {
 
 type Once = {
   readonly prs?: readonly PrRow[];
+  /** head rollup의 `build` 결론. 사실이 바뀌는 경우를 만든다. */
+  readonly buildConclusion?: string;
   readonly slack?: SlackPoster | null;
   readonly provider?: SummaryProvider;
   readonly onlyPr?: number | null;
@@ -220,7 +259,7 @@ type Once = {
 async function digestOnce(opts: Once = {}): Promise<DigestReport> {
   const store = new SqliteDigestStore(dbPath);
   try {
-    return await runDigest(new FakeOrca(), new FakeGh(opts.prs ?? [prRow()]), {
+    return await runDigest(new FakeOrca(), new FakeGh(opts.prs ?? [prRow()], opts.buildConclusion), {
       config: CONFIG,
       channel: opts.channel ?? CHANNEL,
       store,
@@ -260,10 +299,7 @@ describe('runDigest 멱등', () => {
     await digestOnce({ slack });
     expect(slack.posts).toHaveLength(1);
 
-    const changed = prRow({
-      statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'FAILURE' }],
-    });
-    const second = await digestOnce({ slack, prs: [changed] });
+    const second = await digestOnce({ slack, buildConclusion: 'FAILURE' });
     expect(card(second).action).toBe('update');
     expect(slack.posts).toHaveLength(1);
     expect(slack.updates).toHaveLength(1);
@@ -313,10 +349,7 @@ describe('runDigest 요약 재사용', () => {
     const provider = new StubProvider();
 
     await digestOnce({ slack, provider });
-    const changed = prRow({
-      statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'FAILURE' }],
-    });
-    const second = await digestOnce({ slack, provider, prs: [changed] });
+    const second = await digestOnce({ slack, provider, buildConclusion: 'FAILURE' });
 
     expect(provider.calls).toHaveLength(2);
     expect(card(second).summaryReused).toBe(false);

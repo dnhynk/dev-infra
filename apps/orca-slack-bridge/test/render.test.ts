@@ -36,7 +36,7 @@ const basePr: ProjectedPr = {
   state: 'open',
   isDraft: false,
   review: null,
-  checks: [{ kind: 'checkRun', name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }],
+  checks: [{ kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }],
   workerReport: {
     outcome: 'succeeded',
     body: 'renderer를 구현했다. layout이 코드에만 있음을 확인했다. 게시는 T5가 남았다.',
@@ -149,8 +149,8 @@ const cases: Readonly<Record<string, RenderInput>> = {
         findingsTotal: 12,
       },
       checks: [
-        { kind: 'checkRun', name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS', state: null },
-        { kind: 'checkRun', name: 'test', status: 'IN_PROGRESS', conclusion: null, state: null },
+        { kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS', state: null },
+        { kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'test', status: 'IN_PROGRESS', conclusion: null, state: null },
       ],
     },
     summary: {
@@ -368,7 +368,7 @@ describe('renderCard · 의미 요구', () => {
     // CI가 실패해도 상태 라벨은 review verdict만 옮긴다. 둘을 결합한 판정은 C2다(OD-032).
     for (const pr of [
       approved,
-      { ...approved, checks: [{ kind: 'checkRun' as const, name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', state: null }] },
+      { ...approved, checks: [{ kind: 'checkRun' as const, id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', state: null }] },
       { ...approved, isDraft: true },
     ]) {
       const card = renderCard({ pr, summary: okSummary });
@@ -442,7 +442,7 @@ describe('renderCard · section text 3000자 상한', () => {
     '모델 title': { pr: basePr, summary: { ...okSummary, draft: { ...okDraft, title: LONG } } },
     '요약 what': { pr: basePr, summary: { ...okSummary, draft: { ...okDraft, what: LONG } } },
     'check 이름': {
-      pr: { ...basePr, checks: [{ kind: 'checkRun', name: LONG, status: 'COMPLETED', conclusion: 'SUCCESS', state: null }] },
+      pr: { ...basePr, checks: [{ kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: LONG, status: 'COMPLETED', conclusion: 'SUCCESS', state: null }] },
       summary: okSummary,
     },
   };
@@ -597,7 +597,7 @@ describe('renderFingerprint', () => {
     const changed: readonly ProjectedPr[] = [
       { ...basePr, state: 'merged' },
       { ...basePr, isDraft: true },
-      { ...basePr, checks: [{ kind: 'checkRun', name: 'typecheck', status: 'COMPLETED', conclusion: 'FAILURE', state: null }] },
+      { ...basePr, checks: [{ kind: 'checkRun', id: 'CR_x', appId: null, startedAt: null, completedAt: null, name: 'typecheck', status: 'COMPLETED', conclusion: 'FAILURE', state: null }] },
       { ...basePr, workerReport: null },
       { ...basePr, truncation: { prBody: true, changedFiles: false } },
       { ...basePr, project: null },

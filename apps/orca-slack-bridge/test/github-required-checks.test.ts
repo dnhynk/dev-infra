@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { fetchBranchRequiredRules, type BranchRequiredRules } from '../src/github/branch-rules.js';
 import { checkState, joinRequiredChecks } from '../src/github/required-checks.js';
-import type { CheckFact } from '../src/github/pull-request.js';
+import type { CheckFact } from '../src/github/rollup.js';
 import { GhCommandError, type GhRunner } from '../src/github/runner.js';
 import { repositoryIdentity } from '../src/identity/repository.js';
 
@@ -24,6 +24,50 @@ const PROTECTION_JSON = JSON.stringify({
   ],
 });
 
+/**
+ * 2026-08-23 `dnhynk/THROWAWAY-orca-c2-appbind-c6ddffc0`에서 그대로 복사한 응답이다.
+ *
+ * `app_id: -1`로 쓴 `classic-explicit-any`는 읽을 때 `null`로 돌아왔다.
+ */
+const APPBOUND_PROTECTION_JSON = JSON.stringify({
+  strict: false,
+  contexts: ['classic-anyapp', 'classic-appbound', 'classic-explicit-any'],
+  checks: [
+    { context: 'classic-anyapp', app_id: null },
+    { context: 'classic-appbound', app_id: 15368 },
+    { context: 'classic-explicit-any', app_id: null },
+  ],
+});
+
+/** 같은 repository의 `rules/branches/main`. 두 ruleset이 각각 rule 하나씩을 냈다. */
+const APPBOUND_RULES_JSON = JSON.stringify([
+  {
+    type: 'required_status_checks',
+    parameters: {
+      strict_required_status_checks_policy: false,
+      do_not_enforce_on_create: false,
+      required_status_checks: [
+        { context: 'ruleset-anyapp' },
+        { context: 'ruleset-appbound', integration_id: 15368 },
+      ],
+    },
+    ruleset_source_type: 'Repository',
+    ruleset_source: 'dnhynk/THROWAWAY-orca-c2-appbind-c6ddffc0',
+    ruleset_id: 21234549,
+  },
+  {
+    type: 'required_status_checks',
+    parameters: {
+      strict_required_status_checks_policy: false,
+      do_not_enforce_on_create: false,
+      required_status_checks: [{ context: 'ruleset-page2' }],
+    },
+    ruleset_source_type: 'Repository',
+    ruleset_source: 'dnhynk/THROWAWAY-orca-c2-appbind-c6ddffc0',
+    ruleset_id: 21234552,
+  },
+]);
+
 const RULES_JSON = JSON.stringify([
   {
     type: 'required_status_checks',
@@ -38,12 +82,31 @@ const RULES_JSON = JSON.stringify([
   },
 ]);
 
-/** 같은 PR의 `gh pr view --json statusCheckRollup` 응답. 세 row 모두 StatusContext다. */
+/** 같은 PR head의 rollup. 세 row 모두 commit status이며 app을 식별할 field가 없어 appId는 null이다. */
 const ROLLUP: readonly CheckFact[] = [
-  { kind: 'statusContext', name: 'classic-failing', status: '', conclusion: null, state: 'FAILURE' },
-  { kind: 'statusContext', name: 'ruleset-pending', status: '', conclusion: null, state: 'PENDING' },
-  { kind: 'statusContext', name: 'classic-passing', status: '', conclusion: null, state: 'SUCCESS' },
+  statusAt('SC_kwDOUBdGbs8AAAAMR1EFj1', 'classic-failing', 'FAILURE', '2026-08-23T10:59:41Z'),
+  statusAt('SC_kwDOUBdGbs8AAAAMR1EFj2', 'ruleset-pending', 'PENDING', '2026-08-23T10:59:42Z'),
+  statusAt('SC_kwDOUBdGbs8AAAAMR1EFj3', 'classic-passing', 'SUCCESS', '2026-08-23T10:59:41Z'),
 ];
+
+function statusRow(name: string, state: string): CheckFact {
+  return statusAt(`SC_${name}_${state}`, name, state, '2026-08-23T10:59:41Z');
+}
+
+function statusAt(id: string, name: string, state: string, createdAt: string): CheckFact {
+  return {
+    kind: 'statusContext', id, name, status: '', conclusion: null, state,
+    appId: null, startedAt: createdAt, completedAt: null,
+  };
+}
+
+function checkRunRow(name: string, conclusion: string | null, appId: number | null): CheckFact {
+  return {
+    kind: 'checkRun', id: `CR_${name}_${appId ?? 'any'}`, name,
+    status: conclusion === null ? 'IN_PROGRESS' : 'COMPLETED', conclusion, state: null,
+    appId, startedAt: '2026-08-23T11:40:51Z', completedAt: conclusion === null ? null : '2026-08-23T11:41:00Z',
+  };
+}
 
 type Reply = string | GhCommandError;
 
@@ -52,7 +115,7 @@ class FakeGh implements GhRunner {
   constructor(private readonly replies: { protection: Reply; rules: Reply }) {}
   async run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
-    const path = args[1] ?? '';
+    const path = args.join(' ');
     const reply = path.includes('/protection/required_status_checks')
       ? this.replies.protection
       : path.includes('/rules/branches/')
@@ -77,10 +140,10 @@ describe('fetchBranchRequiredRules', () => {
     expect(rules.branchProtection).toBe('present');
     expect(rules.repositoryRuleset).toBe('present');
     expect(rules.contexts).toEqual([
-      { context: 'classic-failing', sources: ['branchProtection'] },
-      { context: 'classic-passing', sources: ['branchProtection'] },
-      { context: 'ruleset-missing', sources: ['repositoryRuleset'] },
-      { context: 'ruleset-pending', sources: ['repositoryRuleset'] },
+      { context: 'classic-failing', sources: ['branchProtection'], appId: null },
+      { context: 'classic-passing', sources: ['branchProtection'], appId: null },
+      { context: 'ruleset-missing', sources: ['repositoryRuleset'], appId: null },
+      { context: 'ruleset-pending', sources: ['repositoryRuleset'], appId: null },
     ]);
   });
 
@@ -96,7 +159,7 @@ describe('fetchBranchRequiredRules', () => {
     });
     const rules = await fetchBranchRequiredRules(gh, REPO, 'main');
     expect(rules.contexts).toEqual([
-      { context: 'ci', sources: ['branchProtection', 'repositoryRuleset'] },
+      { context: 'ci', sources: ['branchProtection', 'repositoryRuleset'], appId: null },
     ]);
   });
 
@@ -147,14 +210,18 @@ describe('fetchBranchRequiredRules', () => {
   it('deprecated `contexts`만 있는 protection 응답도 읽는다', async () => {
     const gh = new FakeGh({ protection: JSON.stringify({ contexts: ['legacy'] }), rules: '[]' });
     const rules = await fetchBranchRequiredRules(gh, REPO, 'main');
-    expect(rules.contexts).toEqual([{ context: 'legacy', sources: ['branchProtection'] }]);
+    expect(rules.contexts).toEqual([{ context: 'legacy', sources: ['branchProtection'], appId: null }]);
   });
 });
 
-function rules(contexts: readonly string[]): BranchRequiredRules {
+function rules(contexts: readonly (string | { context: string; appId: number | null })[]): BranchRequiredRules {
   return {
     branch: 'main',
-    contexts: contexts.map((context) => ({ context, sources: ['branchProtection' as const] })),
+    contexts: contexts.map((c) =>
+      typeof c === 'string'
+        ? { context: c, sources: ['branchProtection' as const], appId: null }
+        : { context: c.context, sources: ['branchProtection' as const], appId: c.appId },
+    ),
     branchProtection: 'present',
     repositoryRuleset: 'absent',
   };
@@ -181,8 +248,10 @@ describe('joinRequiredChecks', () => {
     expect(missing).toEqual({
       context: 'never-starts',
       sources: ['branchProtection'],
+      appId: null,
       state: 'missing',
       observed: null,
+      unmatchedByApp: [],
     });
   });
 
@@ -193,16 +262,60 @@ describe('joinRequiredChecks', () => {
   it('optional check는 결과에 넣지 않는다', () => {
     const withOptional: readonly CheckFact[] = [
       ...ROLLUP,
-      { kind: 'checkRun', name: 'optional-fail', status: 'COMPLETED', conclusion: 'FAILURE', state: null },
+      checkRunRow('optional-fail', 'FAILURE', null),
     ];
     const joined = joinRequiredChecks(rules(['classic-passing']), withOptional);
     expect(joined.map((r) => r.context)).toEqual(['classic-passing']);
   });
 
+  it('바인딩 없는 rule은 어느 app이 보고해도 이름만으로 조인한다', () => {
+    const [ci] = joinRequiredChecks(rules(['ci']), [checkRunRow('ci', 'SUCCESS', 99999)]);
+    expect(ci?.appId).toBeNull();
+    expect(ci?.state).toBe('passing');
+    expect(ci?.unmatchedByApp).toEqual([]);
+  });
+
+  it('app-bound rule은 그 app이 보고한 row만 충족시킨다', () => {
+    const [ci] = joinRequiredChecks(
+      rules([{ context: 'ci', appId: 15368 }]),
+      [checkRunRow('ci', 'SUCCESS', 15368)],
+    );
+    expect(ci?.state).toBe('passing');
+    expect(ci?.observed?.appId).toBe(15368);
+    expect(ci?.unmatchedByApp).toEqual([]);
+  });
+
+  it('다른 app이 보고한 동명 SUCCESS는 app-bound rule을 충족시키지 않는다', () => {
+    // 실측(2026-08-23, `dnhynk/THROWAWAY-orca-c2-appbind-c6ddffc0`): app_id 15368에 바인딩된
+    // required context에 다른 주체가 올린 success가 있어도 merge는
+    // `405 ... was not set by the expected GitHub app`이었다.
+    const other = checkRunRow('ci', 'SUCCESS', 99999);
+    const [ci] = joinRequiredChecks(rules([{ context: 'ci', appId: 15368 }]), [other]);
+    expect(ci?.state).toBe('missing');
+    expect(ci?.observed).toBeNull();
+    expect(ci?.unmatchedByApp).toEqual([other]);
+  });
+
+  it('동명 commit status도 app-bound rule을 충족시키지 않는다', () => {
+    // commit status에는 app을 식별할 field가 없다. 확정할 수 없는 것을 통과로 올리지 않는다.
+    const row = statusRow('classic-appbound', 'SUCCESS');
+    const [ci] = joinRequiredChecks(rules([{ context: 'classic-appbound', appId: 15368 }]), [row]);
+    expect(ci?.state).toBe('missing');
+    expect(ci?.unmatchedByApp).toEqual([row]);
+  });
+
+  it('app-bound rule과 바인딩 없는 rule이 같은 이름이면 각각 판정한다', () => {
+    const joined = joinRequiredChecks(
+      rules([{ context: 'ci', appId: null }, { context: 'ci', appId: 15368 }]),
+      [checkRunRow('ci', 'SUCCESS', 99999)],
+    );
+    expect(joined.map((r) => [r.appId, r.state])).toEqual([[null, 'passing'], [15368, 'missing']]);
+  });
+
   it('같은 context에 row가 여러 개면 가장 무거운 상태를 남긴다', () => {
     const dup: readonly CheckFact[] = [
-      { kind: 'checkRun', name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', state: null },
-      { kind: 'checkRun', name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE', state: null },
+      checkRunRow('ci', 'SUCCESS', null),
+      { ...checkRunRow('ci', 'FAILURE', null), id: 'CR_ci_2' },
     ];
     const [ci] = joinRequiredChecks(rules(['ci']), dup);
     expect(ci?.state).toBe('failing');
@@ -212,9 +325,8 @@ describe('joinRequiredChecks', () => {
 
 describe('checkState', () => {
   const checkRun = (status: string, conclusion: string | null): CheckFact =>
-    ({ kind: 'checkRun', name: 'x', status, conclusion, state: null });
-  const statusContext = (state: string): CheckFact =>
-    ({ kind: 'statusContext', name: 'x', status: '', conclusion: null, state });
+    ({ ...checkRunRow('x', conclusion, null), status });
+  const statusContext = (state: string): CheckFact => statusRow('x', state);
 
   it('완료되지 않은 check run은 pending이다', () => {
     for (const s of ['REQUESTED', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'PENDING']) {
