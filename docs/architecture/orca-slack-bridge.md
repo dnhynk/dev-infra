@@ -43,13 +43,17 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
 ### Discovery
 
 - D1에서는 설정 파일에 수동 등록한 repository와 그 Run 후보만 찾는다.
-- Run과 live coordinator terminal/worktree/repository를 연결한다.
+- Run identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·`consumer_generation`을
+  권위로 읽고, live/stale은 `consumer_generation`으로 구분한다(OD-020).
+- coordinator 세션의 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID`는 보조 단서로만 쓴다.
 - global worker list의 Run↔worktree 정보는 repository 후보 복구에 사용할 수 있지만 historical/released worker를 liveness로 사용하지 않는다.
 - Git remote 기반 자동 repository 등록은 O1에서 다룬다.
 - 설정 또는 durable store의 Project↔Repository mapping을 적용한다.
 - 자동 발견된 다중 repository routing도 O1에서 다룬다(OD-068).
 
-현재 로컬 Orca의 `run-list`만으로 repository와 coordinator liveness를 알 수 없으므로 terminal/worktree 상관관계 또는 추가 등록 계약이 필요하다.
+`run-use` 인수 뒤 coordinator handle·pane key는 새 터미널 값으로 바뀌고 generation이 올라가므로, 최초 handle을
+Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설정(OD-068)을 따르며, 관측된
+`<uuid>::<path>` worktree id 형식은 안정성이 보장된 계약으로 파싱하지 않는다.
 
 ### Orca Collector
 

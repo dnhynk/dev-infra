@@ -150,11 +150,14 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 
 D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견·Git remote 기반 자동 등록·자동 발견된
 다중 repository routing은 O1 범위다(OD-068).
+Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·
+`consumer_generation`을 권위로 읽고 live/stale은 generation으로 구분한다. coordinator 환경변수는 보조
+단서로만 쓴다(OD-020).
 
 출구 조건:
 
 - Slack 표시가 확정된 Orca 집계 규칙과 일치함
-- live/stale Run을 구분함
+- `consumer_generation`으로 live/stale Run을 구분함(OD-020)
 - 재시작 뒤 같은 Run root를 재사용함
 
 ## 8. Bridge Slice D2 · Gate UI와 Orca Resolution
