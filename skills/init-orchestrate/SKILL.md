@@ -171,13 +171,64 @@ Run이 끝날 때는 §8의 정리 대기가 없음을 먼저 확인하고 hando
   이전 배치가 유지된다.
 - 완료 보고가 수락된 worker와 reviewer는 즉시 후속 Dispatch에 재사용하지 않는 한
   `worker-release`한다. 성공·실패 모두 같으며, 출력은 release 뒤에도 `worker-read`로 확인한다.
-- merge를 확인한 뒤에는 해당 Task가 만든 worktree와 local·remote branch를 §8의 절차로 정리하고,
-  정리 결과를 재조회한 다음 다음 ready task를 자동으로 지시한다.
+- Task가 끝난 뒤에는(PR이 있으면 merge를 확인한 뒤) 해당 Task가 만든 worktree와 branch를 §8의
+  절차로 정리하고, 정리 결과를 재조회한 다음 다음 ready task를 자동으로 지시한다.
 - 한 Task가 사람 결정을 기다려도 그 결정과 독립인 ready task와 worker는 계속 실행한다.
+
+### 턴 계약 — 무인 운용의 성립 조건
+
+무인 운용은 이 규칙 하나에 달려 있다. **도구 호출 없이 텍스트를 내면 그 턴은 거기서 끝나고
+세션은 사용자 입력을 기다린다.** worker가 돌고 있어도 마찬가지다. 배경 진행 같은 것은 없다.
+
+그러므로 **미결 Dispatch가 하나라도 있으면 텍스트로 턴을 끝내지 않는다.** 보고를 쓰더라도 같은
+턴에서 다음 도구 호출로 이어간다. 미결 Dispatch가 있을 때 coordinator의 마지막 행동은 언제나
+대기 재개다.
+
+```text
+orca orchestration check --ack <delivery_id> --wait --types worker_done,escalation,question --timeout-ms <n> --json
+```
+
+Delivery의 모든 메시지를 처리하고 아래 정리 결정을 끝냈으면 곧바로 같은 명령으로 다음 Delivery를
+기다린다. `{count:0}`이나 timeout은 checkpoint이지 worker 실패가 아니다. 코딩 Task는 15~60분이
+정상이다. 도구 타임아웃은 `--timeout-ms`보다 크게 준다. 이 대기를 `run_in_background`로 돌리지
+않는다 — 도구가 즉시 반환해 그 턴에 할 일이 없어지고, 결국 텍스트로 턴을 끝내게 된다.
+
+**턴을 끝내도 되는 경우는 다음뿐이다.**
+
+| 조건 | 근거 |
+|---|---|
+| 모든 Dispatch가 settle됐고 정리가 끝났으며 ready task가 없다 | Run 완료 |
+| 사용자 답 없이 진행할 수 없는 Gate·질문을 올렸고, 그 결정과 독립인 ready task도 미결 Dispatch도 없다 | 실제 blocking |
+| §1 전제조건 실패 | 부팅 불가 |
+| §4 fresh boot의 방향 합의 대기 | 착수 전 승인 |
+| §11 롤오버 8번 | 승계 완료 |
+
+이 표에 없으면 끝내지 않는다. 특히 다음은 종료 사유가 **아니다.**
+
+- 중간 보고, 현황 정리, 마일스톤 도달
+- §10 handoff checkpoint 기록
+- worker dispatch 직후
+- 리뷰 결과 수신, PR merge, Task 정리 완료
+- 사용자가 나중에 답해도 되는 비차단 질문 — 보고에 적고 계속 진행한다
+
+이 스킬의 다른 절이 "사용자에게 명시한다 / 제시한다 / 올린다"고 말하는 곳(§2, §3, §9, §11, §12)은
+**턴 안에서 출력하라는 뜻이지 턴을 끝내라는 뜻이 아니다.** 위 표에 해당하지 않으면 출력한 뒤
+대기를 재개한다.
+
+**"기다린다" "계속 무인으로 진행한다"고 써놓고 텍스트로 턴을 끝내면 그 문장은 거짓이 된다.**
+그렇게 쓰고 싶어지는 순간이 바로 `check --wait`를 호출해야 하는 순간이다.
 
 ### 완료와 리소스 정리
 
-정리는 Run 끝에 몰아서 하지 않고 Task가 merge될 때마다 수행한다. 다음 순서를 지킨다.
+정리는 Run 끝에 몰아서 하지 않고 Task마다 수행한다. 트리거는 Task 종류에 따라 다르다.
+
+- PR을 만드는 Task: 그 PR의 merge를 확인한 시점
+- PR을 만들지 않는 Task(리뷰, 조사, 관측): 완료 보고를 수락한 시점
+
+**PR 없는 Task를 정리 대상에서 빠뜨리지 않는다.** reviewer worktree는 merge에 도달하지 않으므로
+merge만 트리거로 쓰면 Run이 끝날 때까지 남는다.
+
+다음 순서를 지킨다. PR이 없는 Task는 2번과 5번의 PR head branch 항목을 건너뛴다.
 
 1. 수락한 `worker_done`마다 같은 agent에 같은 배치의 즉시 후속 Task가 있으면 새 Dispatch로 terminal
    ownership을 넘긴다. 그렇지 않으면 coordinator가 Delivery를 ack하거나 다시 wait하기 전에
@@ -200,6 +251,14 @@ Run이 끝날 때는 §8의 정리 대기가 없음을 먼저 확인하고 hando
    먼저 안전 삭제를 시도하되 squash/rebase merge라서 거부되면, PR이 실제 `MERGED`이고 branch identity가
    일치하며 remote PR head에 push되지 않은 local commit이 없다는 2·3번의 증거가 모두 있을 때만 그 정확한
    local branch를 강제 삭제한다. `git branch --merged`의 빈 결과는 미병합이나 `cleanup_pending`의 근거가 아니다.
+
+   PR head branch와 별개로, **worktree를 만들 때 Orca가 자동으로 생성한 branch**(`<user>/<worktree 이름>`
+   형태)도 같은 단계에서 정리한다. PR head는 아니지만 이 Run이 만든 리소스다. worker나 reviewer가 다른
+   ref로 옮겨가면 — reviewer가 PR head로 detach하는 경우가 대표적이다 — 그 branch는 worktree에 체크아웃돼
+   있지 않게 되어 `worktree rm`으로 사라지지 않는다. 어느 worktree에도 체크아웃돼 있지 않음을 확인한 뒤
+   `git branch -d`로 **안전 삭제만** 시도한다. 거부되면 고유 commit이 있다는 뜻이므로 강제하지 않고
+   `cleanup_pending`으로 남긴다. 이 branch는 remote에 push되지 않는 것이 정상이므로 remote 삭제는
+   시도하지 않는다.
 6. Orca Worker/Dispatch/Worktree와 Git local/remote branch를 다시 조회한다. worker가 released됐거나
    의도적으로 retained됐고, worktree와 branch가 제거됐거나 근거 있는 예외로 기록됐을 때만 Task 정리를
    완료로 표시한다. 명령이 중간에 실패해도 확인된 단계부터 멱등하게 재개한다.
