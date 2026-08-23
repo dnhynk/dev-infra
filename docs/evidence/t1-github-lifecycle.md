@@ -4,7 +4,7 @@
 
 [관측] `gh 2.98.0`을 `dnhynk` 계정으로 사용했고 인증 scope는 `gist`, `read:org`, `repo`, `workflow`였다.
 
-[관측] 기존 운영 repository와 PR은 읽기만 했고, write 관측은 명시적으로 허용된 `dnhynk/THROWAWAY-orca-github-lifecycle-bc06`와 독립 재현용 `dnhynk/THROWAWAY-orca-pr11-od032-71b6`에서만 수행했다. 두 repository는 관측 뒤 archive했다.
+[관측] 기존 운영 repository와 PR은 읽기만 했고, write 관측은 명시적으로 허용된 `dnhynk/THROWAWAY-orca-github-lifecycle-bc06`, 독립 재현용 `dnhynk/THROWAWAY-orca-pr11-od032-71b6`, head polling 재현용 `dnhynk/THROWAWAY-orca-pr11-headpoll-6180d8`에서만 수행했다. 세 repository는 관측 뒤 archive했다.
 
 [관측] 기존 [platform-capabilities.md §5](../platform-capabilities.md#5-github)의 `merged PR은 mergeable/mergeStateStatus가 UNKNOWN`, `reviewDecision은 대상 repository에서 null`, `check 수는 repository별로 다름`과 어긋나는 결과는 없었다.
 
@@ -22,6 +22,7 @@
 | `cli/cli#14056` | [관측] changes-requested review의 명시적 dismissal |
 | THROWAWAY PR `#1` | [관측] required/optional checks, commit status, `mergeable:null`, out-of-order snapshot, body edit, commit trailer, 실제 merge |
 | `THROWAWAY-orca-pr11-od032-71b6#1` | [관측] 빈 repository부터 OD-032 절차 독립 재현, 미보고 required의 405와 제거 뒤 optional failure 상태의 실제 merge |
+| `THROWAWAY-orca-pr11-headpoll-6180d8#1` | [관측] final update 뒤 stale head read와 bounded polling, 새 head의 required success·optional failure 상태에서 실제 merge 재현 |
 
 [문서] REST PR, review, check, status, protection, timeline의 현재 계약은 각각 [Pull requests](https://docs.github.com/en/rest/pulls/pulls), [Pull request reviews](https://docs.github.com/en/rest/pulls/reviews), [Check runs](https://docs.github.com/en/rest/checks/runs), [Commit statuses](https://docs.github.com/en/rest/commits/statuses), [Protected branches](https://docs.github.com/en/rest/branches/branch-protection), [Timeline events](https://docs.github.com/en/rest/issues/timeline)에 있다.
 
@@ -232,9 +233,9 @@ gh api graphql -f query='query{checkStatus:__type(name:"CheckStatusState"){enumV
 ```
 
 ```powershell
-$repo = 'dnhynk/THROWAWAY-orca-pr11-od032-71b6'
+$repo = 'dnhynk/THROWAWAY-orca-pr11-headpoll-6180d8'
 gh repo create $repo --public --add-readme `
-  --description 'THROWAWAY: independent PR #11 OD-032 reproduction; safe to archive'
+  --description 'THROWAWAY: PR #11 stale head polling reproduction; safe to archive'
 
 # final check들을 실제로 만드는 workflow를 main에 설치
 $workflowText = @'
@@ -276,15 +277,38 @@ gh api --method PUT repos/$repo/contents/result.txt `
 $initialProtection = '{"required_status_checks":{"strict":true,"contexts":["required-ci","optional-skip","legacy-required","never-starts"]},"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}'
 $initialProtection | gh api --method PUT repos/$repo/branches/main/protection --input -
 gh pr create --repo $repo --head probe --base main `
-  --title 'THROWAWAY lifecycle probe' --body '<!-- orca-run: run_THROWAWAY_pr11_fix -->'
+  --title 'THROWAWAY lifecycle probe' --body '<!-- orca-run: run_THROWAWAY_pr11_headpoll -->'
 
-# 누락됐던 final check 상태 생성: final head를 갱신하고 Actions 완료까지 기다린다.
+# final update 직전 head를 기억하고 content API가 반환한 새 commit을 기대값으로 잡는다.
+$previousHeadSha = gh pr view 1 --repo $repo --json headRefOid --jq .headRefOid
+Write-Output "previous_head=$previousHeadSha"
 $resultBlobSha = gh api "repos/$repo/contents/result.txt?ref=probe" --jq .sha
 $successBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("success`n"))
-gh api --method PUT repos/$repo/contents/result.txt `
+$expectedHeadSha = gh api --method PUT repos/$repo/contents/result.txt `
   -f message='test: create final required success' -f content=$successBase64 `
-  -f branch=probe -f sha=$resultBlobSha
-$headSha = gh pr view 1 --repo $repo --json headRefOid --jq .headRefOid
+  -f branch=probe -f sha=$resultBlobSha --jq .commit.sha
+Write-Output "expected_head=$expectedHeadSha"
+if ($expectedHeadSha -eq $previousHeadSha) {
+  throw 'Final update did not advance the head; stop before posting status, selecting a run, or merging.'
+}
+
+# headRefOid는 update 직후 stale할 수 있다. 최대 60초 동안 2초 간격으로 기대 SHA를 확인한다.
+# timeout이면 throw로 중단하며 잘못된 head에 status/run/merge를 연결하지 않는다.
+$headDeadline = (Get-Date).AddSeconds(60)
+$headPollCount = 0
+do {
+  $headPollCount += 1
+  $headSha = gh pr view 1 --repo $repo --json headRefOid --jq .headRefOid
+  Write-Output "head_poll[$headPollCount]=$headSha"
+  if ($headSha -eq $expectedHeadSha) { break }
+  if ((Get-Date) -ge $headDeadline) {
+    throw "Timed out waiting for final head: previous=$previousHeadSha expected=$expectedHeadSha observed=$headSha. Stop before posting status, selecting a run, or merging."
+  }
+  Start-Sleep -Seconds 2
+} while ($true)
+Write-Output "head_advanced previous=$previousHeadSha final=$headSha polls=$headPollCount"
+
+# 확인된 final head에만 status를 만들고 그 SHA의 Actions 완료까지 기다린다.
 gh api --method POST repos/$repo/statuses/$headSha `
   -f state=success -f context=legacy-required -f description='THROWAWAY required status success'
 do {
@@ -364,10 +388,16 @@ CheckConclusionState: ACTION_REQUIRED, TIMED_OUT, CANCELLED, FAILURE, SUCCESS, N
 ```
 
 ```text
-독립 재현 repository: https://github.com/dnhynk/THROWAWAY-orca-pr11-od032-71b6
+독립 재현 repository: https://github.com/dnhynk/THROWAWAY-orca-pr11-headpoll-6180d8
 initial required contexts: required-ci, optional-skip, legacy-required, never-starts
 
-final head f2aba36d7c4442e0ea2e2ed77d8ce85a0683f832, Actions run 32619609898:
+previous_head=8ea532ad63f3e8c25c20310180cac79a9a809b36
+expected_head=0fd0c73b04c17ec3be8958f60c517ba4af7db2cf
+head_poll[1]=8ea532ad63f3e8c25c20310180cac79a9a809b36
+head_poll[2]=0fd0c73b04c17ec3be8958f60c517ba4af7db2cf
+head_advanced previous=8ea532ad63f3e8c25c20310180cac79a9a809b36 final=0fd0c73b04c17ec3be8958f60c517ba4af7db2cf polls=2
+
+final head 0fd0c73b04c17ec3be8958f60c517ba4af7db2cf, Actions run 32620551511:
 required-ci   completed/success
 optional-skip completed/skipped
 optional-fail completed/failure
@@ -388,7 +418,7 @@ mergeable=MERGEABLE mergeStateStatus=UNSTABLE
 
 같은 head의 merge 재시도:
 HTTP/2.0 200 OK
-{"sha":"a9b5eb047b9ea8769bcf10b832d9db03a6399985","merged":true,"message":"Pull Request successfully merged"}
+{"sha":"1446c5ad3f969c63da9fbec659260993325746c8","merged":true,"message":"Pull Request successfully merged"}
 repository archived=true
 ```
 
@@ -405,6 +435,8 @@ repository archived=true
 - [관측] required success, required skipped, required commit-status success, optional failure 조합에서 GraphQL `mergeStateStatus=UNSTABLE`이었지만 admin protection까지 강제한 실제 merge API는 성공했다.
 - [관측] 새 THROWAWAY의 final head에서 Actions로 위 check run 3개를 생성하고 commit status를 success로 만든 뒤에도, 미보고 `never-starts`가 admin-enforced required set에 남아 있으면 merge API는 `405 Required status check "never-starts" is expected`로 거절했다.
 - [관측] 같은 head와 check 상태에서 `never-starts`만 required set에서 제거하자 `mergeStateStatus=UNSTABLE`이 됐고 merge API는 `200`, `merged=true`를 반환했다. 따라서 optional failure에도 merge 가능하다는 기존 결론은 독립 재현에서도 유지됐다.
+- [관측] final content update 직후 첫 `gh pr view`는 PUT이 반환한 새 SHA가 아니라 이전 SHA를 반환했고, 2초 뒤 두 번째 조회에서 새 SHA로 수렴했다.
+- [추론] 이 endpoint 간 stale read는 OD-044의 ordering·reconciliation에서도 head update와 후속 status/run을 단발 PR snapshot만으로 결합하면 안 된다는 근거다.
 - [문서] protected branch의 required check는 `successful`, `skipped`, `neutral`이면 통과로 취급되며 check run과 commit status가 모두 required context가 될 수 있다.
 - [관측] required-neutral live PR은 찾은 공개 표본에 없었고 THROWAWAY에서 직접 만들지 못했다.
 - [실행하지 않음] 현재 자격증명은 GitHub App `checks:write`가 아니므로 neutral check run 생성은 시도하지 않았다.
