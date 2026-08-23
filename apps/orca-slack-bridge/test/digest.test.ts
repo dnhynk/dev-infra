@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runDigest, formatReport, type DigestReport } from '../src/digest/digest.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
-import type { GhRunner } from '../src/github/runner.js';
+import { GhCommandError, type GhRunner } from '../src/github/runner.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import type { BridgeConfig } from '../src/project/config.js';
 import { DEFAULT_CORRELATION_KEYS } from '../src/project/config.js';
@@ -154,6 +154,12 @@ function prRow(over: PrRow = {}): PrRow {
 class FakeGh implements GhRunner {
   constructor(private readonly prs: readonly PrRow[]) {}
   async run(args: readonly string[]): Promise<string> {
+    const path = args[1] ?? '';
+    // required rule 조회. 이 fixture repo는 protection도 ruleset도 없다(dev-infra 실측과 같다).
+    if (args[0] === 'api' && path.includes('/protection/required_status_checks')) {
+      throw new GhCommandError(args, 1, 'gh: Branch not protected (HTTP 404)');
+    }
+    if (args[0] === 'api' && path.includes('/rules/branches/')) return '[]';
     if (args[0] === 'api') return JSON.stringify({ id: REPO_ID, full_name: REPO });
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(this.prs);
     throw new Error('예상치 못한 gh 호출: ' + args.join(' '));

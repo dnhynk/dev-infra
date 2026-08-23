@@ -53,8 +53,10 @@ function pr(over: Partial<PullRequestFacts> = {}): PullRequestFacts {
     baseRefName: 'main',
     mergedAt: null,
     reviewDecision: null,
-    reviewCount: 0,
-    checks: [{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    reviews: [],
+    requiredRules: { branch: 'main', contexts: [], branchProtection: 'absent', repositoryRuleset: 'absent' },
+    requiredChecks: [],
+    checks: [{ kind: 'checkRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }],
     changedPaths: ['apps/orca-slack-bridge/src/digest/types.ts'],
     changedFilesTotal: 1,
     ...over,
@@ -390,7 +392,7 @@ describe('ProjectedPr 조립', () => {
     expect(p.pr.url).toBe('https://github.com/dnhynk/dev-infra/pull/1');
     expect(p.pr.headSha).toBe('7e9479ebdebe35fc9956b65c0f851ff096c56130');
     expect(p.pr.state).toBe('open');
-    expect(p.pr.checks).toEqual([{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }]);
+    expect(p.pr.checks).toEqual([{ kind: 'checkRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', state: null }]);
     expect(p.pr.truncation).toEqual({ prBody: false, changedFiles: false });
   });
 

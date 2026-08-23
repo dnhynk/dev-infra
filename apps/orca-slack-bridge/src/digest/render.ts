@@ -174,7 +174,8 @@ function findingLine(f: FindingFacts): string {
 
 function checkLine(c: CheckFact): string {
   // 집계하지 않고 required/optional을 판정하지도 않는다(OD-032). 결론을 그대로 옮긴다.
-  const conclusion = c.conclusion ?? (c.status !== '' ? c.status : 'unknown');
+  // StatusContext row에는 conclusion도 status도 없고 state만 있다.
+  const conclusion = c.conclusion ?? c.state ?? (c.status !== '' ? c.status : 'unknown');
   return `• ${esc(c.name === '' ? '(이름 없음)' : c.name)}: ${esc(conclusion)}`;
 }
 

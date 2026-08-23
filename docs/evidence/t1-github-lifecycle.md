@@ -23,6 +23,7 @@
 | THROWAWAY PR `#1` | [관측] required/optional checks, commit status, `mergeable:null`, out-of-order snapshot, body edit, commit trailer, 실제 merge |
 | `THROWAWAY-orca-pr11-od032-71b6#1` | [관측] 빈 repository부터 OD-032 절차 독립 재현, 미보고 required의 405와 제거 뒤 optional failure 상태의 실제 merge |
 | `THROWAWAY-orca-pr11-headpoll-6180d8#1` | [관측] final update 뒤 stale head read와 bounded polling, 새 head의 required success·optional failure 상태에서 실제 merge 재현 |
+| `THROWAWAY-orca-c2-ruleset-11c46c2b#1` | [관측] classic protection과 repository ruleset이 동시에 적용된 base branch의 required rule 합집합과 rollup 조인 |
 
 [문서] REST PR, review, check, status, protection, timeline의 현재 계약은 각각 [Pull requests](https://docs.github.com/en/rest/pulls/pulls), [Pull request reviews](https://docs.github.com/en/rest/pulls/reviews), [Check runs](https://docs.github.com/en/rest/checks/runs), [Commit statuses](https://docs.github.com/en/rest/commits/statuses), [Protected branches](https://docs.github.com/en/rest/branches/branch-protection), [Timeline events](https://docs.github.com/en/rest/issues/timeline)에 있다.
 
@@ -450,6 +451,69 @@ repository archived=true
 - [관측] `mergeable=true`는 changes-requested나 required-check failure를 막지 않았고 merge conflict 가능 여부와 정책 충족 여부가 다른 축임을 확인했다.
 - [추론] `mergeStateStatus`는 유용한 요약이지만 `UNSTABLE`인 PR도 optional failure뿐이면 merge 가능하므로 단독 merge-ready boolean이 아니다.
 
+### [추가 관측] ruleset 표본 (2026-08-23, C2-2 구현 중)
+
+[관측] 위 §9의 `[관측 불가] ruleset ... 권한이 없어 조회하지 못했다`는 표본 부재였다. 같은 scope
+(`gist`, `read:org`, `repo`, `workflow`)의 토큰으로 `dnhynk/dev-infra`의 두 정책 API가 모두 읽혔다.
+
+```powershell
+gh api repos/dnhynk/dev-infra/branches/main/protection   # 404 {"message":"Branch not protected"}
+gh api repos/dnhynk/dev-infra/rulesets                   # []
+```
+
+[관측] ruleset이 실제로 적용된 표본을 만들기 위해 `dnhynk/THROWAWAY-orca-c2-ruleset-11c46c2b`에
+classic protection과 repository ruleset을 **동시에** 걸고 PR `#1`의 head에 commit status 3개만 만들었다.
+
+```powershell
+$repo = 'dnhynk/THROWAWAY-orca-c2-ruleset-11c46c2b'
+'{"required_status_checks":{"strict":false,"contexts":["classic-passing","classic-failing"]},"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}' |
+  gh api --method PUT repos/$repo/branches/main/protection --input -
+# ruleset: target=branch, refs/heads/main, required_status_checks = ruleset-pending, ruleset-missing
+gh api --method POST repos/$repo/rulesets --input ruleset.json
+
+gh api repos/$repo/rules/branches/main
+gh api repos/$repo/branches/main/protection/required_status_checks
+gh pr view 1 --repo $repo --json headRefOid,mergeable,mergeStateStatus,statusCheckRollup,reviews
+gh pr checks 1 --repo $repo --required
+```
+
+```text
+rules/branches/main:
+[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,
+  "do_not_enforce_on_create":false,"required_status_checks":[{"context":"ruleset-pending"},
+  {"context":"ruleset-missing"}]},"ruleset_source_type":"Repository",
+  "ruleset_source":"dnhynk/THROWAWAY-orca-c2-ruleset-11c46c2b","ruleset_id":21233618}]
+
+protection/required_status_checks:
+{"strict":false,"contexts":["classic-passing","classic-failing"],
+ "checks":[{"context":"classic-passing","app_id":null},{"context":"classic-failing","app_id":null}]}
+
+statusCheckRollup (head 41326a121680602f736d39ced9f6a4990f949c0a):
+{"__typename":"StatusContext","context":"classic-failing","state":"FAILURE"}
+{"__typename":"StatusContext","context":"ruleset-pending","state":"PENDING"}
+{"__typename":"StatusContext","context":"classic-passing","state":"SUCCESS"}
+mergeable=MERGEABLE mergeStateStatus=BLOCKED
+
+gh pr checks 1 --required:
+classic-failing  fail
+ruleset-pending  pending
+classic-passing  pass
+exit=1
+```
+
+- [관측] `rules/branches/{branch}`는 ruleset이 준 required context만 반환했고 classic protection의
+  `classic-passing`/`classic-failing`은 포함하지 않았다. 두 API는 서로를 포함하지 않는다.
+- [관측] 반대로 `protection/required_status_checks`에는 ruleset이 준 두 context가 없었다.
+- [관측] 한 번도 보고되지 않은 `ruleset-missing`은 rollup에도 `gh pr checks --required`에도 없었다.
+  ruleset 경로에서도 미보고 required는 §OD-032 본문의 classic 경로와 같게 보이지 않는다.
+- [관측] `cli/cli` trunk에서는 `rules/branches/trunk`가 `200`으로 `copilot_code_review` rule을 반환했고
+  같은 시각 `branches/trunk/protection/required_status_checks`는 `404 Not Found`였다. rules API는 admin이
+  아니어도 읽히고 protection GET은 그렇지 않다.
+- [관측] `protection/required_status_checks`의 `404`는 소유 repository에서 `Branch not protected`,
+  타인 repository에서 `Not Found`였다. 미설정과 권한 없음을 이 응답만으로 구분할 수 없다.
+- [관측] 이 repository는 관측 뒤 archive했다.
+- [실행하지 않음] merge queue가 적용된 표본은 만들지 않았고 merge queue rule은 조회하지 않았다.
+
 ### [배제되는 선택지]
 
 - [추론] 현재 `statusCheckRollup`만 읽어 required/optional을 판정하는 선택지는 배제된다.
@@ -787,7 +851,8 @@ existing test name: 'correlated지만 task가 없으면 task_missing이다'
 - [관측 불가] required-neutral의 live PR 조합은 공개 표본에서 찾지 못했고 GitHub App `checks:write`가 없어 직접 생성하지 않았다.
 - [관측 불가] 같은 API의 응답이 네트워크 out-of-order로 도착하는 장시간/고동시성 경우는 실행하지 않았고, 대신 push 직후 서로 다른 endpoint에서 stale head snapshot이 섞인 경우를 관측했다.
 - [관측 불가] GraphQL `userContentEdits`와 timeline/reviews/commits의 무기한 retention 보장은 문서에서 확인하지 못했다.
-- [관측 불가] ruleset과 merge queue가 실제로 적용된 repository의 상세 required rule은 권한이 없어 조회하지 못했다.
+- [관측 불가] ruleset과 merge queue가 실제로 적용된 repository의 상세 required rule은 권한이 없어 조회하지 못했다. — SUPERSEDED (ruleset 부분은 §OD-032 추가 관측에서 반증됐다. 권한 부족이 아니라 표본 부재였다.)
+- [관측 불가] merge queue가 적용된 repository의 상세 rule은 그런 repository 표본을 만들지 않아 여전히 조회하지 않았다.
 - [관측] THROWAWAY PR `#1`은 merge했고 remote `probe` branch와 classic branch protection을 삭제했다.
 - [관측] repository 삭제는 token에 `delete_repo` scope가 없어 HTTP `403`으로 거부됐다.
 - [관측] scope를 넓히지 않고 `dnhynk/THROWAWAY-orca-github-lifecycle-bc06`를 public archived 상태로 남겼다.
