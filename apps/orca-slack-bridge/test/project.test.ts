@@ -1,13 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   capFindings,
-  deriveDigestStatus,
   pickReviewerResult,
   pickWorkerReport,
   projectPullRequest,
-  toPrState,
   type OrcaFacts,
 } from '../src/digest/project.js';
+import { deriveDigestStatus, deriveTerminal } from '../src/digest/state.js';
 import type { ProjectedPr } from '../src/digest/types.js';
 import {
   INBOX_LIMIT,
@@ -389,7 +388,7 @@ describe('ProjectedPr 조립', () => {
     expect(p.pr.number).toBe(1);
     expect(p.pr.url).toBe('https://github.com/dnhynk/dev-infra/pull/1');
     expect(p.pr.headSha).toBe('7e9479ebdebe35fc9956b65c0f851ff096c56130');
-    expect(p.pr.state).toBe('open');
+    expect(p.pr.terminal).toBe('open');
     expect(p.pr.checks).toEqual([{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }]);
     expect(p.pr.truncation).toEqual({ prBody: false, changedFiles: false });
   });
@@ -443,7 +442,7 @@ describe('ProjectedPr 조립', () => {
     expect(() => projectPullRequest(REPO, pr({ state: 'DRAFTED' }), CORRELATED, f, CONFIG)).toThrow(
       /PR state/,
     );
-    expect(toPrState('MERGED')).toBe('merged');
+    expect(deriveTerminal('MERGED', null)).toBe('merged');
   });
 });
 

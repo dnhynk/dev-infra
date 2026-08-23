@@ -3,6 +3,7 @@ import type { SlackBlock } from '../slack/post.js';
 import type { Risk } from '../summarize/validate.js';
 import type { CheckFact } from '../github/pull-request.js';
 import type { FindingFacts } from '../summarize/contract.js';
+import { deriveDigestStatus } from './state.js';
 import type { DigestStatus, ProjectedPr, RenderInput } from './types.js';
 
 /**
@@ -38,6 +39,7 @@ export type RenderedCard = {
  *
  * 문구는 관찰된 사실을 넘지 않는다. `awaiting_review`는 "리뷰 진행 중"이 아니라
  * "reviewer_result가 없다"는 뜻이고, `review_approved`는 병합 준비 완료라는 주장이 아니다.
+ * draft와 checks는 headline에 접히지 않으므로 여기 없다. 각각 `현재`와 `CI` 절이 표시한다.
  */
 const STATUS_LABEL: Readonly<
   Record<DigestStatus, { readonly emoji: string; readonly label: string }>
@@ -143,20 +145,6 @@ function labelled(label: string, lines: readonly string[]): SlackBlock {
 }
 
 /**
- * 카드가 표시할 상태를 사실에서 파생한다.
- *
- * 순서는 `digest/types.ts`의 `DigestStatus`가 고정한 것이고 여기서 바꾸지 않는다.
- * CI 결론, `worker_done` 유무, draft 여부, risk는 이 값에 섞이지 않는다. 각각 따로 표시한다.
- */
-export function deriveStatus(pr: ProjectedPr): DigestStatus {
-  if (pr.state === 'merged') return 'merged';
-  if (pr.state === 'closed') return 'closed';
-  if (pr.review?.verdict === 'request_changes') return 'changes_requested';
-  if (pr.review?.verdict === 'approve') return 'review_approved';
-  return 'awaiting_review';
-}
-
-/**
  * 카드 최상단 identity.
  *
  * Project가 설정에 있으면 `[Project] owner/repo #N`, 없으면 `owner/repo #N`이다(OD-047).
@@ -186,7 +174,8 @@ function checkLine(c: CheckFact): string {
  */
 export function renderCard(input: RenderInput): RenderedCard {
   const { pr, summary } = input;
-  const status = deriveStatus(pr);
+  // 파생은 `digest/state.ts` 하나뿐이다. renderer가 같은 판정을 다시 쓰지 않는다.
+  const status = deriveDigestStatus(pr);
   const { emoji, label } = STATUS_LABEL[status];
   const identity = identityLine(pr);
   // 요약이 실패하면 PR 원문 제목이 카드 제목의 fallback이다(OD-035).

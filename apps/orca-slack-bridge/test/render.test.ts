@@ -2,10 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   renderCard,
   renderFingerprint,
-  deriveStatus,
   identityLine,
   type RenderedCard,
 } from '../src/digest/render.js';
+import { deriveDigestStatus } from '../src/digest/state.js';
 import type {
   DigestStatus,
   ProjectedPr,
@@ -33,10 +33,11 @@ const basePr: ProjectedPr = {
   title: 'feat(c1): deterministic renderer',
   url: PR_URL,
   headSha: 'abc1234',
-  state: 'open',
+  terminal: 'open',
   isDraft: false,
   review: null,
   checks: [{ name: 'typecheck', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+  mergePolicy: 'unobserved',
   workerReport: {
     outcome: 'succeeded',
     body: 'renderer를 구현했다. layout이 코드에만 있음을 확인했다. 게시는 T5가 남았다.',
@@ -115,8 +116,8 @@ const ALL_STATES: readonly ProjectedPr[] = [
   basePr,
   withReview('approve', 'same', 'abc1234'),
   withReview('request_changes', 'same', 'abc1234'),
-  { ...basePr, state: 'closed' },
-  { ...basePr, state: 'merged' },
+  { ...basePr, terminal: 'closed' },
+  { ...basePr, terminal: 'merged' },
 ];
 
 const STATUS_TEXT_LABEL: Readonly<Record<DigestStatus, string>> = {
@@ -173,7 +174,7 @@ const cases: Readonly<Record<string, RenderInput>> = {
     summary: { ...okSummary, risk: 'low' },
   },
   merged: {
-    pr: { ...basePr, state: 'merged', workerReport: null },
+    pr: { ...basePr, terminal: 'merged', workerReport: null },
     summary: okSummary,
   },
 };
@@ -297,7 +298,7 @@ describe('renderCard · 의미 요구', () => {
     // 판정이 있는 것처럼 보이는 줄을 만들지 않는다.
     expect(contains(card, '판정:')).toBe(false);
     expect(contains(card, '보고된 finding 없음')).toBe(false);
-    expect(deriveStatus(basePr)).toBe('awaiting_review');
+    expect(deriveDigestStatus(basePr)).toBe('awaiting_review');
     expect(contains(card, STATUS_TEXT_LABEL.awaiting_review)).toBe(true);
   });
 
@@ -333,7 +334,7 @@ describe('renderCard · 의미 요구', () => {
     for (const pr of ALL_STATES) {
       for (const summary of [okSummary, failedSummary]) {
         const card = renderCard({ pr, summary });
-        seen.add(deriveStatus(pr));
+        seen.add(deriveDigestStatus(pr));
         expect(contains(card, '[dev-infra] dnhynk/dev-infra #7')).toBe(true);
         expect(card.text).toContain('[dev-infra] dnhynk/dev-infra #7');
         expect(contains(card, PR_URL)).toBe(true);
@@ -347,14 +348,14 @@ describe('renderCard · 의미 요구', () => {
   it('emoji와 색을 지워도 상태를 알 수 있다', () => {
     for (const pr of ALL_STATES) {
       const card = renderCard({ pr, summary: okSummary });
-      const label = STATUS_TEXT_LABEL[deriveStatus(pr)];
+      const label = STATUS_TEXT_LABEL[deriveDigestStatus(pr)];
       expect(withoutEmoji(JSON.stringify(card.blocks))).toContain(label);
       expect(withoutEmoji(card.text)).toContain(label);
     }
   });
 
   it('closed 카드도 라벨·identity·링크를 모두 남긴다', () => {
-    const card = renderCard({ pr: { ...basePr, state: 'closed' }, summary: failedSummary });
+    const card = renderCard({ pr: { ...basePr, terminal: 'closed' }, summary: failedSummary });
     expect(contains(card, STATUS_TEXT_LABEL.closed)).toBe(true);
     expect(withoutEmoji(card.text)).toContain(STATUS_TEXT_LABEL.closed);
     expect(contains(card, '[dev-infra] dnhynk/dev-infra #7')).toBe(true);
@@ -363,7 +364,7 @@ describe('renderCard · 의미 요구', () => {
 
   it('review_approved가 병합 준비 완료를 주장하지 않는다', () => {
     const approved = withReview('approve', 'same', basePr.headSha);
-    expect(deriveStatus(approved)).toBe('review_approved');
+    expect(deriveDigestStatus(approved)).toBe('review_approved');
 
     // CI가 실패해도 상태 라벨은 review verdict만 옮긴다. 둘을 결합한 판정은 C2다(OD-032).
     for (const pr of [
@@ -538,11 +539,11 @@ describe('renderCard · 상한이 astral 문자를 쪼개지 않는다', () => {
   });
 });
 
-describe('deriveStatus', () => {
+describe('deriveDigestStatus', () => {
   it('merged가 review verdict보다 앞선다', () => {
     const pr: ProjectedPr = {
       ...basePr,
-      state: 'merged',
+      terminal: 'merged',
       review: {
         verdict: 'request_changes',
         reviewedHeadSha: null,
@@ -551,15 +552,15 @@ describe('deriveStatus', () => {
         findingsTotal: 0,
       },
     };
-    expect(deriveStatus(pr)).toBe('merged');
+    expect(deriveDigestStatus(pr)).toBe('merged');
   });
 
   it('closed는 merged 다음이고 verdict보다 앞선다', () => {
-    expect(deriveStatus({ ...basePr, state: 'closed' })).toBe('closed');
+    expect(deriveDigestStatus({ ...basePr, terminal: 'closed' })).toBe('closed');
   });
 
   it('verdict가 없으면 awaiting_review다', () => {
-    expect(deriveStatus(basePr)).toBe('awaiting_review');
+    expect(deriveDigestStatus(basePr)).toBe('awaiting_review');
   });
 
   it('verdict를 그대로 옮긴다', () => {
@@ -573,9 +574,9 @@ describe('deriveStatus', () => {
         findingsTotal: 0,
       },
     };
-    expect(deriveStatus(approved)).toBe('review_approved');
+    expect(deriveDigestStatus(approved)).toBe('review_approved');
     expect(
-      deriveStatus({ ...approved, review: { ...approved.review!, verdict: 'request_changes' } }),
+      deriveDigestStatus({ ...approved, review: { ...approved.review!, verdict: 'request_changes' } }),
     ).toBe('changes_requested');
   });
 });
@@ -595,7 +596,7 @@ describe('renderFingerprint', () => {
   it('카드에 표시하는 사실이 바뀌면 지문이 바뀐다', () => {
     const base = renderFingerprint(renderCard({ pr: basePr, summary: okSummary }));
     const changed: readonly ProjectedPr[] = [
-      { ...basePr, state: 'merged' },
+      { ...basePr, terminal: 'merged' },
       { ...basePr, isDraft: true },
       { ...basePr, checks: [{ name: 'typecheck', status: 'COMPLETED', conclusion: 'FAILURE' }] },
       { ...basePr, workerReport: null },
