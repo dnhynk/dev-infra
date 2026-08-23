@@ -136,7 +136,14 @@ thread 요구:
 실행 중
 
 진행
-6 / 10 tasks
+completed 6
+dispatched 2
+blocked 1
+ready 1
+task-list.count 10
+
+Dispatch attempts
+12
 
 PR
 #184 ✅ merged
@@ -169,7 +176,7 @@ blocker는 open Gate, blocked Task, waiting dependency, worker ask, CI failure, 
 연결 ID로 표시한다. 고유 blocker 총합은 dedup 정책 전에는 표시하지 않고 `agentWait`는 provider별 근거 없이
 permission으로 단정하지 않는다(OD-067).
 
-그래픽 progress bar 사용 여부는 Block Kit layout을 확정할 때 결정한다.
+비율을 전제하는 그래픽 progress bar는 사용하지 않는다(OD-069).
 
 ### 3.2 Gate 결정 카드
 

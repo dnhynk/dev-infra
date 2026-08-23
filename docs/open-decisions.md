@@ -1237,7 +1237,8 @@ ID: OD-054
     `mcp.notification()` write는 성공했지만 receipt는 없었고, flag 있는 대화형 세션에서만 receipt가 왔다.
   - 같은 절의 공식 문서도 notification await는 transport write일 뿐 Claude 처리 ACK가 아니라고 명시했다.
 대안과 기각 이유:
-  - notification promise 반환을 delivered/processed로 기록: 다섯 실패 조건에서도 성공해 기각.
+  - notification promise 반환을 delivered/processed로 기록: 네 실패 조건에서도 write는 성공했고, flag 있는 성공 조건에서는
+    write와 receipt가 함께 성립해 transport write만으로 전달을 판별할 수 없으므로 기각.
   - 연결 직후 즉시 outbox flush: 통제 재측정 3회와 재현 1회에서 early write가 모두 유실돼 기각.
 영향 문서/파일: docs/specs/orca-slack-bridge.md §8, docs/architecture/orca-slack-bridge.md §4·§5,
                 docs/ux/slack-surfaces.md §3·§6, docs/roadmap.md §9, docs/traceability.md

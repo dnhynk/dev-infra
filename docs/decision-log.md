@@ -344,7 +344,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - transport write는 어떤 전달도 증명하지 않고 application receipt만 전달 신호로 쓴다(OD-054).
 - Orca 효과는 대상 Gate의 `pending`→`resolved` 전이다(OD-055).
 - 세션→daemon 반환은 실제 동작한 reply tool 왕복을 채택하되 이를 유일한 경로라고 규정하지 않는다(OD-059).
-- 근거: 다섯 실패 조건에서 notification write 성공과 receipt가 갈렸고, reply tool receipt와 Gate 상태는 각각 독립 조회됐다.
+- 근거: 네 실패 조건에서는 notification write 성공과 receipt 부재가 갈렸고, 한 성공 조건에서는 둘 다 성립했다. reply tool receipt와 Gate 상태는 각각 독립 조회됐다.
 
 ### DL-048 · opt-in과 중복 처리는 probe와 Orca 상태로 판정한다
 
