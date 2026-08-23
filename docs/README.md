@@ -20,6 +20,7 @@
 11. [검증된 플랫폼 역량과 제약](platform-capabilities.md)
 12. [Slack App 준비 절차](ops/slack-app-setup.md)
 13. [요구사항 추적표](traceability.md)
+14. [Phase 0 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
 
 ## 문서 권위와 표기
 
@@ -47,6 +48,8 @@
 | 버전 의존 외부 사실 | [플랫폼 검증](platform-capabilities.md) |
 
 [요구사항 추적표](traceability.md)는 감사용 색인이며 새로운 요구사항을 만들지 않는다.
+
+`docs/evidence/`는 C2·D1·D2·D3의 미결정을 닫기 위해 수집한 실측 기록이며 normative source가 아니다. 사용자 결정 후 [플랫폼 검증](platform-capabilities.md)과 [미결정 사항](open-decisions.md)으로 흡수하고 디렉터리를 삭제한다.
 
 문서의 상태 표기는 다음 의미를 가진다.
 
