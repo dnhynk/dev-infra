@@ -6,10 +6,11 @@ import type { GhRunner } from '../github/runner.js';
 import { runKey, taskKey, type PullRequestKey } from '../identity/keys.js';
 import {
   listWorkerDone,
-  unreadableTaskResults,
+  unreadableGateFields,
+  unreadableTaskFields,
   type OrcaRunner,
   type OrcaTask,
-  type UnreadableTaskResult,
+  type UnreadableField,
 } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
 import type { SlackPoster, ThreadPoster } from '../slack/post.js';
@@ -181,17 +182,20 @@ export type DigestReport = {
   /** Slack과 store에 쓰지 않았다는 사실. 출력이 실제 게시처럼 읽히지 않게 한다. */
   readonly dryRun: boolean;
   /**
-   * 이번 관찰에서 `result`를 읽지 못한 Orca task 전부(OD-079).
+   * 이번 관찰에서 읽지 못한 Orca 칸 전부(OD-079).
    *
-   * 카드별이 아니라 관찰 단위다. `run-list`에 필터가 없어 관측 1회가 이 호스트의 모든 Run을
-   * 훑으므로, 여기 실리는 Run이 이번에 카드를 만든 PR과 무관할 수 있다. 그 무관함이 바로
-   * 이 목록을 카드 아래가 아니라 보고 위에 두는 이유다.
+   * task의 `deps`·`result`·reviewer_result shape, gate의 `options`, `worker_done`의 `payload`가
+   * 한 목록에 들어온다. 칸마다 목록을 나누면 소비자가 하나를 빠뜨린다.
+   *
+   * 카드별이 아니라 관찰 단위다. `run-list`에도 `inbox`에도 필터가 없어 관측 1회가 이 호스트의
+   * 모든 Run을 훑으므로, 여기 실리는 Run이 이번에 카드를 만든 PR과 무관할 수 있다. 그 무관함이
+   * 바로 이 목록을 카드 아래가 아니라 보고 위에 두는 이유다.
    *
    * **비어 있지 않은데 카드가 나왔다면 그 카드는 이 실패를 알지 못한 채 그려진 것이다.**
-   * 읽지 못한 row가 reviewer_result였는지 아닌지도 알 수 없으므로, 같은 Run의 카드에서
-   * "리뷰 결과 없음"은 "reviewer_result를 관측하지 못했다"까지만 뜻한다.
+   * 같은 Run의 카드에서 "리뷰 결과 없음"은 "reviewer_result를 관측하지 못했다"까지만,
+   * "worker 보고 없음"은 "읽은 메시지에는 없었다"까지만 뜻한다.
    */
-  readonly degraded: readonly UnreadableTaskResult[];
+  readonly degraded: readonly UnreadableField[];
   readonly results: readonly DigestResult[];
 };
 
@@ -270,9 +274,15 @@ export async function runDigest(
   return {
     observedAt: options.now().toISOString(),
     dryRun: options.slack === null,
-    // 읽지 못한 row를 버리지 않고 관찰 결과로 싣는다. 파싱 실패는 task 하나에 갇히고
-    // 나머지 Run은 그대로 관측된다(OD-079).
-    degraded: runs.flatMap((r) => unreadableTaskResults(r.tasks)),
+    // 읽지 못한 칸을 버리지 않고 관찰 결과로 싣는다. 파싱·shape 실패는 row 하나에 갇히고
+    // 나머지 Run과 나머지 메시지는 그대로 관측된다(OD-079).
+    degraded: [
+      ...runs.flatMap((r) => [
+        ...unreadableTaskFields(r.tasks),
+        ...unreadableGateFields(r.gates),
+      ]),
+      ...inbox.unreadable,
+    ],
     results,
   };
 }
@@ -520,11 +530,13 @@ export function formatReport(report: DigestReport): string {
   // 카드보다 위에 둔다. dry-run은 카드마다 blocks 전문을 찍으므로 아래에 두면 묻힌다.
   if (report.degraded.length > 0) {
     lines.push(
-      `degraded: Orca task result ${report.degraded.length}건을 읽지 못했다. ` +
-        '실패를 그 task에 가두고 나머지는 관측했다(OD-079)',
+      `degraded: Orca 관측에서 ${report.degraded.length}칸을 읽지 못했다. ` +
+        '실패를 그 row에 가두고 나머지는 관측했다(OD-079)',
     );
     for (const d of report.degraded) {
-      lines.push(`  ${d.runId} / ${d.taskId}: ${d.reason.slice(0, REASON_CAP)}`);
+      lines.push(
+        `  ${d.runId} / ${d.id} · ${d.subject}.${d.field}: ${d.reason.slice(0, REASON_CAP)}`,
+      );
     }
     lines.push('');
   }
@@ -558,7 +570,7 @@ export function formatReport(report: DigestReport): string {
   const cards = report.results.filter((r) => r.kind === 'card').length;
   lines.push(
     `카드 ${cards}건 / 관찰 ${report.results.length}건 / ` +
-      `읽지 못한 task result ${report.degraded.length}건`,
+      `읽지 못한 칸 ${report.degraded.length}건`,
   );
   return lines.join('\n');
 }

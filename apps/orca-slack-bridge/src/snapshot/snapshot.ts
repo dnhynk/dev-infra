@@ -3,7 +3,7 @@ import { projectForRepository } from '../project/config.js';
 import { fetchRepositoryIdentity } from '../github/repository.js';
 import { listPullRequests, type PullRequestFacts } from '../github/pull-request.js';
 import type { GhRunner } from '../github/runner.js';
-import { listRuns, listTasks, listGates, unreadableTaskResults, type OrcaRunner, type OrcaRun, type OrcaTask, type OrcaGate } from '../orca/client.js';
+import { listRuns, listTasks, listGates, unreadableGateFields, unreadableTaskFields, type OrcaRunner, type OrcaRun, type OrcaTask, type OrcaGate } from '../orca/client.js';
 import { parseCorrelationMetadata } from '../correlate/metadata.js';
 import { resolveCorrelation, type Correlation, type OrcaCorrelationView } from '../correlate/resolve.js';
 import type { RepositoryIdentity } from '../identity/repository.js';
@@ -109,12 +109,14 @@ export function summarize(s: Snapshot): string {
   for (const r of s.runs) {
     const tag = r.run.legacy ? ' [legacy]' : '';
     const open = r.gates.filter((g) => g.status === 'pending').length;
-    // result를 읽지 못한 task를 이 줄에서 드러낸다. 읽지 못한 것을 없는 것처럼 세면 관측이
-    // 조용히 관대해진다(OD-079). 이유 전문은 `--json`의 task row에 그대로 있다.
-    const unreadable = unreadableTaskResults(r.tasks);
+    // 읽지 못한 칸을 이 줄에서 드러낸다. 읽지 못한 것을 없는 것처럼 세면 관측이 조용히
+    // 관대해진다(OD-079). 이유 전문은 `--json`의 task·gate row에 그대로 있다.
+    const unreadable = [...unreadableTaskFields(r.tasks), ...unreadableGateFields(r.gates)];
     lines.push(
       `  ${r.run.id}${tag}  tasks=${r.tasks.length} gates=${r.gates.length} open=${open}` +
-        (unreadable.length > 0 ? `  unreadable=${unreadable.map((u) => u.taskId).join(',')}` : '') +
+        (unreadable.length > 0
+          ? `  unreadable=${unreadable.map((u) => `${u.id}.${u.field}`).join(',')}`
+          : '') +
         (r.worktreePaths.length > 0 ? `  worktree=${r.worktreePaths.join(',')}` : ''),
     );
   }
