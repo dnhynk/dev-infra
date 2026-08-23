@@ -26,67 +26,431 @@ TRANSPORT_WRITE_ATTEMPTED       Adapter가 mcp.notification() 을 오류 없이 
 APPLICATION_RECEIPT_RECEIVED    세션이 reply tool 을 호출
 ```
 
-관측은 두 라운드다. **round 1**은 2026-08-23 04:29~04:56Z, `.mcp.json`이 `adapter.mjs`를 가리키던 구성. **round 3**은 05:36~06:05Z, §(d)의 dead window를 동일 payload로 재측정하려고 `adapter3.mjs`/`daemon3.mjs`로 계측을 바꾼 구성이다. 아래 발췌에는 어느 라운드·어느 run·adapter 시작 기준 몇 ms인지를 함께 적는다. 원시 로그 전문은 싣지 않는다(레포 밖, 커밋하지 않음: `daemon-round1.log`, `adapter.log`, `state-round1.json`, `daemon3-run<N>.log`, `adapter3-run<N>.log`, `state-round3-run<N>.json`, `adapter3-boot-<tag>-<pid>.json`).
+관측 원시 로그 전문은 레포 밖(시스템 temp)에 보존하고 커밋하지 않는다. §(a)의 13건 smoke는 초기 관측(2026-08-23 04:29~04:56Z)에서, §(c)의 opt-in 대조·binding 위조와 §(d)의 dead-window **통제 재측정**은 아래 하니스로 같은 날 얻었다. 발췌에는 run과 adapter 시작(T0) 기준 offset(ms)을 함께 적는다. dead-window의 이전 사다리 측정값 `(0.178s,0.418s]`는 통제되지 않은 payload에서 나온 값이라 폐기하고 아래 통제 재측정으로 대체한다.
 
-### 재현 절차
+### 재현 하니스
 
-빈 상태에서 아래를 그대로 하면 §(a)·§(c)·§(d)·§(e)의 관측이 재현된다. secret은 필요 없다.
+이 문서의 §(a)·§(c)·§(d)·§(e) 관측은 아래 네 소스로 재현된다. secret은 없다. 소스는 `<!-- extract: FILE -->` 마커가 붙은 코드 블록으로 실려 있고, §[재현 확인]이 이 블록들을 기계적으로 추출해 변수 0개의 새 셸에서 돌려 재현됨을 증명한다.
 
-**1. 하니스 디렉터리** — 레포 밖(시스템 temp)에 만든다. `npm init -y && npm i @modelcontextprotocol/sdk`.
+**Adapter** (`adapter.mjs`) — `.mcp.json`에 등록돼 Claude Code가 stdio로 spawn한다. 채널 인정 조건은 `capabilities.experimental['claude/channel']` 하나뿐이고 나머지는 표준 MCP다. daemon에 재시도 client로 붙어 push를 `notifications/claude/channel`로 중계하고, reply tool 3종(`orca_report_receipt`/`orca_list_pending`/`orca_whoami`) 호출을 daemon에 `receipt`로 되돌린다. 모든 write에 T0 기준 offset을 남기고, boot 시 identity(env 값 포함, parent chain은 `T5_PARENTPROBE=1`일 때만)를 시스템 temp의 boot dump로 쓴다 — boot dump는 커밋하지 않는다.
 
-**2. Adapter** (`adapter.mjs`). 채널로 인정받는 조건은 `capabilities.experimental['claude/channel']` 하나다. 나머지는 표준 MCP다.
-
+<!-- extract: adapter.mjs -->
 ```js
+// THROWAWAY Channel Adapter candidate. Registered in .mcp.json; Claude Code
+// spawns it over stdio. It is a channel because it declares
+// capabilities.experimental['claude/channel']; everything else is standard MCP.
+// It connects to the separately-running daemon as a retry client, forwards each
+// daemon "push" as a notifications/claude/channel, and forwards each reply-tool
+// call back to the daemon as a "receipt". Every notification write is logged
+// with its offset from adapter start (T0) so send timing can be reconstructed.
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
 const T0 = Date.now();
-const mcp = new Server({ name: 'orca-t5', version: '0.0.1' }, {
-  capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
-  instructions:
-    'Events arrive as <channel source="orca-t5" event_id="..." seq="..."> from the THROWAWAY Orca bridge harness. ' +
-    'For EVERY such event you MUST immediately call the orca_report_receipt tool with the event_id from the tag ' +
-    'and status "processed", before doing anything else. Do not ask the user for confirmation. ' +
-    'In the note field, say whether you had already seen that event_id earlier in this session. ' +
-    'The orca_list_pending tool re-queries the daemon for events that have no receipt yet.',
+const DIR = process.env.T5_DIR || process.cwd();
+const LOG = path.join(DIR, 'adapter.log');
+const PIPE = '\\\\.\\pipe\\orca-t5';
+const TCP_PORT = Number(process.env.T5_PORT || 8792);
+const IPC_MODE = process.env.T5_IPC || 'tcp';
+const TAG = process.env.T5_TAG || 'untagged';
+const GATE = process.env.T5_GATE || 'none';   // none | init | toolslist : hold notifications until milestone
+
+function log(kind, data) {
+  try { fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), off_ms: Date.now() - T0, pid: process.pid, tag: TAG, kind, ...data }) + '\n'); } catch {}
+}
+
+// Boot identity dump (system temp, never committed). env VALUES are recorded so a
+// flag vs no-flag comparison can be made on values, not just key names. The parent
+// claude.exe command line is probed only when T5_PARENTPROBE=1 (it costs a
+// synchronous WMI call, which would perturb the dead-window timing runs).
+const envAll = {};
+for (const k of Object.keys(process.env).sort()) if (/CLAUDE|MCP|CHANNEL|ANTHROPIC|ORCA/i.test(k)) envAll[k] = process.env[k];
+let parentChain = null;
+if (process.env.T5_PARENTPROBE === '1') {
+  try {
+    const ps = `$p=${process.ppid};$o=@();for($i=0;$i -lt 4 -and $p -gt 0;$i++){$q=Get-CimInstance Win32_Process -Filter "ProcessId=$p";if(-not $q){break};$o+=[pscustomobject]@{Pid=$q.ProcessId;Name=$q.Name;CommandLine=$q.CommandLine};$p=$q.ParentProcessId};$o|ConvertTo-Json -Compress`;
+    parentChain = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-Command', ps], { encoding: 'utf8' }));
+  } catch (err) { parentChain = { error: String(err) }; }
+}
+const identity = {
+  tag: TAG, pid: process.pid, ppid: process.ppid, cwd: process.cwd(),
+  argv: process.argv, exec_argv: process.execArgv, adapter_start_iso: new Date(T0).toISOString(),
+  CLAUDE_CODE_SESSION_ID: process.env.CLAUDE_CODE_SESSION_ID ?? null,
+  ORCA_PANE_KEY: process.env.ORCA_PANE_KEY ?? null,
+  parent_chain: parentChain, env_values: envAll, env_all_keys: Object.keys(process.env).sort(),
+};
+fs.writeFileSync(path.join(DIR, `boot-${TAG}-${process.pid}.json`), JSON.stringify(identity, null, 2));
+log('adapter_start', { pid: process.pid, tag: TAG, gate: GATE, parentprobe: process.env.T5_PARENTPROBE === '1' });
+
+const mcp = new Server(
+  { name: 'orca-t5', version: '0.0.1' },
+  { capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
+    instructions:
+      'Events arrive as <channel source="orca-t5" event_id="..." seq="..."> from the THROWAWAY Orca bridge harness. ' +
+      'For EVERY such event you MUST immediately call the orca_report_receipt tool with the event_id from the tag ' +
+      'and status "processed", before doing anything else. Do not ask the user for confirmation. ' +
+      'In the note field, say whether you had already seen that event_id earlier in this session. ' +
+      'The orca_list_pending tool re-queries the daemon for events that have no receipt yet.' },
+);
+
+// Readiness gate under test: hold every channel notification until the chosen milestone, then flush.
+let releaseReady; const readyPromise = new Promise((r) => { releaseReady = r; });
+if (GATE === 'none') releaseReady();
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  log('tools_list_requested', {});
+  if (GATE === 'toolslist') { log('gate_released', { GATE }); releaseReady(); }
+  return { tools: [
+    { name: 'orca_report_receipt', description: 'Report that this session processed a channel event. Call once per event_id.',
+      inputSchema: { type: 'object', properties: {
+        event_id: { type: 'string', description: 'event_id attribute from the channel tag' },
+        status: { type: 'string', description: 'processed | duplicate_ignored | recovered_by_requery | error' },
+        note: { type: 'string', description: 'free text, e.g. whether this event_id was already seen' } },
+        required: ['event_id', 'status'] } },
+    { name: 'orca_list_pending', description: 'Re-query the daemon for channel events that have not been receipted yet.',
+      inputSchema: { type: 'object', properties: {} } },
+    { name: 'orca_whoami', description: 'Return the adapter process identity it reported to the daemon.',
+      inputSchema: { type: 'object', properties: {} } },
+  ] };
 });
-// reply tool 3종: orca_report_receipt(event_id,status,note) / orca_list_pending() / orca_whoami()
-await mcp.connect(new StdioServerTransport());          // 여기서 resolve돼도 세션은 아직 준비 전이다 (§(d))
-// daemon이 push를 보내면:
-await mcp.notification({
-  method: 'notifications/claude/channel',
-  params: { content: ev.content, meta: { ...ev.meta, event_id: ev.id } },
+
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const name = req.params.name; const args = req.params.arguments || {};
+  log('tool_call', { name, args });
+  if (name === 'orca_report_receipt') {
+    toDaemon({ type: 'receipt', event_id: args.event_id, status: args.status, note: args.note ?? '' });
+    return { content: [{ type: 'text', text: `receipt recorded for ${args.event_id}` }] };
+  }
+  if (name === 'orca_list_pending') return { content: [{ type: 'text', text: JSON.stringify(await requestPending()) }] };
+  if (name === 'orca_whoami') return { content: [{ type: 'text', text: JSON.stringify({ pid: identity.pid, tag: TAG }) }] };
+  throw new Error(`unknown tool: ${name}`);
 });
-log('notification_written', { id: ev.id, offset_ms: Date.now() - T0 });   // 시점 판정의 기준선
+
+mcp.oninitialized = () => {
+  if (GATE === 'init') { log('gate_released', { GATE }); releaseReady(); }
+  log('mcp_initialized', { clientVersion: mcp.getClientVersion(), clientCapabilities: mcp.getClientCapabilities() });
+};
+
+await mcp.connect(new StdioServerTransport());
+log('mcp_connected', {});
+
+let sock = null, connected = false, attempt = 0, reqSeq = 0;
+const pendingWaiters = new Map();
+function toDaemon(msg) {
+  if (!connected || !sock) { log('to_daemon_dropped', { msg }); return false; }
+  try { sock.write(JSON.stringify(msg) + '\n'); return true; } catch (err) { log('to_daemon_error', { err: String(err) }); return false; }
+}
+function requestPending() {
+  return new Promise((resolve) => {
+    const req_id = `req_${++reqSeq}`;
+    if (!toDaemon({ type: 'list_pending', req_id })) return resolve({ error: 'daemon_not_connected' });
+    const timer = setTimeout(() => { pendingWaiters.delete(req_id); resolve({ error: 'timeout' }); }, 5000);
+    pendingWaiters.set(req_id, (v) => { clearTimeout(timer); resolve(v); });
+  });
+}
+async function onDaemonMessage(msg) {
+  if (msg.type === 'push') {
+    const ev = msg.event; await readyPromise;
+    try {
+      await mcp.notification({ method: 'notifications/claude/channel', params: { content: ev.content, meta: { ...(ev.meta || {}), event_id: ev.id } } });
+      const off = Date.now() - T0; log('notification_written', { id: ev.id, offset_ms: off });
+      toDaemon({ type: 'pushed', event_id: ev.id, ok: true, offset_ms: off });
+    } catch (err) {
+      log('notification_error', { id: ev.id, err: String(err) });
+      toDaemon({ type: 'pushed', event_id: ev.id, ok: false, err: String(err), offset_ms: Date.now() - T0 });
+    }
+  } else if (msg.type === 'pending') {
+    const w = pendingWaiters.get(msg.req_id); if (w) { pendingWaiters.delete(msg.req_id); w(msg.pending); }
+  }
+}
+function connect() {
+  attempt++;
+  const s = IPC_MODE === 'tcp' ? net.createConnection({ port: TCP_PORT, host: '127.0.0.1' }) : net.createConnection(PIPE);
+  let buf = '';
+  s.on('connect', () => { connected = true; sock = s; log('daemon_connected', { attempt, IPC_MODE }); toDaemon({ type: 'hello', identity: { ...identity, env_values: undefined } }); });
+  s.on('data', (chunk) => { buf += chunk.toString('utf8'); let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) { try { onDaemonMessage(JSON.parse(line)); } catch { log('bad_daemon_line', { line }); } } } });
+  s.on('error', (err) => log('daemon_connect_error', { attempt, err: String(err) }));
+  s.on('close', () => { if (connected) log('daemon_disconnected', {}); connected = false; sock = null; setTimeout(connect, 2000); });
+}
+connect();
 ```
 
-**3. daemon** (`daemon.mjs`) — 별도 프로세스. named pipe `\\.\pipe\orca-t5-throwaway`와 TCP `127.0.0.1:8792`를 listen하고, 운영자용 HTTP control plane을 `127.0.0.1:8791`에 연다. Adapter는 재시도 client로 붙고 연결되면 `{"type":"hello","identity":{...}}`를 보낸다. daemon은 hello를 받으면 **application receipt가 없는 event를 전부 재전송**하고, `{"type":"receipt",...}`를 받으면 그 event를 재전송 대상에서 뺀다. event별로 `NOTIFICATION_PENDING → TRANSPORT_WRITE_REQUESTED → TRANSPORT_WRITE_ATTEMPTED → APPLICATION_RECEIPT_RECEIVED` 이력을 남긴다.
+**Daemon** (`daemon.mjs`) — 별도 프로세스. named pipe `\\.\pipe\orca-t5`, TCP `127.0.0.1:8792`, 운영자용 HTTP control plane `127.0.0.1:8791`을 연다. Adapter가 재시도 client로 붙어 `{"type":"hello",identity}`를 보내면 daemon은 receipt 없는 event를 재전송하고, receipt를 받으면 재전송 대상에서 뺀다. event별로 `NOTIFICATION_PENDING → TRANSPORT_WRITE_REQUESTED → TRANSPORT_WRITE_ATTEMPTED → APPLICATION_RECEIPT_RECEIVED` 이력을 남긴다. **fresh adapter의 hello에 dead-window 실험을 건다**: (1) 미receipt event를 hello 직후 재전송(early), (2) content·meta가 서로·early와 **바이트 단위로 같고** event_id와 전송 offset만 다른 사다리, (3) +25초에 같은 event를 다시 씀(late). offset은 daemon 로그(`ladder_write`·`write_tag`)에만 남고 **notification payload에는 싣지 않는다** — 이것이 이전 라운드 사다리(meta.off_ms를 함께 바꿔 timing과 payload를 뒤섞음)에 대한 정정이다.
 
-**4. `.mcp.json`** — 하니스 디렉터리에 둔다.
+<!-- extract: daemon.mjs -->
+```js
+// THROWAWAY Bridge daemon. Separate process from the Adapter. Listens on a named
+// pipe, a TCP loopback port, and an HTTP control plane. The Adapter connects as a
+// retry client and sends {type:"hello",identity}. On a *fresh* adapter's hello the
+// daemon runs the dead-window experiment against that one connection:
+//   (1) EARLY  : re-send every not-yet-receipted dw event, at hello (~+16ms).
+//   (2) LADDER : send N events whose content and meta are BYTE-IDENTICAL to each
+//                other and to the dw event; only event_id and the send offset
+//                differ. The offset is recorded in the daemon log via write_tag /
+//                ladder_write, and is NEVER placed in the notification payload.
+//                (This is the round-4 fix: the earlier ladder injected meta.off_ms,
+//                which confounded timing with payload.)
+//   (3) LATE   : re-send the same dw event (same id/content/meta) at +25s.
+// It also serves list_pending and records receipts, giving each event the state
+// history NOTIFICATION_PENDING -> TRANSPORT_WRITE_REQUESTED -> TRANSPORT_WRITE_ATTEMPTED
+// -> APPLICATION_RECEIPT_RECEIVED.
+import net from 'node:net';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 
-```json
-{ "mcpServers": { "orca-t5": {
-    "command": "node",
-    "args": ["<하니스경로>\\adapter.mjs"],
-    "env": { "T5_IPC": "tcp" } } } }
+const DIR = process.env.T5_DIR || process.cwd();
+const LOG = path.join(DIR, 'daemon.log');
+const PIPE = '\\\\.\\pipe\\orca-t5';
+const TCP_PORT = Number(process.env.T5_PORT || 8792);
+const HTTP_PORT = Number(process.env.T5_HTTP || 8791);
+
+// One payload, many (event_id, send-time) points. content and meta are fixed;
+// meta carries NO offset. Ladder rungs are sent at these offsets (ms after hello).
+const LADDER = (process.env.T5_LADDER || '150,250,350,450,700,1500').split(',').map(Number);
+const LATE_MS = 25000;
+const FIXED_CONTENT = 'Gate gate_dw resolved by the owner. Re-read it from Orca.';
+const FIXED_META = { seq: '900', gate_id: 'gate_dw', kind: 'gate_resolved' };
+
+function log(kind, data) { const line = JSON.stringify({ t: new Date().toISOString(), kind, ...data }); fs.appendFileSync(LOG, line + '\n'); }
+
+const events = new Map(); const adapters = new Map(); let connSeq = 0, helloSeq = 0;
+function setState(id, state, extra) { const e = events.get(id); if (!e) return; e.state = state; e.history.push({ t: new Date().toISOString(), state, ...(extra || {}) }); log('event_state', { id, state, ...(extra || {}) }); }
+function ensure(id, content, meta) { if (!events.has(id)) events.set(id, { id, content, meta, state: 'NOTIFICATION_PENDING', history: [] }); return events.get(id); }
+function writeTo(connId, e, tag) {
+  const a = adapters.get(connId); if (!a) { log('write_skipped_gone', { connId, id: e.id, tag }); return; }
+  a.socket.write(JSON.stringify({ type: 'push', event: { id: e.id, content: e.content, meta: e.meta } }) + '\n');
+  setState(e.id, 'TRANSPORT_WRITE_REQUESTED', { connId, write_tag: tag });
+}
+function handleAdapterLine(connId, line) {
+  let msg; try { msg = JSON.parse(line); } catch { log('bad_line', { connId, line }); return; }
+  log('from_adapter', { connId, msg }); const a = adapters.get(connId); if (!a) return;
+  if (msg.type === 'hello') {
+    a.identity = msg.identity; const round = ++helloSeq; a.round = round;
+    a.socket.write(JSON.stringify({ type: 'hello_ack', daemon_pid: process.pid, round }) + '\n');
+    const ageMs = Date.now() - Date.parse(msg.identity?.adapter_start_iso || 0);
+    log('hello', { connId, round, session: msg.identity?.CLAUDE_CODE_SESSION_ID, adapter_pid: msg.identity?.pid, adapter_age_ms: ageMs });
+    // Only a freshly-spawned adapter measures a startup window; a reconnecting
+    // adapter from an already-running session would time the ladder off nothing.
+    if (!(ageMs >= 0 && ageMs < 10000)) { log('hello_stale_skipped', { connId, round, adapter_age_ms: ageMs }); return; }
+    // (1) EARLY re-send of pending dw events (same id/content/meta), at hello.
+    const pending = [...events.values()].filter((e) => e.state !== 'APPLICATION_RECEIPT_RECEIVED' && !e.id.startsWith('r' + round + '_'));
+    if (pending.length) log('redeliver_on_connect', { connId, round, count: pending.length, ids: pending.map((e) => e.id) });
+    for (const e of pending) writeTo(connId, e, 'early_at_hello');
+    // (2) LADDER: identical content+meta; only event_id and offset differ.
+    LADDER.forEach((off, k) => setTimeout(() => {
+      const id = `r${round}_${k + 1}`; const e = ensure(id, FIXED_CONTENT, { ...FIXED_META });
+      setState(id, 'NOTIFICATION_PENDING', { round });
+      log('ladder_write', { id, offset_ms: off, rung: k + 1 });
+      writeTo(connId, e, `ladder_${off}`);
+    }, off));
+    // (3) LATE re-send of the same dw events at +25s.
+    setTimeout(() => { for (const e of pending) { setState(e.id, 'NOTIFICATION_PENDING', { round, late: true }); writeTo(connId, e, 'late_same_payload'); } }, LATE_MS);
+  } else if (msg.type === 'pushed') {
+    setState(msg.event_id, 'TRANSPORT_WRITE_ATTEMPTED', { connId, ok: msg.ok, err: msg.err, offset_ms: msg.offset_ms });
+  } else if (msg.type === 'receipt') {
+    setState(msg.event_id, 'APPLICATION_RECEIPT_RECEIVED', { connId, status: msg.status, note: msg.note });
+  } else if (msg.type === 'list_pending') {
+    const pending = [...events.values()].filter((e) => e.state !== 'APPLICATION_RECEIPT_RECEIVED').map((e) => ({ id: e.id, content: e.content, meta: e.meta, state: e.state }));
+    a.socket.write(JSON.stringify({ type: 'pending', req_id: msg.req_id, pending }) + '\n');
+    log('served_list_pending', { connId, count: pending.length });
+  }
+}
+function onConn(transport) {
+  return (socket) => {
+    const connId = `${transport}#${++connSeq}`; adapters.set(connId, { socket, transport, identity: null });
+    log('adapter_connected', { connId, transport }); let buf = '';
+    socket.on('data', (chunk) => { buf += chunk.toString('utf8'); let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) handleAdapterLine(connId, line); } });
+    socket.on('close', () => { adapters.delete(connId); log('adapter_disconnected', { connId }); });
+    socket.on('error', (err) => log('adapter_socket_error', { connId, err: String(err) }));
+  };
+}
+const pipeServer = net.createServer(onConn('pipe')); pipeServer.on('error', (err) => log('pipe_listen_error', { err: String(err) })); pipeServer.listen(PIPE, () => log('listening_pipe', { pipe: PIPE }));
+const tcpServer = net.createServer(onConn('tcp')); tcpServer.on('error', (err) => log('tcp_listen_error', { err: String(err) })); tcpServer.listen(TCP_PORT, '127.0.0.1', () => log('listening_tcp', { port: TCP_PORT }));
+http.createServer((req, res) => {
+  let body = ''; req.on('data', (c) => (body += c)); req.on('end', () => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/enqueue') {
+      const p = JSON.parse(body || '{}'); const e = ensure(p.id, p.content ?? FIXED_CONTENT, p.meta ?? { ...FIXED_META });
+      setState(p.id, 'NOTIFICATION_PENDING', { offline: true });
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, id: e.id, adapters: adapters.size }));
+    } else if (url.pathname === '/state') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ adapters: [...adapters.entries()].map(([k, v]) => ({ connId: k, transport: v.transport, round: v.round, identity: v.identity })), events: [...events.values()] }, null, 2));
+    } else { res.writeHead(404); res.end('{}'); }
+  });
+}).listen(HTTP_PORT, '127.0.0.1', () => log('listening_http', { port: HTTP_PORT }));
+log('daemon_start', { pid: process.pid, dir: DIR, LADDER, LATE_MS });
 ```
 
-**5. 세션 기동** — daemon을 먼저 띄운 뒤 하니스 디렉터리에서:
+**Fake-client** (`fakeclient.mjs`) — binding 위조 #2 재현용. Claude Code 안에서 실행된 적 없는 평범한 TCP client가 위조 session id를 담은 hello를 daemon에 보낸다.
+
+<!-- extract: fakeclient.mjs -->
+```js
+// THROWAWAY binding-forgery probe #2 (fake hello). A plain TCP client that never
+// ran inside Claude Code connects to the daemon's Adapter port and sends a
+// fabricated hello carrying an arbitrary CLAUDE_CODE_SESSION_ID. If the daemon
+// authenticates nothing, it returns hello_ack and immediately redelivers every
+// not-yet-receipted event to this client. Whatever content/meta come back are
+// proof that the daemon endpoint is an unauthenticated drain. No secret is used;
+// the forged id is a fixed obviously-fake value.
+import net from 'node:net';
+const PORT = Number(process.env.T5_PORT || 8792);
+const FORGED_ID = '00000000-dead-beef-0000-000000000000';
+const received = [];
+const s = net.createConnection({ port: PORT, host: '127.0.0.1' }, () => {
+  const hello = { type: 'hello', identity: {
+    tag: 'FAKE-CLIENT', pid: process.pid, ppid: process.ppid,
+    CLAUDE_CODE_SESSION_ID: FORGED_ID,               // forged: not this process's session
+    adapter_start_iso: new Date().toISOString(),      // fresh, so the daemon does not skip us
+  } };
+  process.stdout.write('SENT hello: ' + JSON.stringify(hello) + '\n');
+  s.write(JSON.stringify(hello) + '\n');
+});
+let buf = '';
+s.on('data', (chunk) => {
+  buf += chunk.toString('utf8'); let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (msg.type === 'hello_ack') process.stdout.write('RECV hello_ack: ' + line + '\n');
+    else if (msg.type === 'push') { received.push(msg.event); process.stdout.write('RECV push (leaked event): ' + JSON.stringify(msg.event) + '\n'); }
+  }
+});
+// Collect for a short window, then report and exit.
+setTimeout(() => {
+  process.stdout.write('LEAKED_COUNT=' + received.length + '\n');
+  process.stdout.write('VERDICT=' + (received.length > 0 ? 'FORGED_HELLO_DRAINED_PENDING' : 'no_leak') + '\n');
+  s.end(); process.exit(0);
+}, 2500);
+```
+
+**Driver** (`run.ps1`) — 자기 파일 위치(`$PSScriptRoot`)를 하니스 디렉터리로 삼아 SDK 설치·`.mcp.json` 생성·daemon 기동·Orca 터미널 생성·flag 세션 기동·기동 대화상자 처리(렌더 화면 감시)·dead-window 1회 구동·판정·정리를 모두 스스로 한다. id는 파일과 HTTP control plane으로만 오가고 사람이 값을 옮기는 단계가 없다.
+
+<!-- extract: run.ps1 -->
+```powershell
+# THROWAWAY self-contained dead-window + delivery reproduction driver.
+# Run from a clean shell with no pre-set variables:  pwsh -NoProfile -File run.ps1
+# It uses its own file location as the harness dir (so no path needs editing),
+# installs the MCP SDK if missing, writes .mcp.json, starts the daemon, creates
+# its own Orca terminal, launches a flagged Claude Code session, clears the
+# startup dialogs by watching the rendered screen, drives one dead-window round,
+# then prints per-event delivered/lost and a verdict. IDs are passed via files
+# and the HTTP control plane; the operator copies no values by hand.
+$ErrorActionPreference = 'Stop'
+$DIR = $PSScriptRoot
+$ORCA = 'orca'
+$PORT = 8792; $HTTP = 8791
+$esc = { param($p) $p -replace '\\', '\\' }
+
+"[0] clean-shell proof: RUN=$($env:RUN) T=$($env:T) ORCA_TERMINAL_HANDLE=$($env:ORCA_TERMINAL_HANDLE)"
+"[0] harness dir: $DIR"
+
+# --- ensure the MCP SDK is present (the only dependency) ---
+if (-not (Test-Path (Join-Path $DIR 'node_modules/@modelcontextprotocol/sdk'))) {
+  Push-Location $DIR
+  if (-not (Test-Path (Join-Path $DIR 'package.json'))) { & npm init -y | Out-Null }
+  & npm i @modelcontextprotocol/sdk | Out-Null
+  Pop-Location
+}
+
+# --- write .mcp.json pointing at THIS dir's adapter ---
+$mcp = '{ "mcpServers": { "orca-t5": { "command": "node", "args": ["' + (& $esc (Join-Path $DIR 'adapter.mjs')) + '"], "env": { "T5_IPC": "tcp", "T5_PORT": "8792", "T5_DIR": "' + (& $esc $DIR) + '", "T5_TAG": "flag" } } } }'
+Set-Content -Path (Join-Path $DIR '.mcp.json') -Value $mcp -Encoding utf8
+
+# --- (re)start the daemon with empty state ---
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*daemon.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Start-Sleep 1
+Remove-Item (Join-Path $DIR 'daemon.log'), (Join-Path $DIR 'adapter.log') -ErrorAction SilentlyContinue
+$env:T5_DIR = $DIR; $env:T5_PORT = "$PORT"; $env:T5_HTTP = "$HTTP"
+Start-Process -FilePath 'node' -ArgumentList 'daemon.mjs' -WorkingDirectory $DIR -WindowStyle Hidden `
+  -RedirectStandardOutput (Join-Path $DIR 'daemon.out') -RedirectStandardError (Join-Path $DIR 'daemon.err')
+Start-Sleep 3
+
+# --- enqueue the dw event while NO adapter is connected ---
+$ev = @{ id = 'dw'; content = 'Gate gate_dw resolved by the owner. Re-read it from Orca.'; meta = @{ seq = '900'; gate_id = 'gate_dw'; kind = 'gate_resolved' } } | ConvertTo-Json -Compress
+$enq = Invoke-RestMethod -Uri "http://127.0.0.1:$HTTP/enqueue" -Method Post -Body $ev -ContentType 'application/json'
+"[3] enqueued dw while adapters=$($enq.adapters)"
+
+# --- create a throwaway terminal and launch a flagged session in this dir ---
+$t = (& $ORCA terminal create --json | ConvertFrom-Json).result.terminal.handle
+"[1] terminal: $t"
+& $ORCA terminal send --terminal $t --text "Set-Location '$DIR'" --enter | Out-Null
+Start-Sleep 2
+& $ORCA terminal send --terminal $t --text 'claude --dangerously-load-development-channels server:orca-t5' --enter | Out-Null
+
+# --- clear startup dialogs by watching the rendered screen ---
+$booted = $false; $deadline = (Get-Date).AddSeconds(75)
+while ((Get-Date) -lt $deadline) {
+  Start-Sleep 3
+  $s = (& $ORCA terminal read --terminal $t --screen) -join "`n"
+  if ($s -match 'inject directly in this session') { $booted = $true; break }
+  if ($s -match 'trust this folder' -or $s -match 'New MCP server found' -or $s -match 'Loading development channels') {
+    & $ORCA terminal send --terminal $t --enter | Out-Null
+  }
+}
+"[4] session booted: $booted"
+
+# --- wait out the ladder + the +25s late re-push + receipts, then dump ---
+Start-Sleep 70
+$st = Invoke-RestMethod -Uri "http://127.0.0.1:$HTTP/state" -Method Get
+$st | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $DIR 'state-repro.json') -Encoding utf8
+
+$earlyOff = $null; $earlyLost = $false; $lateOk = $false
+foreach ($e in $st.events) {
+  $writes = @($e.history | Where-Object { $_.state -eq 'TRANSPORT_WRITE_ATTEMPTED' } | ForEach-Object { $_.offset_ms })
+  $rcpt = @($e.history | Where-Object { $_.state -eq 'APPLICATION_RECEIPT_RECEIVED' })
+  $status = if ($rcpt.Count) { $rcpt[0].status } else { 'NO_RECEIPT' }
+  "[5] {0,-6} writes@ms={1,-22} -> {2}" -f $e.id, ('[' + ($writes -join ',') + ']'), $status
+  if ($e.id -eq 'dw' -and $writes.Count -ge 2 -and $writes[0] -lt 1000 -and $writes[-1] -gt 20000) {
+    $earlyOff = $writes[0]; if ($status -eq 'processed') { $earlyLost = $true; $lateOk = $true }
+  }
+}
+""
+if ($earlyLost -and $lateOk) { "[verdict] dead window REPRODUCED: dw early write (+${earlyOff}ms) lost, late re-push (+25s) delivered" }
+else { "[verdict] NOT reproduced (booted=$booted) — inspect state-repro.json" }
+
+# --- tear down ---
+& $ORCA terminal send --terminal $t --text '/quit' --enter | Out-Null
+Start-Sleep 3
+& $ORCA terminal close --terminal $t --tab | Out-Null
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*daemon.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+"[done] harness dir retained: $DIR"
+```
+
+### 재현 명령
+
+**전달·dead window (§(a)·§(d)).** 하니스 디렉터리(레포 밖)에 위 네 파일을 두고, 변수 없는 새 셸에서:
 
 ```text
-claude --dangerously-load-development-channels server:orca-t5
+pwsh -NoProfile -File run.ps1
 ```
 
-첫 기동에는 folder trust와 `New MCP server found in this project: orca-t5` 대화상자가 붙고, development-channels 경고 대화상자는 **매 기동** 뜬다. 경고는 `1. I am using this for local development`(Enter)로 통과시킨다. 무인 기동은 이 키 입력을 자동화해야 한다.
+driver가 daemon을 띄우고 event를 enqueue한 뒤 flag 세션을 기동한다. 첫 기동이면 folder trust·`New MCP server found in this project: orca-t5`·development-channels 세 대화상자가 뜨고, 이미 신뢰된 디렉터리에서는 development-channels 경고만 **매 기동** 뜬다. driver는 렌더된 화면에서 이 문구들을 보고 Enter로 통과시킨다. `-p` 비대화형은 확인 대화상자가 없지만 event가 도달하지 않는다(§(a)).
 
-**6. push** — HTTP control plane에 POST. round 1의 실제 payload 형태:
+**push payload와 tag.** daemon `/enqueue`에 POST하는 형태와 세션이 실제로 보는 tag:
 
 ```text
-POST http://127.0.0.1:8791/push
+POST http://127.0.0.1:8791/enqueue
 {"id":"ev_001","content":"Gate gate_84 was resolved by the owner. Re-read it from Orca.",
  "meta":{"seq":"1","gate_id":"gate_84","kind":"gate_resolved"}}
+→ <channel source="orca-t5" seq="1" gate_id="gate_84" kind="gate_resolved" event_id="ev_001">
 ```
 
-이 payload가 세션에 도달하면 tag는 `<channel source="orca-t5" seq="1" gate_id="gate_84" kind="gate_resolved" event_id="ev_001">`가 된다. 속성 순서는 `meta` 객체의 삽입 순서이고 `event_id`는 Adapter가 마지막에 넣는다.
+속성 순서는 `meta` 객체의 삽입 순서이고 `event_id`는 Adapter가 마지막에 넣는다. `source`는 `.mcp.json`의 서버 키 그대로(`server:` 접두 없음)다.
 
-**7. session prompt** — round 3은 사용자 턴을 **전혀 주지 않았다.** MCP `instructions` 문자열만으로 세션이 매 event에 `orca_report_receipt`를 부른다. round 1은 여기에 더해 첫 event 뒤에 아래 사용자 턴을 줬다. 이 지시는 §(e)의 판정에 교란으로 작용하므로 재현 시 **넣지 않는 쪽이 기본**이다.
+**binding 위조 #1 (.mcp.json env override).** `.mcp.json`의 `env`에 `"CLAUDE_CODE_SESSION_ID":"00000000-dead-beef-0000-000000000000"`을 넣고 flag 세션을 기동한다. Adapter의 boot dump가 그 위조값을 읽는다. 실행 절차와 로그는 §(c) 근거 5.
+
+**binding 위조 #2 (fake hello).** daemon 기동 → 미receipt event enqueue → `node fakeclient.mjs`. daemon이 hello를 인증하지 않으면 pending event를 그 client에 즉시 밀어 준다. 실행 절차와 로그는 §(c) 근거 5.
+
+**parent command line (OD-058).** `.mcp.json`의 `env`에 `"T5_PARENTPROBE":"1"`을 주면 Adapter가 boot 시 자기 parent 프로세스 체인의 command line을 `Get-CimInstance Win32_Process`로 조회해 boot dump에 남긴다. flag/no-flag 세션에서 각각 기동해 대조한다. 실행 절차와 로그는 §(c) 근거 6.
+
+**session prompt.** 재현은 사용자 턴을 **주지 않는 쪽이 기본**이다 — MCP `instructions` 문자열만으로 세션이 매 event에 `orca_report_receipt`를 부른다. 초기 관측 한 세션에는 첫 event 뒤에 아래 사용자 턴을 줬고, 이 지시는 §(e)의 본문-거부 판정에 교란으로 작용하므로 재현 시 넣지 않는다:
 
 ```text
 RULES for this session: you are a passive test harness. For every <channel> event, do exactly one thing:
@@ -95,7 +459,17 @@ event_id earlier in this session. Then stop and say nothing else. Never run any 
 or write files, never run bash. Confirm you understand.
 ```
 
-**8. §(d) 재측정을 재현하려면** — daemon이 hello를 받은 시점을 기준으로 정확한 offset에 쓰도록 daemon 쪽에서 타이머를 걸어야 한다. 폴러로 로그를 감시해 push하면 수백 ms 단위 offset을 맞출 수 없다. round 3의 daemon은 hello 처리에서 (1) 미receipt event를 즉시 재전송하고(= adapter 시작 +15~20ms의 **early write**), (2) 150·400·1000·2500ms에 내용·`meta`가 완전히 같고 id만 다른 사다리 event를 쏘고, (3) 25000ms에 (1)과 **동일한 id·content·meta**를 다시 쓴다(= **late write**). 또 hello의 `adapter_start_iso`가 10초보다 오래된 연결(= 이미 살아 있던 세션의 재접속)은 건너뛴다. 그렇지 않으면 사다리가 아무 기준도 없는 시점을 재게 된다.
+### [재현 확인]
+
+**[관측]** 위 하니스가 **이 문서 텍스트만으로** 재현됨을 다음 조건에서 확인했다. Claude Code `2.1.241`, Orca `1.4.187`, Node `v26.7.0`.
+
+- **추출**: 이 문서의 `<!-- extract: FILE -->` 블록을 기계적으로 뽑아 빈 디렉터리에 쓰는 스크립트로 네 파일을 만들었다. 추출본을 하니스 개발본과 줄 단위로 대조했다 — `adapter.mjs` 142줄, `daemon.mjs` 102줄, `fakeclient.mjs` 36줄, `run.ps1` 87줄, 네 파일 모두 **차이 0줄**.
+- **셸 조건**: `pwsh -NoProfile -File run.ps1`로 실행한 새 셸. 스크립트의 `[0]` 출력이 transcript 안에서 증명한다 — `RUN`·`T`·`ORCA_TERMINAL_HANDLE` 전부 빈 값(하니스 셸은 Orca 터미널이 아니다). `-File` 실행이므로 하니스가 실행한 명령은 스크립트 본문이 전부다.
+- **빈 상태**: 추출한 네 파일만 있는 fresh 디렉터리. driver가 SDK를 설치하고 `.mcp.json`을 생성하고, folder trust·`New MCP server`·development-channels 세 대화상자를 렌더 화면을 보고 Enter로 통과시켰다(`session booted: True`).
+- **결과**: `dw` early write(+13ms) 유실, late re-push(+25028ms) 도달 → 판정 "dead window REPRODUCED", exit 0. 이 세션은 사다리를 +172ms부터 도달시켜 runs 1·2와 또 다른 경계를 보였다 — fresh 세션에서 경계 불안정이 한 번 더 확인된다.
+- **생성 리소스**: Orca 터미널 `term_73efa487-…`(driver가 `terminal close --tab`으로 닫음), 하니스 디렉터리 `%TEMP%\orca-THROWAWAY-t5-repro`(원시 로그 보존, 레포 밖).
+
+즉 "내가 재현했다"가 아니라 "문서 텍스트가 재현된다"를 보인다 — 추출본이 개발본과 0줄 차이이고, 그 추출본이 변수 없는 셸에서 dead window를 다시 냈다.
 
 ---
 
@@ -340,6 +714,58 @@ receipt from tcp#4 ev_optin processed        # tcp#4 = pid 33884 = flag 세션
 
 부수 관측: [관측] 서버의 `instructions` 문자열은 **flag 유무와 무관하게** 세션 system prompt의 `# MCP Server Instructions` 절에 들어간다. 따라서 "instructions가 보이니 channel이 켜졌다"는 판정은 틀린다.
 
+### 근거 5 — binding 위조 재현 (두 방향)
+
+`CLAUDE_CODE_SESSION_ID`는 인증되지 않은 주장이다. 두 방향을 실행 절차로 재현했고 secret은 쓰지 않았다. 하니스는 §재현 하니스.
+
+**위조 #1 — `.mcp.json` env override.** `.mcp.json`의 `env`에 위조 session id를 넣고 flag 세션을 기동한다. Adapter가 상속받아 읽는 값이 그 위조값이 된다.
+
+```text
+# .mcp.json 의 env (레포에 커밋될 수 있는 파일)
+"env": { "T5_IPC":"tcp", "T5_TAG":"spoof", "CLAUDE_CODE_SESSION_ID":"00000000-dead-beef-0000-000000000000" }
+# Adapter boot dump (boot-spoof-<pid>.json)
+"CLAUDE_CODE_SESSION_ID": "00000000-dead-beef-0000-000000000000"
+```
+
+커밋된 설정 파일 하나가 binding 주장을 바꾼다. Adapter는 이 값을 검증할 수단이 없다.
+
+**위조 #2 — fake hello.** Claude Code 안에서 실행된 적 없는 평범한 TCP client(`fakeclient.mjs`)가 daemon에 붙어 위조 session id를 담은 hello를 보낸다. 절차: daemon 기동 → 미receipt event 하나 enqueue(adapter 0 connected) → `node fakeclient.mjs`.
+
+```text
+# fakeclient.mjs stdout
+SENT hello: {"type":"hello","identity":{"tag":"FAKE-CLIENT","CLAUDE_CODE_SESSION_ID":"00000000-dead-beef-0000-000000000000",...}}
+RECV hello_ack: {"type":"hello_ack","daemon_pid":26532,"round":1}
+RECV push (leaked event): {"id":"secret_evt","content":"Gate gate_secret was resolved by the owner. Re-read it from Orca.","meta":{"seq":"42","gate_id":"gate_secret","kind":"gate_resolved"}}
+VERDICT=FORGED_HELLO_DRAINED_PENDING
+
+# daemon.log (같은 순간)
+{"kind":"adapter_connected","connId":"tcp#1","transport":"tcp"}
+{"kind":"hello","connId":"tcp#1","round":1,"session":"00000000-dead-beef-0000-000000000000","adapter_pid":19100,"adapter_age_ms":2}
+{"kind":"redeliver_on_connect","connId":"tcp#1","round":1,"count":1,"ids":["secret_evt"]}
+```
+
+daemon이 hello를 인증하지 않으므로 아무 로컬 프로세스나 붙어서 pending event의 content·meta를 그대로 받아 간다(위 `count":1,"ids":["secret_evt"]`). 이 client는 이어서 daemon이 fresh hello마다 거는 사다리도 받아 총 7건을 받았다. **이것이 §남는 선택지 5(payload 최소화)의 근거다** — 위조를 막지 못하니 새는 것을 무해하게 만든다.
+
+### 근거 6 — parent command line은 opt-in을 구분한다 (OD-058)
+
+Adapter는 자기 `ppid`를 안다(근거 1 identity). 그 ppid의 프로세스 command line을 `Get-CimInstance Win32_Process`로 조회하면 직접 parent가 `claude.exe`이고 **그 command line에 flag가 그대로 있다.** `.mcp.json`의 `env`에 `T5_PARENTPROBE=1`을 주어 flag/no-flag 세션 boot dump에 parent chain을 남겨 대조했다.
+
+```text
+# flag 세션 (boot-spoof-<pid>.json, chain[0])
+claude.exe :: "C:\Users\dongh\.local\bin\claude.exe" --dangerously-load-development-channels server:orca-t5
+# no-flag 세션 (boot-noflag-<pid>.json, chain[0])
+claude.exe :: "C:\Users\dongh\.local\bin\claude.exe"
+```
+
+즉 Adapter가 볼 수 있는 곳에 opt-in을 가르는 신호가 **있다.** 다만 이것은 문서화된 계약이 아니라 프로세스 트리 관측이며 아래 조건에서 깨진다.
+
+- **권한**: 다른 사용자·권한 상승 프로세스의 command line 조회는 막힐 수 있다(이 관측은 같은 사용자).
+- **프로세스 트리**: 직접 parent가 `claude.exe`라는 보장이 없다. 런처·래퍼·재spawn이 끼면 위로 올라가 찾아야 하고(이 하니스는 chain을 4단계까지 걸었다), IDE·SDK·다른 OS에서는 트리 모양이 다르다.
+- **command line 가시성**: OS·권한에 따라 command line이 비거나 잘릴 수 있다.
+- **버전 계약 없음**: flag 이름·전달 방식이 preview에서 바뀔 수 있다(§(f)). 문자열 파싱은 계약이 아니다.
+
+그러므로 parent-command-line 조회는 **opt-in 판정 후보**로 성립하되 위 조건에서 취약하다. OD-058을 닫지 않는다.
+
 ### 확인된 사실
 
 - [관측] `CLAUDE_CODE_SESSION_ID`는 Adapter 자기 세션 값이며, 이 값이 `claude --resume`의 인자와 동일하다. 세션을 **구분**하는 1차 키로 쓸 수 있다. 세션을 **인증**하지는 못한다(아래).
@@ -347,17 +773,15 @@ receipt from tcp#4 ev_optin processed        # tcp#4 = pid 33884 = flag 세션
 - [관측] flag 없는 `claude` 재기동은 **매번 새 id**를 만든다.
 - [관측] `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID`가 Adapter에 그대로 상속된다. 동일 worktree의 두 세션은 `ORCA_WORKTREE_ID`가 같고 `ORCA_PANE_KEY`·`CLAUDE_CODE_SESSION_ID`가 다르다.
 - [관측] daemon이 IPC 연결을 `CLAUDE_CODE_SESSION_ID`로 색인하면 per-session routing이 성립한다. 2세션 동시 접속에서 각각 1건씩만 도달했다.
-- [관측] **Adapter가 볼 수 있는 곳에는 opt-in 신호가 없다.** argv·execArgv·env(값까지)·MCP `initialize` payload 어디에도 flag 세션과 no-flag 세션을 가르는 것이 없고, `mcp.notification()`은 opt-in 안 된 세션에서도 오류 없이 성공한다.
-- [관측] **세션도 자기 opt-in 여부를 알 수 없다.** launch 명령줄에 접근할 수 없다.
+- [관측] **Adapter의 argv·execArgv·env(값까지)·MCP `initialize` payload에는 opt-in 신호가 없다.** 그 넷 어디에도 flag 세션과 no-flag 세션을 가르는 것이 없고, `mcp.notification()`은 opt-in 안 된 세션에서도 오류 없이 성공한다. **그러나 신호가 아예 없는 것은 아니다 — parent `claude.exe` command line에는 flag가 그대로 있다(근거 6).**
+- [관측] **세션(모델 컨텍스트)은 자기 opt-in 여부를 직접 알 수 없다.** launch 명령줄에 접근할 수 없다(근거 4-4). 단, Adapter나 tool이 parent 프로세스 command line을 조회하면 판정 신호를 얻을 수 있다(근거 6).
 - [관측] `initialize`에서 client version(`2.1.241`)은 얻을 수 있다. 버전 gating은 가능하다.
-- [관측] **`CLAUDE_CODE_SESSION_ID`는 인증되지 않은 주장이며, 양쪽 방향 모두에서 위조된다.** 두 가지를 실제로 해 봤다.
-  - `.mcp.json`의 `env` 블록에 `"CLAUDE_CODE_SESSION_ID": "00000000-dead-beef-0000-000000000000"`을 넣고 flag 세션을 띄웠다. Adapter가 읽은 값은 그 위조값이었다. 레포에 커밋된 설정 파일 하나가 binding 주장을 바꾼다.
-  - Claude Code 세션에서 실행된 적 없는 평범한 소켓 클라이언트로 daemon에 접속해 살아 있는 다른 세션의 id를 담은 `hello`를 보냈다. daemon은 `hello_ack`을 돌려주고 **그 세션 앞으로 쌓여 있던 pending event를 즉시 그 클라이언트에게 전부 밀어 줬다.**
-- [추론] 따라서 opt-in 검증은 **이 Task가 관측한 범위 안에서는** end-to-end probe로만 가능하다. daemon이 probe event를 보내고 receipt가 돌아오는지로 판정하는 것 외에 다른 수단을 찾지 못했다. **다만 조사하지 않은 경로가 남아 있으므로**(위 `CLAUDE_CODE_MESSAGING_SOCKET`) "end-to-end probe뿐"은 확정이 아니다. OD-058은 **미확정**으로 남는다.
+- [관측] **`CLAUDE_CODE_SESSION_ID`는 인증되지 않은 주장이며, 양쪽 방향 모두에서 위조된다.** 두 방향을 실행 절차·로그와 함께 재현했다(근거 5): (1) `.mcp.json`의 `env`로 위조값을 주입하면 Adapter가 그 값을 읽는다, (2) Claude Code 밖의 평범한 TCP client가 위조 hello를 보내면 daemon이 `hello_ack`과 함께 pending event를 그 client에 밀어 준다.
+- [관측·추론] opt-in 판정 후보는 이 Task 범위에서 둘이다 — (1) **end-to-end probe**: daemon이 probe event를 보내고 receipt가 돌아오는지로 판정(세션 협조 불필요), (2) **parent `claude.exe` command line 조회**(근거 6): Adapter가 직접 볼 수 있으나 문서화 안 됨·프로세스 트리/권한 의존. 어느 것도 인증은 아니고, 조사하지 않은 경로(`CLAUDE_CODE_MESSAGING_SOCKET`)도 남는다. OD-058은 **미확정**으로 남는다.
 
 ### 배제되는 선택지
 
-- Adapter가 자기 argv/env/initialize를 보고 opt-in을 판정하는 설계. [관측] 신호가 존재하지 않는다.
+- Adapter가 자기 **argv·env·initialize**를 보고 opt-in을 판정하는 설계. [관측] 그 셋에는 신호가 없다. (parent `claude.exe` command line은 별도 신호이나 문서화 안 됨·프로세스 트리 의존이라 계약이 아니다 — 근거 6.)
 - `mcp.notification()`의 성공을 opt-in 증거로 삼는 설계. [관측] no-flag 세션에서도 `ok:true`가 나온다.
 - coordinator에게 "너 channel 켜져 있니?"라고 물어 답을 신뢰하는 설계. [관측] 세션이 알 수 없다고 답한다. `instructions`가 보이는 것은 opt-in 증거가 아니다.
 - `CLAUDE_PID`나 `ORCA_WORKSPACE_ID` 기반 binding. [관측] 2.1.241에서 둘 다 Adapter 환경에 없다.
@@ -388,9 +812,10 @@ receipt from tcp#4 ev_optin processed        # tcp#4 = pid 33884 = flag 세션
 **opt-in 검증 책임(OD-058):**
 - (A) daemon이 hello 직후 probe event를 보내고 N초 안에 receipt가 없으면 그 세션을 `channel_unverified`로 표시한다.
 - (B) coordinator가 부팅 절차에서 스스로 probe를 요청하는 tool을 호출한다.
-- (C) 둘 다.
+- (C) Adapter가 parent `claude.exe` command line을 조회해 flag를 확인한다(근거 6). [관측] flag/no-flag를 실제로 갈랐다. 문서화 안 됨·프로세스 트리/권한 의존이라 계약이 아니다.
+- (D) 위 조합.
 
-(A)만이 세션 협조 없이 성립한다. [추론] (B)는 세션이 그 tool을 부른다는 보장이 없다. channel 본문으로 세션에 probe를 시키는 형태는 §(e)를 볼 것 — 본문 지시가 통하는지는 이 Task가 확정하지 못했다.
+(A)와 (C)는 세션 협조 없이 성립한다. [추론] (B)는 세션이 그 tool을 부른다는 보장이 없다. (C)는 신호를 즉시 주지만 취약(근거 6)하므로 (A)의 보강용으로 쓸 수 있다. channel 본문으로 세션에 probe를 시키는 형태는 §(e)를 볼 것 — 본문 지시가 통하는지는 이 Task가 확정하지 못했다.
 
 ---
 
@@ -427,66 +852,46 @@ adapter: {"kind":"tool_call","name":"orca_report_receipt","args":{"event_id":"ev
 daemon:  {"kind":"event_state","id":"ev_001","state":"APPLICATION_RECEIPT_RECEIVED","status":"processed"}
 ```
 
-**새 실패 모드 — startup dead window.**
+**새 실패 모드 — startup dead window (통제 재측정).**
 
 가설: adapter 프로세스 시작 직후에 쓴 notification은 세션에 도달하지 않는다.
-반증 관측: **완전히 동일한 payload**를 한 세션 안에서 두 시점(직후 / 수십 초 뒤)에 쓴다. 뒤엣것만 도달하면 payload가 아니라 시점이 변수다. 두 번 다 도달하거나 두 번 다 유실되면 가설은 틀렸다.
+통제: 변수를 하나만 움직인다. **content와 meta를 바이트 단위로 고정**하고 event_id(필수 유일·opaque·시점을 인코딩하지 않음)와 전송 시점만 바꾼다. `off_ms` 같은 시점 값을 payload에 싣지 않고 daemon 로그에만 남긴다. 이전 사다리는 `meta.off_ms`를 함께 바꿔 변한 것이 timing인지 payload인지 분리하지 못했으므로, 그 측정에서 나온 `(0.178s,0.418s]`는 폐기하고 아래로 대체한다.
 
-round 1은 이 대조를 하지 않았다. round 1이 남긴 것은 `ev_300`을 서로 다른 두 세션 기동 직후에 한 번씩 쓴 기록(adapter 시작 +29ms, +47ms)과, 그 뒤 세션이 `orca_list_pending`으로 회수해 `recovered_by_requery`로 receipt한 사실뿐이다. **`ev_300`의 성공적인 channel 재전송은 일어나지 않았다.** 같은 창에서 성공한 `probe_3`(+3.12s)는 id·content·`meta`가 모두 다른 별개 event이므로 시점 대조의 짝이 되지 못한다.
-
-그래서 round 3에서 동일 payload로 다시 쟀다. 한 세션 안에서 event `dw_N`을 **같은 id·content·meta·연결로** early(hello 직후)와 late(+25초) 두 번 쓴다.
-
-**표본: 세션 기동 4회(run 2~5), 각 회 1쌍.** 4쌍 모두 같은 방향으로 갈렸다.
+**존재 — early/late 대조.** 한 세션 안에서 `dw` event를 **같은 id·content·meta·연결**로 early(hello 직후)와 late(+25초) 두 번 쓴다. 뒤엣것만 도달하면 payload가 아니라 시점이 변수다. flag 세션 3회 전부 같은 방향으로 갈렸다.
 
 | run | session id | early write | 도달 | late write (동일 payload) | 도달 |
 |---|---|---|---|---|---|
-| 2 | `80aa04d5-…` | +16ms | ✗ | +25028ms | ✓ |
-| 3 | `1dd7c501-…` | +16ms | ✗ | +25022ms | ✓ |
-| 4 | `07252c90-…` | +16ms | ✗ | +25025ms | ✓ |
-| 5 | `72caa451-…` | +15ms | ✗ | +25016ms | ✓ |
+| 1 | `299cda85-…` | +17ms | ✗ | +25019ms | ✓ |
+| 2 | `41617de4-…` | +14ms | ✗ | +25027ms | ✓ |
+| 3 | `7f1d2f7d-…` | +14ms | ✗ | +25023ms | ✓ |
 
-`dw_N`의 receipt는 매번 late write 뒤에 한 번만 왔고 note가 "not seen earlier in this session"이었다. early write가 도달했다면 그 시점에 첫 receipt가 났어야 하고, late는 `duplicate_ignored`로 왔어야 한다. run 2 원시 기록:
-
-```text
-[round3 run2, adapter pid 기준 offset]
-+1      adapter_start
-+6      mcp_connected                       ← await mcp.connect() 반환
-+16     notification_written dw_2           ← early, 유실
-+177    mcp_initialized
-+281    tools_list_requested
-+25028  notification_written dw_2           ← late, 동일 id·content·meta
-+35262  tool_call orca_report_receipt {"event_id":"dw_2","status":"processed",
-        "note":"Not seen earlier in this session — new event_id, ..."}
-```
-
-**경계.** 같은 세션 안에서 내용·`meta`가 완전히 같고 **id와 쓴 시점만 다른** 사다리 event 4개를 함께 썼다. run 2~5 전부 같은 자리에서 갈렸다.
-
-| run | ~150ms | ~400ms | ~1000ms | ~2500ms | `mcp_initialized` | `tools/list` |
-|---|---|---|---|---|---|---|
-| 2 | 171 ✗ | 421 ✓ | 1026 ✓ | 2525 ✓ | 177 | 281 |
-| 3 | 178 ✗ | 418 ✓ | 1037 ✓ | 2524 ✓ | 186 | 294 |
-| 4 | 170 ✗ | 429 ✓ | 1023 ✓ | 2523 ✓ | 170 | 268 |
-| 5 | 169 ✗ | 425 ✓ | 1025 ✓ | 2523 ✓ | 162 | 255 |
-
-유실된 사다리 event는 세션이 나중에 `orca_list_pending`으로 회수하면서 스스로 "never arrived as a channel tag here, only surfaced via `orca_list_pending`"이라고 적었다(run 4 receipt note). 즉 유실 판정은 receipt 부재만이 아니라 세션의 진술로도 뒷받침된다.
-
-**readiness 신호 후보는 둘 다 반증됐다.**
-
-- `tools/list`: round 1에서 Adapter가 첫 `tools/list`를 기다렸다 쓰도록 gate를 넣었는데(`adapter_start` 04:45:43.632 → `tools_list_requested` +17ms → `gate_released`·`notification_written` +29ms) 그 write는 유실됐다. `tools/list`가 dead window보다 먼저 올 수 있다.
-- `initialize` 완료: run 5는 `mcp_initialized`가 +162ms인데 **그 뒤인 +169ms에 쓴 event가 유실됐다.** 직접 검증도 했다 — run 6에서 Adapter가 `oninitialized`가 뜰 때까지 모든 notification을 붙잡았다가 flush하게 했다.
+유실 판정은 receipt 부재 + 세션 진술로 뒷받침된다. 유실된 event의 receipt는 late write 뒤 한 번만 왔고 note가 "not seen earlier in this session" 또는 "never delivered into this session's transcript … only surfaced via `orca_list_pending`"였다. early가 도달했다면 그 시점에 첫 receipt가 나고 late는 `duplicate_ignored`로 왔어야 한다. run 1 원시 기록(adapter 시작 기준 offset):
 
 ```text
-[round3 run6, T5_GATE=init]
-+153    gate_released                        ← initialize 완료로 gate 해제
-+154    notification_written dw_6            ← 유실
-+176    notification_written lad1_150        ← 유실 (세션 진술: never arrived as a channel tag)
-+416    notification_written lad1_400        ← 도달
-+25017  notification_written dw_6 (late)     ← 도달
++2      adapter_start
++6      mcp_connected                        ← await mcp.connect() 반환
++17     notification_written dw (early)      ← 유실
++198    mcp_initialized
++303    tools_list_requested
++25019  notification_written dw (late, 동일 id·content·meta)  ← 도달
 ```
 
-`dw_6`의 receipt는 +37897ms에 왔다. +416ms 이후 event들의 receipt는 +16796·+19961·+22926ms에 한 턴으로 몰려 나왔는데 `dw_6`은 그 묶음에 없었다. **initialize 완료를 기다려도 창은 닫히지 않는다** (run 6, 1회).
+**경계 — 사다리.** 같은 세션 안에서 content·meta가 서로 같고 **event_id와 전송 시점만 다른** 사다리 6개를 함께 썼다(전송 offset 약 150·250·350·450·700·1500ms). 숫자는 adapter 시작 기준 실제 write offset(ms), ✓ 도달, ✗ 유실(`recovered_by_requery`).
 
-**대조군.** flag 없이 띄운 세션(run 7)에서는 +19·171·432·1031·2521·25027ms 여섯 write 전부 receipt 0건이었다. 위 결과가 "늦게 쓰면 도달한다"가 아니라 flag의 효과임을 분리한다.
+| run | ~150 | ~250 | ~350 | ~450 | ~700 | ~1500 | `mcp_init` | `tools/list` |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 176 ✗ | 269 ✗ | 373 ✓ | 473 ✓ | 720 ✓ | 1521 ✓ | 198 | 303 |
+| 2 | 168 ✗ | 275 ✗ | 376 ✓ | 469 ✓ | 723 ✓ | 1515 ✓ | 174 | 272 |
+| 3 | 166 ✓ | 270 ✓ | 369 ✓ | 472 ✓ | 721 ✓ | 1521 ✓ | 15 | 21 |
+
+**경계값은 이 표본으로 특정되지 않는다.** payload를 고정했는데도 마지막 유실 지점과 첫 도달 지점이 run마다 달랐다 — run 3은 +166ms부터 도달했고 run 1·2는 +269~275ms까지 유실됐다. 창의 상단 경계가 세 fresh 세션(distinct session id)에서 ~166ms와 ~375ms 사이를 오갔다(같은 머신·버전·하니스). 그러므로 좁은 경계 구간은 근거가 없다. 이 표본이 지지하는 것은 둘뿐이다: **(1) early ~14~17ms write가 3/3 유실된다(존재)**, **(2) 연결 직후 즉시 flush는 신뢰할 수 없다.**
+
+**readiness 신호 후보 둘 다 반증된다.** 경계는 관측된 어떤 프로토콜 이정표도 따라가지 않는다.
+
+- `initialize` 완료: run 1·2는 `mcp_initialized`가 +174~198ms에 끝났는데 그 뒤 +269~275ms write가 유실됐다 — 완료가 창을 닫지 못한다. run 3은 `mcp_initialized`가 +15ms인데 그와 무관하게 +14ms early가 유실됐다.
+- `tools/list`: run 2는 `tools_list_requested`가 +272ms인데 그 3ms 뒤 +275ms write가 유실됐다. run 3은 +21ms인데 첫 도달은 +166ms였다.
+
+**대조군 (no-flag).** flag 없이 띄운 세션에서는 daemon이 쏜 6개 write(early·사다리·late)에 receipt가 0건이었다(`notification_written` 6, `tool_call` 0). 위 도달이 "늦게 쓰면 도달한다"가 아니라 **flag(=channel opt-in)의 효과**임을 분리한다.
 
 ### 확인된 사실
 
@@ -494,19 +899,19 @@ round 1은 이 대조를 하지 않았다. round 1이 남긴 것은 `ev_300`을 
 - [관측] `TRANSPORT_WRITE_ATTEMPTED`와 `APPLICATION_RECEIPT_RECEIVED`가 물리적으로 다른 사건이며, 5가지 조건에서 실제로 갈라진다.
 - [관측] transport write 성공은 **어떤 것도 증명하지 않는다.** 세션이 opt-in했는지, 살아 있는지, 대화형인지, 준비됐는지 전부 구분하지 못한다.
 - [관측] 세션이 결과를 daemon에 돌려주는 **관측된** 경로는 Adapter가 노출한 tool을 세션이 호출하는 것이고, 그 경로는 실제로 동작한다. 이 Task는 다른 로컬 경로를 시도하지 않았으므로 **유일성은 관측하지 못했다.** [문서] 공식 문서도 reply tool을 권고할 뿐 다른 경로를 배제하지 않는다("If you need delivery confirmation, track event state in your server and expose a reply tool that Claude can call to report status back." — Notification format). 배제되지 않은 후보는 §남는 선택지에 적는다.
-- [관측] **startup dead window가 존재한다.** 동일 payload를 한 세션 안에서 두 시점에 쓴 4쌍 전부에서, adapter 시작 +15~16ms의 write는 유실되고 +25초의 write는 도달했다.
-- [관측] 창의 경계는 **(0.178s, 0.418s]** 구간 안에 있다. 4회 기동 모두 +169~178ms는 유실, +418~429ms는 도달이었다. round 1이 남긴 (0.047s, 3.12s]는 짝이 맞지 않는 두 event를 비교한 값이라 폐기한다.
-- [관측] 그 경계가 무엇에 묶여 있는지는 **여전히 모른다.** MCP 프로토콜 이정표 두 개가 후보였고 둘 다 반증됐다 — `tools/list`(round 1), `initialize` 완료(run 5의 순서 역전 + run 6의 gate 직접 검증). 관측된 어떤 프로토콜 사건도 창의 종료를 표시하지 않는다.
+- [관측] **startup dead window가 존재한다.** content·meta를 고정한 통제 재측정 3회 전부에서 adapter 시작 +14~17ms의 early write는 유실되고 +25초 late write(동일 payload)는 도달했다(재현 확인의 clean-shell 실행에서도 +13ms 유실·late 도달로 한 번 더).
+- [관측] **경계값은 특정되지 않는다.** payload를 고정했는데도 마지막 유실/첫 도달 지점이 run마다 달랐다 — run 3은 +166ms부터 도달, run 1·2는 +269~275ms까지 유실. 창 상단 경계가 세 fresh 세션에서 ~166ms와 ~375ms 사이를 오갔다(같은 머신·버전·하니스). 이전 사다리의 (0.178s,0.418s]와 round 1의 (0.047s,3.12s]는 둘 다 폐기한다 — 통제되지 않은 비교였다.
+- [관측] 경계가 무엇에 묶여 있는지는 **모른다.** MCP 이정표 두 개가 후보였고 둘 다 반증됐다 — `initialize` 완료(run 1·2는 완료 +174~198ms 뒤 +269~275ms write 유실), `tools/list`(run 2는 +272ms 뒤 +275ms write 유실). 관측된 어떤 프로토콜 사건도 창의 종료를 표시하지 않는다.
 - [관측] `await mcp.connect()`는 +5~6ms에 반환한다. 이 반환은 준비 완료와 무관하다.
 - [관측] receipt는 모델 턴을 거치므로 시간이 걸린다. 이것은 전송 지연이 아니라 반응 시간이다. idle 세션에 5초 간격으로 밀어 넣은 round 1에서는 5.5~9.9초였고, 기동 직후 첫 event는 round 3에서 16.8~23.3초였다. **타임아웃을 잡을 때 기동 직후를 정상 구간의 하한으로 삼으면 안 된다.**
 
 ### 배제되는 선택지
 
 - `await mcp.notification()` 반환을 delivered로 기록하는 설계. [관측] 5가지 실패 조건 전부에서 성공을 반환한다.
-- Adapter가 연결 직후 즉시 pending outbox를 flush하는 설계. [관측] 동일 payload 4쌍에서 early write가 4/4 유실됐다.
-- `tools/list` 수신을 "채널 준비 완료"로 삼는 설계. [관측] 반증됐다.
-- `initialize` 완료를 "채널 준비 완료"로 삼는 설계. [관측] 반증됐다(run 5, run 6).
-- 고정 지연만으로 dead window를 회피하는 설계. [추론] 경계를 (0.178s, 0.418s]까지 좁혔지만 그 값이 무엇에 묶여 있는지 모른다. 머신 속도·버전·부하가 바뀌면 같이 움직일 수 있다. 지연은 확률을 낮출 뿐 계약이 되지 못한다.
+- Adapter가 연결 직후 즉시 pending outbox를 flush하는 설계. [관측] 통제 재측정 3회 + 재현 1회에서 early write가 매번 유실됐다.
+- `tools/list` 수신을 "채널 준비 완료"로 삼는 설계. [관측] 반증됐다(run 2: tools/list +272ms 뒤 write 유실).
+- `initialize` 완료를 "채널 준비 완료"로 삼는 설계. [관측] 반증됐다(run 1·2: 완료 뒤 write 유실).
+- 고정 지연만으로 dead window를 회피하는 설계. [관측] 경계값이 fresh 세션마다 ~166~375ms로 흔들렸고(통제 재측정 3회) 무엇에 묶인 값인지도 모른다. 머신 속도·버전·부하가 바뀌면 같이 움직일 수 있다. 지연은 확률을 낮출 뿐 계약이 되지 못한다.
 
 ### 남는 선택지
 
@@ -529,20 +934,22 @@ round 1은 이 대조를 하지 않았다. round 1이 남긴 것은 `ev_300`을 
 
 | 후보 | 관측 수단 | 증명하는 것 | 증명하지 못하는 것 |
 |---|---|---|---|
-| Gate가 pending 목록에서 사라짐 | `gate-list --run <id> --json` → `gates[]`·`count` | 그 Gate가 더는 blocking이 아니다 | 누가 언제 풀었는지. coordinator가 아니라 사람이 UI에서 풀었어도 같게 보인다 |
+| Gate가 pending에서 빠짐 / `resolved`로 전이 | `gate-list --run <id> --status pending --json`의 `count`가 1→0. (unfiltered `gate-list --run <id>`로는 안 됨 — 아래 정정) | 그 Gate가 더는 pending(blocking)이 아니다 | 누가 언제 풀었는지. coordinator가 아니라 사람이 UI에서 풀어도 같게 보인다 |
 | Task `status` 전이 (`blocked`→`ready`/`dispatched`) | `task-list --run <id> --json` → `status` | Task가 실제로 진행 가능/진행 중 상태가 됐다 | 그 전이가 이 Gate 때문인지. `task-update`는 임의 시점에 누구나 부를 수 있다 |
 | Task `completed_at`·`result` 채워짐 | 같은 명령 | 그 Task가 끝났다 | 재개와 완료는 다른 사건이다. 재개 표시용으로는 너무 늦다 |
 | 새 Dispatch 생성 | `dispatch-show --task <id> --json` → `dispatch.id`·`dispatched_at`·`status` | coordinator가 후속 작업을 실제로 배치했다 | Gate resolution이 그 Dispatch의 원인인지 |
 | Dispatch `last_heartbeat_at` 갱신 | 같은 명령 | 배치된 worker가 살아 있다 | 그 worker가 이 Gate와 관련된 일을 하는지 |
 
-[관측] 위 필드는 실제 응답에서 확인했다. 예: 이 Task 자신의 dispatch record는 `status`·`dispatched_at`·`completed_at`·`last_heartbeat_at`·`failure_count`·`termination_reason`을 돌려준다. Task record는 `status`·`created_at`·`completed_at`·`result`를 돌려준다.
+[관측] 첫 행 정정 — **unfiltered `gate-list --run <id>`는 resolved Gate를 목록에 남긴다.** 따라서 "pending 목록에서 사라짐"은 그 명령으로 관측되지 않는다. 기존 Run에서 읽기 전용으로 확인했다: `gate-list --run <id>` → 3건 전부 `status:"resolved"`(retained), `gate-list --run <id> --status pending` → `count:0`, `--status resolved` → 3건. 따라서 pending 소멸을 보려면 `--status pending`의 `count` 변화를 봐야 하고, unfiltered로 보려면 그 Gate 행의 `status`가 `resolved`로 바뀌는 것을 봐야 한다(누가 풀었는지는 증명 못 함, 위 표).
+
+[관측] 나머지 필드도 실제 응답에서 확인했다. 예: 이 Task 자신의 dispatch record는 `status`·`dispatched_at`·`completed_at`·`last_heartbeat_at`·`failure_count`·`termination_reason`을 돌려준다. Task record는 `status`·`created_at`·`completed_at`·`result`를 돌려준다. 위 확인은 전부 읽기 전용 조회이며, **Gate를 실제로 풀고 그 뒤 Task/Dispatch가 어떻게 바뀌는지의 왕복은 돌려 보지 않았다**(이 Run의 리소스를 건드리지 않기 위해). 그 실측은 D3 착수 판단으로 남긴다.
 
 [추론] 어느 후보도 **인과**를 증명하지 못한다. "Gate가 풀렸고 그 뒤 Task 상태가 바뀌었다"는 시간 순서일 뿐이다. 인과를 원하면 Bridge가 상관 키(예: `gate_id`)를 Dispatch나 Task result에 실어 두고 그 키로 대조해야 하며, 그건 이 Task가 관측한 범위 밖이다.
 
 **dead window 대응:**
 - (i) receipt 없으면 재시도하는 outbox를 두고 재시도 간격을 지연보다 길게 잡는다. [추론] 시점 가정 없이 성립하는 유일한 형태다.
 - (ii) daemon이 hello 직후 probe를 보내고 receipt가 온 뒤에야 실제 event를 flush한다(§(c) 선택지 A와 동일 메커니즘). [추론] probe 자체가 dead window에 걸리면 아무 event도 나가지 않으므로 probe에도 (i)의 재시도가 필요하다.
-- (iii) dead window의 정확한 경계를 측정해 고정 지연을 쓴다. [관측] 경계를 (0.178s, 0.418s]까지 좁혔지만 무엇에 묶인 값인지 모른다. 버전마다 재측정이 필요해 research preview에서는 취약하다.
+- (iii) dead window의 경계를 측정해 고정 지연을 쓴다. [관측] **취약하다 — 경계 자체가 특정되지 않는다.** 통제 재측정에서 fresh 세션마다 ~166~375ms로 흔들렸고 무엇에 묶인 값인지도 모른다. 고정 지연은 어느 값을 잡아도 일부 세션에서 창 안에 떨어진다.
 - (iv) MCP 프로토콜 이정표를 readiness 신호로 삼는다. [관측] **배제된다.** `tools/list`와 `initialize` 완료 둘 다 창보다 먼저 올 수 있다.
 
 ---
@@ -793,9 +1200,9 @@ seq=500 ev_500 TRANSPORT_WRITE_ATTEMPTED write=04:56:09.184Z receipt=-
 [관측] **계약을 짤 때 반드시 반영해야 할 제약이 다섯 개다.**
 
 1. 대화형 세션에만 도달한다. `-p`는 2개 버전에서 반복 실패.
-2. startup dead window가 있다. 연결 직후 즉시 flush하면 유실된다(동일 payload 4쌍에서 4/4). 경계는 (0.178s, 0.418s]이고 무엇에 묶인 값인지 모른다. 관측된 프로토콜 이정표는 창의 종료를 표시하지 못한다.
+2. startup dead window가 있다. 연결 직후 즉시 flush하면 유실된다(통제 재측정 early ~14~17ms 3/3 + 재현 1회). **경계값은 특정되지 않는다** — fresh 세션마다 ~166~375ms로 흔들렸고 무엇에 묶인 값인지 모른다. 관측된 프로토콜 이정표는 창의 종료를 표시하지 못한다.
 3. transport write 성공은 아무것도 증명하지 않는다. receipt만이 신호다.
-4. Adapter도 세션도 opt-in 여부를 자기 힘으로 알 수 없다. 이 Task가 찾은 판정 수단은 probe뿐이다.
+4. 세션(모델 컨텍스트)은 opt-in 여부를 직접 알 수 없다. 판정 후보는 둘 — daemon의 end-to-end probe, 그리고 Adapter의 parent `claude.exe` command line 조회(관측됨, 단 문서화 안 됨·프로세스 트리 의존, 근거 6). 어느 것도 인증은 아니다.
 5. 배포 경로가 development flag 하나뿐이고 매 기동 확인 대화상자를 요구한다.
 
 [추론] 2·3·4는 "receipt 없으면 미전달로 간주하고 재시도" 하나로 덮인다. 1도 설계로 흡수 가능하다. 5는 설계로 흡수되지 않는 외부 조건이며 D3 착수 여부를 사용자가 판단할 재료다.
@@ -821,7 +1228,7 @@ roadmap §9의 출구 조건 대비:
 
 ## 관측하지 못한 것
 
-- startup dead window가 무엇에 묶여 있는지. 구간은 (0.178s, 0.418s]로 좁혔고 `tools/list`와 `initialize` 완료는 배제했지만, 창을 여닫는 실제 사건은 못 찾았다.
+- startup dead window의 경계가 무엇에 묶여 있는지. 통제 재측정에서 경계가 fresh 세션마다 ~166~375ms로 흔들렸고, `tools/list`와 `initialize` 완료는 배제했지만 창을 여닫는 실제 사건은 못 찾았다. 존재(early write 유실)는 확정이나 경계값은 특정하지 못했다.
 - 세션 재시작·컨텍스트 압축 이후의 중복 식별 능력. OD-057이 열려 있는 이유가 그대로 남는다.
 - sender allowlist를 세운 구성에서 channel 본문 지시가 어떻게 처리되는지. round 1의 1회 관측은 allowlist 없는 구성이었고 사용자 턴 지시가 교란으로 서 있었다.
 - `CLAUDE_CODE_MESSAGING_SOCKET`에 접속했을 때 무엇이 오가는지. 값이 세션마다 다르다는 것만 확인했다.
@@ -837,9 +1244,9 @@ roadmap §9의 출구 조건 대비:
 ## 확신이 낮은 결론
 
 - **§(e)의 중복 식별.** 단일 세션·짧은 컨텍스트·명시적 사용자 지시라는 유리한 조건에서의 1회 관측이다. 이것을 근거로 coordinator 멱등성을 모델 판단에 맡기면 안 된다.
-- **§(d)의 유실 판정 방식.** "도달하지 않았다"는 receipt 부재와 세션의 진술로 판정했다. `-p` 판정과 같은 종류의 증거이며, "모델에 도달했으나 tool을 부르지 않았다"를 완전히는 배제하지 못한다. 다만 같은 세션·같은 연결에서 늦게 쓴 동일 payload가 4/4로 도달했으므로 "이 세션은 이 event를 안 부른다"로는 설명되지 않는다.
-- **§(d)의 dead window 경계 (0.178s, 0.418s].** 4회 기동에서 재현됐지만 전부 같은 머신·같은 버전·같은 하니스다. 다른 환경에서 같은 값일 근거는 없다.
-- **§(d)의 initialize gate 반증.** run 6의 1회 관측이다. 다만 run 5가 독립적으로 같은 방향(initialize 이후 write 유실)을 보인다.
+- **§(d)의 유실 판정 방식.** "도달하지 않았다"는 receipt 부재와 세션의 진술로 판정했다. `-p` 판정과 같은 종류의 증거이며, "모델에 도달했으나 tool을 부르지 않았다"를 완전히는 배제하지 못한다. 다만 같은 세션·같은 연결에서 늦게 쓴 동일 payload가 3/3로 도달했으므로 "이 세션은 이 event를 안 부른다"로는 설명되지 않는다.
+- **§(d)의 dead window 경계.** 존재(early write 유실)는 통제 3회 + 재현 1회로 견고하나, 경계값은 fresh 세션마다 ~166~375ms로 흔들려 특정하지 못했다. 3~4회 모두 같은 머신·버전·하니스이므로 다른 환경의 경계는 더더욱 알 수 없다.
+- **§(d)의 initialize 반증.** run 1·2에서 `initialize` 완료 뒤 write가 유실되는 것을 독립적으로 관측했다(각 1회). run 3은 완료가 +15ms로 매우 일러 이 축으로는 판정에 못 쓴다.
 - **§(a)의 `-p` 미도달.** receipt 부재로 판정했다. "모델에 도달했으나 tool을 부르지 않았다"를 완전히는 배제하지 못한다. 다만 [관측] 대화형 세션에서 dead window 밖에 쓴 notification은 전부 receipt를 냈고(두 라운드 합계 27건), `-p`에서 dead window 밖에 쓴 5건은 receipt 0건·`tool_call` 로그 0건이라 [추론] 도달 자체가 없었다고 본다.
 
 ## 정리한 THROWAWAY 리소스
@@ -848,22 +1255,22 @@ roadmap §9의 출구 조건 대비:
 
 | 리소스 | 처리 |
 |---|---|
-| Orca terminal `term_df8bf929-...` (THROWAWAY-T5-CHANNEL) | 종료 |
-| Orca terminal `term_07ecc0b1-...` (THROWAWAY-T5-CHANNEL-B) | 종료 |
-| Orca terminal `term_6ffb561b-...` (THROWAWAY-T5-DW, round 3) | 종료·close |
-| daemon 프로세스, named pipe `\\.\pipe\orca-t5-throwaway`·`\\.\pipe\orca-t5-dw`, TCP 8791·8792·8891·8892 | 종료·해제 (listen 0건 확인) |
-| 하니스 디렉터리 `%TEMP%\orca-THROWAWAY-t5-channel` | 원시 로그 보존을 위해 남김. 레포 밖 |
+| Orca terminal `term_019c6474-…` (통제 재측정 run 1~5 재사용) | close (`terminal close --tab`, ok 확인) |
+| Orca terminal `term_e219f93a-…`(driver 자체 테스트)·`term_73efa487-…`(재현 확인) | driver가 스스로 close |
+| Orca terminal `term_df8bf929-…`·`term_07ecc0b1-…`·`term_6ffb561b-…` (초기 관측) | 종료·close |
+| daemon 프로세스, named pipe `\\.\pipe\orca-t5`(재측정)·`\\.\pipe\orca-t5-throwaway`·`\\.\pipe\orca-t5-dw`(초기), TCP 8791·8792 | 종료·해제 (listen 0건 확인) |
+| 하니스 디렉터리 `%TEMP%\orca-THROWAWAY-t5-r4`(재측정)·`%TEMP%\orca-THROWAWAY-t5-repro`(재현 확인)·`%TEMP%\orca-THROWAWAY-t5-channel`(초기) | 원시 로그 보존을 위해 남김. 레포 밖 |
 
-새 Orca Run·Task·Gate·Dispatch를 만들지 않았다. 기존 Run(`run_36d28e6e947a`, `run_7804be5a654f`)과 그 리소스를 변경하지 않았다. Slack·GitHub 설정을 변경하지 않았다.
+새 Orca Run·Task·Gate·Dispatch를 만들지 않았다. gate-list 의미 확인(§(d))은 기존 Run `run_f039af831871`에 **읽기 전용**으로만 했고 변경하지 않았다. 이 Run(`run_36d28e6e947a`)과 기존 Run을 변경하지 않았다. Slack·GitHub 설정을 변경하지 않았다.
 
 **남은 잔여물.** 하니스 디렉터리를 지워도 아래는 남는다. 전부 시스템 temp 경로에 대한 항목이라 다른 프로젝트에 영향이 없어 제거하지 않았다.
 
 | 위치 | 내용 | 정리 방법 |
 |---|---|---|
-| `~/.claude.json` → `projects["C:/Users/.../Temp/orca-THROWAWAY-t5-channel"]` | **folder trust만** 있다 (`hasTrustDialogAccepted: true`). `mcpServers`·`enabledMcpjsonServers`·`disabledMcpjsonServers`·`allowedTools`는 전부 비어 있다 | 그 `projects` 키 하나를 지운다 |
-| `%TEMP%\orca-THROWAWAY-t5-channel\.claude\settings.local.json` | **MCP 승인이 여기 있다** — `{"enabledMcpjsonServers":["orca-t5"],"enableAllProjectMcpServers":true}` | 하니스 디렉터리를 지우면 함께 사라진다 |
-| `~/.claude/projects/C--Users-dongh-AppData-Local-Temp-orca-THROWAWAY-t5-channel/` | 세션 transcript `*.jsonl` **15개** (round 1·2에서 8개, round 3에서 7개). 빈 `memory/` 하위 디렉터리 | 디렉터리째 지운다. 세션을 더 띄우면 개수가 는다 |
-| `~/.claude/history.jsonl` | 하니스 경로가 찍힌 프롬프트 기록 **22줄** (`project` 필드가 하니스 경로) | 해당 줄을 걸러내고 다시 쓴다 |
+| `~/.claude.json` → `projects[…"orca-THROWAWAY-t5-r4"]`·`[…"orca-THROWAWAY-t5-repro"]`·`[…"orca-THROWAWAY-t5-channel"]` | **folder trust만** (`hasTrustDialogAccepted:true`). MCP 승인은 여기 없음 | 그 `projects` 키들을 지운다 |
+| 각 하니스 디렉터리 `.claude\settings.local.json` | **MCP 승인** — `{"enabledMcpjsonServers":["orca-t5"]}` | 하니스 디렉터리를 지우면 함께 사라진다 |
+| `~/.claude/projects/…-t5-r4/`(transcript 5)·`…-t5-repro/`(transcript 1)·`…-t5-channel/`(초기 15) | 세션 transcript `*.jsonl` | 디렉터리째 지운다. 세션을 더 띄우면 개수가 는다 |
+| `~/.claude/history.jsonl` | 하니스 경로가 찍힌 프롬프트 기록 (재측정·재현 7줄 + 초기 22줄) | 해당 줄을 걸러내고 다시 쓴다 |
 
 ## 참고 자료
 
