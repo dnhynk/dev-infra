@@ -264,7 +264,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - identity는 `(repository databaseId, PR number)`, terminal latch는 `mergedAt`, review/check scope는 `headSha`다(OD-044).
 - `merged` downgrade 금지는 timestamp 비교가 아니라 terminal dominance rule이다.
 - 동일 head 안의 review/check는 각 resource의 timestamp와 id로 reconcile한다.
-- 근거: 같은 PR `updated_at`에서 서로 다른 head가 관측됐고 review/check 변화가 PR timestamp를 갱신하지 않아 전역 timestamp last-write-wins가 성립하지 않았다.
+- 근거: 같은 PR `updated_at`에서 서로 다른 head가 관측됐고 mergeability와 check run 변화가 PR timestamp를 갱신하지 않아 전역 timestamp last-write-wins가 성립하지 않았다.
 
 ### DL-037 · 유실된 Slack 카드는 current 상태만 재생성한다
 
