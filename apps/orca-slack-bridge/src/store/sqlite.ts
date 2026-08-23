@@ -3,6 +3,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 import type { CheckFact } from '../github/pull-request.js';
+import { pullRequestNumber } from '../identity/keys.js';
 import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
@@ -14,6 +15,7 @@ import {
   type DigestStore,
   type NewPrMessage,
   type NewPrTask,
+  type NewRunMessage,
   type NewThreadEvent,
   type ObservationRecord,
   type PrMessageRecord,
@@ -21,6 +23,9 @@ import {
   type PrStateSnapshot,
   type PrTaskRecord,
   type PrThreadEventRecord,
+  type RunMessageRecord,
+  type RunPullRequestRecord,
+  type RunStore,
 } from './schema.js';
 
 /**
@@ -232,6 +237,121 @@ SELECT pr_key, dedupe_key, kind, message_ts, recorded_at
   FROM pr_thread_event WHERE pr_key = ?
  ORDER BY recorded_at, dedupe_key`;
 
+const SELECT_RUN_ROW = `
+SELECT run_key, channel_id, message_ts, render_fingerprint, created_at, updated_at
+  FROM run_message WHERE run_key = ?`;
+
+const INSERT_RUN_ROW = `
+INSERT INTO run_message
+  (run_key, channel_id, message_ts, render_fingerprint, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)`;
+
+const UPDATE_RUN_OBSERVATION = `
+UPDATE run_message SET render_fingerprint = ?, updated_at = ? WHERE run_key = ?`;
+
+/**
+ * 이 Run에 연결된 PR과 저장된 상태를 함께 읽는다.
+ *
+ * `pr_task`는 (PR, Task) 쌍마다 한 행이므로(OD-076) 한 PR을 여러 Task가 이어서 갱신하면 같은
+ * `pr_key`가 여러 행이다. `GROUP BY`로 PR당 한 행으로 접고 관측 시각은 최소/최대를 쓴다.
+ *
+ * `LEFT JOIN`이다. `pr_state` 행이 없어도 PR을 목록에서 빼지 않는다 — 연관을 관측했다는 사실과
+ * 상태를 저장했다는 사실은 다르고, 빼면 카드가 그 PR을 아예 모르는 것처럼 보인다.
+ *
+ * `ORDER BY`를 지정하지 않으면 같은 파일이 실행마다 다른 순서를 낼 수 있고, 그러면 렌더 지문이
+ * 흔들려 사실이 그대로여도 `chat.update`가 발생한다. 번호 정렬은 `pr_key` 사전순으로 되지
+ * 않으므로(`#10`이 `#9`보다 앞선다) 여기서는 `pr_key`로만 고정하고 번호 정렬은 호출부가 한다.
+ */
+const SELECT_RUN_PULL_REQUESTS = `
+SELECT t.pr_key AS pr_key,
+       MIN(t.first_seen_at) AS first_seen_at,
+       MAX(t.last_seen_at)  AS last_seen_at,
+       s.terminal           AS terminal,
+       s.merged_at          AS merged_at,
+       s.review_verdict     AS review_verdict,
+       s.observed_at        AS observed_at
+  FROM pr_task t
+  LEFT JOIN pr_state s ON s.pr_key = t.pr_key
+ WHERE t.run_key = ?
+ GROUP BY t.pr_key
+ ORDER BY t.pr_key`;
+
+/** sqlite가 돌려주는 run_message 한 행. 컬럼명 그대로다. */
+type RunMessageRow = {
+  readonly run_key: string;
+  readonly channel_id: string;
+  readonly message_ts: string;
+  readonly render_fingerprint: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
+
+/** `SELECT_RUN_PULL_REQUESTS`가 돌려주는 한 행. `pr_state` 쪽 칸은 join이 비면 NULL이다. */
+type RunPullRequestRow = {
+  readonly pr_key: string;
+  readonly first_seen_at: string;
+  readonly last_seen_at: string;
+  readonly terminal: string | null;
+  readonly merged_at: string | null;
+  readonly review_verdict: string | null;
+  readonly observed_at: string | null;
+};
+
+function toRunMessageRecord(row: RunMessageRow): RunMessageRecord {
+  return {
+    runKey: row.run_key as RunKey,
+    channelId: row.channel_id,
+    messageTs: row.message_ts,
+    renderFingerprint: row.render_fingerprint,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
+ * join 결과 한 행을 record로 옮긴다.
+ *
+ * `terminal`이 NULL인지로 `pr_state` 행의 유무를 판정한다. 그 칸은 `NOT NULL`이므로 행이
+ * 있으면 값이 있고, NULL은 join이 비었다는 뜻뿐이다. `observed_at`으로 판정해도 같지만 판정
+ * 근거를 한 칸으로 고정한다.
+ *
+ * 행이 있는데 `observed_at`이 NULL이면 던진다. 그 칸도 `NOT NULL`이므로 그 조합은 이 코드가
+ * 만든 파일에서 나올 수 없고, 빈 문자열로 접으면 카드에 `(관측 )`이 그려진다. 파일이 손상됐다는
+ * 사실은 드러나야 한다(`parseChecks`와 같은 판정).
+ */
+function toRunPullRequestRecord(row: RunPullRequestRow): RunPullRequestRecord {
+  const prKey = row.pr_key as PullRequestKey;
+  if (row.terminal !== null && row.observed_at === null) {
+    throw new TypeError(`${row.pr_key}의 pr_state에 terminal은 있는데 observed_at이 없다`);
+  }
+  return {
+    prKey,
+    number: pullRequestNumber(prKey),
+    firstSeenAt: row.first_seen_at,
+    lastSeenAt: row.last_seen_at,
+    state:
+      row.terminal === null || row.observed_at === null
+        ? null
+        : {
+            terminal: row.terminal as PrTerminal,
+            mergedAt: row.merged_at,
+            reviewVerdict: row.review_verdict as ReviewerResult['verdict'] | null,
+            observedAt: row.observed_at,
+          },
+  };
+}
+
+/**
+ * PR 번호 오름차순으로 정렬한다. 같으면 `prKey` 사전순이다.
+ *
+ * SQL이 아니라 여기서 하는 이유는 `pr_key`가 번호를 문자열로 담아 `#10`이 `#9`보다 앞서기
+ * 때문이다. 순서를 고정하지 않으면 렌더 지문이 흔들린다.
+ */
+function byPullRequestNumber(a: RunPullRequestRecord, b: RunPullRequestRecord): number {
+  if (a.number !== b.number) return a.number - b.number;
+  return a.prKey < b.prKey ? -1 : a.prKey > b.prKey ? 1 : 0;
+}
+
 /** sqlite가 돌려주는 pr_state 한 행. 컬럼명 그대로다. */
 type PrStateRow = {
   readonly pr_key: string;
@@ -339,7 +459,7 @@ function toRecord(row: PrMessageRow): PrMessageRecord {
   };
 }
 
-export class SqliteDigestStore implements DigestStore {
+export class SqliteDigestStore implements DigestStore, RunStore {
   private readonly db: DatabaseSync;
 
   /** 파일을 열고 스키마를 준비한다. 부모 디렉터리가 없으면 만든다. */
@@ -454,6 +574,49 @@ export class SqliteDigestStore implements DigestStore {
     }
   }
 
+  findRunMessage(runKey: RunKey): RunMessageRecord | null {
+    const row = this.db.prepare(SELECT_RUN_ROW).get(runKey) as RunMessageRow | undefined;
+    return row === undefined ? null : toRunMessageRecord(row);
+  }
+
+  insertRunMessage(input: NewRunMessage): void {
+    try {
+      this.db
+        .prepare(INSERT_RUN_ROW)
+        .run(
+          input.runKey,
+          input.channelId,
+          input.messageTs,
+          input.renderFingerprint,
+          input.at,
+          input.at,
+        );
+    } catch (e) {
+      // `insertPrMessage`와 같은 이유로 조용히 덮어쓰지 않는다. 덮어쓰면 앞서 게시한 Slack
+      // 루트를 잃어버린다.
+      const detail = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `${input.runKey}의 루트 메시지를 기록할 수 없다 ` +
+          `(channel ${input.channelId}, ts ${input.messageTs}): ${detail}`,
+        { cause: e },
+      );
+    }
+  }
+
+  updateRunObservation(runKey: RunKey, renderFingerprint: string, at: string): void {
+    const result = this.db.prepare(UPDATE_RUN_OBSERVATION).run(renderFingerprint, at, runKey);
+    if (Number(result.changes) === 0) {
+      // 갱신할 행이 없다는 것은 호출 순서가 깨졌다는 뜻이다. 새 행을 만들어 덮지 않는다.
+      throw new Error(`${runKey}의 매핑 행이 없어 관찰 결과를 갱신할 수 없다`);
+    }
+  }
+
+  listRunPullRequests(runKey: RunKey): readonly RunPullRequestRecord[] {
+    return (this.db.prepare(SELECT_RUN_PULL_REQUESTS).all(runKey) as RunPullRequestRow[])
+      .map(toRunPullRequestRecord)
+      .sort(byPullRequestNumber);
+  }
+
   close(): void {
     // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -498,7 +661,7 @@ type OpenedCopy = {
  * 복사본에는 쓴다. 원본이 옛 버전이면 `openCopy`가 복사본에만 migration을 건다. 원본은
  * 그대로이므로 "아무것도 쓰지 않는다"는 유지되고, dry-run은 실제 실행과 같은 컬럼을 읽는다.
  */
-export class ReadOnlyDigestStore implements DigestStore {
+export class ReadOnlyDigestStore implements DigestStore, RunStore {
   private readonly opened: OpenedCopy;
 
   constructor(private readonly path: string) {
@@ -551,6 +714,29 @@ export class ReadOnlyDigestStore implements DigestStore {
 
   recordThreadEvent(): void {
     throw new Error(`dry-run은 store에 쓰지 않는다. thread 전이를 기록하려 했다: ${this.path}`);
+  }
+
+  findRunMessage(runKey: RunKey): RunMessageRecord | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_RUN_ROW).get(runKey) as RunMessageRow | undefined;
+    return row === undefined ? null : toRunMessageRecord(row);
+  }
+
+  insertRunMessage(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Run 루트 매핑을 기록하려 했다: ${this.path}`);
+  }
+
+  updateRunObservation(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Run 관찰 결과를 갱신하려 했다: ${this.path}`);
+  }
+
+  listRunPullRequests(runKey: RunKey): readonly RunPullRequestRecord[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_RUN_PULL_REQUESTS).all(runKey) as RunPullRequestRow[])
+      .map(toRunPullRequestRecord)
+      .sort(byPullRequestNumber);
   }
 
   close(): void {

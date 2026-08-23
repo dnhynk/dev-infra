@@ -63,7 +63,7 @@ import type { PrTerminal, ReviewerResult } from '../digest/types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -185,6 +185,62 @@ CREATE TABLE pr_thread_event (
 )`;
 
 /**
+ * `run_message` 테이블 DDL. `PR_TASK_TABLE`과 같은 이유로 상수 하나로 묶는다.
+ *
+ * `pr_message`가 PR에 하는 일을 Run에 한다. Run 하나가 `#agent-runs`의 루트 메시지 하나에
+ * 매핑되고, 재관찰과 재시작이 그 매핑을 찾아 `chat.update`로 간다(로드맵 §7 출구 조건).
+ *
+ * **`pr_message`와 달리 요약 관련 컬럼이 없다.** Run 카드는 LLM을 부르지 않는 결정적
+ * renderer의 출력이므로(`run/render.ts`) 재사용할 요약도, 요약 입력의 지문도 없다. 없는
+ * 컬럼을 대칭을 위해 만들지 않는다.
+ *
+ * 보장하는 것.
+ *
+ * - Run당 매핑 행이 하나다 → `run_key`가 PRIMARY KEY다.
+ * - 두 Run이 한 Slack 메시지를 가리키지 않는다 → `RUN_MESSAGE_INDEX`가 강제한다.
+ * - 재시작 후 기존 메시지를 찾아 update할 수 있다 → channel/ts를 그 행에 함께 남긴다.
+ *
+ * 보장하지 않는 것.
+ *
+ * - **Slack 루트가 Run당 하나라는 것.** `pr_message`와 **같은 두 창**이 그대로 있다. 창 1은
+ *   crash다 — `chat.postMessage`가 성공한 뒤 `insertRunMessage` 전에 죽으면 매핑 행이 없으므로
+ *   다음 실행이 루트를 하나 더 만든다. 창 2는 delivery unknown이다 — 응답을 받지 못했거나
+ *   Slack이 부분 성공 가능성을 명시하는 오류(`internal_error`, `fatal_error`)를 준 경우
+ *   호출자에게는 실패로 보이지만 메시지는 이미 있을 수 있다(판정 기준은 `slack/post.ts`).
+ *   그 실행에는 매핑 행이 남지 않으므로 다음 관찰이 루트를 하나 더 만든다.
+ *
+ *   두 창을 D1에서 닫지 않는다. 스펙 §9가 crash 경계별 atomicity와 outbox를 TBD로 두었고 같은
+ *   성격의 미결정 항목이 OD-051이다. 여기서 outbox나 요청 idempotency key를 만들면 미결정
+ *   항목을 구현자가 조용히 닫는 것이 된다.
+ *
+ * - **한 Slack 메시지가 Run과 PR에 동시에 매핑되지 않는다는 것.** 두 unique index는 각자의
+ *   표 안에서만 유효하다. 실무에서는 두 카드가 다른 채널(`agentRuns`·`prDigest`)로 가므로
+ *   겹치지 않지만, 그것은 설정이 만드는 성질이지 스키마가 강제하는 성질이 아니다.
+ *
+ * D1 출구 조건 "재시작 뒤 같은 Run root를 재사용함"(로드맵 §7)이 검증하는 것은 하나다. 매핑
+ * 행이 남은 뒤의 재관찰이 `findRunMessage`로 기존 행을 찾아 `chat.update`로 간다는 것.
+ * 검증하지 않는 것은 위의 두 창이다.
+ */
+const RUN_MESSAGE_TABLE = `
+CREATE TABLE run_message (
+  -- identity/keys.ts의 RunKey. 형식은 run:<Orca run id>다.
+  -- Orca Run ID는 Run마다 새로 발급되므로 이 key가 다른 Run과 겹치지 않는다.
+  run_key            TEXT PRIMARY KEY,
+  -- chat.update는 channel과 ts를 함께 요구한다. 또한 대상 채널 설정이 바뀌었을 때
+  -- 예전 채널의 ts로 update를 시도하는 대신 불일치를 판정할 수 있다.
+  channel_id         TEXT NOT NULL,
+  message_ts         TEXT NOT NULL,
+  -- 마지막으로 게시한 카드의 지문. 같으면 chat.update를 호출하지 않는다.
+  render_fingerprint TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+)`;
+
+/** 두 Run이 같은 Slack 메시지를 가리키면 한 카드가 다른 카드를 덮어쓴다. */
+const RUN_MESSAGE_INDEX = `
+CREATE UNIQUE INDEX run_message_slack_identity ON run_message (channel_id, message_ts)`;
+
+/**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
  *
  * **비어 있는 파일에만 쓴다.** 이미 버전이 기록된 파일은 `MIGRATIONS`가 올린다. 그래서 이
@@ -231,6 +287,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS pr_message_slack_identity
 ${PR_TASK_TABLE};
 ${PR_STATE_TABLE};
 ${PR_THREAD_EVENT_TABLE};
+${RUN_MESSAGE_TABLE};
+${RUN_MESSAGE_INDEX};
 `;
 
 /**
@@ -266,6 +324,10 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // 뜻이고 그 PR의 첫 관측은 전이를 내지 않는다. 과거 상태를 GitHub history로 채우지 않는다 —
   // check는 400일 뒤 archive되고 다시 10일 뒤 삭제되어 완전 재생을 보장할 수 없다(OD-046).
   [PR_STATE_TABLE, PR_THREAD_EVENT_TABLE],
+  // v4 → v5: Run당 Slack 루트 매핑 표를 붙인다(로드맵 §7). 기존 행은 건드리지 않는다.
+  // 비어 있는 채로 시작하고 그것이 맞다. 행이 없다는 것은 "이 Run의 루트를 아직 만들지
+  // 않았다"는 뜻이고, 첫 관찰이 루트를 만들며 채운다. 과거에 게시한 Run 카드는 없다.
+  [RUN_MESSAGE_TABLE, RUN_MESSAGE_INDEX],
 ];
 
 /**
@@ -486,4 +548,104 @@ export interface DigestStore {
   recordThreadEvent(input: NewThreadEvent): void;
   /** WAL 파일을 정리하고 열린 handle을 남기지 않는다. */
   close(): void;
+}
+
+/**
+ * Run 카드 하나의 Slack message identity와 마지막 관찰이 남긴 값.
+ *
+ * 시각은 ISO8601 문자열이다. `PrMessageRecord`와 달리 요약 관련 값이 없다 — 근거는
+ * `RUN_MESSAGE_TABLE`에 있다.
+ */
+export type RunMessageRecord = {
+  readonly runKey: RunKey;
+  readonly channelId: string;
+  readonly messageTs: string;
+  readonly renderFingerprint: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+/** Run 루트 메시지를 처음 기록할 때 넘기는 값. */
+export type NewRunMessage = {
+  readonly runKey: RunKey;
+  readonly channelId: string;
+  readonly messageTs: string;
+  readonly renderFingerprint: string;
+  /** ISO8601. `created_at`과 `updated_at`에 같은 값을 쓴다. */
+  readonly at: string;
+};
+
+/**
+ * 이 Run에 연결된 PR 하나와 **직전 관측이 저장한** 그 PR의 상태.
+ *
+ * 재료는 둘 다 이미 store에 있다. 연결은 `pr_task.run_key`(OD-076)이고 상태는
+ * `pr_state`(OD-044)다. **GitHub을 새로 조회하지 않는다.**
+ *
+ * ## 이 목록의 경계 — 카드가 숨기지 않는다
+ *
+ * `pr_task`에는 `digest`가 관측하고 correlation에 성공한 PR만 있다. 그래서 이 Run이 만든
+ * PR이라도 아직 `digest`가 돌지 않았거나 correlation이 실패했으면 여기 없다. 목록이 비어
+ * 있다는 것은 "이 Run에 PR이 없다"가 아니라 **"store에 기록된 PR이 없다"**이고, 카드는 그
+ * 차이를 문구로 드러낸다(`run/render.ts`).
+ *
+ * `state`가 null인 경우도 사실이다. `pr_task` 행은 있는데 `pr_state` 행이 없다는 뜻이며,
+ * 연관은 관측했지만 그 PR의 상태를 아직 저장하지 않았다는 것이다. terminal을 `open`으로
+ * 추측해 채우지 않는다.
+ */
+export type RunPullRequestRecord = {
+  readonly prKey: PullRequestKey;
+  /** 표시용 PR 번호. `prKey`에서 되읽는다(`identity/keys.ts`). */
+  readonly number: number;
+  /** 이 Run의 Task가 이 PR을 처음/마지막으로 가리킨 시각. ISO8601이다. */
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+  /** `pr_state`에 저장된 직전 관측 상태. 행이 없으면 null이며 이는 정상 출력이다. */
+  readonly state: {
+    readonly terminal: PrTerminal;
+    readonly mergedAt: string | null;
+    readonly reviewVerdict: ReviewerResult['verdict'] | null;
+    readonly observedAt: string;
+  } | null;
+};
+
+/**
+ * Run 카드가 쓰는 durable store.
+ *
+ * `DigestStore`와 **따로 둔다.** 두 카드는 다른 slice가 다른 시점에 게시하고, 한쪽만 필요한
+ * 호출자(D1-C의 dry-run, digest의 `ReadOnlyDigestStore`)가 다른 쪽 계약까지 구현해야 하는
+ * 이유가 없다. `SqliteDigestStore`는 두 인터페이스를 함께 구현한다 — 파일이 하나이기 때문이지
+ * 계약이 하나여서가 아니다.
+ *
+ * 사용 순서와 crash 경계는 `pr_message`와 같다.
+ *
+ * ```text
+ * findRunMessage → null  → chat.postMessage → insertRunMessage
+ * findRunMessage → row   → 렌더 지문이 같으면 Slack을 부르지 않음
+ *                        → 다르면 chat.update → updateRunObservation
+ * ```
+ *
+ * `chat.postMessage` 성공과 `insertRunMessage` 사이에서 죽으면 다음 실행이 루트를 하나 더
+ * 만든다. 게시 결과를 모른 채 끝난 호출도 결과가 같다. 두 창의 설명은 `RUN_MESSAGE_TABLE`에
+ * 있고 D1은 두 창을 없앴다고 주장하지 않는다.
+ */
+export interface RunStore {
+  /** 기록된 Run 루트 메시지를 찾는다. 없으면 null이며 이는 정상 출력이다. */
+  findRunMessage(runKey: RunKey): RunMessageRecord | null;
+  /** 처음 기록한다. 이미 있으면 던진다. 중복 루트 생성을 조용히 덮어쓰지 않는다. */
+  insertRunMessage(input: NewRunMessage): void;
+  /**
+   * 렌더 지문과 `updated_at`만 갱신한다. row가 없으면 던진다. `at`은 ISO8601이다.
+   *
+   * message identity는 건드리지 않는다. 그것을 바꾸는 것은 루트를 옮기는 일이고 이 계약에
+   * 없다.
+   */
+  updateRunObservation(runKey: RunKey, renderFingerprint: string, at: string): void;
+  /**
+   * 이 Run에 연결된 PR과 저장된 상태. 없으면 빈 배열이며 이는 정상 출력이다.
+   *
+   * 한 PR을 여러 Task가 이어서 갱신해도 PR당 한 원소다(OD-076의 (PR, Task) N행을 PR로 접는다).
+   * 순서는 PR 번호 오름차순, 같으면 `prKey` 사전순으로 고정한다. 정렬을 지정하지 않으면 같은
+   * 파일이 실행마다 다른 순서를 내고 그때마다 렌더 지문이 달라져 `chat.update`가 발생한다.
+   */
+  listRunPullRequests(runKey: RunKey): readonly RunPullRequestRecord[];
 }
