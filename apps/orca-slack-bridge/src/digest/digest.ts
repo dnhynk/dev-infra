@@ -121,8 +121,8 @@ export type PrTransitionOutcome =
   /**
    * 게시하지 않았다. 기록도 하지 않았으므로 다음 관측에서 다시 후보가 된다.
    *
-   * dry-run이거나 thread 게시 경계가 아직 없을 때다. 기록만 하고 게시를 건너뛰면 그 전이가
-   * 영영 사라지므로 그렇게 하지 않는다.
+   * dry-run이거나, 매달 루트를 확정할 수 없거나(channel 불일치), 게시 경계를 받지 못했을 때다.
+   * 기록만 하고 게시를 건너뛰면 그 전이가 영영 사라지므로 그렇게 하지 않는다.
    */
   | 'unposted';
 
@@ -192,9 +192,9 @@ export type DigestOptions = {
   /**
    * PR thread write 경계. **null이면 전이를 게시하지 않는다.**
    *
-   * `slack`과 따로 받는다. 실제 thread 게시는 C2-4가 붙이고, 그때까지 전이 판정과 dedupe는
-   * 실행 경로에 그대로 있어야 한다. null이어도 후보를 버리지 않고 `unposted`로 남기므로,
-   * 아직 참인 전이는 게시 경계가 붙는 순간 나간다(`digest/transition.ts`).
+   * `slack`과 따로 받는다. 루트는 알아도 어느 thread에 매달지 확정할 수 없는 관측이 있기
+   * 때문이다. null이어도 후보를 버리지 않고 `unposted`로 남기므로, 아직 참인 전이는 다음
+   * 관측에서 다시 후보가 된다(`digest/transition.ts`).
    */
   readonly thread: ThreadPoster | null;
   readonly provider: SummaryProvider;

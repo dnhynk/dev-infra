@@ -9,6 +9,7 @@ import { GhCommandError, type GhRunner } from '../src/github/runner.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import type { BridgeConfig } from '../src/project/config.js';
 import { DEFAULT_CORRELATION_KEYS } from '../src/project/config.js';
+import { SlackWebApiPoster } from '../src/slack/post.js';
 import type {
   PostMessageInput,
   PostedMessage,
@@ -262,7 +263,7 @@ class FakeSlack implements SlackPoster {
   }
 }
 
-/** thread write 경계 대역. 실제 게시는 C2-4이므로 이 대역이 C2-3의 유일한 thread 경로다. */
+/** thread write 경계 대역. 실제 Slack을 부르지 않고 `digest`의 게시 순서만 본다. */
 class FakeThread implements ThreadPoster {
   readonly replies: ThreadReplyInput[] = [];
   private seq = 0;
@@ -975,6 +976,55 @@ describe('runDigest 전이', () => {
     ]);
     expect(thread.replies).toHaveLength(1);
     expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000001.000001']);
+  });
+
+  /**
+   * 같은 계약을 **프로덕션 구현**으로 다시 본다.
+   *
+   * 위 두 테스트의 대역은 `ThreadPoster`를 손으로 구현한 것이라, 실제 게시 경계가 실패를
+   * 삼키거나 재시도하면 그대로 지나간다. 여기서는 `SlackWebApiPoster`를 `thread`로 넣고
+   * Slack 응답만 대역으로 둔다. 실제 Slack은 부르지 않는다.
+   */
+  it('실제 poster로도 실패한 게시는 행을 남기지 않고 재시도하지 않는다', async () => {
+    const calls: string[] = [];
+    const fetchWith = (body: unknown): typeof fetch =>
+      async (_url, init) => {
+        calls.push(String((init ?? {}).body));
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+    const posterWith = (body: unknown): SlackWebApiPoster =>
+      new SlackWebApiPoster({
+        token: ['xoxb', 'FAKE', 'NOTAREALBOTTOKENVALUE'].join('-'),
+        fetchImpl: fetchWith(body),
+        sleep: async () => {},
+      });
+
+    await digestOnce({ verdict: null, prs: [prRow(OPEN_ROW)] });
+
+    // 게시 여부를 알 수 없는 실패다. 재시도하면 thread에 같은 전이가 두 번 남는다.
+    await expect(
+      digestOnce({
+        thread: posterWith({ ok: false, error: 'internal_error' }),
+        verdict: 'approve',
+        prs: [prRow(OPEN_ROW)],
+      }),
+    ).rejects.toThrow('internal_error');
+    expect(calls).toHaveLength(1);
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const ok = posterWith({ ok: true, channel: CHANNEL, ts: '1700000002.000002' });
+    const recovered = await digestOnce({ thread: ok, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+
+    expect(card(recovered).transitions.map((t) => [t.kind, t.outcome])).toEqual([
+      ['review_approved', 'posted'],
+    ]);
+    // 저장된 루트의 ts가 실제 요청의 thread_ts로 실렸다. 이 값이 빠지면 루트가 하나 더 생긴다.
+    expect(JSON.parse(calls[1]!)['thread_ts']).toBe(readPrMessage(PR_KEY)?.messageTs);
+    // ledger는 Slack이 준 ts를 그대로 기록한다.
+    expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000002.000002']);
   });
 });
 

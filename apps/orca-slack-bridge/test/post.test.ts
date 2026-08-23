@@ -46,6 +46,12 @@ function poster(fake: FakeFetch, maxRetries = 3): SlackWebApiPoster {
 }
 
 const postInput = { channel: 'C1', text: '대체 텍스트', blocks: BLOCKS };
+const replyInput = {
+  channel: 'C1',
+  threadTs: '1700000000.000100',
+  text: '전이 대체 텍스트',
+  blocks: BLOCKS,
+};
 const updateInput = { channel: 'C1', ts: '1.1', text: '대체 텍스트', blocks: BLOCKS };
 
 describe('SlackWebApiPoster', () => {
@@ -295,6 +301,93 @@ describe('SlackWebApiPoster · post와 update의 재시도 비대칭', () => {
       await expect(poster(fake).post(postInput)).rejects.toThrow(code);
       expect(fake.calls).toHaveLength(1);
     }
+  });
+});
+
+/**
+ * thread reply.
+ *
+ * `chat.postMessage`이고 같은 요청임을 Slack이 알아볼 identity가 없다. 그래서 재시도 규율이
+ * `post`와 같아야 한다 — 게시 여부를 알 수 없는 실패를 재시도하면 thread에 같은 전이가 두 번
+ * 남고 되돌릴 수 없다. 아래 단언은 `update`가 아니라 `post`와 대조한다.
+ */
+describe('SlackWebApiPoster.reply', () => {
+  it('chat.postMessage를 호출하고 thread_ts를 함께 보낸다', async () => {
+    const fake = new FakeFetch([{ body: { ok: true, channel: 'C9', ts: '1700000009.000009' } }]);
+    const result = await poster(fake).reply(replyInput);
+    // 응답의 channel/ts를 그대로 PostedMessage로 만든다. store가 이 값을 기록한다.
+    expect(result).toEqual({ channel: 'C9', ts: '1700000009.000009' });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]!.url).toBe('https://slack.com/api/chat.postMessage');
+    expect(JSON.parse(String(fake.calls[0]!.init.body))).toEqual({
+      channel: 'C1',
+      // 이 필드가 빠지면 thread reply가 아니라 루트가 하나 더 생긴다.
+      thread_ts: '1700000000.000100',
+      text: '전이 대체 텍스트',
+      blocks: BLOCKS,
+    });
+  });
+
+  it('ok:false를 성공으로 처리하지 않고 error 코드를 그대로 올린다', async () => {
+    const fake = new FakeFetch([{ body: { ok: false, error: 'message_not_found' } }]);
+    const err = (await poster(fake)
+      .reply(replyInput)
+      .catch((e: unknown) => e)) as SlackApiError;
+    expect(err).toBeInstanceOf(SlackApiError);
+    // 루트가 지워져 다시 연결해야 하는 경우를 호출자가 구분할 수 있어야 한다(UX §6).
+    expect(err.code).toBe('message_not_found');
+    expect(err.method).toBe('chat.postMessage');
+  });
+
+  it('ok:true인데 channel/ts가 없으면 빈 값으로 진행하지 않는다', async () => {
+    const fake = new FakeFetch([{ body: { ok: true, channel: 'C1' } }]);
+    await expect(poster(fake).reply(replyInput)).rejects.toThrow('channel/ts가 없다');
+  });
+
+  it('게시 여부를 알 수 없는 실패를 재시도하지 않는다', async () => {
+    const ok = { body: { ok: true, channel: 'C1', ts: '9.9' } } as const;
+    const cases = [
+      // 응답을 아예 받지 못했다.
+      new Error('socket hang up'),
+      // Slack 문서가 "some aspect of the operation succeeded" 가능성을 적는 코드들.
+      { body: { ok: false, error: 'internal_error' } },
+      { body: { ok: false, error: 'fatal_error' } },
+      { status: 503, body: {} },
+    ];
+    for (const first of cases) {
+      // 뒤에 성공 응답을 둔다. 재시도했다면 성공으로 끝나 실패를 놓치지 않는다.
+      const forReply = new FakeFetch([first, ok]);
+      await expect(poster(forReply).reply(replyInput)).rejects.toThrow();
+      expect(forReply.calls).toHaveLength(1);
+
+      // `post`와 같은 판정인지 대조한다. 갈라지면 여기서 드러난다.
+      const forPost = new FakeFetch([first, ok]);
+      await expect(poster(forPost).post(postInput)).rejects.toThrow();
+      expect(forPost.calls).toHaveLength(1);
+    }
+  });
+
+  it('처리되지 않았음이 확실한 rate limit만 재시도한다', async () => {
+    const fake = new FakeFetch([
+      { body: { ok: false, error: 'ratelimited' }, headers: { 'retry-after': '1' } },
+      { body: { ok: true, channel: 'C1', ts: '4.4' } },
+    ]);
+    await expect(poster(fake).reply(replyInput)).resolves.toEqual({ channel: 'C1', ts: '4.4' });
+    expect(fake.calls).toHaveLength(2);
+    // 재시도한 요청에도 thread_ts가 그대로 실린다.
+    expect(JSON.parse(String(fake.calls[1]!.init.body))['thread_ts']).toBe('1700000000.000100');
+  });
+
+  it('토큰이 오류에 실리지 않는다', async () => {
+    const fake = new FakeFetch([
+      new Error(`connect ECONNREFUSED authorization=Bearer ${TOKEN}`),
+    ]);
+    const err = (await poster(fake, 0)
+      .reply(replyInput)
+      .catch((e: unknown) => e)) as Error;
+    expect(`${err.message}
+${err.stack ?? ''}`).not.toContain(TOKEN);
+    expect(err.message).toContain(maskToken(TOKEN));
   });
 });
 
