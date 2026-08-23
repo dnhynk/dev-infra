@@ -57,6 +57,7 @@
 | OD-075 | `task.result`가 덮어쓴 `worker_report`의 durable 조회·pagination 계약 | C2 전 | DECIDED |
 | OD-076 | PR 1 : Task N correlation metadata와 cardinality | AB-1/C2 전 | DECIDED |
 | OD-077 | run만 있고 task가 없는 PR의 correlation kind와 처리 정책 | S0/C2 전 | DECIDED |
+| OD-079 | Orca row 파싱·shape 실패의 봉쇄 범위와 노출 형태 | C2 전 | DECIDED |
 
 ## PR state와 요약
 
@@ -1402,4 +1403,53 @@ ID: OD-020
            이 Run에서 worktree id를 `<uuid>::<path>` 형식으로 반복 사용해 모두 동작했지만 형식 계약의
            보장은 관측하지 못했다. 이 형식의 안정성은 남은 위험이며 관측을 보장으로 격상하지 않는다.
 결정일: 2026-08-23
+```
+
+```text
+ID: OD-079
+상태: DECIDED
+결정: 엄격 parser는 파싱·shape 실패에 계속 던진다. `parseJsonField`도, `reviewer_result` v1 shape 검사도,
+      `worker_done` payload의 outcome 검사도 그대로다. **호출부가 그 실패를 row 하나에 가두고** 읽지
+      못했다는 사실을 `Read<T>`의 `unreadable`로 남긴다. 봉쇄 대상은 다섯 칸이다 — task의 `deps`와
+      `result`, 그 `result`를 reviewer_result로 읽는 shape 검사, gate의 `options`, `worker_done`의
+      `payload`. digest 보고는 그 사실을 runId·row 종류·row id·칸 이름·이유와 함께 관찰 단위 `degraded`
+      목록으로 낸다. gate와 message는 taskId로 자리를 특정할 수 없으므로 gate id·message id가 그 자리다.
+      degraded 수집 범위는 **이번 관찰이 읽은 row 전부**다. `pickReviewerResult`는 correlated Run의 task만
+      판정하지만, `kind`가 `reviewer_result`인 row가 v1 shape를 어기는 것은 어느 Run에 있든 관측된 사실이다.
+      판정 범위에 맞춰 수집을 좁히면 사실을 세는 곳이 판정 경로와 수집 경로 둘로 갈라진다.
+근거:
+  - `origin/main` 9b9decbb을 빌드해 `node apps/orca-slack-bridge/dist/cli.js digest --pr 25 --dry-run`을
+    실행하면 stdout 0바이트, stderr `JSON 필드를 파싱할 수 없다: {kind:reviewer_result,schemaVersion:1,...`,
+    exit 1이었다. 카드도 리포트도 나오지 않았다.
+  - 같은 시점 로컬 Orca DB의 Run 16개를 전수 조사한 결과 깨진 `result` row는 하나였다. `run_59bccb319e7f`의
+    `task_5694362d24f8`이며 `result`에 따옴표 없는 JSON이 들어 있었다. 이전 세션 probe가 남긴 값으로
+    관측 대상 Run과 무관하다.
+  - `run-list`에도 `inbox`에도 필터가 없어 관측 1회가 이 호스트의 모든 Run과 그 Run들의 메시지를 훑는다.
+    그래서 무관한 Run의 row 하나가 관측 전체를 중단시킨다.
+  - 나머지 네 칸도 같은 성질이다. fake runner로 각 칸에 malformed row 하나를 넣으면 `listTasks`(`deps`),
+    `listGates`(`options`), `listWorkerDone`(`payload`), `pickReviewerResult`(reviewer_result shape)가
+    모두 던졌다. `pickReviewerResult`는 correlated Run의 task만 보지만, 던지면 그 PR뿐 아니라 설정의
+    모든 repository의 모든 카드가 사라진다.
+  - OD-072가 정한 것은 degraded를 성공처럼 숨기지 않는 것이지 degraded를 만나면 관측을 멈추는 것이 아니다.
+    docs/contracts/observation-and-correlation.md §6·§7도 degraded를 표시하라고 하지 중단하라고 하지 않는다.
+대안과 기각 이유:
+  - fallback으로 덮기: 파싱 실패를 null이나 빈 배열로 접으면 "값이 없다"와 "읽지 못했다"가 같은 값이 되어
+    데이터 손실을 숨기므로 기각. `orca/coerce.ts` 주석이 적은 근거 그대로이고 그 계약은 유지한다.
+  - 엄격 parser를 관대하게 바꾸기: malformed한 reviewer_result의 verdict가 카드에 그려지고 계약 밖 outcome이
+    `succeeded`로 접힌다. 계약("실패는 던진다")과 범위("어디까지 죽는가")는 다른 것이고 여기서 좁히는 것은
+    범위뿐이다. 기각.
+  - 그대로 중단: 무관한 row 하나가 나머지 관측을 전부 없애므로 기각. 위 재현이 그 결과다.
+  - `result` 한 칸만 가두기: 나머지 네 칸이 같은 목록·같은 관측 1회에서 오므로 다음 malformed row가 다시
+    관측 전체를 없앤다. 기각.
+  - 칸마다 다른 degraded 표현 만들기: 보고와 소비자가 칸마다 갈라져 하나를 빠뜨린다. `Read<T>`와
+    `UnreadableField` 한 모양을 다섯 칸이 함께 쓴다. 기각.
+  - catch를 row 읽기 전체로 넓히기: `parseOrcaTimestamp` 실패나 CLI 호출 실패까지 삼키면 진짜 장애가
+    degraded 한 줄로 축소된다. 감싸는 것은 파싱·shape 검사 호출뿐이다. 기각.
+영향 문서/파일: apps/orca-slack-bridge/src/orca/client.ts, apps/orca-slack-bridge/src/digest/project.ts,
+                apps/orca-slack-bridge/src/digest/digest.ts, apps/orca-slack-bridge/src/snapshot/snapshot.ts,
+                docs/decision-log.md
+검증 방법: 칸마다 "깨진 row 1건 + 정상 row N건" fixture에서 정상 row는 그대로 관측되고 깨진 칸만 degraded로
+           나오는지 확인한다. 엄격 parser가 같은 값에 여전히 던지는지도 함께 고정한다. 실제 CLI 재실행이
+           exit 0으로 바뀌고 보고와 `--json`에 runId·row id·칸 이름·이유가 나오는지 확인한다.
+결정일: 2026-08-24
 ```

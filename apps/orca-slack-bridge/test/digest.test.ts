@@ -38,6 +38,29 @@ const REPO = 'o/r';
 const REPO_ID = 4242;
 const HEAD = 'a'.repeat(40);
 const CHANNEL = 'C_TEST_CHANNEL';
+/** 이 PR과 무관한 Run. 관측 1회가 모든 Run을 훑기 때문에 같은 목록에 섞여 온다(OD-079). */
+const FOREIGN_RUN = 'run_59bccb319e7f';
+const FOREIGN_TASK = 'task_5694362d24f8';
+/**
+ * 실측된 깨진 `result`. 따옴표가 없어 JSON으로 읽히지 않는다.
+ *
+ * `orca orchestration task-list --run run_59bccb319e7f --json`(2026-08-24)의
+ * `task_5694362d24f8` `result`를 그대로 옮겼다. 이전 세션의 throwaway probe가 남긴 값이고
+ * 이 Run과 아무 관계가 없다.
+ */
+const BROKEN_RESULT =
+  '{kind:reviewer_result,schemaVersion:1,verdict:approve,pr:{repo:THROWAWAY/none,number:10},' +
+  'reviewedHeadSha:deadbeef,findings:[],gates:{evidence_discipline:pass},note:two words}';
+/**
+ * 나머지 세 칸의 깨진 row. `foreign`이 만드는 깨진 `result`와 같은 Run에 얹는다(OD-079).
+ *
+ * `run-list`에도 `inbox`에도 필터가 없으므로 관측 1회가 이 넷을 한 번에 만난다. 한 칸만
+ * 가두면 나머지가 그대로 관측을 중단시킨다.
+ */
+const FOREIGN_DEPS_TASK = 'task_baddeps001';
+const FOREIGN_SHAPE_TASK = 'task_badshape01';
+const FOREIGN_GATE = 'gate_badoptions1';
+const BROKEN_MESSAGE = 'msg_badpayload1';
 
 let dir: string;
 let dbPath: string;
@@ -54,8 +77,19 @@ afterEach(() => {
 /** 실측 형태를 그대로 흉내낸 합성 fixture (DL-023). */
 class FakeOrca implements OrcaRunner {
   readonly calls: string[][] = [];
-  /** null이면 reviewer task 자체가 없다. 리뷰 전 상태를 만든다. */
-  constructor(private readonly verdict: 'approve' | 'request_changes' | null = 'approve') {}
+  constructor(
+    /** null이면 reviewer task 자체가 없다. 리뷰 전 상태를 만든다. */
+    private readonly verdict: 'approve' | 'request_changes' | null = 'approve',
+    /** 참이면 깨진 result를 가진 무관한 Run 하나를 관측에 섞는다(OD-079). */
+    private readonly foreign = false,
+    /**
+     * 참이면 나머지 세 칸(`deps`·reviewer_result shape·`options`)과 깨진 `payload`도 섞는다.
+     *
+     * `foreign`과 따로 둔다. 깨진 `result` 한 칸만 있는 관측과 네 칸이 모두 깨진 관측이 서로
+     * 다른 사실이고, 둘을 한 플래그로 묶으면 어느 쪽이 고정됐는지 알 수 없다.
+     */
+    private readonly brokenFields = false,
+  ) {}
   async run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
     const wrap = (result: unknown): string => JSON.stringify({ id: 'x', ok: true, result });
@@ -71,6 +105,72 @@ class FakeOrca implements OrcaRunner {
             created_at: '2026-08-22T00:00:00Z',
             updated_at: '2026-08-22T00:00:00Z',
           },
+          ...(this.foreign
+            ? [
+                {
+                  id: FOREIGN_RUN,
+                  objective: 'THROWAWAY PR10 reviewer probe',
+                  coordinator_handle: 'term_1235a5d1',
+                  coordinator_pane_key: 'e119e82a:ed65e315',
+                  legacy: 0,
+                  created_at: '2026-08-23T04:50:00Z',
+                  updated_at: '2026-08-23T04:52:36Z',
+                },
+              ]
+            : []),
+        ],
+      });
+    }
+    if (args[1] === 'task-list' && args[3] === FOREIGN_RUN) {
+      return wrap({
+        tasks: [
+          {
+            id: FOREIGN_TASK,
+            run_id: FOREIGN_RUN,
+            task_title: 'THROWAWAY PR10 reviewer probe',
+            display_name: 'THROWAWAY PR10 reviewer probe',
+            status: 'completed',
+            deps: '[]',
+            result: BROKEN_RESULT,
+            created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+            created_at: '2026-08-23 04:50:32',
+            completed_at: '2026-08-23T04:52:36.700Z',
+          },
+          ...(this.brokenFields
+            ? [
+                {
+                  id: FOREIGN_DEPS_TASK,
+                  run_id: FOREIGN_RUN,
+                  task_title: 'deps가 깨진 probe',
+                  display_name: 'deps가 깨진 probe',
+                  status: 'completed',
+                  deps: '[task_1,task_2]',
+                  result: '{"provenance":"worker_report"}',
+                  created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+                  created_at: '2026-08-23 04:50:33',
+                  completed_at: '2026-08-23T04:52:37.700Z',
+                },
+                {
+                  id: FOREIGN_SHAPE_TASK,
+                  run_id: FOREIGN_RUN,
+                  task_title: 'shape가 깨진 probe',
+                  display_name: 'shape가 깨진 probe',
+                  status: 'completed',
+                  deps: '[]',
+                  // JSON으로는 읽히지만 OD-073 v1 shape가 아니다.
+                  result: JSON.stringify({
+                    kind: 'reviewer_result',
+                    schemaVersion: 1,
+                    verdict: 'lgtm',
+                    pr: { repo: REPO, number: 7 },
+                    findings: [],
+                  }),
+                  created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+                  created_at: '2026-08-23 04:50:34',
+                  completed_at: '2026-08-23T04:52:38.700Z',
+                },
+              ]
+            : []),
         ],
       });
     }
@@ -129,6 +229,34 @@ class FakeOrca implements OrcaRunner {
         ],
       });
     }
+    if (args[1] === 'gate-list' && args[3] === FOREIGN_RUN && this.brokenFields) {
+      return wrap({
+        gates: [
+          {
+            id: FOREIGN_GATE,
+            run_id: FOREIGN_RUN,
+            task_id: FOREIGN_TASK,
+            question: '어느 쪽으로 갈까',
+            options: '[A,B]',
+            status: 'pending',
+            resolution: null,
+            created_at: '2026-08-23 04:51:00',
+            resolved_at: null,
+          },
+          {
+            id: 'gate_ok0000001',
+            run_id: FOREIGN_RUN,
+            task_id: FOREIGN_TASK,
+            question: '정상 gate',
+            options: '["A","B"]',
+            status: 'resolved',
+            resolution: 'A',
+            created_at: '2026-08-23 04:51:01',
+            resolved_at: '2026-08-23 04:52:00',
+          },
+        ],
+      });
+    }
     if (args[1] === 'gate-list') return wrap({ gates: [] });
     if (args[1] === 'inbox') {
       return wrap({
@@ -142,6 +270,19 @@ class FakeOrca implements OrcaRunner {
             payload: JSON.stringify({ taskId: TASK, dispatchId: 'ctx_1', outcome: 'succeeded' }),
             created_at: '2026-08-22 01:00:00',
           },
+          ...(this.brokenFields
+            ? [
+                {
+                  id: BROKEN_MESSAGE,
+                  run_id: FOREIGN_RUN,
+                  type: 'worker_done',
+                  subject: '완료',
+                  body: '했다. 봤다. 남았다.',
+                  payload: '{taskId:task_1,outcome:succeeded}',
+                  created_at: '2026-08-23 04:52:00',
+                },
+              ]
+            : []),
         ],
       });
     }
@@ -320,6 +461,10 @@ type Once = {
   readonly thread?: ThreadPoster | null;
   /** reviewer verdict. null이면 reviewer task 자체가 없어 리뷰 전 상태가 된다. */
   readonly verdict?: 'approve' | 'request_changes' | null;
+  /** 참이면 깨진 result를 가진 무관한 Run 하나가 관측에 섞인다(OD-079). */
+  readonly foreign?: boolean;
+  /** 참이면 `deps`·reviewer_result shape·`options`·`payload`의 깨진 row도 함께 섞인다(OD-079). */
+  readonly brokenFields?: boolean;
   readonly gh?: GhOver;
 };
 
@@ -328,7 +473,11 @@ async function digestOnce(opts: Once = {}): Promise<DigestReport> {
   const store = new SqliteDigestStore(dbPath);
   try {
     return await runDigest(
-      new FakeOrca(opts.verdict === undefined ? 'approve' : opts.verdict),
+      new FakeOrca(
+        opts.verdict === undefined ? 'approve' : opts.verdict,
+        opts.foreign ?? false,
+        opts.brokenFields ?? false,
+      ),
       new FakeGh(opts.prs ?? [prRow()], opts.buildConclusion, opts.gh),
       {
         config: CONFIG,
@@ -1152,5 +1301,95 @@ describe('runDigest 전이 경계', () => {
     expect(card(mismatched).transitions.map((t) => t.outcome)).toEqual(['unposted']);
     // 관측한 사실 자체는 남는다(`recordPrTask`와 같은 근거).
     expect(readPrState(PR_KEY)?.reviewVerdict).toBe('approve');
+  });
+});
+
+/**
+ * 깨진 row 하나가 관측 전체를 죽이지 않는다(OD-079).
+ *
+ * 실제로 재현된 실패다. `origin/main` 9b9decbb에서 `digest --pr 25 --dry-run`이 stdout 0바이트에
+ * exit 1로 끝났고, 원인은 이 Run과 무관한 `run_59bccb319e7f`의 row 하나였다.
+ *
+ * 봉쇄 대상은 네 호출부다. 여기서는 관찰 1회가 넷을 모두 만났을 때 보고가 넷을 다 싣는지 본다.
+ * 칸마다의 봉쇄 자체는 `project.test.ts`의 '깨진 task result 봉쇄'가 고정한다.
+ */
+describe('runDigest 깨진 task result 봉쇄', () => {
+  it('무관한 Run의 깨진 row가 있어도 나머지는 그대로 관측된다', async () => {
+    const withBroken = await digestOnce({ foreign: true });
+    const clean = await digestOnce({ slack: null });
+
+    // 카드는 깨진 row가 없을 때와 같다. 봉쇄가 정상 경로를 바꾸지 않는다.
+    expect(card(withBroken).card).toEqual(card(clean).card);
+    expect(card(withBroken).fingerprint).toBe(card(clean).fingerprint);
+  });
+
+  it('어느 Run의 어느 task가 왜 실패했는지 사실로 남긴다', async () => {
+    const report = await digestOnce({ foreign: true });
+    expect(report.degraded).toHaveLength(1);
+    expect(report.degraded[0]).toMatchObject({
+      runId: FOREIGN_RUN,
+      subject: 'task',
+      id: FOREIGN_TASK,
+      field: 'result',
+    });
+    // 이유는 `parseJsonField`가 만든 메시지 그대로다. 읽지 못한 값이 그 안에 남는다.
+    expect(report.degraded[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+    expect(report.degraded[0]?.reason).toContain('{kind:reviewer_result');
+  });
+
+  it('깨진 row가 없으면 degraded도 비어 있다', async () => {
+    expect((await digestOnce({})).degraded).toEqual([]);
+  });
+
+  it('사람이 읽는 보고가 그 사실을 숨기지 않는다', async () => {
+    const text = formatReport(await digestOnce({ foreign: true }));
+    expect(text).toContain(`${FOREIGN_RUN} / ${FOREIGN_TASK}`);
+    expect(text).toContain('읽지 못한 칸 1건');
+    // 깨진 row가 있어도 카드는 그대로 나온다.
+    expect(text).toContain('카드 1건');
+  });
+
+  /**
+   * 네 호출부가 한 관찰에 모두 걸린 경우.
+   *
+   * `run-list`에도 `inbox`에도 필터가 없으므로 이것이 실제로 일어나는 모양이다. 한 칸만 가두면
+   * 나머지가 그대로 관측을 중단시킨다.
+   */
+  it('네 칸의 깨진 row가 모두 있어도 관측은 끝까지 간다', async () => {
+    const withBroken = await digestOnce({ foreign: true, brokenFields: true });
+    const clean = await digestOnce({ slack: null });
+    // 카드는 깨진 row가 없을 때와 같다. 봉쇄가 정상 경로를 바꾸지 않는다.
+    expect(card(withBroken).card).toEqual(card(clean).card);
+    expect(card(withBroken).fingerprint).toBe(card(clean).fingerprint);
+  });
+
+  it('읽지 못한 네 칸을 한 목록에 runId·row id·칸 이름과 함께 싣는다', async () => {
+    const report = await digestOnce({ foreign: true, brokenFields: true });
+    expect(
+      report.degraded.map((d) => [d.runId, d.subject, d.id, d.field]),
+    ).toEqual([
+      [FOREIGN_RUN, 'task', FOREIGN_TASK, 'result'],
+      [FOREIGN_RUN, 'task', FOREIGN_DEPS_TASK, 'deps'],
+      [FOREIGN_RUN, 'task', FOREIGN_SHAPE_TASK, 'result.reviewer_result'],
+      [FOREIGN_RUN, 'gate', FOREIGN_GATE, 'options'],
+      [FOREIGN_RUN, 'worker_done', BROKEN_MESSAGE, 'payload'],
+    ]);
+    // 이유는 각 엄격 parser가 만든 메시지 그대로다.
+    const reason = (id: string): string =>
+      report.degraded.find((d) => d.id === id)?.reason ?? '';
+    expect(reason(FOREIGN_DEPS_TASK)).toContain('[task_1,task_2]');
+    expect(reason(FOREIGN_SHAPE_TASK)).toContain('verdict가 approve/request_changes가 아니다');
+    expect(reason(FOREIGN_GATE)).toContain('[A,B]');
+    expect(reason(BROKEN_MESSAGE)).toContain('{taskId:task_1,outcome:succeeded}');
+  });
+
+  it('사람이 읽는 보고가 네 칸을 모두 드러낸다', async () => {
+    const text = formatReport(await digestOnce({ foreign: true, brokenFields: true }));
+    expect(text).toContain(`${FOREIGN_RUN} / ${FOREIGN_DEPS_TASK} · task.deps`);
+    expect(text).toContain(`${FOREIGN_RUN} / ${FOREIGN_SHAPE_TASK} · task.result.reviewer_result`);
+    expect(text).toContain(`${FOREIGN_RUN} / ${FOREIGN_GATE} · gate.options`);
+    expect(text).toContain(`${FOREIGN_RUN} / ${BROKEN_MESSAGE} · worker_done.payload`);
+    expect(text).toContain('읽지 못한 칸 5건');
+    expect(text).toContain('카드 1건');
   });
 });

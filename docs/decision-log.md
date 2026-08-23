@@ -405,3 +405,27 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 근거는 새로 만들지 않았다. `src/github/required-checks.ts`의 `RequiredCheckState` 주석과
   `src/github/branch-rules.ts`의 `RuleSourceStatus` 주석에 실측과 함께 있고 그 코드는 merge됐다.
 - 상세 계약은 [관찰·상관관계 계약](contracts/observation-and-correlation.md) §6에 있다.
+
+## 2026-08-24 · 깨진 row 봉쇄
+
+### DL-053 · 파싱·shape 실패는 계속 던지고 호출부가 row 단위로 가둔다
+
+- 엄격 parser의 throw는 유효하다. 파싱 실패를 fallback으로 덮으면 데이터 손실을 조용히 넘기고,
+  shape 실패를 관대하게 읽으면 malformed한 값이 카드에 그려진다. 이 결정은 그 선택을 뒤집지 않고
+  **실패의 범위만 좁힌다**(OD-079).
+- 두 가지를 구분한다. **계약**은 "파싱·shape 실패는 던진다"이고 **범위**는 "row 하나"다. 계약을
+  관대하게 바꾸는 것과 범위를 좁히는 것은 같은 일이 아니다.
+- 좁히는 지점은 다섯 칸이다. task의 `deps`와 `result`, 그 `result`를 reviewer_result로 읽는 shape
+  검사(`readReviewerResult`), gate의 `options`, `worker_done`의 `payload`다. 다섯이 `Read<T>` 한
+  합타입을 쓰므로 소비자는 "읽지 못했다"를 "값이 없다"로 접을 수 없다.
+- 좁히는 것은 **파싱·shape 검사 호출뿐**이다. `parseOrcaTimestamp`도 CLI 호출도 감싸지 않는다. 감싸는
+  범위를 넓히면 진짜 장애가 degraded 한 줄로 축소된다.
+- 읽지 못한 것을 없는 것으로 세지 않는다. `digest` 보고와 `--json`이 `degraded`에 runId·row 종류·row
+  id·칸 이름·이유를 싣고, `snapshot` 요약은 Run 줄에 `unreadable=<row id>.<칸>`을 붙인다. gate와
+  message는 taskId로 자리를 특정할 수 없어 gate id·message id가 그 자리다.
+- 카드는 이 사실을 싣지 않는다. degraded를 카드에 항상 표시하는 것은 D1/D2 규칙이고(OD-072),
+  C1 카드가 표시하는 degraded는 요약 실패·입력 절단·worker 보고 없음 셋이다. 그래서 같은 관찰에
+  읽지 못한 칸이 있는 카드에서 "리뷰 결과 없음"은 **"reviewer_result를 관측하지 못했다"까지만**,
+  "worker 보고 없음"은 **"읽은 메시지에는 없었다"까지만** 뜻한다. 그 이상을 뜻하게 하려면
+  `ProjectedPr`에 사실을 하나 더 실어야 하고 그것은 이 결정의 범위가 아니다.
+- 재현 근거는 [미결정 사항](open-decisions.md)의 OD-079에 있다. 여기서 다시 적지 않는다.

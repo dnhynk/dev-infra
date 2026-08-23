@@ -10,10 +10,15 @@ import { deriveDigestStatus, deriveTerminal } from '../src/digest/state.js';
 import type { ProjectedPr } from '../src/digest/types.js';
 import {
   INBOX_LIMIT,
+  listGates,
   listWorkerDone,
   listTasks,
   parseReviewerResult,
+  unreadableGateFields,
+  unreadableTaskFields,
   type OrcaRunner,
+  type OrcaTask,
+  type TaskResult,
   type WorkerDoneInbox,
   type WorkerDoneMessage,
 } from '../src/orca/client.js';
@@ -33,6 +38,24 @@ const CONFIG: BridgeConfig = {
   projects: [{ name: 'dev-infra', repositories: ['dnhynk/dev-infra'] }],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
+
+/**
+ * fixture의 읽은 result를 값으로 꺼낸다.
+ *
+ * `OrcaTask.result`가 합타입이므로 테스트도 그대로 다룬다. 읽지 못한 fixture를 값처럼 쓰면
+ * 검증 대상이 조용히 달라진다.
+ */
+function resultValue(task: OrcaTask | undefined): Record<string, unknown> {
+  if (task === undefined || task.result.kind !== 'value') {
+    throw new Error('fixture의 result를 읽지 못했다');
+  }
+  return task.result.value as Record<string, unknown>;
+}
+
+/** 값 하나를 읽은 result로 감싼다. */
+function readResult(value: unknown): TaskResult {
+  return { kind: 'value', value };
+}
 
 const CORRELATED: Correlation = {
   kind: 'correlated',
@@ -169,7 +192,7 @@ async function facts(): Promise<OrcaFacts> {
 
 /** 포화되지 않은 inbox. 여기서 못 찾은 것은 정말 없는 것이다. */
 function inbox(messages: readonly WorkerDoneMessage[], saturated = false): WorkerDoneInbox {
-  return { messages, saturated, limit: INBOX_LIMIT };
+  return { messages, unreadable: [], saturated, limit: INBOX_LIMIT };
 }
 
 /**
@@ -220,7 +243,13 @@ describe('Orca 사실 수집', () => {
     });
   });
 
-  it('outcome이 계약 밖 값이면 던진다', async () => {
+  /**
+   * 계약 밖 outcome을 강제로 읽지 않는다. 다만 그 실패는 이 row 하나에 갇힌다(OD-079).
+   *
+   * `succeeded`/`failed` 중 하나로 접으면 카드가 완료 여부를 잘못 말한다. 그렇다고 던지면
+   * 무관한 Run의 row 하나가 관측 전체를 없앤다. 읽지 못한 사실로 남기는 것이 둘 다 피한다.
+   */
+  it('outcome이 계약 밖 값이면 그 row를 읽지 못한 것으로 남긴다', async () => {
     const bad: OrcaRunner = {
       async run(): Promise<string> {
         return JSON.stringify({
@@ -234,14 +263,20 @@ describe('Orca 사실 수집', () => {
         });
       },
     };
-    await expect(listWorkerDone(bad)).rejects.toThrow(/outcome/);
+    const got = await listWorkerDone(bad);
+    expect(got.messages).toEqual([]);
+    expect(got.unreadable).toHaveLength(1);
+    expect(got.unreadable[0]).toMatchObject({
+      runId: 'r', subject: 'worker_done', id: 'msg_1', field: 'payload',
+    });
+    expect(got.unreadable[0]?.reason).toMatch(/outcome/);
   });
 
   it('task result에서 reviewer_result만 읽고 나머지는 null이다', async () => {
     const tasks = await listTasks(new FakeOrca(), 'run_7804be5a654f');
     // worker_report provenance는 리뷰 결과가 아니다.
-    expect(parseReviewerResult(tasks[0]?.result, 'task_56972eaff901')).toBeNull();
-    expect(parseReviewerResult(tasks[1]?.result, 'task_8bf3d72f262a')).toEqual({
+    expect(parseReviewerResult(resultValue(tasks[0]), 'task_56972eaff901')).toBeNull();
+    expect(parseReviewerResult(resultValue(tasks[1]), 'task_8bf3d72f262a')).toEqual({
       verdict: 'request_changes',
       repo: 'dnhynk/dev-infra',
       prNumber: 1,
@@ -349,14 +384,32 @@ describe('reviewer_result 엄격 검증', () => {
     expect(() => parse({ verdict: 'lgtm' })).toThrow(/task_8bf3d72f262a/);
   });
 
-  it('malformed reviewer_result는 projection까지 조용히 통과하지 않는다', async () => {
+  /**
+   * shape 실패의 봉쇄 범위(OD-079).
+   *
+   * 두 가지를 함께 본다. malformed한 result가 verdict로 그려지지 않는 것(엄격 검증)과, 그 실패가
+   * 카드를 통째로 없애지 않는 것(봉쇄)이다. 어느 한쪽만 만족하면 계약이 깨진다.
+   */
+  it('malformed reviewer_result는 카드에 verdict를 그리지 않고 사실로 남는다', async () => {
     const f = await facts();
     const base = f.tasks[1];
     if (base === undefined) throw new Error('fixture가 깨졌다');
-    const broken = [{ ...base, result: { ...(base.result as object), schemaVersion: 2 } }];
-    expect(() => projectPullRequest(REPO, pr(), CORRELATED, { ...f, tasks: broken }, CONFIG)).toThrow(
-      /schemaVersion 2/,
-    );
+    const broken = [{ ...base, result: readResult({ ...resultValue(base), schemaVersion: 2 }) }];
+    const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, tasks: broken }, CONFIG);
+    expect(p.kind).toBe('card');
+    if (p.kind !== 'card') return;
+    // 관대한 강제를 하지 않는다. 읽지 못한 result에서 verdict를 만들어내지 않는다.
+    expect(p.pr.review).toBeNull();
+    // 읽지 못했다는 사실은 버리지 않고 관측 결과로 남는다.
+    const degraded = unreadableTaskFields(broken);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      runId: 'run_7804be5a654f',
+      subject: 'task',
+      id: 'task_8bf3d72f262a',
+      field: 'result.reviewer_result',
+    });
+    expect(degraded[0]?.reason).toContain('schemaVersion 2');
   });
 });
 
@@ -636,12 +689,12 @@ describe('reviewer_result 파생', () => {
       ...base,
       id: 'task_2379c41dcc5f',
       completedAt: new Date('2026-08-22T11:23:14.067Z'),
-      result: {
+      result: readResult({
         kind: 'reviewer_result', schemaVersion: 1, verdict: 'approve',
         pr: { repo: 'dnhynk/dev-infra', number: 1 },
         reviewedHeadSha: '7e9479ebdebe35fc9956b65c0f851ff096c56130',
         findings: [],
-      },
+      }),
     };
     // 입력 순서를 뒤집어도 같은 결과가 나와야 한다.
     for (const tasks of [[...f.tasks, later], [later, ...f.tasks]]) {
@@ -656,7 +709,7 @@ describe('reviewer_result 파생', () => {
     const tie = {
       ...base,
       id: 'task_zzzzzzzzzzzz',
-      result: { ...(base.result as object), verdict: 'approve', findings: [] },
+      result: readResult({ ...resultValue(base), verdict: 'approve', findings: [] }),
     };
     expect(pickReviewerResult([tie, base], REPO, 1)?.verdict).toBe('approve');
     expect(pickReviewerResult([base, tie], REPO, 1)?.verdict).toBe('approve');
@@ -687,12 +740,12 @@ describe('reviewer_result 파생', () => {
     if (base === undefined) throw new Error('fixture가 깨졌다');
     const wide = {
       ...base,
-      result: {
-        ...(base.result as object),
+      result: readResult({
+        ...resultValue(base),
         findings: Array.from({ length: 12 }, (_, i) => ({
           severity: 'minor', file: `f${i}.ts`, line: null, summary: `f ${i}`,
         })),
-      },
+      }),
     };
     const p = projectPullRequest(REPO, pr(), CORRELATED, { ...f, tasks: [wide] }, CONFIG);
     expect(p.kind === 'card' && p.pr.review?.findings).toHaveLength(10);
@@ -723,7 +776,9 @@ describe('DigestStatus 파생', () => {
     const f = await facts();
     const base = f.tasks[1];
     if (base === undefined) throw new Error('fixture가 깨졌다');
-    const approved = [{ ...base, result: { ...(base.result as object), verdict: 'approve', findings: [] } }];
+    const approved = [
+      { ...base, result: readResult({ ...resultValue(base), verdict: 'approve', findings: [] }) },
+    ];
     expect(deriveDigestStatus(await card({}, approved))).toBe('review_approved');
   });
 
@@ -845,5 +900,289 @@ describe('inbox 포화', () => {
     const got = await listWorkerDone(new SaturatingInbox([otherRun]), 1);
     expect(got.saturated).toBe(true);
     expect(() => pickWorkerReport(got, origin)).toThrow(/부재를 증명할 수 없다/);
+  });
+});
+
+/**
+ * 깨진 row 봉쇄 (OD-079).
+ *
+ * 실측된 깨진 row를 그대로 fixture에 넣는다.
+ * `orca orchestration task-list --run run_59bccb319e7f --json`(2026-08-24)의 `task_5694362d24f8`
+ * `result`이며, 이전 세션 probe가 남긴 따옴표 없는 JSON이다.
+ *
+ * 봉쇄가 필요한 칸이 다섯이고(`task.deps`, `task.result`, reviewer_result shape, `gate.options`,
+ * `worker_done.payload`) 아래 fixture가 칸마다 "깨진 row 1건 + 정상 row N건"을 만든다. 한 칸만
+ * 고정하면 다음 malformed row가 다시 관측 전체를 없앤다.
+ */
+describe('깨진 task result 봉쇄', () => {
+  const BROKEN_RESULT =
+    '{kind:reviewer_result,schemaVersion:1,verdict:approve,pr:{repo:THROWAWAY/none,number:10},' +
+    'reviewedHeadSha:deadbeef,findings:[],gates:{evidence_discipline:pass},note:two words}';
+
+  /** 같은 목록에 깨진 row와 정상 reviewer_result row가 섞여 온다. */
+  const mixed: OrcaRunner = {
+    async run(args: readonly string[]): Promise<string> {
+      if (args[1] !== 'task-list') throw new Error('예상치 못한 호출: ' + args.join(' '));
+      return JSON.stringify({
+        id: 'x',
+        ok: true,
+        result: {
+          runId: 'run_59bccb319e7f',
+          count: 2,
+          tasks: [
+            {
+              id: 'task_5694362d24f8', run_id: 'run_59bccb319e7f',
+              task_title: 'THROWAWAY PR10 reviewer probe',
+              display_name: 'THROWAWAY PR10 reviewer probe',
+              status: 'completed', deps: '[]', result: BROKEN_RESULT,
+              created_by_process_incarnation: 'ccb3c8ee::C:/review-pr10@@43d9a730:df5d1fc8',
+              created_at: '2026-08-23 04:50:32', completed_at: '2026-08-23T04:52:36.700Z',
+            },
+            {
+              id: 'task_8bf3d72f262a', run_id: 'run_59bccb319e7f',
+              task_title: 'R1 · PR #1 리뷰', display_name: 'R1 · PR #1 리뷰',
+              status: 'completed', deps: '[]',
+              result: JSON.stringify({
+                kind: 'reviewer_result', schemaVersion: 1, verdict: 'approve',
+                pr: { repo: 'dnhynk/dev-infra', number: 1 },
+                reviewedHeadSha: 'dbdc4e9d8c9bb75a980b6070b4dd8448bbff22c5',
+                findings: [],
+              }),
+              created_by_process_incarnation: 'ccb3c8ee::D:/dev-infra@@2798f0da:87e85235',
+              created_at: '2026-08-23 04:55:00', completed_at: '2026-08-23T04:56:00.000Z',
+            },
+          ],
+        },
+      });
+    },
+  };
+
+  it('깨진 row 하나가 같은 목록의 나머지를 없애지 않는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    expect(tasks.map((t) => t.id)).toEqual(['task_5694362d24f8', 'task_8bf3d72f262a']);
+    expect(tasks[0]?.result.kind).toBe('unreadable');
+    // 깨진 row의 나머지 칸은 그대로 읽는다. 못 읽은 것은 `result` 한 칸이다.
+    expect(tasks[0]?.completedAt?.toISOString()).toBe('2026-08-23T04:52:36.700Z');
+    expect(resultValue(tasks[1])).toMatchObject({ kind: 'reviewer_result', verdict: 'approve' });
+  });
+
+  it('어느 Run의 어느 task가 왜 실패했는지 사실로 남긴다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    const degraded = unreadableTaskFields(tasks);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      runId: 'run_59bccb319e7f',
+      subject: 'task',
+      id: 'task_5694362d24f8',
+      field: 'result',
+    });
+    // 이유는 `parseJsonField`가 만든 메시지 그대로다. 읽지 못한 값이 그 안에 남는다.
+    expect(degraded[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+    expect(degraded[0]?.reason).toContain('{kind:reviewer_result');
+  });
+
+  // `result`를 읽지 못한 row는 reviewer_result shape를 다시 보지 않는다. 같은 실패를 두 줄로
+  // 세면 degraded 건수가 실제 실패한 칸 수보다 커진다.
+  it('한 칸의 실패를 두 번 세지 않는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    expect(unreadableTaskFields(tasks).map((d) => d.field)).toEqual(['result']);
+  });
+
+  it('깨진 row와 섞여도 정상 task의 reviewer_result를 읽는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    expect(pickReviewerResult(tasks, REPO, 1)?.verdict).toBe('approve');
+  });
+
+  /**
+   * 봉쇄가 관대함이 되지 않는지 본다.
+   *
+   * 깨진 row의 **문자열**은 `THROWAWAY/none#10`의 approve처럼 읽히지만 그것은 읽지 못한 값이다.
+   * 여기서 verdict가 나오면 파싱 실패를 추측으로 메운 것이다.
+   */
+  it('읽지 못한 row에서 verdict를 만들어내지 않는다', async () => {
+    const tasks = await listTasks(mixed, 'run_59bccb319e7f');
+    const throwaway = repositoryIdentity(999, 'THROWAWAY/none');
+    expect(pickReviewerResult(tasks, throwaway, 10)).toBeNull();
+  });
+
+  const RUN_ID = 'run_59bccb319e7f';
+
+  /** `task-list` 응답의 task row 하나. 넘긴 칸만 덮는다. */
+  function taskRow(over: Record<string, unknown>): Record<string, unknown> {
+    return {
+      id: 'task_ok', run_id: RUN_ID, task_title: 't', display_name: 't',
+      status: 'completed', deps: '[]', result: null,
+      created_by_process_incarnation: 'ccb3c8ee::D:/dev-infra@@2798f0da:87e85235',
+      created_at: '2026-08-23 04:55:00', completed_at: null,
+      ...over,
+    };
+  }
+
+  /** `gate-list` 응답의 gate row 하나. */
+  function gateRow(over: Record<string, unknown>): Record<string, unknown> {
+    return {
+      id: 'gate_ok', run_id: RUN_ID, task_id: 'task_ok', question: 'q',
+      options: '["A","B"]', status: 'pending', resolution: null,
+      created_at: '2026-08-23 04:55:00', resolved_at: null,
+      ...over,
+    };
+  }
+
+  /** `inbox` 응답의 message row 하나. */
+  function messageRow(over: Record<string, unknown>): Record<string, unknown> {
+    return {
+      id: 'msg_ok', run_id: RUN_ID, type: 'worker_done', subject: '완료',
+      body: '했다. 봤다. 남았다.',
+      payload: JSON.stringify({ taskId: 'task_ok', dispatchId: 'ctx_1', outcome: 'succeeded' }),
+      created_at: '2026-08-23T04:55:00Z',
+      ...over,
+    };
+  }
+
+  /** 주어진 row 목록만 돌려주는 대역. 다른 명령을 부르면 fixture가 잘못된 것이다. */
+  function only(command: string, key: string, rows: readonly unknown[]): OrcaRunner {
+    return {
+      async run(args: readonly string[]): Promise<string> {
+        if (args[1] !== command) throw new Error('예상치 못한 호출: ' + args.join(' '));
+        return JSON.stringify({ id: 'x', ok: true, result: { [key]: rows, count: rows.length } });
+      },
+    };
+  }
+
+  it('깨진 deps 하나가 같은 목록의 나머지를 없애지 않는다', async () => {
+    const tasks = await listTasks(
+      only('task-list', 'tasks', [
+        taskRow({ id: 'task_baddeps', deps: '[task_1,task_2]' }),
+        taskRow({ id: 'task_ok1', deps: '["task_baddeps"]' }),
+        taskRow({ id: 'task_ok2' }),
+      ]),
+      RUN_ID,
+    );
+    expect(tasks.map((t) => t.id)).toEqual(['task_baddeps', 'task_ok1', 'task_ok2']);
+    expect(tasks[0]?.deps.kind).toBe('unreadable');
+    // 정상 row의 deps는 그대로 관측된다.
+    expect(tasks[1]?.deps).toEqual({ kind: 'value', value: ['task_baddeps'] });
+    expect(tasks[2]?.deps).toEqual({ kind: 'value', value: [] });
+    // 봉쇄는 칸 단위다. 같은 row의 나머지 칸은 그대로 읽는다.
+    expect(tasks[0]?.result.kind).toBe('value');
+    expect(tasks[0]?.title).toBe('t');
+
+    const degraded = unreadableTaskFields(tasks);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      runId: RUN_ID, subject: 'task', id: 'task_baddeps', field: 'deps',
+    });
+    expect(degraded[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+    expect(degraded[0]?.reason).toContain('[task_1,task_2]');
+  });
+
+  it('shape가 어긋난 reviewer_result 하나가 나머지 판정을 없애지 않는다', async () => {
+    const tasks = await listTasks(
+      only('task-list', 'tasks', [
+        taskRow({
+          id: 'task_badshape',
+          result: JSON.stringify({
+            kind: 'reviewer_result', schemaVersion: 1, verdict: 'lgtm',
+            pr: { repo: 'dnhynk/dev-infra', number: 1 }, findings: [],
+          }),
+        }),
+        taskRow({
+          id: 'task_goodreview',
+          result: JSON.stringify({
+            kind: 'reviewer_result', schemaVersion: 1, verdict: 'approve',
+            pr: { repo: 'dnhynk/dev-infra', number: 1 },
+            reviewedHeadSha: 'dbdc4e9d8c9bb75a980b6070b4dd8448bbff22c5', findings: [],
+          }),
+          completed_at: '2026-08-23T04:56:00.000Z',
+        }),
+        taskRow({ id: 'task_worker', result: '{"provenance":"worker_report"}' }),
+      ]),
+      RUN_ID,
+    );
+    // `result` 자체는 읽혔다. 어긋난 것은 OD-073 shape다.
+    expect(tasks[0]?.result.kind).toBe('value');
+    // 같은 목록의 정상 reviewer_result는 그대로 판정된다.
+    expect(pickReviewerResult(tasks, REPO, 1)?.verdict).toBe('approve');
+
+    const degraded = unreadableTaskFields(tasks);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      runId: RUN_ID, subject: 'task', id: 'task_badshape', field: 'result.reviewer_result',
+    });
+    expect(degraded[0]?.reason).toContain('verdict가 approve/request_changes가 아니다');
+    expect(degraded[0]?.reason).toContain('task_badshape');
+  });
+
+  it('깨진 gate options 하나가 같은 목록의 나머지를 없애지 않는다', async () => {
+    const gates = await listGates(
+      only('gate-list', 'gates', [
+        gateRow({ id: 'gate_badoptions', options: '[A,B]' }),
+        gateRow({ id: 'gate_ok1' }),
+        gateRow({ id: 'gate_ok2', options: '["예","아니오"]' }),
+      ]),
+      RUN_ID,
+    );
+    expect(gates.map((g) => g.id)).toEqual(['gate_badoptions', 'gate_ok1', 'gate_ok2']);
+    expect(gates[0]?.options.kind).toBe('unreadable');
+    expect(gates[1]?.options).toEqual({ kind: 'value', value: ['A', 'B'] });
+    expect(gates[2]?.options).toEqual({ kind: 'value', value: ['예', '아니오'] });
+    // 같은 row의 나머지 칸은 그대로 읽는다.
+    expect(gates[0]?.question).toBe('q');
+    expect(gates[0]?.status).toBe('pending');
+
+    const degraded = unreadableGateFields(gates);
+    expect(degraded).toHaveLength(1);
+    // 자리를 특정하는 것은 gate id다. 한 task에 gate가 여럿일 수 있어 taskId로는 어느 gate인지
+    // 알 수 없다.
+    expect(degraded[0]).toMatchObject({
+      runId: RUN_ID, subject: 'gate', id: 'gate_badoptions', field: 'options',
+    });
+    expect(degraded[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+  });
+
+  it('깨진 worker_done payload 하나가 같은 inbox의 나머지를 없애지 않는다', async () => {
+    const got = await listWorkerDone(
+      only('inbox', 'messages', [
+        messageRow({ id: 'msg_badjson', payload: '{taskId:task_1,outcome:succeeded}' }),
+        messageRow({ id: 'msg_badoutcome', payload: '{"taskId":"task_1","outcome":"cancelled"}' }),
+        messageRow({ id: 'msg_ok1' }),
+        messageRow({
+          id: 'msg_ok2',
+          payload: JSON.stringify({ taskId: 'task_ok2', dispatchId: 'ctx_2', outcome: 'failed' }),
+        }),
+        // worker_done이 아닌 row의 깨진 payload는 애초에 읽지 않는다. degraded에도 오르지 않는다.
+        messageRow({ id: 'msg_heartbeat', type: 'heartbeat', payload: '{phase:investigating}' }),
+      ]),
+    );
+    expect(got.messages.map((m) => m.messageId)).toEqual(['msg_ok1', 'msg_ok2']);
+    expect(got.messages[0]?.taskId).toBe('task_ok');
+    expect(got.messages[1]?.outcome).toBe('failed');
+
+    // 읽지 못한 row는 목록에서 사라지지 않고 `unreadable`로 간다. payload가 없으면 taskId를
+    // 모르므로 message id가 그 자리를 대신한다.
+    expect(got.unreadable.map((u) => u.id)).toEqual(['msg_badjson', 'msg_badoutcome']);
+    expect(got.unreadable[0]).toMatchObject({
+      runId: RUN_ID, subject: 'worker_done', id: 'msg_badjson', field: 'payload',
+    });
+    expect(got.unreadable[0]?.reason).toContain('JSON 필드를 파싱할 수 없다');
+    // 파싱과 shape 실패가 같은 자리에 실리고 이유만 다르다.
+    expect(got.unreadable[1]?.reason).toContain('outcome이 succeeded/failed가 아니다');
+    expect(got.unreadable[1]?.reason).toContain('msg_badoutcome');
+  });
+
+  it('깨진 payload가 섞여도 정상 메시지로 worker 보고를 판정한다', async () => {
+    const got = await listWorkerDone(
+      only('inbox', 'messages', [
+        messageRow({ id: 'msg_badjson', payload: '{taskId:task_ok,outcome:succeeded}' }),
+        messageRow({ id: 'msg_ok1' }),
+      ]),
+    );
+    const origin = {
+      kind: 'correlated' as const,
+      run: runKey(RUN_ID),
+      task: taskKey('task_ok'),
+      dispatch: null,
+    };
+    expect(pickWorkerReport(got, origin)).toMatchObject({ outcome: 'succeeded' });
   });
 });

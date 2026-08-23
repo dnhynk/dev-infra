@@ -49,14 +49,52 @@ export type OrcaRun = {
   readonly updatedAt: Date;
 };
 
+/**
+ * row의 한 칸을 읽은 결과.
+ *
+ * 합타입으로 둔다. 값 하나로 두고 실패를 기본값(null·빈 배열)으로 접으면 "값이 없다"와 "읽지
+ * 못했다"가 같은 값이 되어 소비자가 후자를 빠뜨린다. `PrProjection`이 "카드를 만들지 않았다"를
+ * 반환값에서 빠뜨릴 수 없게 하는 것과 같은 이유다(OD-079).
+ *
+ * 봉쇄가 필요한 칸이 넷이고 넷이 이 한 모양을 쓴다. 칸마다 다른 표현을 만들면 보고와 소비자가
+ * 칸마다 갈라진다.
+ */
+export type Read<T> =
+  /** 읽었다. */
+  | { readonly kind: 'value'; readonly value: T }
+  /** 읽지 못했다. `reason`은 엄격 parser가 만든 메시지 그대로다. */
+  | { readonly kind: 'unreadable'; readonly reason: string };
+
+/** task row의 `result` 한 칸. `value`가 null이면 result가 없는 정상 row다. */
+export type TaskResult = Read<unknown>;
+
+/**
+ * 엄격 parser 한 번을 이 칸 하나에 가둔다(OD-079).
+ *
+ * `parse`에는 **파싱과 shape 검사만** 넣는다. 네트워크·프로세스 호출을 이 안에 넣으면 진짜
+ * 장애가 degraded 한 줄로 축소되어 관측이 조용히 관대해진다.
+ */
+function read<T>(parse: () => T): Read<T> {
+  try {
+    return { kind: 'value', value: parse() };
+  } catch (e) {
+    return { kind: 'unreadable', reason: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export type OrcaTask = {
   readonly id: string;
   readonly runId: string;
   readonly title: string;
   readonly status: string;
-  readonly deps: readonly string[];
-  /** 구조화 결과. reviewer verdict가 여기 실린다(DL-016). */
-  readonly result: unknown;
+  /** 선행 task id. 읽지 못한 row는 `unreadable`이며 그것도 관측 결과다(OD-079). */
+  readonly deps: Read<readonly string[]>;
+  /**
+   * 구조화 결과. reviewer verdict가 여기 실린다(DL-016).
+   *
+   * 읽지 못한 row는 `unreadable`이며 그것도 관측 결과다. 버리지 않는다(OD-079).
+   */
+  readonly result: TaskResult;
   /** created_by_process_incarnation에서 뽑은 작업 디렉터리. 형식이 다르면 null. */
   readonly worktreePath: string | null;
   readonly createdAt: Date;
@@ -75,7 +113,8 @@ export type OrcaGate = {
   readonly runId: string;
   readonly taskId: string;
   readonly question: string;
-  readonly options: readonly string[];
+  /** 선택지. 읽지 못한 row는 `unreadable`이며 그것도 관측 결과다(OD-079). */
+  readonly options: Read<readonly string[]>;
   readonly status: string;
   readonly resolution: string | null;
   readonly createdAt: Date;
@@ -105,6 +144,101 @@ export async function listRuns(runner: OrcaRunner): Promise<OrcaRun[]> {
   });
 }
 
+/**
+ * 읽지 못한 칸 하나. **어느 Run의 어느 row의 어느 칸이 왜 실패했는지** 그대로 남긴다(OD-079).
+ */
+export type UnreadableField = {
+  readonly runId: string;
+  /** row 종류. 아래 `id`가 무엇의 id인지 정한다. */
+  readonly subject: 'task' | 'gate' | 'worker_done';
+  /**
+   * 그 row의 id. task id · gate id · message id다.
+   *
+   * `runId`와 함께 실패한 자리를 특정한다. gate와 message에는 taskId가 없으므로 이 값이 그
+   * 자리를 대신한다. 잃으면 degraded 한 줄이 어디를 가리키는지 알 수 없다.
+   */
+  readonly id: string;
+  /** 읽지 못한 칸. */
+  readonly field: UnreadableFieldName;
+  readonly reason: string;
+};
+
+/** 봉쇄 대상인 칸의 이름. */
+export type UnreadableFieldName =
+  | 'deps'
+  | 'result'
+  /** `result`는 읽었지만 OD-073 reviewer_result shape가 어긋났다. */
+  | 'result.reviewer_result'
+  | 'options'
+  | 'payload';
+
+/**
+ * 관측한 task 중 읽지 못한 칸만 사실로 모은다.
+ *
+ * 별도 채널로 세지 않고 관측된 row에서 그대로 파생한다. 두 곳에 두면 서로 어긋난다.
+ *
+ * `result`를 읽지 못한 row는 reviewer_result shape를 보지 않는다. 같은 실패를 두 줄로 세면
+ * degraded 건수가 실제 실패한 칸 수보다 커져 보고가 규모를 잘못 말한다.
+ *
+ * 여기 넘어온 task 전부를 본다. `pickReviewerResult`는 correlated Run의 task만 판정하지만,
+ * `kind`가 `reviewer_result`인 row가 OD-073 v1 shape를 어기는 것은 어느 Run에 있든 관측된
+ * 사실이다. 판정 범위에 맞춰 수집을 좁히면 사실을 세는 곳이 둘로 갈라진다(OD-079).
+ */
+export function unreadableTaskFields(tasks: readonly OrcaTask[]): readonly UnreadableField[] {
+  const out: UnreadableField[] = [];
+  for (const t of tasks) {
+    const at = (field: UnreadableFieldName, reason: string): UnreadableField => ({
+      runId: t.runId,
+      subject: 'task',
+      id: t.id,
+      field,
+      reason,
+    });
+    if (t.deps.kind === 'unreadable') out.push(at('deps', t.deps.reason));
+    if (t.result.kind === 'unreadable') {
+      out.push(at('result', t.result.reason));
+      continue;
+    }
+    const reviewer = readReviewerResult(t);
+    if (reviewer.kind === 'unreadable') out.push(at('result.reviewer_result', reviewer.reason));
+  }
+  return out;
+}
+
+/** 관측한 gate 중 `options`를 읽지 못한 것만 사실로 모은다. gate id가 taskId 자리다(OD-079). */
+export function unreadableGateFields(gates: readonly OrcaGate[]): readonly UnreadableField[] {
+  const out: UnreadableField[] = [];
+  for (const g of gates) {
+    if (g.options.kind !== 'unreadable') continue;
+    out.push({
+      runId: g.runId,
+      subject: 'gate',
+      id: g.id,
+      field: 'options',
+      reason: g.options.reason,
+    });
+  }
+  return out;
+}
+
+/**
+ * task row를 읽는다. **파싱 실패를 그 칸 하나에 가둔다**(OD-079).
+ *
+ * `parseJsonField`는 그대로 던진다. 파싱 실패를 fallback으로 덮으면 데이터 손실을 조용히
+ * 넘기기 때문이고, 그 계약은 여기서 바꾸지 않는다. 여기서 하는 것은 **실패의 범위를 좁히는
+ * 것**이다.
+ *
+ * 좁혀야 하는 이유는 조회 표면이 정한다. `run-list`에 필터가 없어 관측 1회가 이 호스트의 모든
+ * Run을 훑으므로, 카드와 아무 관계 없는 Run의 row가 같은 목록에 섞여 온다. 실측(2026-08-24,
+ * 로컬 Orca DB Run 16개 전수): 따옴표 없는 JSON이 든 row가 `run_59bccb319e7f`의
+ * `task_5694362d24f8` 하나였고, 그 row 때문에 `digest --pr 25 --dry-run`이 stdout 0바이트에
+ * exit 1로 끝났다. 관측을 중단하는 것은 OD-072가 정한 "degraded를 숨기지 않는다"가 아니라
+ * 무관한 row 하나가 나머지 관측을 없애는 것이다.
+ *
+ * 봉쇄는 **칸 단위**다. `deps`를 읽지 못해도 같은 row의 `result`는 그대로 읽고 그 반대도 같다.
+ * `parseOrcaTimestamp`는 `read`로 감싸지 않는다. 봉쇄 대상은 OD-079가 정한 네 칸이고, 감싸는
+ * 범위를 넓히면 진짜 장애까지 degraded 한 줄로 축소된다.
+ */
 export async function listTasks(runner: OrcaRunner, runId: string): Promise<OrcaTask[]> {
   const r = await call<{ tasks?: unknown[] }>(runner, [
     'orchestration', 'task-list', '--run', runId, '--json',
@@ -117,10 +251,8 @@ export async function listTasks(runner: OrcaRunner, runId: string): Promise<Orca
       runId: str(o['run_id']),
       title: str(o['task_title']) || str(o['display_name']),
       status: str(o['status']),
-      deps: parseJsonField<string[]>(o['deps'], []),
-      result: o['result'] === null || o['result'] === undefined
-        ? null
-        : parseJsonField<unknown>(o['result'], null),
+      deps: read(() => parseJsonField<readonly string[]>(o['deps'], [])),
+      result: read(() => parseJsonField<unknown>(o['result'], null)),
       worktreePath: inc === '' ? null : worktreePathFromIncarnation(inc),
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
       completedAt: (() => {
@@ -131,6 +263,7 @@ export async function listTasks(runner: OrcaRunner, runId: string): Promise<Orca
   });
 }
 
+/** gate row를 읽는다. `options` 파싱 실패를 그 gate 하나에 가둔다. 근거는 `listTasks`와 같다. */
 export async function listGates(runner: OrcaRunner, runId: string): Promise<OrcaGate[]> {
   const r = await call<{ gates?: unknown[] }>(runner, [
     'orchestration', 'gate-list', '--run', runId, '--json',
@@ -143,7 +276,7 @@ export async function listGates(runner: OrcaRunner, runId: string): Promise<Orca
       runId: str(o['run_id']),
       taskId: str(o['task_id']),
       question: str(o['question']),
-      options: parseJsonField<string[]>(o['options'], []),
+      options: read(() => parseJsonField<readonly string[]>(o['options'], [])),
       status: str(o['status']),
       resolution: strOrNull(o['resolution']),
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
@@ -277,6 +410,27 @@ export function parseReviewerResult(result: unknown, taskId: string): OrcaReview
 }
 
 /**
+ * task 하나의 `result`를 reviewer_result로 읽는다. **shape 실패를 이 task에 가둔다**(OD-079).
+ *
+ * `parseReviewerResult`의 엄격한 throw 계약은 그대로다. 관대한 강제를 하면 malformed한 result의
+ * verdict가 카드에 그려진다. 여기서 하는 것은 범위를 좁히는 것뿐이다. 좁히지 않으면 correlated
+ * Run의 row 하나가 이 PR뿐 아니라 **모든 repository의 모든 카드**를 없앤다.
+ *
+ * review task가 아니면 `value`가 null이다. 그것은 정상 출력이지 실패가 아니다.
+ *
+ * `result` 자체를 읽지 못했으면 그 사실을 그대로 넘긴다. 그 row의 degraded 사실은 `result` 칸이
+ * 이미 싣고 있으므로 `unreadableTaskFields`가 여기서 다시 세지 않는다.
+ *
+ * 판정과 degraded 수집이 이 함수를 각각 부른다. `parseReviewerResult`가 순수 함수여서 같은 row에
+ * 항상 같은 결과를 내므로 두 값이 어긋날 수 없다.
+ */
+export function readReviewerResult(task: OrcaTask): Read<OrcaReviewerResult | null> {
+  if (task.result.kind === 'unreadable') return task.result;
+  const value = task.result.value;
+  return read(() => parseReviewerResult(value, task.id));
+}
+
+/**
  * worker가 보낸 `worker_done` 메시지.
  *
  * 실측(`orca orchestration inbox --limit 200 --json`): row는 `type`이 `worker_done`이고
@@ -307,6 +461,14 @@ export type WorkerDoneInbox = {
   /** 상한 안에서 관찰된 `worker_done` 전부. 모든 Run이 섞여 있다. */
   readonly messages: readonly WorkerDoneMessage[];
   /**
+   * `payload`를 읽지 못해 `messages`에 넣지 못한 row 전부(OD-079).
+   *
+   * `messages`와 나란히 둔다. 읽지 못한 row를 목록에서 그냥 빼면 "그런 메시지가 없었다"와 같은
+   * 값이 되어 봉쇄가 조용한 관용이 된다. `payload`가 없으면 taskId를 모르므로 이 row는 Task에
+   * 붙일 수 없고, 그래서 message id가 그 자리를 대신한다.
+   */
+  readonly unreadable: readonly UnreadableField[];
+  /**
    * 반환 행 수가 요청 상한과 같았다. 더 오래된 행이 잘렸을 수 있다는 뜻이다.
    *
    * 참이면 **부재를 증명할 수 없다.** 찾은 것은 여전히 사실이지만, 못 찾은 것은 "없다"가
@@ -329,6 +491,32 @@ export type WorkerDoneInbox = {
 export const INBOX_LIMIT = 5000;
 
 /**
+ * `worker_done` row의 `payload`를 읽는다. 엄격하게 검사하고 어긋나면 던진다.
+ *
+ * 파싱과 outcome shape 검사를 한 함수에 둔다. 둘 다 "이 row를 `WorkerDoneMessage`로 읽지
+ * 못했다"는 같은 실패이고, 계약은 **읽지 못한 것을 읽은 것처럼 만들지 않는 것**이다. 호출부가
+ * 그 실패를 row 하나에 가둔다(OD-079).
+ */
+function readWorkerDonePayload(
+  raw: unknown,
+  messageId: string,
+): {
+  readonly taskId: string | null;
+  readonly dispatchId: string | null;
+  readonly outcome: 'succeeded' | 'failed';
+} {
+  const payload = parseJsonField<unknown>(raw, null);
+  const p = isRecord(payload) ? payload : {};
+  const outcome = p['outcome'];
+  if (outcome !== 'succeeded' && outcome !== 'failed') {
+    throw new TypeError(
+      `worker_done ${messageId}의 outcome이 succeeded/failed가 아니다: ${String(outcome)}`,
+    );
+  }
+  return { taskId: strOrNull(p['taskId']), dispatchId: strOrNull(p['dispatchId']), outcome };
+}
+
+/**
  * `worker_done`을 **소비하지 않고** 읽는다.
  *
  * `orca orchestration check`는 기본 동작이 배치를 읽음 처리하고 `--ack`가 그것을 확정하므로
@@ -340,6 +528,11 @@ export const INBOX_LIMIT = 5000;
  * heartbeat·question·status도 같은 목록에 섞여 온다(실측 55행 중 worker_done은 19행).
  *
  * `--full`은 쓰지 않는다. 실측에서 `--full` 유무로 `body` 길이가 달라진 row가 0건이었다.
+ *
+ * `payload`를 읽지 못한 row는 **그 row 하나에 가둔다**(OD-079). `inbox`도 모든 Run의 메시지를
+ * 한 목록으로 주므로 무관한 Run의 row 하나가 관측 전체를 없앨 이유가 없다. 읽지 못한 row는
+ * `messages`가 아니라 `unreadable`로 간다. taskId를 모르므로 Task 판정에 쓸 수 없고, 그 사실을
+ * 버리면 "그런 메시지가 없었다"와 구분되지 않기 때문이다.
  *
  * ## 남는 한계 — C1이 닫지 않는다
  *
@@ -366,23 +559,31 @@ export async function listWorkerDone(
   ]);
   const rows = r.messages ?? [];
   const out: WorkerDoneMessage[] = [];
+  const unreadable: UnreadableField[] = [];
   for (const row of rows) {
     const o = row as Record<string, unknown>;
     if (o['type'] !== 'worker_done') continue;
-    const payload = parseJsonField<unknown>(o['payload'], null);
-    const p = isRecord(payload) ? payload : {};
-    const outcome = p['outcome'];
-    if (outcome !== 'succeeded' && outcome !== 'failed') {
-      throw new TypeError(
-        `worker_done ${str(o['id'])}의 outcome이 succeeded/failed가 아니다: ${String(outcome)}`,
-      );
+    const messageId = str(o['id']);
+    const runId = str(o['run_id']);
+    // 봉쇄 범위는 `payload` 한 칸이다. `run_id`는 payload가 아니라 row의 칸이므로 읽지 못한
+    // row도 어느 Run의 것인지는 남는다. `parseOrcaTimestamp`는 감싸지 않는다.
+    const payload = read(() => readWorkerDonePayload(o['payload'], messageId));
+    if (payload.kind === 'unreadable') {
+      unreadable.push({
+        runId,
+        subject: 'worker_done',
+        id: messageId,
+        field: 'payload',
+        reason: payload.reason,
+      });
+      continue;
     }
     out.push({
-      messageId: str(o['id']),
-      runId: str(o['run_id']),
-      taskId: strOrNull(p['taskId']),
-      dispatchId: strOrNull(p['dispatchId']),
-      outcome,
+      messageId,
+      runId,
+      taskId: payload.value.taskId,
+      dispatchId: payload.value.dispatchId,
+      outcome: payload.value.outcome,
       subject: str(o['subject']),
       body: str(o['body']),
       createdAt: parseOrcaTimestamp(str(o['created_at'])),
@@ -390,5 +591,5 @@ export async function listWorkerDone(
   }
   // 포화 판정은 worker_done 수가 아니라 **반환된 전체 행 수**로 한다. 잘린 것은 목록이지
   // 목록에서 걸러낸 결과가 아니다.
-  return { messages: out, saturated: rows.length >= limit, limit };
+  return { messages: out, unreadable, saturated: rows.length >= limit, limit };
 }
