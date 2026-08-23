@@ -4,7 +4,7 @@
 
 [관측] `gh 2.98.0`을 `dnhynk` 계정으로 사용했고 인증 scope는 `gist`, `read:org`, `repo`, `workflow`였다.
 
-[관측] 기존 운영 repository와 PR은 읽기만 했고, write 관측은 명시적으로 허용된 `dnhynk/THROWAWAY-orca-github-lifecycle-bc06`에서만 수행했다.
+[관측] 기존 운영 repository와 PR은 읽기만 했고, write 관측은 명시적으로 허용된 `dnhynk/THROWAWAY-orca-github-lifecycle-bc06`와 독립 재현용 `dnhynk/THROWAWAY-orca-pr11-od032-71b6`에서만 수행했다. 두 repository는 관측 뒤 archive했다.
 
 [관측] 기존 [platform-capabilities.md §5](../platform-capabilities.md#5-github)의 `merged PR은 mergeable/mergeStateStatus가 UNKNOWN`, `reviewDecision은 대상 repository에서 null`, `check 수는 repository별로 다름`과 어긋나는 결과는 없었다.
 
@@ -21,6 +21,7 @@
 | `microsoft/vscode#331771` | [관측] approval 뒤 새 commit으로 approval이 dismissed되는 경우 |
 | `cli/cli#14056` | [관측] changes-requested review의 명시적 dismissal |
 | THROWAWAY PR `#1` | [관측] required/optional checks, commit status, `mergeable:null`, out-of-order snapshot, body edit, commit trailer, 실제 merge |
+| `THROWAWAY-orca-pr11-od032-71b6#1` | [관측] 빈 repository부터 OD-032 절차 독립 재현, 미보고 required의 405와 제거 뒤 optional failure 상태의 실제 merge |
 
 [문서] REST PR, review, check, status, protection, timeline의 현재 계약은 각각 [Pull requests](https://docs.github.com/en/rest/pulls/pulls), [Pull request reviews](https://docs.github.com/en/rest/pulls/reviews), [Check runs](https://docs.github.com/en/rest/checks/runs), [Commit statuses](https://docs.github.com/en/rest/commits/statuses), [Protected branches](https://docs.github.com/en/rest/branches/branch-protection), [Timeline events](https://docs.github.com/en/rest/issues/timeline)에 있다.
 
@@ -29,6 +30,8 @@
 ## OD-030 · canonical PR state
 
 ### [실행한 명령]
+
+[관측] 첫 block은 최초 표본에서 캡처한 명령 발췌이고 단독 재현 절차가 아니다. 바로 뒤 두 번째 block은 최초 버전에서 누락됐던 final check 생성과 미보고 required 제거를 포함해 빈 repository부터 실행한 완결 절차다.
 
 ```powershell
 gh pr view 14215 --repo cli/cli `
@@ -228,6 +231,89 @@ gh pr list --repo cli/cli --state open --limit 50 --json number,url,statusCheckR
 gh api graphql -f query='query{checkStatus:__type(name:"CheckStatusState"){enumValues{name description}} checkConclusion:__type(name:"CheckConclusionState"){enumValues{name description}}}'
 ```
 
+```powershell
+$repo = 'dnhynk/THROWAWAY-orca-pr11-od032-71b6'
+gh repo create $repo --public --add-readme `
+  --description 'THROWAWAY: independent PR #11 OD-032 reproduction; safe to archive'
+
+# final check들을 실제로 만드는 workflow를 main에 설치
+$workflowText = @'
+name: lifecycle
+
+on:
+  pull_request:
+
+jobs:
+  required-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select outcome from the branch
+        run: grep -qx success result.txt
+
+  optional-skip:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo skipped
+
+  optional-fail:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+'@
+$workflowBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($workflowText))
+gh api --method PUT repos/$repo/contents/.github/workflows/lifecycle.yml `
+  -f message='test: add lifecycle workflow' -f content=$workflowBase64 -f branch=main
+
+$mainSha = gh api repos/$repo/git/ref/heads/main --jq .object.sha
+gh api --method POST repos/$repo/git/refs -f ref='refs/heads/probe' -f sha=$mainSha
+$failureBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("failure`n"))
+gh api --method PUT repos/$repo/contents/result.txt `
+  -f message='test: begin with required failure' -f content=$failureBase64 -f branch=probe
+
+$initialProtection = '{"required_status_checks":{"strict":true,"contexts":["required-ci","optional-skip","legacy-required","never-starts"]},"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}'
+$initialProtection | gh api --method PUT repos/$repo/branches/main/protection --input -
+gh pr create --repo $repo --head probe --base main `
+  --title 'THROWAWAY lifecycle probe' --body '<!-- orca-run: run_THROWAWAY_pr11_fix -->'
+
+# 누락됐던 final check 상태 생성: final head를 갱신하고 Actions 완료까지 기다린다.
+$resultBlobSha = gh api "repos/$repo/contents/result.txt?ref=probe" --jq .sha
+$successBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("success`n"))
+gh api --method PUT repos/$repo/contents/result.txt `
+  -f message='test: create final required success' -f content=$successBase64 `
+  -f branch=probe -f sha=$resultBlobSha
+$headSha = gh pr view 1 --repo $repo --json headRefOid --jq .headRefOid
+gh api --method POST repos/$repo/statuses/$headSha `
+  -f state=success -f context=legacy-required -f description='THROWAWAY required status success'
+do {
+  $finalRunId = gh run list --repo $repo --workflow lifecycle.yml --commit $headSha `
+    --limit 1 --json databaseId --jq '.[0].databaseId'
+  if (-not $finalRunId) { Start-Sleep -Seconds 2 }
+} until ($finalRunId)
+gh run watch $finalRunId --repo $repo
+gh run view $finalRunId --repo $repo --json headSha,status,conclusion,jobs --jq `
+  '{headSha,status,conclusion,jobs:[.jobs[]|{name,status,conclusion}]}'
+gh pr checks 1 --repo $repo --required
+
+# admin에도 protection을 강제하면 미보고 required가 남은 동안 merge는 405다.
+gh api --method POST repos/$repo/branches/main/protection/enforce_admins
+gh api --include --method PUT repos/$repo/pulls/1/merge `
+  -f merge_method=squash -f sha=$headSha
+Write-Output "merge_with_never_starts_exit=$LASTEXITCODE"
+
+# 누락됐던 단계: 초기 required set에서 never-starts를 제거한 뒤 같은 head를 merge한다.
+gh api --method DELETE `
+  repos/$repo/branches/main/protection/required_status_checks/contexts `
+  -f 'contexts[]=never-starts'
+gh api repos/$repo/branches/main/protection/required_status_checks --jq '{strict,contexts,checks}'
+gh pr view 1 --repo $repo --json mergeable,mergeStateStatus,headRefOid
+gh api --include --method PUT repos/$repo/pulls/1/merge `
+  -f merge_method=squash -f sha=$headSha
+gh api --method PATCH repos/$repo -F archived=true --jq '{full_name,archived,html_url}'
+```
+
 ### [출력 발췌]
 
 ```json
@@ -277,6 +363,35 @@ CheckStatusState: REQUESTED, QUEUED, IN_PROGRESS, COMPLETED, WAITING, PENDING
 CheckConclusionState: ACTION_REQUIRED, TIMED_OUT, CANCELLED, FAILURE, SUCCESS, NEUTRAL, SKIPPED, STARTUP_FAILURE, STALE
 ```
 
+```text
+독립 재현 repository: https://github.com/dnhynk/THROWAWAY-orca-pr11-od032-71b6
+initial required contexts: required-ci, optional-skip, legacy-required, never-starts
+
+final head f2aba36d7c4442e0ea2e2ed77d8ce85a0683f832, Actions run 32619609898:
+required-ci   completed/success
+optional-skip completed/skipped
+optional-fail completed/failure
+legacy-required commit status success
+
+gh pr checks --required:
+required-ci       pass
+optional-skip     skipping
+legacy-required   pass
+
+enforce_admins=true, never-starts가 required set에 남은 merge:
+HTTP/2.0 405 Method Not Allowed
+{"message":"Required status check \"never-starts\" is expected.","status":"405"}
+merge_with_never_starts_exit=1
+
+never-starts 제거 응답: ["required-ci","optional-skip","legacy-required"]
+mergeable=MERGEABLE mergeStateStatus=UNSTABLE
+
+같은 head의 merge 재시도:
+HTTP/2.0 200 OK
+{"sha":"a9b5eb047b9ea8769bcf10b832d9db03a6399985","merged":true,"message":"Pull Request successfully merged"}
+repository archived=true
+```
+
 ### [관측된 사실]
 
 - [관측] check run은 REST에서 `status=in_progress, conclusion=null`로 진행 중을, `status=completed`와 `conclusion=failure|success|skipped`로 terminal 결과를 표현했다.
@@ -288,6 +403,8 @@ CheckConclusionState: ACTION_REQUIRED, TIMED_OUT, CANCELLED, FAILURE, SUCCESS, N
 - [추론] required 목록과 현재 head rollup의 set difference를 계산하지 않으면 미시작 check를 성공으로 오판할 수 있다.
 - [관측] optional failure는 전체 rollup에 있었지만 `gh pr checks --required`에는 없었다.
 - [관측] required success, required skipped, required commit-status success, optional failure 조합에서 GraphQL `mergeStateStatus=UNSTABLE`이었지만 admin protection까지 강제한 실제 merge API는 성공했다.
+- [관측] 새 THROWAWAY의 final head에서 Actions로 위 check run 3개를 생성하고 commit status를 success로 만든 뒤에도, 미보고 `never-starts`가 admin-enforced required set에 남아 있으면 merge API는 `405 Required status check "never-starts" is expected`로 거절했다.
+- [관측] 같은 head와 check 상태에서 `never-starts`만 required set에서 제거하자 `mergeStateStatus=UNSTABLE`이 됐고 merge API는 `200`, `merged=true`를 반환했다. 따라서 optional failure에도 merge 가능하다는 기존 결론은 독립 재현에서도 유지됐다.
 - [문서] protected branch의 required check는 `successful`, `skipped`, `neutral`이면 통과로 취급되며 check run과 commit status가 모두 required context가 될 수 있다.
 - [관측] required-neutral live PR은 찾은 공개 표본에 없었고 THROWAWAY에서 직접 만들지 못했다.
 - [실행하지 않음] 현재 자격증명은 GitHub App `checks:write`가 아니므로 neutral check run 생성은 시도하지 않았다.
@@ -349,6 +466,12 @@ gh pr view 1 --repo dnhynk/THROWAWAY-orca-github-lifecycle-bc06 --json headRefOi
 
 # 동일 context의 commit status history
 gh api repos/dnhynk/THROWAWAY-orca-github-lifecycle-bc06/commits/2cba3aff11cb6b003fd32212e804557c080300dd/statuses --paginate
+
+# timeline event type별 identity/time field 재조회
+gh api repos/dnhynk/THROWAWAY-orca-pr11-od032-71b6/issues/1/timeline --paginate --jq `
+  '[.[]|{event,id,node_id,created_at,submitted_at,commit_date:.committer.date}]'
+gh api repos/cli/cli/issues/14136/timeline --paginate --jq `
+  '[.[]|select(.event=="reviewed")|{event,id,node_id,created_at,submitted_at}] | .[0]'
 ```
 
 ### [출력 발췌]
@@ -379,6 +502,16 @@ required-ci check id 97141729519: in_progress/null → 같은 id로 completed/su
 old head legacy-required status: id 52728921646 pending → 새 id 52728926249 failure
 ```
 
+```text
+timeline field 재조회:
+committed id=null node_id=C_kwDOUBJ6rdoAKDhkMWJlZDUzNGFmM2ZjOGZlNTc3ZjYwOTQ0NmIxNGZlOWU3NTJiZjE
+          created_at=null submitted_at=null commit_date=2026-08-23T05:07:51Z
+merged    id=29864308585 node_id=ME_lADOUBJ6rc8AAAABN3WTQc8AAAAG9A0vaQ
+          created_at=2026-08-23T05:10:18Z submitted_at=null commit_date=null
+reviewed  id=4926001186 node_id=PRR_kwDODKw3uc8AAAABJZzQIg
+          created_at=null submitted_at=2026-08-13T10:30:25Z commit_date=null
+```
+
 ### [관측된 사실]
 
 - [관측] 안정된 구간의 짧은 반복 조회에서는 PR snapshot 10회와 check snapshot 6회가 역행하거나 달라지지 않았다.
@@ -394,10 +527,10 @@ old head legacy-required status: id 52728921646 pending → 새 id 52728926249 f
 - [관측] check run id는 한 run의 진행→완료 동안 유지됐고 새 head의 새 run에는 새 id가 생겼다.
 - [관측] commit status는 같은 head/context의 pending→failure마다 새 id가 생겼고 list endpoint는 둘을 최신순으로 보존했다.
 - [관측] head SHA는 head version 경계로 쓸 수 있지만 값의 대소/사전순은 시간 순서가 아니다.
-- [관측] timeline event에는 event별 id/node_id/created_at이 있으나 `reviewed` row는 공통 `created_at` 대신 `submitted_at`을 쓰므로 한 공통 timestamp field도 없다.
-- [추론] 모든 GitHub resource를 가로지르는 단일 monotonic sequence key는 관측되지 않았다.
+- [관측] timeline의 `merged`/`closed` row는 `id`, `node_id`, `created_at`을 줬지만, `reviewed` row는 `id`와 `node_id`가 있으면서 `created_at=null`이고 `submitted_at`을 썼다. `committed` row는 `node_id`, `sha`, `committer.date`를 주지만 `id=null`, `created_at=null`이었다.
+- [추론] 공통 timestamp field가 없을 뿐 아니라 `committed`에는 공통 numeric `id`도 없으므로, 모든 GitHub resource를 가로지르거나 timeline 전체에 적용되는 단일 monotonic sequence key는 관측되지 않았다.
 - [추론] `mergedAt != null`/GraphQL `state=MERGED`는 GitHub에서 되돌릴 수 없는 terminal fact이므로 이를 한 번 저장한 PR은 오래된 open/closed snapshot으로 downgrade하지 않는 latch가 C2 출구 조건을 직접 만족한다.
-- [추론] nonterminal 전이는 PR identity와 head SHA를 먼저 scope로 나누고 resource별 id와 timestamp/status를 써야 한다.
+- [추론] nonterminal 전이는 PR identity와 head SHA를 먼저 scope로 나누고, resource별 identity(`id`/`node_id`/SHA)와 event type별 timestamp(`created_at`/`submitted_at`/commit date) 또는 status를 써야 한다.
 
 ### [배제되는 선택지]
 
