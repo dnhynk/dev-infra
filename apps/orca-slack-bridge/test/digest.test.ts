@@ -244,6 +244,16 @@ async function digestOnce(opts: Once = {}): Promise<DigestReport> {
   }
 }
 
+/** 같은 store 파일을 다시 열어 저장된 루트 매핑을 읽는다. store를 열지 않은 상태에서만 부른다. */
+function readPrMessage(prKey: `pr:${number}#${number}`) {
+  const store = new SqliteDigestStore(dbPath);
+  try {
+    return store.findPrMessage(prKey);
+  } finally {
+    store.close();
+  }
+}
+
 function card(report: DigestReport) {
   const r = report.results.find((x) => x.kind === 'card');
   if (r === undefined || r.kind !== 'card') throw new Error('카드가 없다');
@@ -522,15 +532,23 @@ describe('runDigest 실패와 경계', () => {
     expect(card(report).key).toBe(`pr:${REPO_ID}#8`);
   });
 
-  it('매핑된 채널이 대상 채널과 다르면 아무것도 쓰지 않는다', async () => {
+  // "아무것도" 쓰지 않는 것이 아니다. PR↔Task 연관은 채널 게이트 앞에서 기록된다(OD-076).
+  // 그쪽은 'PR↔Task 연관과 degraded 입력'의 채널 어긋남 테스트가 고정한다.
+  it('매핑된 채널이 대상 채널과 다르면 Slack에 쓰지 않고 pr_message도 갱신하지 않는다', async () => {
     const first = new FakeSlack();
     await digestOnce({ slack: first });
+    const before = readPrMessage(`pr:${REPO_ID}#7`);
 
+    // 사실을 바꿔서 온다. 채널이 맞았다면 이 관찰은 chat.update와 updateObservation로 갔다.
+    const changed = prRow({
+      statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    });
     const other = new FakeSlack();
-    const report = await digestOnce({ slack: other, channel: 'C_OTHER' });
+    const report = await digestOnce({ slack: other, channel: 'C_OTHER', prs: [changed] });
     expect(card(report).action).toBe('channel_mismatch');
     expect(other.posts).toHaveLength(0);
     expect(other.updates).toHaveLength(0);
+    expect(readPrMessage(`pr:${REPO_ID}#7`)).toEqual(before);
   });
 });
 
@@ -638,6 +656,33 @@ describe('PR↔Task 연관과 degraded 입력', () => {
     await digestOnce({ slack });
     await digestOnce({ slack });
     expect(storedTasks(`pr:${REPO_ID}#7`)).toHaveLength(1);
+  });
+
+  /**
+   * `recordPrTask`가 채널 게이트 **앞에** 있다는 판단을 고정한다.
+   *
+   * correlation은 그 카드가 어느 Slack 채널로 가는지와 독립인 사실이다. 채널 설정이 어긋나
+   * 카드를 갱신하지 못한 관찰에서도 PR과 Task의 관계는 관측된 것이고, 그 관계를 기록해 두는
+   * 것이 OD-076이 durable store에 요구한 것이다. 호출을 게이트 뒤로 옮기면 이 테스트가 깨진다.
+   */
+  it('매핑된 채널과 어긋난 관찰에서도 그 관찰의 PR↔Task 연관은 기록된다', async () => {
+    await digestOnce({ slack: new FakeSlack(), prs: [prRow({ body: bodyFor(TASK) })] });
+
+    const other = new FakeSlack();
+    const report = await digestOnce({
+      slack: other,
+      channel: 'C_OTHER',
+      prs: [prRow({ body: bodyFor(SECOND_TASK) })],
+    });
+    expect(card(report).action).toBe('channel_mismatch');
+    expect(other.posts).toHaveLength(0);
+    expect(other.updates).toHaveLength(0);
+
+    // 두 번째 Task는 이 어긋난 관찰에서만 관측됐다. 게이트 뒤에서 기록한다면 여기 남지 않는다.
+    expect(storedTasks(`pr:${REPO_ID}#7`).map((r) => r.taskKey)).toEqual([
+      `task:${TASK}`,
+      `task:${SECOND_TASK}`,
+    ]);
   });
 
   it('dry-run은 연관을 기록하지 않는다', async () => {

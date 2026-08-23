@@ -413,6 +413,16 @@ function writeV1(path: string): void {
  * 문자열은 다르다.
  *
  * 인덱스는 이름으로 정렬한다. 같아야 하는 것은 생성 순서가 아니라 집합이다.
+ *
+ * **완전한 대조가 아니다.** 대조하는 것은 테이블 집합, `table_info`가 주는 컬럼 (`cid`,
+ * 이름, 타입, `notnull`, 기본값, PK 위치), 그리고 `index_list`/`index_info`가 주는 인덱스
+ * 이름·unique·origin·partial 여부와 인덱스 컬럼이다. 여기까지다.
+ *
+ * 대조하지 못하는 것: CHECK 제약, foreign key, trigger, 컬럼 collation, 인덱스 sort order,
+ * partial index의 WHERE 절, `table_info`가 숨기는 generated/hidden 컬럼. 이 중 하나가 새
+ * 파일과 올린 파일 사이에서 갈라져도 이 가드는 통과한다. `schema.ts`의 규율(파괴적 변경
+ * 금지, 덧붙이기만)이 이 부류가 들어올 경로를 좁히고 있어 지금은 확장하지 않는다. 그런
+ * 요소를 `SCHEMA_DDL`에 새로 넣는다면 이 함수도 함께 넓혀야 한다.
  */
 function readSchemaShape(path: string) {
   const db = new DatabaseSync(path);
