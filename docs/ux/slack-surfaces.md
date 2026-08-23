@@ -130,33 +130,61 @@ thread 요구:
 ### 3.1 Run 현재 카드
 
 ```text
-🟡 [toneandmove] RUN-42 · Subscription Billing Refactor
+🟢 [toneandmove] toneandmove/web · run_36d28e6e947a · Subscription Billing Refactor
 
-상태
-실행 중
+Run identity
+Run ID run_36d28e6e947a
+소유자 binding 🟢 live — Run row의 현재 소유자 binding으로 만들어진 Task를 관측했다
+Run row의 현재 소유자 generation 2 · term_6354ef22
+• ⚫ stale · generation 1 · term_29548394 · 이 binding이 만든 Task 39
+• 🟢 live · generation 2 · term_6354ef22 · 이 binding이 만든 Task 24
 
 진행
+task-list.count 10
 completed 6
 dispatched 2
 blocked 1
 ready 1
-task-list.count 10
 
 Dispatch attempts
-12
+attempts 12
+completed 10
+failed 1
+dispatched 1
+재시도가 있었던 Task 1
 
 PR
-#184 ✅ merged
-#185 🟢 ready
-#186 ⚠️ changes requested
+• #184 ✅ 병합 완료 · 리뷰 통과
+• #185 🟡 열림 · 리뷰 결과 없음
+• #186 🟡 열림 · 리뷰에서 수정 요청
 
-Open Gates
+blocker · 현재 상태
+• open Gate 1
+    ↳ gate gate_5c1 · task task_9f2 — 구독 취소 시 권한 종료 시점
+• blocked Task 1
+    ↳ task task_9f2 — 결제 재시도 정책 확정
+
+blocker · 관찰 창 안에서만 판정
+• worker ask 1
+    ↳ task task_7a0 · dispatch ctx_31b · message msg_88c — 환불 한도를 어디서 읽나
+
+blocker · 누적 이력 (현재 blocker가 아니다)
+• failed Dispatch 13
+    ↳ task task_1d4 · dispatch ctx_002 — failed
+
+blocker · 이 관측 표면에서 만들 수 없음
+• ciFailure — Orca schema에 CI 전용 상태가 없다
+
+degraded
+이 Run
+• [unreadable_field] task task_1d4의 deps를 읽지 못했다: JSON 파싱 실패
+관찰 전체
+• 없음
+
+등록되지 않은 Run
 1
-
-Blocked Tasks
-1
-
-[상세 보기]
+• run_7804be5a654f — 관측된 Orca repository id: 3f1e…
+    ↳ [unregistered_repository] 관측된 Orca repository id가 설정에 없다: 3f1e…
 ```
 
 표시할 의미:

@@ -104,8 +104,9 @@ export async function publishRunCard(
   }
 
   if (existing !== null && existing.renderFingerprint === fingerprint) {
-    // 카드가 그대로다. Slack도 store도 부르지 않는다. 관찰 시각은 카드에 있으므로 사실이
-    // 그대로면 지문도 그대로다 — 시각이 움직였다면 지문이 이미 달라 여기 오지 않는다.
+    // 카드가 그대로다. Slack도 store도 부르지 않는다. 이 경로가 살아 있으려면 카드에
+    // 관찰 시각이 없어야 한다 — 시각을 그리면 사실이 그대로여도 지문이 매번 달라져 `skip`이
+    // 실운영에서 발화하지 않는다. 근거는 `store/schema.ts`의 지문 규칙과 `run/render.ts`에 있다.
     return { ...base, action: 'skip', messageTs: existing.messageTs };
   }
 
@@ -149,7 +150,7 @@ export async function publishRunCard(
 /**
  * 관찰 1회의 등록된 Run 전부를 게시한다.
  *
- * 카드 입력을 **여기서 조립한다.** 컬렉션 수준 사실(관측 시각, 컬렉션 degraded, 미등록 Run 수)을
+ * 카드 입력을 **여기서 조립한다.** 컬렉션 수준 사실(컬렉션 degraded, 미등록 Run)을
  * 카드마다 싣고, 이 Run에 연결된 PR을 store에서 읽는다. GitHub을 부르지 않는다.
  *
  * `collection.unregistered`의 Run은 카드를 만들지 않는다. 등록 열쇠가 맞지 않는 Run이므로 어느
@@ -161,8 +162,8 @@ export async function publishRunCollection(
   options: RunPublishOptions,
   collection: RunCollection,
 ): Promise<readonly RunPublishResult[]> {
+  // 관측 시각을 싣지 않는다. 카드에 그리지 않기 때문이고, 그 근거는 `run/render.ts`에 있다.
   const context: RunCollectionContext = {
-    observedAt: collection.observedAt,
     degraded: collection.degraded,
     unregistered: collection.unregistered,
   };

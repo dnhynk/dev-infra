@@ -9,6 +9,7 @@ import type {
   RunDegraded,
   RunFacts,
   RunIdentityFacts,
+  UnregisteredRun,
 } from '../src/run/types.js';
 
 /**
@@ -22,6 +23,8 @@ import type {
  * - `run/types.ts` `failedDispatch`·`escalation`이 현재 blocker와 구분돼 나온다.
  * - OD-020 live/stale/unknown 세 값이 서로 다르게 그려진다.
  * - OD-072 degraded가, OD-078 미등록 Run 수가 카드에 나온다.
+ * - OD-078 미등록 Run 항목이 degraded를 함께 싣어 "조회 실패"와 "등록에 없음"이 다른 카드가 된다.
+ * - 관측 시각을 카드 어디에도 그리지 않는다(`store/schema.ts` 지문 규칙).
  */
 
 const RUN_ID = 'run_36d28e6e947a';
@@ -191,7 +194,6 @@ function input(over: Partial<RunCardInput> = {}): RunCardInput {
     run: facts(),
     pullRequests: [],
     collection: {
-      observedAt: OBSERVED_AT,
       degraded: COLLECTION_DEGRADED,
       unregistered: { count: 0, runs: [] },
     },
@@ -526,7 +528,6 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
       input({
         run: facts({ degraded: [] }),
         collection: {
-          observedAt: OBSERVED_AT,
           degraded: [],
           unregistered: { count: 0, runs: [] },
         },
@@ -564,7 +565,6 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
     const card = renderRunCard(
       input({
         collection: {
-          observedAt: OBSERVED_AT,
           degraded: COLLECTION_DEGRADED,
           unregistered: {
             count: 2,
@@ -582,6 +582,135 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
     expect(section).toContain('run_bbb');
     expect(section).toContain('projects[].orcaRepositoryIds');
   });
+  /*
+   * 이것이 회귀 방지다. 이 절이 degraded를 버리던 동안 아래 세 경우는 **바이트 동일한 카드**였고
+   * 셋 다 "등록하라"고 지시했다. 그러면 OD-078의 완화 장치가 다른 사건을 함께 세게 되고,
+   * 그 수가 조용한 실패를 관측 가능하게 만든다는 근거가 무너진다(OD-072).
+   */
+  it('조회 실패·빈 Run·미등록이 서로 다른 카드가 된다', () => {
+    const card = (run: UnregisteredRun) =>
+      renderRunCard(
+        input({
+          collection: {
+            degraded: COLLECTION_DEGRADED,
+            unregistered: { count: 1, runs: [run] },
+          },
+        }),
+      );
+    // 조회가 실패해 등록 여부를 판정할 수 없다.
+    const unjudged = card({
+      runId: 'run_aaa',
+      repositoryIds: [],
+      degraded: [
+        { kind: 'query_failed', detail: 'task-list 실패: orca가 비정상 종료했다' },
+        {
+          kind: 'repository_unobservable',
+          detail: 'Orca 조회가 실패해 repository id를 관측하지 못했다. 등록 여부를 판정할 수 없다',
+        },
+      ],
+    });
+    // 조회에는 성공했고 Task도 worker도 없어 id가 관측되지 않았다.
+    const empty = card({
+      runId: 'run_aaa',
+      repositoryIds: [],
+      degraded: [
+        {
+          kind: 'repository_unobservable',
+          detail: 'Task도 worker도 없어 Orca repository id를 관측하지 못했다',
+        },
+      ],
+    });
+    // 조회했더니 등록에 없다.
+    const missing = card({
+      runId: 'run_aaa',
+      repositoryIds: ['other-id'],
+      degraded: [
+        { kind: 'unregistered_repository', detail: '관측된 Orca repository id가 설정에 없다: other-id' },
+      ],
+    });
+
+    const label = '등록되지 않은 Run';
+    const [a, b, c] = [unjudged, empty, missing].map((x) => sectionWith(x, label));
+    expect(a).not.toBe(b);
+    expect(b).not.toBe(c);
+    expect(a).not.toBe(c);
+    // 지문까지 갈린다. 갈리지 않으면 게시 경계에서도 두 사건이 한 카드로 접힌다.
+    expect(new Set([unjudged, empty, missing].map(renderFingerprint)).size).toBe(3);
+
+    expect(a).toContain('[query_failed]');
+    expect(a).toContain('등록 여부를 판정할 수 없다');
+    expect(b).not.toContain('[query_failed]');
+    expect(b).toContain('Task도 worker도 없어');
+    expect(c).toContain('[unregistered_repository]');
+  });
+
+  // 조회에 실패한 Run에게 "등록하라"고 지시하면 판정하지 못한 것을 판정한 것처럼 말한다.
+  it('미등록 절이 모든 항목에 등록을 지시하지 않는다', () => {
+    const section = sectionWith(
+      renderRunCard(
+        input({
+          collection: {
+            degraded: COLLECTION_DEGRADED,
+            unregistered: {
+              count: 1,
+              runs: [
+                { runId: 'run_aaa', repositoryIds: [], degraded: [{ kind: 'query_failed', detail: 'task-list 실패' }] },
+              ],
+            },
+          },
+        }),
+      ),
+      '등록되지 않은 Run',
+    );
+    expect(section).toContain('query_failed는 조회가 실패해 등록 여부를 아직 판정하지 못한 것이다');
+  });
+});
+
+/*
+ * 관측 시각(OD-072가 아니라 `store/schema.ts`의 지문 규칙).
+ *
+ * 렌더 지문은 카드에 실제로 표시하는 값에서만 계산한다. 관찰마다 움직이는 값을 카드에 두면
+ * 사실이 그대로여도 매 실행이 `chat.update`를 만들고 `publish.ts`의 `skip`이 실운영에서
+ * 영원히 발화하지 않는다.
+ */
+describe('관측 시각을 카드에 두지 않는다', () => {
+  const pr = (at: string): RunPullRequestRecord => ({
+    prKey: pullRequestKey(1057758478, 27),
+    number: 27,
+    firstSeenAt: '2026-08-24T01:00:00.000Z',
+    lastSeenAt: at,
+    state: { terminal: 'open', mergedAt: null, reviewVerdict: null, observedAt: at },
+  });
+
+  it('ISO8601 시각이 카드 어디에도 없다', () => {
+    const text = cardText(renderRunCard(input({ pullRequests: [pr(OBSERVED_AT)] })));
+    expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    // 가드가 공허하지 않은지 같은 자리에서 확인한다.
+    expect(OBSERVED_AT).toMatch(/\d{4}-\d{2}-\d{2}T/);
+  });
+
+  /*
+   * `pr_state.observed_at`과 `pr_task.last_seen_at`은 **`digest`가 돌 때마다** 갱신된다.
+   * 그 값이 카드에 있으면 Run 사실이 하나도 바뀌지 않아도 `digest`를 돌렸다는 이유만으로
+   * 이 Run 카드가 갱신된다.
+   */
+  it('PR의 관측 시각만 움직여도 지문이 같다', () => {
+    const before = renderRunCard(input({ pullRequests: [pr('2026-08-24T05:00:00.000Z')] }));
+    const after = renderRunCard(input({ pullRequests: [pr('2026-08-24T05:10:00.000Z')] }));
+    expect(renderFingerprint(after)).toBe(renderFingerprint(before));
+    // PR 자체는 카드에 남아 있어야 한다. 줄을 통째로 지운 것이 아니다.
+    expect(sectionWith(after, 'PR')).toContain('#27 🟡 열림');
+  });
+
+  it('pr_state 행이 없을 때도 시각 없이 그 경계를 적는다', () => {
+    const section = sectionWith(
+      renderRunCard(input({ pullRequests: [{ ...pr(OBSERVED_AT), state: null }] })),
+      'PR',
+    );
+    expect(section).toContain('digest가 이 PR의 상태를 아직 관측하지 않았다');
+    expect(section).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+  });
+
 });
 
 describe('결정성과 안전', () => {

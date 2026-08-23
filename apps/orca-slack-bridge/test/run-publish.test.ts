@@ -93,7 +93,7 @@ function input(run: RunFacts = facts()): RunCardInput {
   return {
     run,
     pullRequests: [],
-    collection: { observedAt: AT, degraded: [], unregistered: { count: 0, runs: [] } },
+    collection: { degraded: [], unregistered: { count: 0, runs: [] } },
   };
 }
 
@@ -367,4 +367,53 @@ describe('컬렉션 게시', () => {
     expect(text).toContain('store에 기록된 PR 없음');
     expect(text).not.toContain('#26');
   });
+  /*
+   * `skip`이 실운영에서 살아 있는지를 본다.
+   *
+   * 두 관찰의 Run 사실은 같고 **관측 시각만 다르다** — 컬렉션 `observedAt`도, `digest`가 갱신하는
+   * `pr_state.observed_at`·`pr_task.last_seen_at`도 움직였다. 카드에 그 값이 하나라도 남아 있으면
+   * 지문이 달라져 이 테스트가 `update`를 본다. 고정 시각으로만 도는 테스트는 이 경로를 놓친다.
+   *
+   * **PR이 붙은 Run으로 한다.** PR 없는 Run으로만 하면 `pullRequestLine`의 시각을 놓친다.
+   */
+  it('관측 시각만 다른 재관찰은 Slack을 부르지 않는다', async () => {
+    const store = new SqliteDigestStore(dbPath);
+    const slack = new FakeSlack();
+    const PR = pullRequestKey(1057758478, 27);
+    const snapshot = {
+      terminal: 'open' as const,
+      mergedAt: null,
+      reviewVerdict: null,
+      reviewedHeadSha: null,
+      headSha: 'd'.repeat(40),
+      checksHeadSha: 'd'.repeat(40),
+      checks: [],
+    };
+    const observe = (at: string) => {
+      store.recordPrTask({ prKey: PR, taskKey: taskKey('task_42914531e46b'), runKey: runKey(RUN_ID), at });
+      store.savePrState(PR, snapshot, at);
+    };
+
+    observe(AT);
+    const first = await publishRunCollection(options(store, slack), collection({ runs: [facts()] }));
+
+    const LATER = '2026-08-24T06:30:00.000Z';
+    observe(LATER);
+    const later: RunPublishOptions = { store, slack, channel: CHANNEL, now: () => new Date(LATER) };
+    const second = await publishRunCollection(later, collection({ observedAt: LATER, runs: [facts()] }));
+    store.close();
+
+    // 카드가 PR을 실제로 그렸다는 것을 같은 자리에서 확인한다. 안 그리면 이 테스트가 공허하다.
+    const text = (slack.posts[0]?.blocks ?? [])
+      .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
+      .join('\n');
+    expect(text).toContain('#27 🟡 열림');
+
+    expect(first[0]?.action).toBe('create');
+    expect(second[0]?.action).toBe('skip');
+    expect(second[0]?.fingerprint).toBe(first[0]?.fingerprint);
+    expect(slack.posts).toHaveLength(1);
+    expect(slack.updates).toHaveLength(0);
+  });
+
 });

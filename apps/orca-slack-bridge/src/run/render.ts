@@ -23,6 +23,16 @@ import type {
  * 카드에 나타나는 사실의 유일한 source는 `RunCardInput`이다. 여기서 Orca·GitHub·Slack을 다시
  * 읽지 않는다. 그래서 같은 입력이면 항상 같은 출력이고 렌더 지문이 의미를 가진다.
  *
+ * ## 관측 시각을 카드에 그리지 않는다
+ *
+ * `store/schema.ts`가 정한 규칙이다 — 렌더 지문은 카드에 실제로 표시하는 값에서만 계산한다.
+ * 관찰 시각은 사실이 그대로여도 관찰마다 움직이므로, 카드에 두면 지문이 매번 달라져
+ * `publish.ts`의 `skip`이 실운영에서 영원히 발화하지 않는다. 그래서 `RunCollectionContext`에
+ * 관측 시각을 두지 않는다 — 입력에 없어야 다시 그려지지 않는다.
+ *
+ * 지문에서만 빼고 카드에는 남기는 것은 답이 아니다. 그러면 `skip`된 관찰에서 카드가 낡은
+ * 시각을 표시하게 되어 신선도를 거짓말한다.
+ *
  * ## 이 파일이 만들지 않는 것 — 어기면 실패다
  *
  * - **퍼센트·완료율·성공률.** `total`과 상태별 수를 따로 그리고 둘을 나눈 값을 만들지 않는다.
@@ -234,8 +244,6 @@ export type RunCardInput = {
  * 사실도 함께 사라지므로 모든 카드에 싣는다. 중복은 의도다.
  */
 export type RunCollectionContext = {
-  /** ISO8601. `RunCollection.observedAt` 그대로다. */
-  readonly observedAt: string;
   readonly degraded: readonly RunDegraded[];
   readonly unregistered: UnregisteredRuns;
 };
@@ -304,20 +312,43 @@ function bindingLine(b: ObservedBinding): string {
   );
 }
 
-/** PR 한 줄. store에 저장된 값만 옮긴다. */
+/**
+ * PR 한 줄. store에 저장된 값만 옮긴다.
+ *
+ * **관측 시각을 적지 않는다.** `pr_state.observed_at`과 `pr_task.last_seen_at`은 `digest`가 돌 때마다
+ * 갱신된다 — `digest/digest.ts`가 그 관찰의 시각을 그대로 넣는다. 그 값을 카드에 그리면 **Run 사실이
+ * 하나도 바뀌지 않아도 `digest`를 돌렸다는 이유만으로** 이 Run 카드의 지문이 바뀌고 매번
+ * `chat.update`가 나간다. 상대 시간이나 날짜만 적는 것도 같은 이유로 안 된다 — 결국 움직인다.
+ * 근거는 `store/schema.ts`의 지문 규칙이고 같은 이유로 이 파일은 관측 시각 절도 두지 않는다.
+ */
 function pullRequestLine(pr: RunPullRequestRecord): string {
   if (pr.state === null) {
-    // 연관은 관측했는데 상태 행이 없다. terminal을 추측해 채우지 않는다.
-    return `• #${pr.number} — 상태 기록 없음 (연관만 관측됨, 마지막 관측 ${esc(pr.lastSeenAt)})`;
+    // 연관은 관측했는데 상태 행이 없다. terminal을 추측해 채우지 않고 그 경계를 적는다.
+    return `• #${pr.number} — 상태 기록 없음 (연관만 관측됨. digest가 이 PR의 상태를 아직 관측하지 않았다)`;
   }
   const { emoji, label } = TERMINAL_LABEL[pr.state.terminal];
   const verdict =
     pr.state.reviewVerdict === null ? '리뷰 결과 없음' : VERDICT_LABEL[pr.state.reviewVerdict];
-  return `• #${pr.number} ${emoji} ${label} · ${verdict} (관측 ${esc(pr.state.observedAt)})`;
+  return `• #${pr.number} ${emoji} ${label} · ${verdict}`;
 }
 
 function degradedLine(d: RunDegraded): string {
   return `• [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}`;
+}
+
+/**
+ * 미등록 Run 한 건에 따라붙는 degraded 한 줄(OD-078, OD-072).
+ *
+ * **이 줄이 없으면 "조회에 실패해서 판정할 수 없다"와 "조회했더니 등록에 없다"가 바이트
+ * 동일한 카드가 된다.** 그러면 OD-078의 완화 장치가 거짓을 말한다 — 그 결정이 "id 재생성으로
+ * Run이 조용히 사라진다"는 위험을 감수한 유일한 근거가 "등록에 맞지 않는 Run을 세어 노출한다"인데,
+ * 조회에 실패한 Run이 미등록으로 둔갑하면 그 수가 다른 사건을 함께 센다.
+ *
+ * 가르는 일은 `collect.ts`가 이미 했다 — `repository_unobservable` detail이 "조회가 실패했다"와
+ * "Task도 worker도 없다"를 나눈다. 여기서는 그것을 그린다.
+ */
+function unregisteredDegradedLine(d: RunDegraded): string {
+  return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}`;
 }
 
 /**
@@ -465,27 +496,27 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    */
   const unregisteredLines = [`${collection.unregistered.count}`];
   if (collection.unregistered.count > 0) {
-    unregisteredLines.push(
-      ...collection.unregistered.runs
-        .slice(0, ENTRY_CAP)
-        .map(
-          (u) =>
-            `• ${esc(u.runId)} — 관측된 Orca repository id: ` +
-            `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
-        ),
-    );
+    for (const u of collection.unregistered.runs.slice(0, ENTRY_CAP)) {
+      unregisteredLines.push(
+        `• ${esc(u.runId)} — 관측된 Orca repository id: ` +
+          `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
+      );
+      // degraded를 빼면 이 두 줄이 바이트 동일해진다. 그러면 이 절이 두 사건을 함께 센다.
+      unregisteredLines.push(...u.degraded.map(unregisteredDegradedLine));
+    }
     if (collection.unregistered.runs.length > ENTRY_CAP) {
       unregisteredLines.push(
         `• 외 ${collection.unregistered.runs.length - ENTRY_CAP}건은 카드에 싣지 않았다`,
       );
     }
+    // 모두에게 "등록하라"고 말하지 않는다. 조회가 실패한 Run은 등록 여부가 아직 미판정이다.
     unregisteredLines.push(
-      '설정의 projects[].orcaRepositoryIds에 없는 Run이다. 등록해야 표시 대상이 된다',
+      '각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의' +
+        ' projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해' +
+        ' 등록 여부를 아직 판정하지 못한 것이다',
     );
   }
   blocks.push(labelled('등록되지 않은 Run', unregisteredLines));
-
-  blocks.push(labelled('관측 시각', [esc(collection.observedAt)]));
 
   // blocks를 그리지 못하는 자리에서도 identity·Run ID·판정이 남아야 한다. 그 자리도 mrkdwn으로
   // 해석되므로 blocks와 같은 이스케이프를 거친 값을 쓴다.
