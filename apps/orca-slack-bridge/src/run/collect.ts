@@ -19,6 +19,10 @@ import {
   type UnreadableField,
 } from '../orca/client.js';
 import { projectForOrcaRepositoryId, type BridgeConfig } from '../project/config.js';
+import { projectGateDecisions } from '../gate/project.js';
+import type { GateMetadata } from '../gate/types.js';
+import { runKey } from '../identity/keys.js';
+import type { GateStore } from '../store/schema.js';
 import { aggregateBlockers, aggregateDispatches, aggregateTasks } from './aggregate.js';
 import { runIdentity } from './liveness.js';
 import type {
@@ -50,6 +54,8 @@ import type {
 export type CollectOptions = {
   readonly now?: () => Date;
   readonly inboxLimit?: number;
+  /** D2-A sidecar reader. Omitted callers still get action-free missing-metadata Gate cards. */
+  readonly gateStore?: GateStore;
 };
 
 /** 한 Run의 원천 사실. 조회 실패는 여기서 degraded로 바뀐다. */
@@ -57,6 +63,7 @@ export type RunSources = {
   readonly tasks: readonly OrcaTask[];
   readonly taskCount: number;
   readonly gates: readonly OrcaGate[];
+  readonly gateMetadata: readonly GateMetadata[];
   readonly workers: readonly OrcaWorker[];
   readonly agentWaits: readonly { readonly worker: OrcaWorker; readonly wait: OrcaAgentWait }[];
   readonly degraded: readonly RunDegraded[];
@@ -98,13 +105,18 @@ function byId<T>(pick: (row: T) => string): (a: T, b: T) => number {
   };
 }
 
-async function readRunSources(orca: OrcaRunner, run: OrcaRun): Promise<RunSources> {
+async function readRunSources(
+  orca: OrcaRunner,
+  run: OrcaRun,
+  gateStore: GateStore | undefined,
+): Promise<RunSources> {
   // legacy Run은 읽기 전용 placeholder다. Task/Gate 조회를 시도하지 않는다(snapshot.ts와 같다).
   if (run.legacy) {
     return {
       tasks: [],
       taskCount: 0,
       gates: [],
+      gateMetadata: [],
       workers: [],
       agentWaits: [],
       degraded: [],
@@ -131,6 +143,17 @@ async function readRunSources(orca: OrcaRunner, run: OrcaRun): Promise<RunSource
   } catch (e) {
     degraded.push({ kind: 'query_failed', detail: `gate-list 실패: ${message(e)}` });
   }
+  let gateMetadata: readonly GateMetadata[] = [];
+  if (gateStore !== undefined) {
+    try {
+      gateMetadata = gateStore.listGateMetadata(runKey(run.id));
+    } catch (e) {
+      degraded.push({
+        kind: 'query_failed',
+        detail: `gate_metadata 조회 실패: ${message(e)}`,
+      });
+    }
+  }
   let workers: readonly OrcaWorker[] = [];
   try {
     workers = [...(await listWorkers(orca, run.id))].sort(byId((w) => w.dispatchId));
@@ -154,6 +177,7 @@ async function readRunSources(orca: OrcaRunner, run: OrcaRun): Promise<RunSource
     tasks,
     taskCount,
     gates,
+    gateMetadata,
     workers,
     agentWaits,
     degraded,
@@ -263,6 +287,7 @@ export function projectRun(
       escalations,
       agentWaits: sources.agentWaits,
     }),
+    gates: projectGateDecisions(sources.gates, sources.tasks, sources.gateMetadata),
     degraded,
   };
 }
@@ -363,7 +388,12 @@ export async function collectRunFacts(
   const facts: RunFacts[] = [];
   const unregisteredRuns: UnregisteredRun[] = [];
   for (const run of runs) {
-    const projected = projectRun(run, await readRunSources(orca, run), askInbox, config);
+    const projected = projectRun(
+      run,
+      await readRunSources(orca, run, options.gateStore),
+      askInbox,
+      config,
+    );
     if (projected.project === null) {
       // degraded를 함께 싣는다. 이것이 없으면 조회에 실패한 Run이 미등록으로 둔갑해 OD-078의
       // 완화 장치가 다른 사건을 센다.

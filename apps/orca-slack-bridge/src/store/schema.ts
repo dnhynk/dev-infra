@@ -1,6 +1,7 @@
 import type { CheckFact } from '../github/pull-request.js';
-import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
+import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
+import type { GateMetadata } from '../gate/types.js';
 
 /**
  * durable store 스키마와 접근 경계.
@@ -58,12 +59,12 @@ import type { PrTerminal, ReviewerResult } from '../digest/types.js';
  *   (PR, dedupe key)다. 보장 범위는 `PR_THREAD_EVENT_TABLE`에 적었다.
  * - 이전 관측의 terminal과 check resource를 다음 관측이 읽을 수 있다 → `pr_state`가 PR당 한 행이다.
  *
- * 담지 않는 것: Gate↔action correlation, coordinator notification pending, 관찰 cursor.
- * 각각 D2/D3의 사실이고, 지금 만들면 쓰이지 않는 스키마가 된다.
+ * D2-A는 Gate sidecar와 정적 thread reply mapping만 덧붙인다. Gate resolution/outbox와
+ * coordinator notification은 D2-C/D3의 사실이므로 아직 담지 않는다.
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -284,6 +285,48 @@ CREATE TABLE run_collection_message (
 )`;
 
 /**
+ * Coordinator가 등록한 ask↔Gate mapping과 option metadata. Orca 원문을 복제해 대체하지 않고,
+ * Gate ID에 없는 안정적 option identity/recommendation/impact만 보존한다(DL-040).
+ */
+const GATE_METADATA_TABLE = `
+CREATE TABLE gate_metadata (
+  gate_key                 TEXT PRIMARY KEY,
+  run_key                  TEXT NOT NULL,
+  task_key                 TEXT NOT NULL,
+  dispatch_key             TEXT NOT NULL,
+  ask_message_id           TEXT NOT NULL UNIQUE,
+  question_thread_id       TEXT NOT NULL,
+  options_json             TEXT NOT NULL,
+  recommendation_option_id TEXT NOT NULL,
+  recommendation_reason    TEXT NOT NULL,
+  impact                    TEXT NOT NULL,
+  registered_at             TEXT NOT NULL
+)`;
+
+/** 같은 Run의 metadata를 Gate key 순서로 읽는 production projector용 index. */
+const GATE_METADATA_RUN_INDEX = `
+CREATE INDEX gate_metadata_run_key ON gate_metadata (run_key, gate_key)`;
+
+/**
+ * Gate 하나와 Run root 아래 Slack reply 하나의 durable mapping. `run_message`에 Gate를 섞지 않는다.
+ */
+const GATE_MESSAGE_TABLE = `
+CREATE TABLE gate_message (
+  gate_key            TEXT PRIMARY KEY,
+  run_key             TEXT NOT NULL,
+  channel_id          TEXT NOT NULL,
+  thread_ts           TEXT NOT NULL,
+  message_ts          TEXT NOT NULL,
+  render_fingerprint  TEXT NOT NULL,
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+)`;
+
+/** 두 Gate가 같은 Slack reply를 가리키면 한 카드가 다른 카드를 덮어쓴다. */
+const GATE_MESSAGE_INDEX = `
+CREATE UNIQUE INDEX gate_message_slack_identity ON gate_message (channel_id, message_ts)`;
+
+/**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
  *
  * **비어 있는 파일에만 쓴다.** 이미 버전이 기록된 파일은 `MIGRATIONS`가 올린다. 그래서 이
@@ -333,6 +376,10 @@ ${PR_THREAD_EVENT_TABLE};
 ${RUN_MESSAGE_TABLE};
 ${RUN_MESSAGE_INDEX};
 ${RUN_COLLECTION_MESSAGE_TABLE};
+${GATE_METADATA_TABLE};
+${GATE_METADATA_RUN_INDEX};
+${GATE_MESSAGE_TABLE};
+${GATE_MESSAGE_INDEX};
 `;
 
 /**
@@ -376,6 +423,9 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // 시작하고 그것이 맞다 — 행이 없다는 것은 "컬렉션 루트를 아직 만들지 않았다"는 뜻이고 첫
   // 관찰이 만들며 채운다. 과거에 게시한 컬렉션 카드는 없다.
   [RUN_COLLECTION_MESSAGE_TABLE],
+  // v6 → v7: sidecar producer와 정적 Gate thread consumer가 즉시 쓰는 두 표만 붙인다(D2-A).
+  // 기존 PR/Run/collection 행은 건드리지 않고, 과거 Gate metadata나 Slack reply를 추측해 채우지 않는다.
+  [GATE_METADATA_TABLE, GATE_METADATA_RUN_INDEX, GATE_MESSAGE_TABLE, GATE_MESSAGE_INDEX],
 ];
 
 /**
@@ -678,6 +728,46 @@ export type RunPullRequestRecord = {
     readonly observedAt: string;
   } | null;
 };
+
+/** A Gate thread reply and the Run root thread it must remain attached to. */
+export type GateMessageRecord = {
+  readonly gateKey: GateKey;
+  readonly runKey: RunKey;
+  readonly channelId: string;
+  readonly threadTs: string;
+  readonly messageTs: string;
+  readonly renderFingerprint: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type NewGateMessage = {
+  readonly gateKey: GateKey;
+  readonly runKey: RunKey;
+  readonly channelId: string;
+  readonly threadTs: string;
+  readonly messageTs: string;
+  readonly renderFingerprint: string;
+  /** ISO8601. `created_at`과 `updated_at`에 같은 값을 쓴다. */
+  readonly at: string;
+};
+
+/**
+ * D2-A durable boundary. Metadata registration and static-card publication share the same file but
+ * remain separate from PR and Run-root interfaces so callers request only the effects they use.
+ */
+export interface GateStore {
+  findGateMetadata(gateKey: GateKey): GateMetadata | null;
+  /** Gate key order is fixed in SQL so source-row order cannot change render fingerprints. */
+  listGateMetadata(runKey: RunKey): readonly GateMetadata[];
+  /** First registration only. A conflicting second registration must not overwrite correlation. */
+  insertGateMetadata(metadata: GateMetadata): void;
+  findGateMessage(gateKey: GateKey): GateMessageRecord | null;
+  /** First reply only. A conflicting row must not replace the existing Slack identity. */
+  insertGateMessage(message: NewGateMessage): void;
+  /** Update only the deterministic render fingerprint and observation time. */
+  updateGateObservation(gateKey: GateKey, renderFingerprint: string, at: string): void;
+}
 
 /**
  * Run 카드가 쓰는 durable store.
