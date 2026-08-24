@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { runRunObserver } from '../src/run/publish.js';
 import type { BridgeConfig } from '../src/project/config.js';
@@ -249,6 +250,20 @@ function noActionBlocks(input: { readonly blocks: readonly Record<string, unknow
   );
 }
 
+async function matchedGateFacts(store: SqliteDigestStore, orca: MutableFakeOrca) {
+  const preview = await runRunObserver(orca, {
+    config: CONFIG,
+    channel: CHANNEL,
+    store,
+    slack: null,
+    thread: null,
+    now: () => new Date(AT),
+  });
+  const gate = preview.facts.runs[0]?.gates.find((candidate) => candidate.gateId === GATE_ID);
+  if (gate === undefined) throw new Error('matched Gate preview missing');
+  return gate;
+}
+
 describe('collect → project → render → existing Run thread publish', () => {
   it('Gate마다 한 reply를 만들고 matched pending만 fixed actions를 게시한다', async () => {
     const store = new SqliteDigestStore(dbPath);
@@ -273,11 +288,13 @@ describe('collect → project → render → existing Run thread publish', () =>
       expect(slack.posts).toHaveLength(2); // collection root + Run root
       expect(slack.replies).toHaveLength(2);
       expect(slack.replies.map((reply) => reply.threadTs)).toEqual([RUN_ROOT_TS, RUN_ROOT_TS]);
-      expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(false);
+      expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
       expect(noActionBlocks(slack.replies[1] ?? { blocks: [] })).toBe(true);
-      expect(JSON.stringify(slack.replies[0]?.blocks)).toContain('"value":"keep"');
+      const promoted = slack.updates.find((update) => update.ts === FIRST_GATE_TS);
+      expect(noActionBlocks(promoted ?? { blocks: [] })).toBe(false);
+      expect(JSON.stringify(promoted?.blocks)).toContain('"value":"keep"');
       expect(slack.replies[0]?.text).toContain('정적 Gate card');
-      expect(JSON.stringify(slack.replies[0]?.blocks)).toContain('현재 소비자와 호환된다');
+      expect(JSON.stringify(promoted?.blocks)).toContain('현재 소비자와 호환된다');
       expect(JSON.stringify(slack.replies[1]?.blocks)).toContain('추측하지 않음');
 
       const matched = store.findGateMessage(gateKey(GATE_ID));
@@ -382,6 +399,7 @@ describe('collect → project → render → existing Run thread publish', () =>
       thread: failedSlack,
       now: () => new Date(AT),
     })).rejects.toThrow(/thread reply unavailable/);
+    expect(noActionBlocks(failedSlack.replies[0] ?? { blocks: [] })).toBe(true);
     expect(firstStore.findGateMessage(gateKey(GATE_ID))).toBeNull();
     expect(firstStore.findGateLocalObservation(gateKey(GATE_ID))).toMatchObject({
       metadataState: 'matched', mappingState: 'missing',
@@ -401,6 +419,258 @@ describe('collect → project → render → existing Run thread publish', () =>
       });
       expect(reopened.findGateMessage(gateKey(GATE_ID))).not.toBeNull();
       expect(reopened.findGateLocalObservation(gateKey(GATE_ID))?.mappingState).toBe('matched');
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('keeps a Slack-accepted first reply inert across a crash before durable mapping', async () => {
+    const orca = new MutableFakeOrca();
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const gate = await matchedGateFacts(store, orca);
+    const slack = new FakeSlack();
+    await expect(publishGateCard(
+      {
+        store,
+        slack,
+        thread: slack,
+        channel: CHANNEL,
+        now: () => new Date(AT),
+        fault: (point) => {
+          if (point === 'after_staged_first_reply_before_mapping') {
+            throw new Error('process died after staged reply acceptance');
+          }
+        },
+      },
+      runKey(RUN_ID),
+      RUN_ROOT_TS,
+      gate,
+    )).rejects.toThrow(/staged reply acceptance/);
+    expect(slack.replies).toHaveLength(1);
+    expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
+    expect(slack.updates).toEqual([]);
+    expect(store.findGateMessage(gate.key)).toBeNull();
+    expect(store.findGateLocalObservation(gate.key)?.mappingState).toBe('missing');
+    store.close();
+
+    const reopened = new SqliteDigestStore(dbPath);
+    try {
+      await publishGateCard(
+        {
+          store: reopened,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date('2026-08-24T07:01:00.000Z'),
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        gate,
+      );
+      expect(slack.replies).toHaveLength(2);
+      expect(slack.replies.every(noActionBlocks)).toBe(true);
+      const actionable = slack.updates.filter((update) => !noActionBlocks(update));
+      expect(actionable).toHaveLength(1);
+      expect(actionable[0]?.ts).toBe('1787554800.000102');
+      expect(reopened.findGateMessage(gate.key)?.messageTs).toBe('1787554800.000102');
+      expect(reopened.findGateLocalObservation(gate.key)?.mappingState).toBe('matched');
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('restarts from a durable staged mapping and promotes that same reply in place', async () => {
+    const orca = new MutableFakeOrca();
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const gate = await matchedGateFacts(store, orca);
+    const slack = new FakeSlack();
+    await expect(publishGateCard(
+      {
+        store,
+        slack,
+        thread: slack,
+        channel: CHANNEL,
+        now: () => new Date(AT),
+        fault: (point) => {
+          if (point === 'after_staged_first_mapping_before_action_update') {
+            throw new Error('process died after staged mapping');
+          }
+        },
+      },
+      runKey(RUN_ID),
+      RUN_ROOT_TS,
+      gate,
+    )).rejects.toThrow(/staged mapping/);
+    expect(slack.replies).toHaveLength(1);
+    expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
+    expect(slack.updates).toEqual([]);
+    expect(store.findGateMessage(gate.key)?.messageTs).toBe(FIRST_GATE_TS);
+    expect(store.findGateLocalObservation(gate.key)?.mappingState).toBe('matched');
+    store.close();
+
+    const reopened = new SqliteDigestStore(dbPath);
+    try {
+      await publishGateCard(
+        {
+          store: reopened,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date('2026-08-24T07:01:00.000Z'),
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        gate,
+      );
+      expect(slack.replies).toHaveLength(1);
+      expect(slack.updates).toHaveLength(1);
+      expect(noActionBlocks(slack.updates[0] ?? { blocks: [] })).toBe(false);
+      expect(slack.updates[0]?.ts).toBe(FIRST_GATE_TS);
+      expect(reopened.findGateMessage(gate.key)?.messageTs).toBe(FIRST_GATE_TS);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('leaves only an inert orphan when a second SQLite writer blocks first mapping persistence', async () => {
+    const orca = new MutableFakeOrca();
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const gate = await matchedGateFacts(store, orca);
+    const slack = new FakeSlack();
+    const locker = new DatabaseSync(dbPath);
+    let locked = false;
+    try {
+      await expect(publishGateCard(
+        {
+          store,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date(AT),
+          fault: (point) => {
+            if (point === 'after_staged_first_reply_before_mapping') {
+              locker.exec('BEGIN IMMEDIATE');
+              locked = true;
+            }
+          },
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        gate,
+      )).rejects.toThrow(/thread 메시지를 기록할 수 없다/);
+      expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
+      expect(store.findGateMessage(gate.key)).toBeNull();
+      expect(store.findGateLocalObservation(gate.key)?.mappingState).toBe('missing');
+      locker.exec('COMMIT');
+      locked = false;
+    } finally {
+      if (locked) locker.exec('ROLLBACK');
+      locker.close();
+      store.close();
+    }
+
+    const reopened = new SqliteDigestStore(dbPath);
+    try {
+      await publishGateCard(
+        {
+          store: reopened,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date('2026-08-24T07:01:00.000Z'),
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        gate,
+      );
+      expect(slack.replies).toHaveLength(2);
+      expect(slack.replies.every(noActionBlocks)).toBe(true);
+      expect(slack.updates.filter((update) => !noActionBlocks(update))).toHaveLength(1);
+      expect(reopened.findGateMessage(gate.key)?.messageTs).toBe('1787554800.000102');
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('does not let a stale first-publisher snapshot downgrade the canonical mapped card', async () => {
+    const orca = new MutableFakeOrca();
+    const firstStore = new SqliteDigestStore(dbPath);
+    insertSidecar(firstStore);
+    const staleStore = new SqliteDigestStore(dbPath);
+    const gate = await matchedGateFacts(firstStore, orca);
+    const slack = new FakeSlack();
+    let signalSnapshot!: () => void;
+    let resumeStale!: () => void;
+    const snapshotRead = new Promise<void>((resolve) => { signalSnapshot = resolve; });
+    const staleResume = new Promise<void>((resolve) => { resumeStale = resolve; });
+    try {
+      const stalePublishing = publishGateCard(
+        {
+          store: staleStore,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date(AT),
+          fault: async (point) => {
+            if (point === 'after_gate_message_snapshot_before_observation') {
+              signalSnapshot();
+              await staleResume;
+            }
+          },
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        gate,
+      );
+      await snapshotRead;
+
+      await publishGateCard(
+        {
+          store: firstStore,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date('2026-08-24T07:00:01.000Z'),
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        gate,
+      );
+      expect(firstStore.findGateLocalObservation(gate.key)?.mappingState).toBe('matched');
+      resumeStale();
+      await expect(stalePublishing).rejects.toThrow(/thread 메시지를 기록할 수 없다/);
+
+      expect(slack.replies).toHaveLength(2);
+      expect(slack.replies.every(noActionBlocks)).toBe(true);
+      const actionable = slack.updates.filter((update) => !noActionBlocks(update));
+      expect(actionable).toHaveLength(1);
+      expect(actionable[0]?.ts).toBe(FIRST_GATE_TS);
+      expect(staleStore.findGateLocalObservation(gate.key)?.mappingState).toBe('matched');
+      expect(staleStore.findGateResolution(gate.key)).toBeNull();
+    } finally {
+      staleStore.close();
+      firstStore.close();
+    }
+
+    const reopened = new SqliteDigestStore(dbPath);
+    try {
+      expect(reopened.findGateLocalObservation(gate.key)?.mappingState).toBe('matched');
+      expect(reopened.claimGateResolution({
+        teamId: 'T0TEAM',
+        ownerUserId: 'U0OWNER',
+        apiAppId: null,
+        channelId: CHANNEL,
+        threadTs: RUN_ROOT_TS,
+        messageTs: FIRST_GATE_TS,
+        blockId: gateBlockId(gate.key),
+        actionId: gateActionId(gate.key, 'keep'),
+        actionValue: 'keep',
+        retryRequestId: '22222222-2222-4222-8222-222222222222',
+        at: '2026-08-24T07:00:02.000Z',
+      }).kind).toBe('claimed');
     } finally {
       reopened.close();
     }

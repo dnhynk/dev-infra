@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { GateResolutionEngine, type GateResolutionFault } from '../src/gate/resolve.js';
 import { projectGateResolutionCard } from '../src/gate/resolution-project.js';
@@ -205,6 +206,52 @@ class DeferredFirstSlack implements SlackPoster {
       this.signalStarted();
       await this.firstCompletion;
     }
+    return { channel: input.channel, ts: input.ts };
+  }
+}
+
+class SequencedSlack implements SlackPoster {
+  readonly updates: UpdateMessageInput[] = [];
+  readonly started: readonly Promise<void>[];
+  private readonly signalStarted: readonly (() => void)[];
+  private readonly completions: readonly Promise<void>[];
+  private readonly signalCompletion: readonly (() => void)[];
+
+  constructor(count: number) {
+    const started: Promise<void>[] = [];
+    const signalStarted: (() => void)[] = [];
+    const completions: Promise<void>[] = [];
+    const signalCompletion: (() => void)[] = [];
+    for (let index = 0; index < count; index += 1) {
+      started.push(new Promise((resolve) => signalStarted.push(resolve)));
+      completions.push(new Promise((resolve) => signalCompletion.push(resolve)));
+    }
+    this.started = started;
+    this.signalStarted = signalStarted;
+    this.completions = completions;
+    this.signalCompletion = signalCompletion;
+  }
+
+  release(index: number): void {
+    const release = this.signalCompletion[index];
+    if (release === undefined) throw new Error(`missing Slack completion ${index}`);
+    release();
+  }
+
+  post(_input: PostMessageInput): Promise<PostedMessage> {
+    return Promise.reject(new Error('not used'));
+  }
+
+  async update(input: UpdateMessageInput): Promise<PostedMessage> {
+    const index = this.updates.length;
+    const started = this.signalStarted[index];
+    const completion = this.completions[index];
+    if (started === undefined || completion === undefined) {
+      throw new Error(`unexpected Slack attempt ${index + 1}`);
+    }
+    this.updates.push(input);
+    started();
+    await completion;
     return { channel: input.channel, ts: input.ts };
   }
 }
@@ -589,6 +636,101 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     store.close();
   });
 
+  it('re-arms a completed outbox before projecting a newer renderer fingerprint', async () => {
+    const path = join(dir, 'completed-renderer-drift.db');
+    const store = seed(path);
+    const completed = store.findGateResolutionOutbox(GATE);
+    if (completed === null) throw new Error('outbox missing');
+    const owner = `p${process.pid}.completed-renderer-v0`;
+    expect(store.acquireGateOutboxProjection(GATE, completed.revision, owner, AT)).toBe('acquired');
+    expect(store.markGateOutboxProjected(
+      GATE,
+      completed.revision,
+      'legacy-renderer-fingerprint',
+      owner,
+      AT,
+    )).toBe(true);
+    expect(store.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+
+    const crashedSlack = new FakeSlack();
+    await expect(projectGateResolutionCard(
+      store,
+      crashedSlack,
+      GATE,
+      () => new Date('2026-08-24T10:00:01.000Z'),
+      (point) => {
+        if (point === 'after_outbox_rearm_before_reread') {
+          throw new Error('process died after renderer re-arm');
+        }
+      },
+    )).rejects.toThrow(/renderer re-arm/);
+    expect(crashedSlack.updates).toEqual([]);
+    expect(store.findGateResolutionOutbox(GATE)).toMatchObject({
+      revision: completed.revision + 2,
+      cardPending: true,
+      projectedAt: null,
+    });
+    expect(store.markGateOutboxProjected(
+      GATE,
+      completed.revision,
+      'late-legacy-completion',
+      owner,
+      '2026-08-24T10:00:01.001Z',
+    )).toBe(false);
+    store.close();
+
+    const restarted = new SqliteDigestStore(path);
+    expect(restarted.listPendingGateOutboxes()).toHaveLength(1);
+    const recoveredSlack = new FakeSlack();
+    await expect(projectGateResolutionCard(
+      restarted,
+      recoveredSlack,
+      GATE,
+      () => new Date('2026-08-24T10:00:02.000Z'),
+    )).resolves.toMatchObject({ kind: 'projected' });
+    expect(recoveredSlack.updates).toHaveLength(1);
+    expect(restarted.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+    expect(restarted.findGateMessage(GATE)?.renderFingerprint).not.toBe(
+      'legacy-renderer-fingerprint',
+    );
+    restarted.close();
+  });
+
+  it('startup reconciliation checks a completed terminal card for renderer drift', async () => {
+    const path = join(dir, 'terminal-completed-renderer-drift.db');
+    const store = seed(path);
+    const orca = new FakeOrca();
+    const initialSlack = new FakeSlack();
+    await engine(store, orca, initialSlack).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('resolved');
+    expect(store.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+    const orcaCalls = orca.calls.length;
+    store.close();
+
+    // A renderer deployment changes the deterministic fingerprint without creating a lifecycle
+    // generation. This is fixture evidence for the persisted pre-deploy completed card.
+    const raw = new DatabaseSync(path);
+    raw.prepare('UPDATE gate_message SET render_fingerprint = ? WHERE gate_key = ?').run(
+      'legacy-terminal-renderer-fingerprint',
+      GATE,
+    );
+    raw.close();
+
+    const restarted = new SqliteDigestStore(path);
+    const recoveredSlack = new FakeSlack();
+    try {
+      await engine(restarted, orca, recoveredSlack).reconcile();
+      expect(orca.calls).toHaveLength(orcaCalls); // terminal lifecycle never re-enters Orca
+      expect(recoveredSlack.updates).toHaveLength(1);
+      expect(restarted.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+      expect(restarted.findGateMessage(GATE)?.renderFingerprint).not.toBe(
+        'legacy-terminal-renderer-fingerprint',
+      );
+    } finally {
+      restarted.close();
+    }
+  });
+
   it('a never-settling Slack projection times out, releases ownership, and remains replayable', async () => {
     const store = seed(join(dir, 'outbox-timeout.db'));
     const hanging: SlackPoster = {
@@ -637,6 +779,98 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     expect(JSON.stringify(slack.updates[1])).toContain('degraded');
     expect(store.listPendingGateOutboxes()).toEqual([]);
     expect(store.findGateMessage(GATE)?.renderFingerprint).not.toBe('fp');
+    store.close();
+  });
+
+  it('renews one projection owner across three generations and fences old-boundary takeover', async () => {
+    const path = join(dir, 'three-generation-projection-renewal.db');
+    const store = seed(path);
+    const slack = new SequencedSlack(3);
+    let projectionNow = new Date(AT);
+    const acquisitions: { readonly revision: number; readonly owner: string }[] = [];
+    const originalAcquire = store.acquireGateOutboxProjection.bind(store);
+    vi.spyOn(store, 'acquireGateOutboxProjection').mockImplementation(
+      (gate, revision, owner, at) => {
+        acquisitions.push({ revision, owner });
+        return originalAcquire(gate, revision, owner, at);
+      },
+    );
+    const projecting = projectGateResolutionCard(store, slack, GATE, () => projectionNow);
+    await slack.started[0];
+
+    const lifecycleOwner = 't.three-generation-lifecycle';
+    const leased = store.acquireGateResolutionLease(
+      GATE,
+      lifecycleOwner,
+      AT,
+      '2026-08-24T10:01:00.000Z',
+    );
+    if (leased.kind !== 'acquired') throw new Error(`lifecycle lease failed: ${leased.kind}`);
+    const pendingSnapshot = {
+      gateId: GATE_ID,
+      runId: RUN_ID,
+      taskId: TASK_ID,
+      options: ['현행 유지', '변경'],
+      status: 'pending' as const,
+      resolution: null,
+      resolvedAt: null,
+    };
+    projectionNow = new Date('2026-08-24T10:00:10.000Z');
+    const preRead = store.updateGateResolution(
+      GATE,
+      leased.intent.revision,
+      lifecycleOwner,
+      { lifecycle: 'pre_read', preRead: pendingSnapshot, at: projectionNow.toISOString() },
+    );
+    if (preRead === null) throw new Error('pre-read generation failed');
+    slack.release(0);
+    await slack.started[1];
+
+    projectionNow = new Date('2026-08-24T10:00:20.000Z');
+    const resolving = store.updateGateResolution(
+      GATE,
+      preRead.revision,
+      lifecycleOwner,
+      { lifecycle: 'resolving', at: projectionNow.toISOString() },
+    );
+    if (resolving === null) throw new Error('resolving generation failed');
+    slack.release(1);
+    await slack.started[2];
+
+    const currentOutbox = store.findGateResolutionOutbox(GATE);
+    if (currentOutbox === null) throw new Error('current outbox missing');
+    const contender = new SqliteDigestStore(path, { observationOwnerAlive: () => true });
+    expect(contender.acquireGateOutboxProjection(
+      GATE,
+      currentOutbox.revision,
+      `p${process.pid}.old-boundary-contender`,
+      '2026-08-24T10:00:30.000Z',
+    )).toBe('busy');
+
+    projectionNow = new Date('2026-08-24T10:00:30.000Z');
+    slack.release(2);
+    await projecting;
+    expect(slack.updates).toHaveLength(3);
+    expect(acquisitions.map(({ revision }) => revision)).toEqual([0, 1, 2]);
+    expect(new Set(acquisitions.map(({ owner }) => owner)).size).toBe(1);
+    expect(store.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+    const projectionOwner = acquisitions[0]?.owner;
+    if (projectionOwner === undefined) throw new Error('projection owner missing');
+    expect(store.markGateOutboxProjected(
+      GATE,
+      0,
+      'late-generation-zero',
+      projectionOwner,
+      '2026-08-24T10:00:30.001Z',
+    )).toBe(false);
+    expect(store.markGateOutboxProjected(
+      GATE,
+      1,
+      'late-generation-one',
+      projectionOwner,
+      '2026-08-24T10:00:30.002Z',
+    )).toBe(false);
+    contender.close();
     store.close();
   });
 

@@ -911,8 +911,12 @@ export interface GateStore extends GateResolutionStore {
   /** First registration only. A conflicting second registration must not overwrite correlation. */
   insertGateMetadata(metadata: GateMetadata): void;
   findGateMessage(gateKey: GateKey): GateMessageRecord | null;
-  /** First reply only. A conflicting row must not replace the existing Slack identity. */
-  insertGateMessage(message: NewGateMessage): void;
+  /**
+   * First reply only. A conflicting row must not replace the existing Slack identity. When the
+   * first observation is supplied, the message identity and matched mapping become durable in one
+   * transaction before any action controls are exposed.
+   */
+  insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void;
   /** Settle an ordinary write fence and atomically record the exact observation it projected. */
   updateGateObservation(
     gateKey: GateKey,

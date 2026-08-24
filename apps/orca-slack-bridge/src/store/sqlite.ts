@@ -441,6 +441,14 @@ SELECT o.gate_key, o.revision, o.card_state, o.card_pending, o.notification_stat
  WHERE o.card_pending = 1
  ORDER BY o.gate_key`;
 
+const SELECT_ACKNOWLEDGED_GATE_OUTBOXES = `
+SELECT o.gate_key, o.revision, o.card_state, o.card_pending, o.notification_state, o.projected_at,
+       o.projection_owner, o.projection_expires_at, o.last_error_code, o.created_at, o.updated_at
+  FROM gate_resolution_outbox o
+  JOIN gate_resolution r ON r.gate_key = o.gate_key
+ WHERE r.ack_state = 'acked'
+ ORDER BY o.gate_key`;
+
 const SELECT_GATE_OUTBOX = `
 SELECT gate_key, revision, card_state, card_pending, notification_state, projected_at,
        projection_owner, projection_expires_at, last_error_code, created_at, updated_at
@@ -1512,7 +1520,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     return row === undefined ? null : toGateMessage(row);
   }
 
-  insertGateMessage(message: NewGateMessage): void {
+  insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void {
     toGateMessage({
       gate_key: message.gateKey,
       run_key: message.runKey,
@@ -1523,7 +1531,20 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       created_at: message.at,
       updated_at: message.at,
     });
+    if (
+      observation !== undefined &&
+      (observation.gateKey !== message.gateKey ||
+        observation.runKey !== message.runKey ||
+        observation.mappingState !== 'matched')
+    ) {
+      throw new TypeError(
+        `${message.gateKey}의 첫 Gate message observation correlation이 matched가 아니다`,
+      );
+    }
+    let transactionStarted = false;
     try {
+      this.db.exec('BEGIN IMMEDIATE');
+      transactionStarted = true;
       this.db
         .prepare(INSERT_GATE_MESSAGE)
         .run(
@@ -1536,7 +1557,45 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           message.at,
           message.at,
         );
+      if (observation !== undefined) {
+        // The collection snapshot may have raced sidecar registration. Reconcile metadata inside
+        // the same transaction that makes the Slack identity actionable.
+        const metadata = this.db.prepare(SELECT_GATE_METADATA).get(message.gateKey) as
+          | GateMetadataRow
+          | undefined;
+        const metadataState = reconcileObservationMetadataState(observation, metadata);
+        toGateLocalObservation({
+          gate_key: observation.gateKey,
+          run_key: observation.runKey,
+          task_key: observation.taskKey,
+          status: observation.status,
+          resolution: observation.resolution,
+          resolved_at: observation.resolvedAt,
+          metadata_state: metadataState,
+          mapping_state: 'matched',
+          write_owner: null,
+          write_expires_at: null,
+          observed_at: observation.observedAt,
+        });
+        const mapped = this.db.prepare(UPSERT_GATE_LOCAL_OBSERVATION).run(
+          observation.gateKey,
+          observation.runKey,
+          observation.taskKey,
+          observation.status,
+          observation.resolution,
+          observation.resolvedAt,
+          metadataState,
+          'matched',
+          observation.observedAt,
+        );
+        if (Number(mapped.changes) !== 1) {
+          throw new Error(`${message.gateKey}의 첫 Gate message mapping을 원자적으로 확정하지 못했다`);
+        }
+      }
+      this.db.exec('COMMIT');
+      transactionStarted = false;
     } catch (e) {
+      if (transactionStarted) this.db.exec('ROLLBACK');
       const detail = e instanceof Error ? e.message : String(e);
       throw new Error(
         `${message.gateKey}의 thread 메시지를 기록할 수 없다 ` +
@@ -1657,43 +1716,69 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     }
   }
 
-  saveGateLocalObservation(observation: GateLocalObservation): void {
+  saveGateLocalObservation(
+    observation: GateLocalObservation,
+    expectedFirstMessage?: { readonly channelId: string; readonly threadTs: string | null },
+  ): void {
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      let reconciledObservation = observation;
+      if (expectedFirstMessage !== undefined) {
+        const currentMessage = this.db.prepare(SELECT_GATE_MESSAGE).get(observation.gateKey) as
+          | GateMessageRow
+          | undefined;
+        if (currentMessage !== undefined) {
+          // The caller rendered from an `existing === null` snapshot, but another publisher made
+          // the immutable identity durable first. Preserve the caller's current Orca facts while
+          // deriving correlation from that now-authoritative message instead of writing `missing`.
+          const message = toGateMessage(currentMessage);
+          reconciledObservation = {
+            ...observation,
+            mappingState:
+              expectedFirstMessage.threadTs === null
+                ? 'missing'
+                : message.runKey === observation.runKey &&
+                    message.channelId === expectedFirstMessage.channelId &&
+                    message.threadTs === expectedFirstMessage.threadTs
+                  ? 'matched'
+                  : 'mismatched',
+          };
+        }
+      }
       // Reconcile the caller's earlier collection snapshot against sidecar state in this exact
       // write transaction. A concurrent gate-register may commit between collect and publish;
       // persisting that stale `missing` value would make an otherwise valid store fail on restart.
-      const metadata = this.db.prepare(SELECT_GATE_METADATA).get(observation.gateKey) as
+      const metadata = this.db.prepare(SELECT_GATE_METADATA).get(reconciledObservation.gateKey) as
         | GateMetadataRow
         | undefined;
-      const metadataState = reconcileObservationMetadataState(observation, metadata);
+      const metadataState = reconcileObservationMetadataState(reconciledObservation, metadata);
       // Convert through the strict reader before writing so malformed callers cannot create a row
       // that only fails after restart.
       toGateLocalObservation({
-        gate_key: observation.gateKey,
-        run_key: observation.runKey,
-        task_key: observation.taskKey,
-        status: observation.status,
-        resolution: observation.resolution,
-        resolved_at: observation.resolvedAt,
-      metadata_state: metadataState,
-      mapping_state: observation.mappingState,
-      write_owner: null,
-      write_expires_at: null,
-      observed_at: observation.observedAt,
+        gate_key: reconciledObservation.gateKey,
+        run_key: reconciledObservation.runKey,
+        task_key: reconciledObservation.taskKey,
+        status: reconciledObservation.status,
+        resolution: reconciledObservation.resolution,
+        resolved_at: reconciledObservation.resolvedAt,
+        metadata_state: metadataState,
+        mapping_state: reconciledObservation.mappingState,
+        write_owner: null,
+        write_expires_at: null,
+        observed_at: reconciledObservation.observedAt,
       });
       // A generic observer snapshot may never clear/replace an in-flight remote-write fence.
       // Only updateGateObservation, after Slack returns, may settle it.
       this.db.prepare(UPSERT_GATE_LOCAL_OBSERVATION).run(
-        observation.gateKey,
-        observation.runKey,
-        observation.taskKey,
-        observation.status,
-        observation.resolution,
-        observation.resolvedAt,
+        reconciledObservation.gateKey,
+        reconciledObservation.runKey,
+        reconciledObservation.taskKey,
+        reconciledObservation.status,
+        reconciledObservation.resolution,
+        reconciledObservation.resolvedAt,
         metadataState,
-        observation.mappingState,
-        observation.observedAt,
+        reconciledObservation.mappingState,
+        reconciledObservation.observedAt,
       );
       this.db.exec('COMMIT');
     } catch (e) {
@@ -2059,6 +2144,12 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     return (this.db.prepare(SELECT_PENDING_GATE_OUTBOXES).all() as GateOutboxRow[]).map(toGateOutbox);
   }
 
+  listAcknowledgedGateOutboxes(): readonly GateResolutionOutbox[] {
+    return (this.db.prepare(SELECT_ACKNOWLEDGED_GATE_OUTBOXES).all() as GateOutboxRow[]).map(
+      toGateOutbox,
+    );
+  }
+
   findGateResolutionOutbox(gateKey: GateKey): GateResolutionOutbox | null {
     const row = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as GateOutboxRow | undefined;
     return row === undefined ? null : toGateOutbox(row);
@@ -2162,11 +2253,29 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         this.db.exec('COMMIT');
         return 'superseded';
       }
+      // A completed generation is never leasable. The projector must first durably re-arm and
+      // advance it, then re-read that pending row before any Slack call.
+      if (row.card_pending !== 1) {
+        this.db.exec('COMMIT');
+        return 'superseded';
+      }
       if (
         row.projection_owner === safeOwner &&
         row.projection_expires_at !== null &&
         row.projection_expires_at > at
       ) {
+        const renewed = this.db.prepare(
+          `UPDATE gate_resolution_outbox
+              SET projection_expires_at = ?, updated_at = ?
+            WHERE gate_key = ? AND revision = ? AND card_pending = 1
+              AND projection_owner = ? AND projection_expires_at > ?`,
+        ).run(expiresAt, at, gateKey, expectedRevision, safeOwner, at);
+        if (Number(renewed.changes) !== 1) {
+          this.db.exec('COMMIT');
+          return 'superseded';
+        }
+        LIVE_OBSERVATION_WRITE_OWNERS.add(safeOwner);
+        this.ownedProjectionWrites.add(safeOwner);
         this.db.exec('COMMIT');
         return 'acquired';
       }
@@ -2215,6 +2324,23 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       this.db.exec('ROLLBACK');
       throw e;
     }
+  }
+
+  rearmGateOutboxProjection(
+    gateKey: GateKey,
+    expectedRevision: number,
+    at: string,
+  ): boolean {
+    storedRevision(expectedRevision, `${gateKey}.projection rearm expected revision`);
+    storedIso(at, `${gateKey}.projection rearm at`);
+    const result = this.db.prepare(
+      `UPDATE gate_resolution_outbox
+          SET revision = revision + 1, card_pending = 1, projected_at = NULL,
+              projection_owner = NULL, projection_expires_at = NULL, updated_at = ?
+        WHERE gate_key = ? AND revision = ? AND card_pending = 0
+          AND projection_owner IS NULL AND projection_expires_at IS NULL`,
+    ).run(at, gateKey, expectedRevision);
+    return Number(result.changes) === 1;
   }
 
   markGateOutboxProjected(
@@ -2568,6 +2694,14 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
     return (db.prepare(SELECT_PENDING_GATE_OUTBOXES).all() as GateOutboxRow[]).map(toGateOutbox);
   }
 
+  listAcknowledgedGateOutboxes(): readonly GateResolutionOutbox[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_ACKNOWLEDGED_GATE_OUTBOXES).all() as GateOutboxRow[]).map(
+      toGateOutbox,
+    );
+  }
+
   beginGateObservationWrite(): boolean {
     throw new Error(`dry-run은 store에 쓰지 않는다. Gate ordinary write fence를 세우려 했다: ${this.path}`);
   }
@@ -2578,6 +2712,10 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
 
   acquireGateOutboxProjection(): GateProjectionLeaseResult {
     throw new Error(`dry-run은 store에 쓰지 않는다. Gate projection lease를 얻으려 했다: ${this.path}`);
+  }
+
+  rearmGateOutboxProjection(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate outbox를 재활성화하려 했다: ${this.path}`);
   }
 
   markGateOutboxProjected(): boolean {

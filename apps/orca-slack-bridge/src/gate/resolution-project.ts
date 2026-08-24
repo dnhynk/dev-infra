@@ -17,7 +17,9 @@ export type GateProjectionResult = {
   readonly fingerprint: string | null;
 };
 
-export type GateProjectionFault = 'after_slack_success_before_local_completion';
+export type GateProjectionFault =
+  | 'after_outbox_rearm_before_reread'
+  | 'after_slack_success_before_local_completion';
 
 function projectionState(lifecycle: GateResolutionLifecycle): 'resolving' | 'resolved' | 'conflict' | 'degraded' {
   if (lifecycle === 'resolved') return 'resolved';
@@ -82,6 +84,19 @@ export async function projectGateResolutionCard(
       return { kind: 'current', card, fingerprint };
     }
     if (forceProjection || message.renderFingerprint !== fingerprint) {
+      if (!outbox.cardPending) {
+        if (!store.rearmGateOutboxProjection(
+          gateKey,
+          outbox.revision,
+          now().toISOString(),
+        )) {
+          continue;
+        }
+        // The renderer drift is now a durable pending generation. Never lease or call Slack from
+        // the completed snapshot: re-read the advanced row so stale owners/completions are fenced.
+        await fault?.('after_outbox_rearm_before_reread', gateKey);
+        continue;
+      }
       const lease = store.acquireGateOutboxProjection(
         gateKey,
         outbox.revision,

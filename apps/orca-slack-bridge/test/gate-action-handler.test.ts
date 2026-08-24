@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { GateActionHandler, type SlackSocketEvent } from '../src/gate/action-handler.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { GateResolutionEngine } from '../src/gate/resolve.js';
@@ -133,6 +134,199 @@ describe('fixed-option Slack Gate action boundary', () => {
     expect(outcome).toBe('claimed');
     expect(ackCount).toBe(1);
     expect(engineCalls).toEqual([GATE]);
+    store.close();
+  });
+
+  it('retries a transient two-connection writer lock during the pre-ACK winner claim', async () => {
+    const path = join(dir, 'claim-writer-contention.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    locker.exec('BEGIN IMMEDIATE');
+    const engineCalls: string[] = [];
+    let acks = 0;
+    const release = setTimeout(() => locker.exec('COMMIT'), 25);
+    const outcome = await handler(store, engineCalls).handle(event(body(), () => { acks += 1; }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    clearTimeout(release);
+    locker.close();
+
+    expect(outcome).toBe('claimed');
+    expect(acks).toBe(1);
+    expect(store.findGateResolution(GATE)?.ackState).toBe('acked');
+    expect(engineCalls).toEqual([GATE]);
+    store.close();
+  });
+
+  it('retries transient writer contention while promoting the ACKed winner', async () => {
+    const path = join(dir, 'ack-writer-contention.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    const engineCalls: string[] = [];
+    let acks = 0;
+    let release: ReturnType<typeof setTimeout> | null = null;
+    const outcome = await handler(store, engineCalls).handle(event(body(), () => {
+      acks += 1;
+      locker.exec('BEGIN IMMEDIATE');
+      release = setTimeout(() => locker.exec('COMMIT'), 25);
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    if (release !== null) clearTimeout(release);
+    locker.close();
+
+    expect(outcome).toBe('claimed');
+    expect(acks).toBe(1);
+    expect(store.findGateResolution(GATE)?.ackState).toBe('acked');
+    expect(engineCalls).toEqual([GATE]);
+    store.close();
+  });
+
+  it('ACKs promptly and audits fail-closed when claim contention exhausts local headroom', async () => {
+    const path = join(dir, 'claim-writer-deadline.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    locker.exec('BEGIN IMMEDIATE');
+    const engineCalls: string[] = [];
+    let acks = 0;
+    let ackElapsed = Number.POSITIVE_INFINITY;
+    const began = performance.now();
+    const outcome = await handler(store, engineCalls, {
+      localCasDeadlineMs: 40,
+      slackAckDeadlineMs: 200,
+      sqliteBusyRetryMs: 5,
+      // A stalled injected clock cannot turn bounded retry into an unbounded ACK delay.
+      monotonic: () => 0,
+    }).handle(event(body(), () => {
+      acks += 1;
+      ackElapsed = performance.now() - began;
+      locker.exec('COMMIT');
+    }));
+
+    expect(outcome).toBe('store_failed');
+    expect(acks).toBe(1);
+    expect(ackElapsed).toBeLessThan(200);
+    expect(engineCalls).toEqual([]);
+    expect(store.findGateResolution(GATE)).toBeNull();
+    expect(locker.prepare(
+      'SELECT event, reason FROM gate_resolution_audit ORDER BY id DESC LIMIT 1',
+    ).get()).toEqual({ event: 'store_failed', reason: 'claim_sqlite_busy_deadline' });
+    locker.close();
+    store.close();
+  });
+
+  it('keeps an ACKed-but-unpromoted winner non-runnable when writer contention outlives the deadline', async () => {
+    const path = join(dir, 'ack-writer-deadline.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    const engineCalls: string[] = [];
+    let acks = 0;
+    let ackElapsed = Number.POSITIVE_INFINITY;
+    let release: ReturnType<typeof setTimeout> | null = null;
+    const began = performance.now();
+    const outcome = await handler(store, engineCalls, {
+      localCasDeadlineMs: 40,
+      slackAckDeadlineMs: 80,
+      sqliteBusyRetryMs: 5,
+    }).handle(event(body(), () => {
+      acks += 1;
+      ackElapsed = performance.now() - began;
+      locker.exec('BEGIN IMMEDIATE');
+      release = setTimeout(() => locker.exec('COMMIT'), 120);
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 130));
+    if (release !== null) clearTimeout(release);
+
+    expect(outcome).toBe('store_failed');
+    expect(acks).toBe(1);
+    expect(ackElapsed).toBeLessThan(80);
+    expect(performance.now() - began).toBeLessThan(500);
+    expect(engineCalls).toEqual([]);
+    expect(store.findGateResolution(GATE)?.ackState).toBe('pending');
+    expect(store.listNonterminalGateResolutions()).toEqual([]);
+    locker.close();
+    store.close();
+
+    const restarted = new SqliteDigestStore(path);
+    const remoteCalls: string[] = [];
+    await new GateResolutionEngine({
+      store: restarted,
+      orca: { run: async () => { remoteCalls.push('orca'); return ''; } },
+      slack: {
+        post: async () => { remoteCalls.push('slack:post'); throw new Error('unexpected'); },
+        update: async () => { remoteCalls.push('slack:update'); throw new Error('unexpected'); },
+      },
+      now: () => new Date(AT),
+      leaseOwner: 't.ack-contention-restart',
+    }).reconcile();
+    expect(remoteCalls).toEqual([]);
+    expect(restarted.findGateResolution(GATE)?.ackState).toBe('pending');
+    restarted.close();
+  });
+
+  it('aborts a contended pre-ACK claim sleep, ACKs once, and never starts remote work', async () => {
+    const path = join(dir, 'claim-writer-abort.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    locker.exec('BEGIN IMMEDIATE');
+    const abort = new AbortController();
+    const engineCalls: string[] = [];
+    let acks = 0;
+    const abortTimer = setTimeout(() => abort.abort(), 20);
+    const outcome = await handler(store, engineCalls, {
+      abortSignal: abort.signal,
+      localCasDeadlineMs: 200,
+      slackAckDeadlineMs: 300,
+      sqliteBusyRetryMs: 10,
+    }).handle(event(body(), () => {
+      acks += 1;
+      locker.exec('COMMIT');
+    }));
+    clearTimeout(abortTimer);
+
+    expect(outcome).toBe('store_failed');
+    expect(acks).toBe(1);
+    expect(engineCalls).toEqual([]);
+    expect(store.findGateResolution(GATE)).toBeNull();
+    expect(locker.prepare(
+      'SELECT event, reason FROM gate_resolution_audit ORDER BY id DESC LIMIT 1',
+    ).get()).toEqual({ event: 'store_failed', reason: 'claim_sqlite_busy_aborted' });
+    locker.close();
+    store.close();
+  });
+
+  it('aborts contended ACK promotion without authorizing the durable pending winner', async () => {
+    const path = join(dir, 'ack-writer-abort.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    const abort = new AbortController();
+    const engineCalls: string[] = [];
+    let acks = 0;
+    let release: ReturnType<typeof setTimeout> | null = null;
+    const outcome = await handler(store, engineCalls, {
+      abortSignal: abort.signal,
+      localCasDeadlineMs: 200,
+      slackAckDeadlineMs: 300,
+      sqliteBusyRetryMs: 10,
+    }).handle(event(body(), () => {
+      acks += 1;
+      locker.exec('BEGIN IMMEDIATE');
+      setTimeout(() => abort.abort(), 20);
+      release = setTimeout(() => locker.exec('COMMIT'), 40);
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (release !== null) clearTimeout(release);
+
+    expect(outcome).toBe('store_failed');
+    expect(acks).toBe(1);
+    expect(engineCalls).toEqual([]);
+    expect(store.findGateResolution(GATE)?.ackState).toBe('pending');
+    expect(store.listNonterminalGateResolutions()).toEqual([]);
+    locker.close();
     store.close();
   });
 

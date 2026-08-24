@@ -40,6 +40,9 @@ export type GatePublishOptions = {
   readonly slackTimeoutMs?: number;
   readonly fault?: (
     point:
+      | 'after_gate_message_snapshot_before_observation'
+      | 'after_staged_first_reply_before_mapping'
+      | 'after_staged_first_mapping_before_action_update'
       | 'after_static_slack_before_observation'
       | 'after_static_observation_before_resolution_reproject',
     gateKey: GateDecisionFacts['key'],
@@ -51,6 +54,12 @@ function dryRun(options: GatePublishOptions): boolean {
     throw new Error('Gate publisher의 root/thread Slack 경계가 한쪽만 켜져 있다');
   }
   return options.slack === null;
+}
+
+/** A first reply is inert until its Slack identity and matched observation are durable. */
+function stagedGateCard(card: RenderedCard): RenderedCard {
+  const blocks = card.blocks.filter((block) => block['type'] !== 'actions');
+  return blocks.length === card.blocks.length ? card : { text: card.text, blocks };
 }
 
 /** Publish or update exactly one Gate reply under its existing Run root. */
@@ -97,7 +106,14 @@ export async function publishGateCard(
   // inferred from Slack prose. A newer unsupported/inconsistent state replaces an older pending
   // row so unknown future Orca states cannot leave stale buttons actionable.
   if (!isDryRun) {
-    options.store.saveGateLocalObservation(localObservation);
+    await options.fault?.('after_gate_message_snapshot_before_observation', gate.key);
+    // When this publisher observed no message, recheck that fact inside the SQLite write. A
+    // concurrent first publisher may have mapped and exposed the canonical card while this task
+    // was paused; persist the current facts without downgrading that established mapping.
+    options.store.saveGateLocalObservation(
+      localObservation,
+      existing === null ? { channelId: options.channel, threadTs: rootMessageTs } : undefined,
+    );
   }
   const recoveringOrdinaryWrite =
     !isDryRun && options.store.findGateLocalObservation(gate.key)?.mappingState === 'write_pending';
@@ -166,24 +182,35 @@ export async function publishGateCard(
 
   const at = options.now().toISOString();
   if (existing === null) {
+    const stagedCard = stagedGateCard(card);
+    const stagedFingerprint = renderFingerprint(stagedCard);
     const posted = await options.thread.reply({
       channel: options.channel,
       threadTs: rootMessageTs,
-      text: card.text,
-      blocks: card.blocks,
+      text: stagedCard.text,
+      blocks: stagedCard.blocks,
     });
+    await options.fault?.('after_staged_first_reply_before_mapping', gate.key);
     options.store.insertGateMessage({
       gateKey: gate.key,
       runKey,
       channelId: posted.channel,
       threadTs: rootMessageTs,
       messageTs: posted.ts,
-      renderFingerprint: fingerprint,
+      renderFingerprint: stagedFingerprint,
       at,
+    }, {
+      ...localObservation,
+      mappingState: 'matched',
+      observedAt: at,
     });
-    // The pre-reply row was deliberately `missing`. Once the durable card identity exists, make
-    // it actionable; a crash before this write remains a safe, reopenable missing observation.
-    options.store.saveGateLocalObservation({ ...localObservation, mappingState: 'matched' });
+    await options.fault?.('after_staged_first_mapping_before_action_update', gate.key);
+    if (stagedFingerprint !== fingerprint) {
+      // Re-enter the ordinary bounded update path now that the exact Slack identity is durable.
+      // A crash before/during this update leaves an inert mapped card that the next observer can
+      // safely update in place; a duplicate first publisher can leave only an inert orphan.
+      await publishGateCard(options, runKey, rootMessageTs, gate);
+    }
     return { ...base, action: 'create', messageTs: posted.ts };
   }
 

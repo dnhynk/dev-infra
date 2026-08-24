@@ -150,7 +150,17 @@ export type GateProgressUpdate = {
 };
 
 export interface GateResolutionStore {
-  saveGateLocalObservation(observation: GateLocalObservation): void;
+  /**
+   * Persist an observer snapshot. A first-publisher snapshot may require the Gate message to
+   * remain absent so a stale pre-post read cannot downgrade a concurrently established mapping.
+   */
+  saveGateLocalObservation(
+    observation: GateLocalObservation,
+    expectedFirstMessage?: {
+      readonly channelId: string;
+      readonly threadTs: string | null;
+    },
+  ): void;
   findGateLocalObservation(gateKey: GateKey): GateLocalObservation | null;
   claimGateResolution(input: GateClaimInput): GateClaimResult;
   findGateResolution(gateKey: GateKey): GateResolutionIntent | null;
@@ -182,6 +192,8 @@ export interface GateResolutionStore {
   ): GateResolutionIntent | null;
   findGateResolutionOutbox(gateKey: GateKey): GateResolutionOutbox | null;
   listPendingGateOutboxes(): readonly GateResolutionOutbox[];
+  /** Includes completed terminal cards so deterministic renderer drift is checked on reconcile. */
+  listAcknowledgedGateOutboxes(): readonly GateResolutionOutbox[];
   /** Persisted before an ordinary Slack update so crash recovery cannot trust an older D2 fingerprint. */
   beginGateObservationWrite(gateKey: GateKey, at: string): boolean;
   /** A catchable local unwind ended; keep the durable fence but permit this owner to retry. */
@@ -193,6 +205,8 @@ export interface GateResolutionStore {
     owner: string,
     at: string,
   ): GateProjectionLeaseResult;
+  /** A completed card whose deterministic renderer changed must become a new pending generation. */
+  rearmGateOutboxProjection(gateKey: GateKey, expectedRevision: number, at: string): boolean;
   markGateOutboxProjected(
     gateKey: GateKey,
     expectedRevision: number,

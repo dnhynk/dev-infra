@@ -648,6 +648,7 @@ export async function runDaemonCommand(
   let reconciliation: Promise<void> | null = null;
   const pending = new Set<Promise<void>>();
   const inbound = new Set<Promise<void>>();
+  const inboundAbort = new AbortController();
   try {
     store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
     const configuredOrcaTimeout = dependencies.orcaTimeoutMs ?? 15_000;
@@ -677,6 +678,7 @@ export async function runDaemonCommand(
         const task = job().catch(() => undefined).finally(() => pending.delete(task));
         pending.add(task);
       },
+      abortSignal: inboundAbort.signal,
     });
 
     // No Socket event can race schema validation or startup recovery.
@@ -714,6 +716,7 @@ export async function runDaemonCommand(
     });
     await transport.start();
     await (dependencies.waitForStop ?? processStop)();
+    inboundAbort.abort();
     clearInterval(reconciliationTimer);
     reconciliationTimer = null;
     // Stop accepting new work before store close, then drain already-ACKed durable work.
@@ -724,6 +727,7 @@ export async function runDaemonCommand(
     process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
     return 1;
   } finally {
+    inboundAbort.abort();
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
     if (transport !== null) {
       try {

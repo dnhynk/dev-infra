@@ -19,6 +19,12 @@ export type GateActionHandlerOptions = {
   readonly requestId?: () => string;
   readonly schedule?: (job: () => Promise<void>) => void;
   readonly fault?: (point: GateActionFault) => void;
+  /** Daemon shutdown aborts only local SQLITE_BUSY sleeps; the one Slack ACK is still attempted. */
+  readonly abortSignal?: AbortSignal;
+  /** Test seams may shorten, but never extend, Slack's production three-second ingress budget. */
+  readonly localCasDeadlineMs?: number;
+  readonly slackAckDeadlineMs?: number;
+  readonly sqliteBusyRetryMs?: number;
 };
 
 export type GateActionOutcome =
@@ -32,6 +38,54 @@ export type GateActionOutcome =
 
 const LOCAL_CAS_START_DEADLINE_MS = 2_000;
 const SLACK_ACK_DEADLINE_MS = 3_000;
+const SQLITE_BUSY_RETRY_MS = 10;
+const MAX_SQLITE_BUSY_RETRIES = 512;
+
+type StoreRetryStop = 'deadline' | 'aborted' | 'clock_failed' | 'attempt_limit';
+
+type AckPersistence =
+  | { readonly intent: GateResolutionIntent; readonly reason: null }
+  | { readonly intent: null; readonly reason: string };
+
+function isSqliteBusy(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const sqlite = error as { readonly code?: unknown; readonly errcode?: unknown };
+  return sqlite.code === 'ERR_SQLITE_ERROR' && sqlite.errcode === 5;
+}
+
+function boundedTiming(
+  value: number | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  label: string,
+): number {
+  const candidate = value ?? fallback;
+  if (!Number.isFinite(candidate) || candidate < minimum || candidate > maximum) {
+    throw new TypeError(`${label} must be a finite number between ${minimum} and ${maximum}`);
+  }
+  return Math.trunc(candidate);
+}
+
+function abortableDelay(delayMs: number, signal: AbortSignal | undefined): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    const finish = (completed: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(completed);
+    };
+    const onAbort = (): void => finish(false);
+    const timer = setTimeout(() => finish(true), delayMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 type ParsedAction = {
   readonly teamId: string;
@@ -158,11 +212,35 @@ export class GateActionHandler {
   private readonly monotonic: () => number;
   private readonly requestId: () => string;
   private readonly schedule: (job: () => Promise<void>) => void;
+  private readonly localCasDeadlineMs: number;
+  private readonly slackAckDeadlineMs: number;
+  private readonly sqliteBusyRetryMs: number;
 
   constructor(private readonly options: GateActionHandlerOptions) {
     this.now = options.now ?? (() => new Date());
     this.monotonic = options.monotonic ?? (() => performance.now());
     this.requestId = options.requestId ?? randomUUID;
+    this.slackAckDeadlineMs = boundedTiming(
+      options.slackAckDeadlineMs,
+      SLACK_ACK_DEADLINE_MS,
+      10,
+      SLACK_ACK_DEADLINE_MS,
+      'slackAckDeadlineMs',
+    );
+    this.localCasDeadlineMs = boundedTiming(
+      options.localCasDeadlineMs,
+      LOCAL_CAS_START_DEADLINE_MS,
+      1,
+      this.slackAckDeadlineMs - 1,
+      'localCasDeadlineMs',
+    );
+    this.sqliteBusyRetryMs = boundedTiming(
+      options.sqliteBusyRetryMs,
+      SQLITE_BUSY_RETRY_MS,
+      1,
+      this.localCasDeadlineMs,
+      'sqliteBusyRetryMs',
+    );
     this.schedule =
       options.schedule ??
       ((job) => {
@@ -172,11 +250,15 @@ export class GateActionHandler {
 
   async handle(event: SlackSocketEvent): Promise<GateActionOutcome> {
     let started: number | null = null;
+    const hardStarted = performance.now();
     const elapsedSinceIngress = (): number | null => {
       if (started === null) return null;
       try {
         const elapsed = this.monotonic() - started;
-        return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null;
+        const hardElapsed = performance.now() - hardStarted;
+        return Number.isFinite(elapsed) && elapsed >= 0 && Number.isFinite(hardElapsed)
+          ? Math.max(elapsed, hardElapsed)
+          : null;
       } catch {
         return null;
       }
@@ -187,7 +269,7 @@ export class GateActionHandler {
       acknowledged = true;
       const beforeAckElapsed = elapsedSinceIngress();
       const timeoutMs =
-        beforeAckElapsed === null ? 0 : Math.max(0, SLACK_ACK_DEADLINE_MS - beforeAckElapsed);
+        beforeAckElapsed === null ? 0 : Math.max(0, this.slackAckDeadlineMs - beforeAckElapsed);
       let result: void | Promise<void>;
       try {
         result = event.ack();
@@ -206,7 +288,7 @@ export class GateActionHandler {
         Promise.resolve(result).then(
           () => {
             const completedElapsed = elapsedSinceIngress();
-            finish(completedElapsed !== null && completedElapsed < SLACK_ACK_DEADLINE_MS);
+            finish(completedElapsed !== null && completedElapsed < this.slackAckDeadlineMs);
           },
           () => finish(false),
         );
@@ -256,25 +338,61 @@ export class GateActionHandler {
     } catch {
       return (await ack()) ? 'store_failed' : 'ack_failed';
     }
-    if (elapsed >= LOCAL_CAS_START_DEADLINE_MS) {
+    if (elapsed >= this.localCasDeadlineMs) {
       const acked = await ack();
       this.audit(null, 'rejected', 'local_deadline_exceeded');
       return acked ? 'rejected' : 'ack_failed';
     }
 
+    if (this.options.abortSignal?.aborted) {
+      const acked = await ack();
+      this.audit(null, 'store_failed', 'ingress_aborted');
+      return acked ? 'store_failed' : 'ack_failed';
+    }
+
     let claimed: ReturnType<GateStore['claimGateResolution']> | null = null;
     try {
       this.options.fault?.('before_local_cas');
-      claimed = this.options.store.claimGateResolution({
-        ...action,
-        retryRequestId: this.requestId(),
-        at: this.now().toISOString(),
-      });
+      const retryRequestId = this.requestId();
+      let busyAttempts = 0;
+      for (;;) {
+        try {
+          claimed = this.options.store.claimGateResolution({
+            ...action,
+            retryRequestId,
+            at: this.now().toISOString(),
+          });
+          break;
+        } catch (error) {
+          if (!isSqliteBusy(error)) throw error;
+          busyAttempts += 1;
+          const stopped = await this.waitForSqliteBusy(
+            this.localCasDeadlineMs,
+            busyAttempts,
+            elapsedSinceIngress,
+          );
+          if (stopped !== null) {
+            const acked = await ack();
+            this.audit(null, 'store_failed', `claim_sqlite_busy_${stopped}`);
+            return acked ? 'store_failed' : 'ack_failed';
+          }
+        }
+      }
       this.options.fault?.('after_local_cas_before_ack');
     } catch {
       const acked = await ack();
-      if (claimed?.kind === 'claimed' || claimed?.kind === 'duplicate') {
-        this.persistAck(claimed.intent, acked ? 'acked' : 'failed');
+      // TypeScript does not carry a loop assignment into a catch even though the injected
+      // after-CAS fault can run only after `claimed` was assigned.
+      const faultClaim = claimed as ReturnType<GateStore['claimGateResolution']> | null;
+      if (faultClaim?.kind === 'claimed' || faultClaim?.kind === 'duplicate') {
+        const persisted = await this.persistAck(
+          faultClaim.intent,
+          acked ? 'acked' : 'failed',
+          elapsedSinceIngress,
+        );
+        if (persisted.intent === null) {
+          this.audit(faultClaim.intent.gateKey, 'store_failed', persisted.reason);
+        }
       }
       return acked ? 'store_failed' : 'ack_failed';
     }
@@ -288,7 +406,10 @@ export class GateActionHandler {
     const acked = await ack();
     if (!acked) {
       if (claimed.kind === 'claimed' || claimed.kind === 'duplicate') {
-        this.persistAck(claimed.intent, 'failed');
+        const persisted = await this.persistAck(claimed.intent, 'failed', elapsedSinceIngress);
+        if (persisted.intent === null) {
+          this.audit(claimed.intent.gateKey, 'store_failed', persisted.reason);
+        }
       }
       return 'ack_failed';
     }
@@ -304,7 +425,7 @@ export class GateActionHandler {
     const deadlineFailure =
       postCasElapsed === null || afterAckElapsed === null
         ? 'post_cas_clock_failed'
-        : afterAckElapsed >= SLACK_ACK_DEADLINE_MS
+        : afterAckElapsed >= this.slackAckDeadlineMs
           ? 'post_cas_ack_deadline_miss'
           : null;
     if (deadlineFailure !== null) {
@@ -316,13 +437,20 @@ export class GateActionHandler {
         deadlineFailure,
       );
       if (claimed.kind === 'claimed' || claimed.kind === 'duplicate') {
-        this.persistAck(claimed.intent, 'failed');
+        const persisted = await this.persistAck(claimed.intent, 'failed', elapsedSinceIngress);
+        if (persisted.intent === null) {
+          this.audit(claimed.intent.gateKey, 'store_failed', persisted.reason);
+        }
       }
       return 'rejected';
     }
     if (claimed.kind === 'claimed' || claimed.kind === 'duplicate') {
-      const ready = this.persistAck(claimed.intent, 'acked');
-      if (ready === null || ready.ackState !== 'acked') return 'store_failed';
+      const persisted = await this.persistAck(claimed.intent, 'acked', elapsedSinceIngress);
+      const ready = persisted.intent;
+      if (ready === null || ready.ackState !== 'acked') {
+        this.audit(claimed.intent.gateKey, 'store_failed', persisted.reason ?? 'ack_not_durable');
+        return 'store_failed';
+      }
       const gateKey: GateKey = ready.gateKey;
       this.schedule(() => this.options.engine.resolveAndProject(gateKey));
     }
@@ -337,15 +465,41 @@ export class GateActionHandler {
     }
   }
 
-  private persistAck(
+  private async waitForSqliteBusy(
+    deadlineMs: number,
+    busyAttempts: number,
+    elapsedSinceIngress: () => number | null,
+  ): Promise<StoreRetryStop | null> {
+    if (busyAttempts >= MAX_SQLITE_BUSY_RETRIES) return 'attempt_limit';
+    if (this.options.abortSignal?.aborted) return 'aborted';
+    const elapsed = elapsedSinceIngress();
+    if (elapsed === null) return 'clock_failed';
+    const remaining = deadlineMs - elapsed;
+    if (remaining <= 0) return 'deadline';
+    const slept = await abortableDelay(
+      Math.max(1, Math.min(this.sqliteBusyRetryMs, Math.trunc(remaining))),
+      this.options.abortSignal,
+    );
+    if (!slept) return 'aborted';
+    const afterSleep = elapsedSinceIngress();
+    if (afterSleep === null) return 'clock_failed';
+    return afterSleep < deadlineMs ? null : 'deadline';
+  }
+
+  private async persistAck(
     initial: GateResolutionIntent,
     ackState: 'acked' | 'failed',
-  ): GateResolutionIntent | null {
+    elapsedSinceIngress: () => number | null,
+  ): Promise<AckPersistence> {
     let current = initial;
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    let revisionAttempts = 0;
+    let busyAttempts = 0;
+    while (revisionAttempts < 8) {
       // ACK success is terminal-dominant: a later failing duplicate may never downgrade it.
-      if (current.ackState === 'acked') return current;
-      if (ackState === 'failed' && current.ackState === 'failed') return current;
+      if (current.ackState === 'acked') return { intent: current, reason: null };
+      if (ackState === 'failed' && current.ackState === 'failed') {
+        return { intent: current, reason: null };
+      }
       try {
         const updated = this.options.store.markGateResolutionAck(
           current.gateKey,
@@ -353,14 +507,24 @@ export class GateActionHandler {
           ackState,
           this.now().toISOString(),
         );
-        if (updated !== null) return updated;
+        if (updated !== null) return { intent: updated, reason: null };
         const latest = this.options.store.findGateResolution(current.gateKey);
-        if (latest === null) return null;
+        if (latest === null) return { intent: null, reason: 'ack_intent_missing' };
         current = latest;
-      } catch {
-        return null;
+        revisionAttempts += 1;
+      } catch (error) {
+        if (!isSqliteBusy(error)) return { intent: null, reason: 'ack_store_error' };
+        busyAttempts += 1;
+        const stopped = await this.waitForSqliteBusy(
+          this.slackAckDeadlineMs,
+          busyAttempts,
+          elapsedSinceIngress,
+        );
+        if (stopped !== null) {
+          return { intent: null, reason: `ack_sqlite_busy_${stopped}` };
+        }
       }
     }
-    return null;
+    return { intent: null, reason: 'ack_revision_exhausted' };
   }
 }

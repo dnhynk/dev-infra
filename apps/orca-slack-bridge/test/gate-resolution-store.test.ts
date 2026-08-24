@@ -775,6 +775,62 @@ describe('Gate-local durable CAS and outbox', () => {
     store.close();
   });
 
+  it('same-owner projection reacquisition atomically renews expiry and updated_at', () => {
+    const store = new SqliteDigestStore(path, { observationOwnerAlive: () => true });
+    seed(store);
+    const claimed = claim(store);
+    if (claimed.kind !== 'claimed') throw new Error('projection claim failed');
+    expect(store.markGateResolutionAck(GATE, claimed.intent.revision, 'acked', AT)).not.toBeNull();
+    const outbox = store.findGateResolutionOutbox(GATE);
+    if (outbox === null) throw new Error('projection outbox missing');
+    const owner = `p${process.pid}.same-owner-renewal`;
+    expect(store.acquireGateOutboxProjection(GATE, outbox.revision, owner, AT)).toBe('acquired');
+    expect(store.acquireGateOutboxProjection(
+      GATE,
+      outbox.revision,
+      owner,
+      '2026-08-24T10:00:10.000Z',
+    )).toBe('acquired');
+
+    const raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare(
+      'SELECT projection_expires_at, updated_at FROM gate_resolution_outbox WHERE gate_key = ?',
+    ).get(GATE)).toEqual({
+      projection_expires_at: '2026-08-24T10:00:40.000Z',
+      updated_at: '2026-08-24T10:00:10.000Z',
+    });
+    raw.close();
+    const contender = new SqliteDigestStore(path, { observationOwnerAlive: () => true });
+    const contenderOwner = `p${process.pid}.same-owner-contender`;
+    expect(contender.acquireGateOutboxProjection(
+      GATE,
+      outbox.revision,
+      contenderOwner,
+      '2026-08-24T10:00:30.000Z',
+    )).toBe('busy');
+    expect(contender.acquireGateOutboxProjection(
+      GATE,
+      outbox.revision,
+      contenderOwner,
+      '2026-08-24T10:00:39.999Z',
+    )).toBe('busy');
+    expect(contender.acquireGateOutboxProjection(
+      GATE,
+      outbox.revision,
+      contenderOwner,
+      '2026-08-24T10:00:40.000Z',
+    )).toBe('recovered');
+    expect(store.markGateOutboxProjected(
+      GATE,
+      outbox.revision,
+      'stale-same-owner-completion',
+      owner,
+      '2026-08-24T10:00:40.001Z',
+    )).toBe(false);
+    contender.close();
+    store.close();
+  });
+
   it('ordinary and projection owner expiry overrides a reused live PID and fences stale completion', () => {
     const firstOrdinary = new SqliteDigestStore(path, {
       observationWriteOwner: `p${process.pid}.ordinary-one`,

@@ -120,12 +120,12 @@ export class GateResolutionEngine {
     return task;
   }
 
-  /** Startup reconciliation resumes every acknowledged nonterminal intent and pending card. */
+  /** Startup reconciliation resumes work and also checks completed cards for renderer drift. */
   async reconcile(): Promise<void> {
     for (const intent of this.options.store.listNonterminalGateResolutions()) {
       await this.resolveAndProject(intent.gateKey);
     }
-    for (const outbox of this.options.store.listPendingGateOutboxes()) {
+    for (const outbox of this.options.store.listAcknowledgedGateOutboxes()) {
       await this.project(outbox.gateKey);
     }
   }
