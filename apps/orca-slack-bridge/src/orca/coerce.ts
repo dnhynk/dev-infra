@@ -24,6 +24,31 @@ export function parseJsonField<T>(value: unknown, fallback: T): T {
   }
 }
 
+/**
+ * JSON field whose contract is specifically an array of strings.
+ *
+ * `parseJsonField` intentionally accepts already-decoded objects because `result` is object-shaped.
+ * Reusing its generic cast for `deps` or Gate `options`, however, lets an object masquerade as an
+ * array until a later `.map`/`.join`/iterator call throws and kills the whole observation. Keep the
+ * shape check at the adapter boundary so callers receive the existing explicit `unreadable` outcome.
+ */
+export function parseStringArrayField(
+  value: unknown,
+  fallback: readonly string[],
+  at: string,
+): readonly string[] {
+  const parsed = parseJsonField<unknown>(value, fallback);
+  if (!Array.isArray(parsed)) {
+    throw new TypeError(`${at}이(가) string array가 아니다`);
+  }
+  for (let index = 0; index < parsed.length; index += 1) {
+    if (typeof parsed[index] !== 'string') {
+      throw new TypeError(`${at}[${index}]이(가) string이 아니다`);
+    }
+  }
+  return parsed;
+}
+
 const NAIVE = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/;
 
 /**

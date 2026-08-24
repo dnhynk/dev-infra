@@ -7,6 +7,7 @@ import { askThreadsFrom, listWorkers, readInbox } from '../src/orca/client.js';
 import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
 import { renderRunCard, renderRunCollectionCard } from '../src/run/render.js';
 import { renderFingerprint } from '../src/digest/render.js';
+import { renderGateDecisionCard } from '../src/gate/render.js';
 import type { RunCollection, RunFacts } from '../src/run/types.js';
 
 /**
@@ -499,6 +500,62 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
     expect(c.runs[0]?.project).toBe('dev-infra');
     expect(c.runs[0]?.repositories).toEqual(['dnhynk/dev-infra']);
     expect(c.unregistered.count).toBe(0);
+  });
+
+  it('object-shaped deps/options를 unreadable degraded로 가두고 runs와 정적 Gate 카드를 살린다', async () => {
+    const c = await collect({
+      'task-list': {
+        tasks: [
+          taskRow({ id: 'task_gate' }),
+          taskRow({ id: 'task_bad', status: 'pending', deps: { dependency: 'task_gate' } }),
+          taskRow({ id: 'task_bad_child', deps: '["task_bad"]' }),
+        ],
+        count: 3,
+      },
+      'gate-list': {
+        gates: [
+          {
+            id: 'gate_shape',
+            run_id: 'run_1',
+            task_id: 'task_gate',
+            question: 'shape가 깨진 Gate',
+            options: { invented: '표시하면 안 되는 option' },
+            status: 'pending',
+            resolution: null,
+            created_at: '2026-08-23 00:00:00',
+            resolved_at: null,
+          },
+        ],
+      },
+    });
+
+    expect(c.runs).toHaveLength(1);
+    const run = c.runs[0];
+    const gate = run?.gates[0];
+    expect(gate).toBeDefined();
+    expect(gate?.unclassifiedTasks.map((task) => task.taskId)).toEqual([
+      'task_bad',
+      'task_bad_child',
+    ]);
+    expect(gate?.independentTasks.map((task) => task.taskId)).not.toContain('task_bad');
+    expect(gate).toMatchObject({
+      metadataState: 'missing',
+      correlation: null,
+      options: [],
+      recommendation: null,
+      impact: null,
+    });
+    expect(run?.degraded.map((row) => row.detail).join('\n')).toContain('task task_bad의 deps');
+    expect(run?.degraded.map((row) => row.detail).join('\n')).toContain('gate gate_shape의 options');
+
+    if (gate === undefined) throw new Error('Gate projection이 없다');
+    const card = renderGateDecisionCard(gate);
+    const rendered = JSON.stringify(card);
+    expect(rendered).toContain('표시할 option 없음');
+    expect(rendered).not.toContain('표시하면 안 되는 option');
+    expect(rendered).not.toContain('"type":"actions"');
+    expect(rendered).not.toContain('"type":"button"');
+    expect(rendered).not.toContain('action_id');
   });
 
   it('등록되지 않은 repository의 Run은 표시 대상이 아니다', async () => {

@@ -67,31 +67,51 @@ function metadata(over: Partial<GateMetadata> = {}): GateMetadata {
 }
 
 describe('Gate Task waiting/independent closure', () => {
-  it('Gate Task와 전이적으로 의존하는 current Task만 waiting으로 분류한다', () => {
+  it('current nonterminal Task만 waiting closure node이며 terminal bridge는 끊는다', () => {
     const rows = [
       task('task_z_independent'),
-      task('task_c_wait', deps(['task_b_done', 'task_b_done'])),
+      task('task_b_wait', deps([GATE_TASK, GATE_TASK])),
+      task('task_c_wait', deps(['task_b_wait'])),
       task(GATE_TASK),
-      task('task_b_done', deps([GATE_TASK]), 'completed'),
+      task('task_done_link', deps([GATE_TASK]), 'completed'),
       task('task_failed_link', deps([GATE_TASK]), 'failed'),
-      task('task_d_wait', deps(['task_c_wait'])),
+      task('task_d_after_done', deps(['task_done_link'])),
+      task('task_e_after_failed', deps(['task_failed_link'])),
+      task('task_f_after_terminal_chain', deps(['task_d_after_done'])),
       task('task_a_independent'),
     ];
 
     const got = classifyGateTasks(GATE_TASK, rows);
     expect(got.waiting.map((row) => row.taskId)).toEqual([
+      'task_b_wait',
       'task_c_wait',
-      'task_d_wait',
       GATE_TASK,
     ]);
     expect(got.independent.map((row) => row.taskId)).toEqual([
       'task_a_independent',
+      'task_d_after_done',
+      'task_e_after_failed',
+      'task_f_after_terminal_chain',
       'task_z_independent',
     ]);
     expect(got.unclassified).toEqual([]);
     expect(got.degraded).toEqual([]);
-    expect(got.waiting.map((row) => row.taskId)).not.toContain('task_b_done');
-    expect(got.waiting.map((row) => row.taskId)).not.toContain('task_failed_link');
+    const displayed = [...got.waiting, ...got.independent, ...got.unclassified].map(
+      (row) => row.taskId,
+    );
+    expect(displayed).not.toContain('task_done_link');
+    expect(displayed).not.toContain('task_failed_link');
+  });
+
+  it('terminal Gate Task 자체도 waiting traversal을 seed하지 않는다', () => {
+    const got = classifyGateTasks(GATE_TASK, [
+      task(GATE_TASK, deps([]), 'completed'),
+      task('task_after_terminal_gate', deps([GATE_TASK])),
+    ]);
+    expect(got.waiting).toEqual([]);
+    expect(got.independent.map((row) => row.taskId)).toEqual(['task_after_terminal_gate']);
+    expect(got.unclassified).toEqual([]);
+    expect(got.degraded.join('\n')).toContain('current nonterminal row가 없어');
   });
 
   it('unreadable/missing deps와 그 downstream을 independent로 접지 않는다', () => {
@@ -188,6 +208,22 @@ describe('raw Gate + sidecar projection', () => {
       expect(got?.impact).toBeNull();
       expect(got?.correlation).toBeNull();
     }
+  });
+
+  it('unreadable Gate options는 existing sidecar 의미도 봉쇄하고 option을 발명하지 않는다', () => {
+    const got = projectGateDecisions(
+      [gate({ options: { kind: 'unreadable', reason: 'gate options가 object다' } })],
+      tasks,
+      [metadata()],
+    )[0];
+    expect(got).toMatchObject({
+      metadataState: 'mismatched',
+      correlation: null,
+      options: [],
+      recommendation: null,
+      impact: null,
+    });
+    expect(got?.degraded.join('\n')).toContain('options를 읽지 못해');
   });
 
   it('Gate question/options 텍스트를 correlation이나 recommendation 판정용으로 parsing하지 않는다', () => {

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { loadConfig, defaultConfigPath, type BridgeConfig } from './project/config.js';
 import {
+  persistGateMetadata,
   readGateRegistrationDocument,
-  registerGateMetadata,
+  validateGateRegistrationIdentity,
   type GateRegistrationResult,
 } from './gate/register.js';
 import { GhCli } from './github/runner.js';
@@ -182,6 +183,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   const command = argv[0];
   if (!isCommand(command)) {
     return { kind: 'error', message: `알 수 없는 명령: ${String(command)}` };
+  }
+  if (command !== 'gate-register' && argv.includes('--input')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --input` };
   }
   const missing = missingFlagValue(argv);
   if (missing !== null) return { kind: 'error', message: missing };
@@ -470,10 +474,15 @@ export async function runGateRegisterCommand(
     return 2;
   }
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
-  const store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
+  let store: SqliteDigestStore | null = null;
   try {
     const document = await readGateRegistrationDocument(parsed.inputPath);
-    const result = await registerGateMetadata(orca ?? new OrcaCli(orcaBin), store, document);
+    const candidate = await validateGateRegistrationIdentity(
+      orca ?? new OrcaCli(orcaBin),
+      document,
+    );
+    store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
+    const result = persistGateMetadata(store, candidate);
     process.stdout.write(
       (parsed.json ? JSON.stringify(result, null, 2) : formatGateRegistration(result)) + '\n',
     );
@@ -482,7 +491,7 @@ export async function runGateRegisterCommand(
     process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return 1;
   } finally {
-    store.close();
+    store?.close();
   }
 }
 

@@ -1,14 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { OrcaRunner } from '../src/orca/client.js';
 import {
   parseGateRegistrationDocument,
   registerGateMetadata,
 } from '../src/gate/register.js';
 import type { GateRegistrationDocument } from '../src/gate/types.js';
-import { gateKey, runKey } from '../src/identity/keys.js';
+import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { parseArgs, runGateRegisterCommand } from '../src/cli.js';
 
@@ -88,6 +95,130 @@ class FakeOrca implements OrcaRunner {
     return Promise.resolve(
       JSON.stringify({ id: 'x', ok: true, result: { gates: this.gates } }),
     );
+  }
+}
+
+type PreStoreCase = {
+  readonly name: string;
+  readonly input: 'missing' | 'malformed' | 'strict-invalid' | 'valid';
+  readonly gates: readonly Record<string, unknown>[];
+  readonly expectedCalls: number;
+  readonly error: RegExp;
+};
+
+const PRE_STORE_CASES: readonly PreStoreCase[] = [
+  {
+    name: 'missing input',
+    input: 'missing',
+    gates: [],
+    expectedCalls: 0,
+    error: /읽을 수 없다/,
+  },
+  {
+    name: 'malformed JSON',
+    input: 'malformed',
+    gates: [],
+    expectedCalls: 0,
+    error: /JSON이 아니다/,
+  },
+  {
+    name: 'strict-invalid document',
+    input: 'strict-invalid',
+    gates: [],
+    expectedCalls: 0,
+    error: /알 수 없는 필드.*surprise/,
+  },
+  {
+    name: 'Orca identity mismatch',
+    input: 'valid',
+    gates: [gateRow({ task_id: 'task_other' })],
+    expectedCalls: 1,
+    error: /taskId가 입력과 어긋난다/,
+  },
+  {
+    name: 'Orca options object shape',
+    input: 'valid',
+    gates: [gateRow({ options: { keep: '기존 계약 유지' } })],
+    expectedCalls: 1,
+    error: /options를 읽지 못해 identity를 확인할 수 없다/,
+  },
+];
+
+function writeProbeInput(path: string, kind: PreStoreCase['input']): void {
+  if (kind === 'missing') return;
+  if (kind === 'malformed') {
+    writeFileSync(path, '{"schemaVersion":', 'utf8');
+    return;
+  }
+  writeFileSync(
+    path,
+    JSON.stringify(kind === 'strict-invalid' ? rawDocument({ surprise: true }) : rawDocument()),
+    'utf8',
+  );
+}
+
+function parsedRegistration(inputPath: string, statePath: string) {
+  const parsed = parseArgs(['gate-register', '--input', inputPath, '--state', statePath]);
+  if (parsed.kind !== 'run') throw new Error(`run args가 아니다: ${JSON.stringify(parsed)}`);
+  return parsed;
+}
+
+async function runRegistrationFailure(
+  inputPath: string,
+  statePath: string,
+  orca: OrcaRunner,
+): Promise<{ readonly code: number; readonly error: string }> {
+  const chunks: string[] = [];
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  });
+  try {
+    return {
+      code: await runGateRegisterCommand(parsedRegistration(inputPath, statePath), orca),
+      error: chunks.join(''),
+    };
+  } finally {
+    stderr.mockRestore();
+  }
+}
+
+/** Build an exact v6 shape by removing only the two tables introduced by the v7 migration. */
+function writeV6Probe(path: string): void {
+  new SqliteDigestStore(path).close();
+  const db = new DatabaseSync(path);
+  db.exec('DROP TABLE gate_message; DROP TABLE gate_metadata');
+  db.prepare('UPDATE schema_version SET version = 6, applied_at = ? WHERE id = 1').run(AT);
+  db.prepare(
+    `INSERT INTO run_message
+       (run_key, channel_id, message_ts, render_fingerprint, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(runKey(RUN_ID), 'C0AGENTRUNS', '1787554800.000001', 'sentinel-fp', AT, AT);
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  db.exec('PRAGMA journal_mode = DELETE');
+  db.close();
+}
+
+function v6State(path: string): unknown {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    return {
+      master: db
+        .prepare(
+          `SELECT type, name, tbl_name, sql FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`,
+        )
+        .all(),
+      version: db.prepare('SELECT version, applied_at FROM schema_version WHERE id = 1').get(),
+      sentinel: db
+        .prepare(
+          `SELECT run_key, channel_id, message_ts, render_fingerprint, created_at, updated_at
+             FROM run_message ORDER BY run_key`,
+        )
+        .all(),
+    };
+  } finally {
+    db.close();
   }
 }
 
@@ -288,5 +419,78 @@ describe('gate-register production CLI path', () => {
     } finally {
       reopened.close();
     }
+  });
+
+  it.each(PRE_STORE_CASES)(
+    '$name은 nonexistent SQLite를 만들지 않는다',
+    async ({ name, input, gates, expectedCalls, error }) => {
+      const inputPath = join(dir, `${name.replaceAll(' ', '-')}.json`);
+      const statePath = join(dir, `${name.replaceAll(' ', '-')}-state`, 'state.db');
+      writeProbeInput(inputPath, input);
+      const orca = new FakeOrca(gates);
+
+      const result = await runRegistrationFailure(inputPath, statePath, orca);
+
+      expect(result.code).toBe(1);
+      expect(result.error).toMatch(error);
+      expect(orca.calls).toHaveLength(expectedCalls);
+      expect(existsSync(statePath)).toBe(false);
+      expect(existsSync(dirname(statePath))).toBe(false);
+    },
+  );
+
+  it.each(PRE_STORE_CASES)(
+    '$name은 v6 SQLite의 bytes/schema/rows를 바꾸지 않는다',
+    async ({ name, input, gates, expectedCalls, error }) => {
+      const inputPath = join(dir, `v6-${name.replaceAll(' ', '-')}.json`);
+      const statePath = join(dir, `v6-${name.replaceAll(' ', '-')}.db`);
+      writeProbeInput(inputPath, input);
+      writeV6Probe(statePath);
+      const beforeState = v6State(statePath);
+      const beforeBytes = readFileSync(statePath);
+      const orca = new FakeOrca(gates);
+
+      const result = await runRegistrationFailure(inputPath, statePath, orca);
+
+      expect(result.code).toBe(1);
+      expect(result.error).toMatch(error);
+      expect(orca.calls).toHaveLength(expectedCalls);
+      expect(readFileSync(statePath)).toEqual(beforeBytes);
+      expect(v6State(statePath)).toEqual(beforeState);
+      expect(existsSync(`${statePath}-wal`)).toBe(false);
+      expect(existsSync(`${statePath}-shm`)).toBe(false);
+    },
+  );
+
+  it('post-open persistence failure에서도 SQLite를 닫는다', async () => {
+    const inputPath = join(dir, 'gate-registration-conflict.json');
+    writeFileSync(inputPath, JSON.stringify(rawDocument({ impact: '서로 다른 영향' })), 'utf8');
+    const seed = new SqliteDigestStore(dbPath);
+    seed.insertGateMetadata({
+      gateKey: gateKey(GATE_ID),
+      runKey: runKey(RUN_ID),
+      taskKey: taskKey(TASK_ID),
+      dispatchKey: dispatchKey('ctx_gate'),
+      askMessageId: 'msg_ask_1',
+      questionThreadId: 'thread_question_1',
+      options: document().options,
+      recommendation: document().recommendation,
+      impact: '원래 영향',
+      registeredAt: AT,
+    });
+    seed.close();
+    const close = vi.spyOn(SqliteDigestStore.prototype, 'close');
+    try {
+      const result = await runRegistrationFailure(inputPath, dbPath, new FakeOrca([gateRow()]));
+      expect(result.code).toBe(1);
+      expect(result.error).toMatch(/이미 다른 sidecar metadata/);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      close.mockRestore();
+    }
+
+    const reopened = new SqliteDigestStore(dbPath);
+    expect(reopened.findGateMetadata(gateKey(GATE_ID))?.impact).toBe('원래 영향');
+    reopened.close();
   });
 });

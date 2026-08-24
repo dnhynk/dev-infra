@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseJsonField,
   parseOrcaTimestamp,
+  parseStringArrayField,
   worktreePathFromId,
   worktreePathFromIncarnation,
 } from '../src/orca/coerce.js';
@@ -55,6 +56,20 @@ describe('parseJsonField', () => {
       'reviewedHeadSha:deadbeef,findings:[],gates:{evidence_discipline:pass},note:two words}';
     expect(() => parseJsonField<unknown>(broken, null)).toThrow(SyntaxError);
     expect(() => parseJsonField<unknown>(broken, null)).toThrow(/JSON 필드를 파싱할 수 없다/);
+  });
+});
+
+describe('parseStringArrayField', () => {
+  it('raw/JSON object와 non-string 원소를 string array로 가장하지 않는다', () => {
+    for (const raw of [{ dependency: 'task_x' }, '{"dependency":"task_x"}', ['task_x', 1]]) {
+      expect(() => parseStringArrayField(raw, [], 'task task_shape의 deps')).toThrow(TypeError);
+    }
+  });
+
+  it('null/blank fallback과 이미 decoded된 string array 호환성을 보존한다', () => {
+    expect(parseStringArrayField(null, [], 'deps')).toEqual([]);
+    expect(parseStringArrayField('   ', [], 'deps')).toEqual([]);
+    expect(parseStringArrayField(['task_a'], [], 'deps')).toEqual(['task_a']);
   });
 });
 

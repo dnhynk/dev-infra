@@ -176,16 +176,12 @@ export type GateRegistrationResult = {
   readonly metadata: GateMetadata;
 };
 
-/**
- * Verify the exact Orca Gate identity through a read-only `gate-list`, then persist locally.
- * No Orca mutation and no Slack call exists on this path.
- */
-export async function registerGateMetadata(
+/** Verify the complete Orca Gate identity through one read-only `gate-list`. */
+export async function validateGateRegistrationIdentity(
   orca: OrcaRunner,
-  store: GateStore,
   document: GateRegistrationDocument,
   now: () => Date = () => new Date(),
-): Promise<GateRegistrationResult> {
+): Promise<GateMetadata> {
   const gates = await listGates(orca, document.runId);
   const matches = gates.filter((gate) => gate.id === document.gateId);
   if (matches.length !== 1) {
@@ -219,7 +215,7 @@ export async function registerGateMetadata(
     );
   }
 
-  const candidate: GateMetadata = {
+  return {
     gateKey: gateKey(document.gateId),
     runKey: runKey(document.runId),
     taskKey: taskKey(document.taskId),
@@ -231,13 +227,37 @@ export async function registerGateMetadata(
     impact: document.impact,
     registeredAt: now().toISOString(),
   };
+}
+
+/** Persist an already identity-validated candidate without any Orca or Slack call. */
+export function persistGateMetadata(
+  store: GateStore,
+  candidate: GateMetadata,
+): GateRegistrationResult {
   const existing = store.findGateMetadata(candidate.gateKey);
   if (existing !== null) {
     if (!sameMetadata(existing, candidate)) {
-      throw new Error(`Gate ${document.gateId}가 이미 다른 sidecar metadata로 등록돼 있다`);
+      throw new Error(
+        `Gate ${candidate.gateKey.slice('gate:'.length)}가 이미 다른 sidecar metadata로 등록돼 있다`,
+      );
     }
     return { action: 'already_registered', metadata: existing };
   }
   store.insertGateMetadata(candidate);
   return { action: 'registered', metadata: candidate };
+}
+
+/**
+ * Verify the exact Orca Gate identity through a read-only `gate-list`, then persist locally.
+ * CLI callers validate before constructing the store; this wrapper remains useful to callers that
+ * already own a store. No Orca mutation and no Slack call exists on either path.
+ */
+export async function registerGateMetadata(
+  orca: OrcaRunner,
+  store: GateStore,
+  document: GateRegistrationDocument,
+  now: () => Date = () => new Date(),
+): Promise<GateRegistrationResult> {
+  const candidate = await validateGateRegistrationIdentity(orca, document, now);
+  return persistGateMetadata(store, candidate);
 }

@@ -179,6 +179,17 @@ describe('gate-register transport', () => {
     }
   });
 
+  it('--input은 gate-register 외 모든 명령에서 command-scoped unknown이다', () => {
+    for (const command of ['snapshot', 'verify-slack', 'digest', 'runs'] as const) {
+      const p = parseArgs([command, '--input', 'gate.json']);
+      expect(p.kind).toBe('error');
+      if (p.kind === 'error') {
+        expect(p.message).toContain(command);
+        expect(p.message).toContain('--input');
+      }
+    }
+  });
+
   it('파일 transport와 local/read-only 경계 플래그만 받는다', () => {
     const p = parseArgs([
       'gate-register',

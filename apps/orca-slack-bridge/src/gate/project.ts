@@ -41,18 +41,21 @@ type TaskClassification = {
 /**
  * Find the Gate Task and every Task transitively depending on it.
  *
- * Completed/failed rows still participate as graph links, then are removed from all displayed lists.
- * An unreadable or missing dependency makes that Task (and known downstream dependants) unclassified;
- * it is never silently treated as an empty dependency list.
+ * The closure contains current nonterminal Task nodes only. Completed/failed rows are observed so a
+ * dependency on one is not mistaken for a missing row, but they are neither displayed nor allowed to
+ * bridge the Gate to a downstream current Task. An unreadable or missing dependency makes that Task
+ * (and known downstream dependants) unclassified; it is never silently treated as an empty list.
  */
 export function classifyGateTasks(
   gateTaskId: string,
   input: readonly OrcaTask[],
 ): TaskClassification {
   const ordered = [...input].sort(byTask);
+  const observedIds = new Set(ordered.map((task) => task.id));
   const tasks = new Map<string, OrcaTask>();
   const duplicateIds = new Set<string>();
   for (const task of ordered) {
+    if (TERMINAL_TASK_STATUSES.has(task.status)) continue;
     if (tasks.has(task.id)) {
       duplicateIds.add(task.id);
       continue;
@@ -60,7 +63,7 @@ export function classifyGateTasks(
     tasks.set(task.id, task);
   }
 
-  const waitingIds = new Set<string>([gateTaskId]);
+  const waitingIds = new Set<string>(tasks.has(gateTaskId) ? [gateTaskId] : []);
   let changed = true;
   while (changed) {
     changed = false;
@@ -77,7 +80,7 @@ export function classifyGateTasks(
   const unknownIds = new Set<string>(duplicateIds);
   const issues = new Set<string>();
   if (!tasks.has(gateTaskId)) {
-    issues.add(`Gate Task ${gateTaskId} row가 없어 Task title/status를 표시할 수 없다`);
+    issues.add(`Gate Task ${gateTaskId}의 current nonterminal row가 없어 Task title/status를 표시할 수 없다`);
   }
   for (const task of tasks.values()) {
     if (waitingIds.has(task.id)) continue;
@@ -87,7 +90,7 @@ export function classifyGateTasks(
       continue;
     }
     const missing = [...new Set(task.deps.value)]
-      .filter((dependency) => dependency !== gateTaskId && !tasks.has(dependency))
+      .filter((dependency) => !observedIds.has(dependency))
       .sort(compare);
     if (missing.length > 0) {
       unknownIds.add(task.id);
@@ -115,9 +118,7 @@ export function classifyGateTasks(
     }
   }
 
-  const current = [...tasks.values()]
-    .filter((task) => !TERMINAL_TASK_STATUSES.has(task.status))
-    .sort((a, b) => compare(a.id, b.id));
+  const current = [...tasks.values()].sort((a, b) => compare(a.id, b.id));
   return {
     waiting: current.filter((task) => waitingIds.has(task.id)).map(taskFacts),
     independent: current
