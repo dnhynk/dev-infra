@@ -10,7 +10,7 @@ export type GateOptionMetadata = {
   /** Exact human-readable Orca Gate option. Registration compares this list without parsing it. */
   readonly label: string;
   readonly description: string;
-  /** Text a later D2 resolver will write to Orca. D2-A only preserves it. */
+  /** Exact text the D2-C resolver writes to Orca after the stable option ID wins locally. */
   readonly resolution: string;
 };
 

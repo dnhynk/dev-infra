@@ -1,6 +1,7 @@
 import type { RenderedCard } from '../digest/render.js';
 import type { SlackBlock } from '../slack/post.js';
 import type { GateDecisionFacts, GateTaskFacts } from './types.js';
+import { gateActionId, gateBlockId } from './actions.js';
 
 const SECTION_TEXT_CAP = 3000;
 const SECTION_TRUNCATION_MARK = '\n…(표시 한도 3000자를 넘어 잘림)';
@@ -45,10 +46,7 @@ function taskLines(tasks: readonly GateTaskFacts[]): readonly string[] {
   return shown;
 }
 
-/**
- * Render a static Gate decision card. This module intentionally cannot create `actions` or `button`
- * blocks; D2-C/D own those producers together with their consumers.
- */
+/** Render a Gate card. Only an exactly correlated pending fixed-option Gate receives actions. */
 export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
   const open = gate.status === 'pending';
   const headline = open ? '⚠️ 결정 필요' : '✅ Gate 결정 기록';
@@ -101,6 +99,28 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
         'deps를 읽지 못했거나 dependency row가 없어 independent로 접지 않았다',
       ]),
     );
+  }
+
+  const actionable =
+    gate.status === 'pending' &&
+    gate.metadataState === 'matched' &&
+    gate.correlation !== null &&
+    gate.options.length > 0 &&
+    gate.options.every(
+      (option) => option.id !== null && option.description !== null && option.resolution !== null,
+    );
+  if (actionable) {
+    blocks.push({
+      type: 'actions',
+      block_id: gateBlockId(gate.key),
+      elements: gate.options.map((option) => ({
+        type: 'button',
+        text: { type: 'plain_text', text: cut(option.label, 75), emoji: true },
+        action_id: gateActionId(gate.key, option.id ?? ''),
+        value: option.id,
+        ...(gate.recommendation?.optionId === option.id ? { style: 'primary' } : {}),
+      })),
+    });
   }
 
   if (gate.resolution !== null) {

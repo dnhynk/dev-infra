@@ -140,6 +140,34 @@ afterEach(() => {
 });
 
 describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
+  it('SDK interactive envelope를 production event hook으로 전달하고 ACK callback을 보존한다', async () => {
+    const server = await startHelloServer({ replyToClose: true });
+    vi.stubGlobal('fetch', vi.fn(async () => connectionsOpenResponse(server.url)));
+    const observed: { readonly type: string; readonly body: unknown }[] = [];
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+      event: async (event) => {
+        observed.push({ type: event.type, body: event.body });
+        await event.ack();
+      },
+    });
+    try {
+      await transport.start();
+      server.send(0, {
+        envelope_id: 'e1',
+        type: 'interactive',
+        payload: { type: 'block_actions' },
+      });
+      await vi.waitFor(() => expect(observed).toEqual([
+        { type: 'interactive', body: { type: 'block_actions' } },
+      ]));
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
   it.each([
     ['missing', {}],
     ['mismatch', { app_id: 'A01OTHER' }],

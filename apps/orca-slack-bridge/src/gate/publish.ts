@@ -1,8 +1,11 @@
 import { renderFingerprint, type RenderedCard } from '../digest/render.js';
-import type { RunKey } from '../identity/keys.js';
+import { taskKey, type RunKey } from '../identity/keys.js';
 import type { SlackPoster, ThreadPoster } from '../slack/post.js';
 import type { GateStore } from '../store/schema.js';
 import { renderGateDecisionCard } from './render.js';
+import { projectGateResolutionCard } from './resolution-project.js';
+import { renderGateResolutionCard } from './resolution-render.js';
+import type { GateLocalObservation } from './resolution-types.js';
 import type { GateDecisionFacts } from './types.js';
 
 export type GatePublishAction =
@@ -29,6 +32,12 @@ export type GatePublishOptions = {
   readonly thread: ThreadPoster | null;
   readonly channel: string;
   readonly now: () => Date;
+  readonly fault?: (
+    point:
+      | 'after_static_slack_before_observation'
+      | 'after_static_observation_before_resolution_reproject',
+    gateKey: GateDecisionFacts['key'],
+  ) => void | Promise<void>;
 };
 
 function dryRun(options: GatePublishOptions): boolean {
@@ -50,6 +59,42 @@ export async function publishGateCard(
   const base = { gate, fingerprint, card } as const;
   const existing = options.store.findGateMessage(gate.key);
   const isDryRun = dryRun(options);
+  const mappingState =
+    rootMessageTs === null || existing === null
+      ? 'missing'
+      : existing.channelId === options.channel &&
+          existing.runKey === runKey &&
+          existing.threadTs === rootMessageTs
+        ? 'matched'
+        : 'mismatched';
+  const locallyConsistentPending =
+    gate.status === 'pending' && gate.resolution === null && gate.resolvedAt === null;
+  const locallyConsistentResolved =
+    gate.status === 'resolved' && gate.resolution !== null && gate.resolvedAt !== null;
+  const localObservation: GateLocalObservation = {
+    gateKey: gate.key,
+    runKey,
+    taskKey: taskKey(gate.taskId),
+    status: locallyConsistentPending
+      ? 'pending' as const
+      : locallyConsistentResolved
+        ? 'resolved' as const
+        : 'unsupported' as const,
+    resolution: locallyConsistentResolved ? gate.resolution : null,
+    resolvedAt: locallyConsistentResolved ? gate.resolvedAt : null,
+    metadataState: gate.metadataState,
+    mappingState,
+    observedAt: options.now().toISOString(),
+  };
+
+  // This is the only pre-ACK Gate-state source. It is written by the production observer, never
+  // inferred from Slack prose. A newer unsupported/inconsistent state replaces an older pending
+  // row so unknown future Orca states cannot leave stale buttons actionable.
+  if (!isDryRun) {
+    options.store.saveGateLocalObservation(localObservation);
+  }
+  const recoveringOrdinaryWrite =
+    !isDryRun && options.store.findGateLocalObservation(gate.key)?.mappingState === 'write_pending';
 
   if (rootMessageTs === null && !isDryRun) {
     return { ...base, action: 'root_unavailable', messageTs: existing?.messageTs ?? null };
@@ -64,7 +109,40 @@ export async function publishGateCard(
   ) {
     return { ...base, action: 'thread_mismatch', messageTs: existing.messageTs };
   }
-  if (existing !== null && existing.renderFingerprint === fingerprint) {
+  const resolution = options.store.findGateResolution(gate.key);
+  const resolutionOutbox = options.store.findGateResolutionOutbox(gate.key);
+  if (resolution !== null && resolutionOutbox !== null) {
+    // A claimed-but-unacknowledged action owns no remote effects yet. Freeze the existing card
+    // until ACK succeeds (or a Slack redelivery succeeds) instead of letting the observer race it.
+    if (resolution.ackState !== 'acked') {
+      return { ...base, action: 'skip', messageTs: existing?.messageTs ?? null };
+    }
+    const resolutionCard = renderGateResolutionCard(resolution, resolutionOutbox);
+    const resolutionFingerprint = renderFingerprint(resolutionCard);
+    if (isDryRun || options.slack === null) {
+      return {
+        gate,
+        card: resolutionCard,
+        fingerprint: resolutionFingerprint,
+        action: existing?.renderFingerprint === resolutionFingerprint ? 'skip' : 'update',
+        messageTs: existing?.messageTs ?? null,
+      };
+    }
+    const projection = await projectGateResolutionCard(
+      options.store,
+      options.slack,
+      gate.key,
+      options.now,
+    );
+    return {
+      gate,
+      card: projection.card ?? resolutionCard,
+      fingerprint: projection.fingerprint ?? resolutionFingerprint,
+      action: projection.kind === 'current' ? 'skip' : 'update',
+      messageTs: existing?.messageTs ?? null,
+    };
+  }
+  if (existing !== null && existing.renderFingerprint === fingerprint && !recoveringOrdinaryWrite) {
     return { ...base, action: 'skip', messageTs: existing.messageTs };
   }
   if (isDryRun) {
@@ -95,15 +173,75 @@ export async function publishGateCard(
       renderFingerprint: fingerprint,
       at,
     });
+    // The pre-reply row was deliberately `missing`. Once the durable card identity exists, make
+    // it actionable; a crash before this write remains a safe, reopenable missing observation.
+    options.store.saveGateLocalObservation({ ...localObservation, mappingState: 'matched' });
     return { ...base, action: 'create', messageTs: posted.ts };
   }
 
-  const updated = await options.slack.update({
-    channel: existing.channelId,
-    ts: existing.messageTs,
-    text: card.text,
-    blocks: card.blocks,
-  });
-  options.store.updateGateObservation(gate.key, fingerprint, at);
+  if (!options.store.beginGateObservationWrite(gate.key, at)) {
+    // The fence and Gate claim use the same BEGIN IMMEDIATE boundary. If a winner committed after
+    // the earlier read, never start the ordinary Slack update; render/project that durable state.
+    const racedIntent = options.store.findGateResolution(gate.key);
+    const racedOutbox = options.store.findGateResolutionOutbox(gate.key);
+    if (racedIntent?.ackState === 'acked' && racedOutbox !== null) {
+      const resolutionCard = renderGateResolutionCard(racedIntent, racedOutbox);
+      const resolutionFingerprint = renderFingerprint(resolutionCard);
+      const projection = await projectGateResolutionCard(
+        options.store,
+        options.slack,
+        gate.key,
+        options.now,
+      );
+      return {
+        gate,
+        card: projection.card ?? resolutionCard,
+        fingerprint: projection.fingerprint ?? resolutionFingerprint,
+        action: projection.kind === 'current' ? 'skip' : 'update',
+        messageTs: existing.messageTs,
+      };
+    }
+    return { ...base, action: 'skip', messageTs: existing.messageTs };
+  }
+  let updated: Awaited<ReturnType<SlackPoster['update']>>;
+  try {
+    updated = await options.slack.update({
+      channel: existing.channelId,
+      ts: existing.messageTs,
+      text: card.text,
+      blocks: card.blocks,
+    });
+  } catch (e) {
+    options.store.abandonGateObservationWrite(gate.key);
+    throw e;
+  }
+  await options.fault?.('after_static_slack_before_observation', gate.key);
+  try {
+    options.store.updateGateObservation(gate.key, fingerprint, at, localObservation);
+  } catch (e) {
+    options.store.abandonGateObservationWrite(gate.key);
+    throw e;
+  }
+  await options.fault?.('after_static_observation_before_resolution_reproject', gate.key);
+  // If a winner appeared while the ordinary update was in flight, D2 deterministically wins the
+  // shared message and restores its newest durable generation before this observer returns.
+  const racedResolution = options.store.findGateResolution(gate.key);
+  if (racedResolution?.ackState === 'acked') {
+    const projection = await projectGateResolutionCard(
+      options.store,
+      options.slack,
+      gate.key,
+      options.now,
+    );
+    if (projection.card !== null && projection.fingerprint !== null) {
+      return {
+        gate,
+        card: projection.card,
+        fingerprint: projection.fingerprint,
+        action: 'update',
+        messageTs: updated.ts,
+      };
+    }
+  }
   return { ...base, action: 'update', messageTs: updated.ts };
 }

@@ -50,8 +50,8 @@ function text(card: ReturnType<typeof renderGateDecisionCard>): string {
     .join('\n');
 }
 
-describe('static Gate decision renderer', () => {
-  it('문제/선택지/권장/영향/waiting/independent/correlation을 action 없이 그린다', () => {
+describe('Gate decision renderer', () => {
+  it('matched pending Gate만 stable option ID 기반 fixed actions로 그린다', () => {
     const card = renderGateDecisionCard(facts());
     const rendered = text(card);
     const json = JSON.stringify(card.blocks);
@@ -64,10 +64,12 @@ describe('static Gate decision renderer', () => {
     expect(rendered).toContain('task_side');
     expect(rendered).toContain('msg_ask');
     expect(rendered).toContain('ctx_gate');
-    expect(card.blocks.every((block) => block['type'] === 'section')).toBe(true);
-    expect(json).not.toContain('"type":"actions"');
-    expect(json).not.toContain('"type":"button"');
-    expect(json).not.toContain('action_id');
+    expect(card.blocks.filter((block) => block['type'] === 'actions')).toHaveLength(1);
+    expect(json).toContain('"type":"button"');
+    expect(json).toContain('orca_gate_fixed_options_v1');
+    expect(json).toContain('orca_gate_resolve_v1');
+    expect(json).toContain('"value":"keep"');
+    expect(json).toContain('"value":"change"');
   });
 
   it('degraded card는 recommendation/impact를 추측하지 않고 판정 불가 Task를 드러낸다', () => {

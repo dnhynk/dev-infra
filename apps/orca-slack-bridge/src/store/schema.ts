@@ -2,6 +2,7 @@ import type { CheckFact } from '../github/pull-request.js';
 import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import type { GateMetadata } from '../gate/types.js';
+import type { GateLocalObservation, GateResolutionStore } from '../gate/resolution-types.js';
 
 /**
  * durable store 스키마와 접근 경계.
@@ -59,12 +60,13 @@ import type { GateMetadata } from '../gate/types.js';
  *   (PR, dedupe key)다. 보장 범위는 `PR_THREAD_EVENT_TABLE`에 적었다.
  * - 이전 관측의 terminal과 check resource를 다음 관측이 읽을 수 있다 → `pr_state`가 PR당 한 행이다.
  *
- * D2-A는 Gate sidecar와 정적 thread reply mapping만 덧붙인다. Gate resolution/outbox와
- * coordinator notification은 D2-C/D3의 사실이므로 아직 담지 않는다.
+ * D2-C는 v7 sidecar/thread mapping 위에 local Gate observation, immutable winner intent,
+ * bounded evidence와 card/notification outbox를 additive v8로 덧붙인다. D3 notification
+ * transport는 여전히 구현하지 않고 notification state는 pending으로만 보존한다.
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -326,6 +328,126 @@ CREATE TABLE gate_message (
 const GATE_MESSAGE_INDEX = `
 CREATE UNIQUE INDEX gate_message_slack_identity ON gate_message (channel_id, message_ts)`;
 
+/** D2-C local source-of-truth boundary. All tables are additive to the v7 sidecar/card shape. */
+const GATE_LOCAL_OBSERVATION_TABLE = `
+CREATE TABLE gate_local_observation (
+  gate_key       TEXT PRIMARY KEY,
+  run_key        TEXT NOT NULL,
+  task_key       TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK (status IN ('pending', 'resolved', 'unsupported')),
+  resolution     TEXT,
+  resolved_at    TEXT,
+  metadata_state TEXT NOT NULL CHECK (metadata_state IN ('matched', 'missing', 'mismatched')),
+  mapping_state  TEXT NOT NULL CHECK (mapping_state IN ('matched', 'missing', 'mismatched', 'write_pending')),
+  write_owner    TEXT CHECK (write_owner IS NULL OR length(write_owner) BETWEEN 1 AND 80),
+  observed_at    TEXT NOT NULL,
+  CHECK ((mapping_state = 'write_pending' AND write_owner IS NOT NULL)
+      OR (mapping_state <> 'write_pending' AND write_owner IS NULL)),
+  CHECK ((status = 'pending' AND resolution IS NULL AND resolved_at IS NULL)
+      OR (status = 'resolved' AND resolution IS NOT NULL AND resolved_at IS NOT NULL)
+      OR (status = 'unsupported' AND resolution IS NULL AND resolved_at IS NULL))
+)`;
+
+const GATE_RESOLUTION_TABLE = `
+CREATE TABLE gate_resolution (
+  gate_key             TEXT PRIMARY KEY,
+  revision             INTEGER NOT NULL CHECK (revision >= 0),
+  ack_state            TEXT NOT NULL CHECK (ack_state IN ('pending','acked','failed')),
+  lease_owner          TEXT CHECK (lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 80),
+  lease_expires_at     TEXT,
+  retry_request_id     TEXT NOT NULL UNIQUE,
+  option_id            TEXT NOT NULL CHECK (length(option_id) BETWEEN 1 AND 64),
+  option_resolution    TEXT NOT NULL CHECK (length(option_resolution) BETWEEN 1 AND 3000),
+  ask_message_id       TEXT NOT NULL,
+  question_thread_id   TEXT NOT NULL,
+  dispatch_id          TEXT NOT NULL,
+  task_id              TEXT NOT NULL,
+  team_id              TEXT NOT NULL,
+  owner_user_id        TEXT NOT NULL,
+  api_app_id           TEXT,
+  channel_id           TEXT NOT NULL,
+  thread_ts            TEXT NOT NULL,
+  message_ts           TEXT NOT NULL,
+  block_id             TEXT NOT NULL,
+  action_id            TEXT NOT NULL,
+  action_value         TEXT NOT NULL,
+  lifecycle            TEXT NOT NULL CHECK (lifecycle IN
+    ('claimed','pre_read','resolving','uncertain','post_read','resolved','conflict','degraded')),
+  mutation_ownership   TEXT NOT NULL CHECK (mutation_ownership IN ('not_started','unknown','structured')),
+  pre_read_json         TEXT,
+  resolve_result_json   TEXT,
+  post_read_json        TEXT,
+  last_error_code       TEXT CHECK (last_error_code IS NULL OR length(last_error_code) <= 80),
+  last_error_detail     TEXT CHECK (last_error_detail IS NULL OR length(last_error_detail) <= 500),
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL,
+  CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL)
+       OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
+)`;
+
+const GATE_RESOLUTION_LIFECYCLE_INDEX = `
+CREATE INDEX gate_resolution_lifecycle ON gate_resolution (lifecycle, gate_key)`;
+
+const GATE_RESOLUTION_OUTBOX_TABLE = `
+CREATE TABLE gate_resolution_outbox (
+  gate_key            TEXT PRIMARY KEY,
+  revision            INTEGER NOT NULL CHECK (revision >= 0),
+  card_state          TEXT NOT NULL CHECK (card_state IN ('resolving','resolved','conflict','degraded')),
+  card_pending        INTEGER NOT NULL CHECK (card_pending IN (0, 1)),
+  notification_state  TEXT NOT NULL CHECK (notification_state = 'pending'),
+  projected_at        TEXT,
+  projection_owner    TEXT CHECK (projection_owner IS NULL OR length(projection_owner) BETWEEN 1 AND 80),
+  last_error_code     TEXT CHECK (last_error_code IS NULL OR length(last_error_code) <= 80),
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  CHECK (card_pending = 1 OR projection_owner IS NULL)
+)`;
+
+const GATE_RESOLUTION_OUTBOX_INDEX = `
+CREATE INDEX gate_resolution_outbox_pending ON gate_resolution_outbox (card_pending, gate_key)`;
+
+const GATE_RESOLUTION_ATTEMPT_TABLE = `
+CREATE TABLE gate_resolution_attempt (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  gate_key    TEXT NOT NULL,
+  phase       TEXT NOT NULL CHECK (length(phase) BETWEEN 1 AND 40),
+  outcome     TEXT NOT NULL CHECK (length(outcome) BETWEEN 1 AND 40),
+  detail      TEXT CHECK (detail IS NULL OR length(detail) <= 500),
+  created_at  TEXT NOT NULL
+)`;
+
+const GATE_RESOLUTION_ATTEMPT_INDEX = `
+CREATE INDEX gate_resolution_attempt_gate ON gate_resolution_attempt (gate_key, id)`;
+
+const GATE_RESOLUTION_AUDIT_TABLE = `
+CREATE TABLE gate_resolution_audit (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  gate_key    TEXT,
+  event       TEXT NOT NULL CHECK (length(event) BETWEEN 1 AND 40),
+  reason      TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 80),
+  created_at  TEXT NOT NULL
+)`;
+
+const GATE_RESOLUTION_AUDIT_INDEX = `
+CREATE INDEX gate_resolution_audit_gate ON gate_resolution_audit (gate_key, id)`;
+
+/** Exact code-owned v8 objects. Startup compares normalized sqlite_master SQL fail-closed. */
+export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  gate_metadata: GATE_METADATA_TABLE,
+  gate_metadata_run_key: GATE_METADATA_RUN_INDEX,
+  gate_message: GATE_MESSAGE_TABLE,
+  gate_message_slack_identity: GATE_MESSAGE_INDEX,
+  gate_local_observation: GATE_LOCAL_OBSERVATION_TABLE,
+  gate_resolution: GATE_RESOLUTION_TABLE,
+  gate_resolution_lifecycle: GATE_RESOLUTION_LIFECYCLE_INDEX,
+  gate_resolution_outbox: GATE_RESOLUTION_OUTBOX_TABLE,
+  gate_resolution_outbox_pending: GATE_RESOLUTION_OUTBOX_INDEX,
+  gate_resolution_attempt: GATE_RESOLUTION_ATTEMPT_TABLE,
+  gate_resolution_attempt_gate: GATE_RESOLUTION_ATTEMPT_INDEX,
+  gate_resolution_audit: GATE_RESOLUTION_AUDIT_TABLE,
+  gate_resolution_audit_gate: GATE_RESOLUTION_AUDIT_INDEX,
+};
+
 /**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
  *
@@ -380,6 +502,15 @@ ${GATE_METADATA_TABLE};
 ${GATE_METADATA_RUN_INDEX};
 ${GATE_MESSAGE_TABLE};
 ${GATE_MESSAGE_INDEX};
+${GATE_LOCAL_OBSERVATION_TABLE};
+${GATE_RESOLUTION_TABLE};
+${GATE_RESOLUTION_LIFECYCLE_INDEX};
+${GATE_RESOLUTION_OUTBOX_TABLE};
+${GATE_RESOLUTION_OUTBOX_INDEX};
+${GATE_RESOLUTION_ATTEMPT_TABLE};
+${GATE_RESOLUTION_ATTEMPT_INDEX};
+${GATE_RESOLUTION_AUDIT_TABLE};
+${GATE_RESOLUTION_AUDIT_INDEX};
 `;
 
 /**
@@ -426,6 +557,19 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // v6 → v7: sidecar producer와 정적 Gate thread consumer가 즉시 쓰는 두 표만 붙인다(D2-A).
   // 기존 PR/Run/collection 행은 건드리지 않고, 과거 Gate metadata나 Slack reply를 추측해 채우지 않는다.
   [GATE_METADATA_TABLE, GATE_METADATA_RUN_INDEX, GATE_MESSAGE_TABLE, GATE_MESSAGE_INDEX],
+  // v7 → v8: one immutable Gate-local winner, exact observations, bounded append-only evidence,
+  // and replayable D2 card/notification projection. No existing row is inferred or rewritten.
+  [
+    GATE_LOCAL_OBSERVATION_TABLE,
+    GATE_RESOLUTION_TABLE,
+    GATE_RESOLUTION_LIFECYCLE_INDEX,
+    GATE_RESOLUTION_OUTBOX_TABLE,
+    GATE_RESOLUTION_OUTBOX_INDEX,
+    GATE_RESOLUTION_ATTEMPT_TABLE,
+    GATE_RESOLUTION_ATTEMPT_INDEX,
+    GATE_RESOLUTION_AUDIT_TABLE,
+    GATE_RESOLUTION_AUDIT_INDEX,
+  ],
 ];
 
 /**
@@ -753,10 +897,10 @@ export type NewGateMessage = {
 };
 
 /**
- * D2-A durable boundary. Metadata registration and static-card publication share the same file but
- * remain separate from PR and Run-root interfaces so callers request only the effects they use.
+ * Gate metadata/card mapping plus the D2-C resolution boundary. It remains separate from PR and
+ * Run-root interfaces so callers request only the effects they use.
  */
-export interface GateStore {
+export interface GateStore extends GateResolutionStore {
   findGateMetadata(gateKey: GateKey): GateMetadata | null;
   /** Gate key order is fixed in SQL so source-row order cannot change render fingerprints. */
   listGateMetadata(runKey: RunKey): readonly GateMetadata[];
@@ -765,8 +909,13 @@ export interface GateStore {
   findGateMessage(gateKey: GateKey): GateMessageRecord | null;
   /** First reply only. A conflicting row must not replace the existing Slack identity. */
   insertGateMessage(message: NewGateMessage): void;
-  /** Update only the deterministic render fingerprint and observation time. */
-  updateGateObservation(gateKey: GateKey, renderFingerprint: string, at: string): void;
+  /** Settle an ordinary write fence and atomically record the exact observation it projected. */
+  updateGateObservation(
+    gateKey: GateKey,
+    renderFingerprint: string,
+    at: string,
+    observation?: GateLocalObservation,
+  ): void;
 }
 
 /**

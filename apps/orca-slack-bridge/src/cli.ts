@@ -7,7 +7,7 @@ import {
   type GateRegistrationResult,
 } from './gate/register.js';
 import { GhCli } from './github/runner.js';
-import { OrcaCli, type OrcaRunner } from './orca/client.js';
+import { boundedOrcaRunner, OrcaCli, type OrcaRunner } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
 import { formatRunCollection } from './run/collect.js';
 import {
@@ -15,8 +15,14 @@ import {
   runRunObserver,
   type RunObserveOptions,
 } from './run/publish.js';
-import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
-import { verifySocketPreflight } from './slack/socket.js';
+import { appToken, verifySlack, formatVerify, maskToken } from './slack/verify.js';
+import {
+  SlackSocketTransport,
+  slackSdkConnectionFactory,
+  verifySocketPreflight,
+  type SocketConnectionFactory,
+  type SocketTimeouts,
+} from './slack/socket.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import {
   SlackWebApiPoster,
@@ -33,8 +39,10 @@ import {
   SummaryProviderError,
   type SummaryProvider,
 } from './summarize/index.js';
+import { GateActionHandler } from './gate/action-handler.js';
+import { GateResolutionEngine } from './gate/resolve.js';
 
-export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register';
+export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register' | 'daemon';
 
 export type ParsedArgs =
   | { readonly kind: 'help' }
@@ -72,7 +80,7 @@ function arg(argv: readonly string[], name: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs', 'gate-register'];
+const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs', 'gate-register', 'daemon'];
 
 function isCommand(v: string | undefined): v is Command {
   return v !== undefined && (COMMANDS as readonly string[]).includes(v);
@@ -95,7 +103,7 @@ const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run', '--socket'];
  * 이 목록의 명령은 write 안전 때문에 모르는 인자를 거부한다. `verify-slack`은 별도로
  * Socket preflight 선택 오타를 막기 위해 exact allowlist를 쓴다.
  */
-const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs', 'gate-register'];
+const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs', 'gate-register', 'daemon'];
 
 /** `gate-register` has a deliberately narrow production transport; other known flags are still invalid. */
 function unknownGateRegisterArg(argv: readonly string[]): string | null {
@@ -110,6 +118,22 @@ function unknownGateRegisterArg(argv: readonly string[]): string | null {
       continue;
     }
     if (boolFlags.has(token)) continue;
+    return token;
+  }
+  return null;
+}
+
+/** Long-running consumer accepts only the identities needed to open its exact local/remote paths. */
+function unknownDaemonArg(argv: readonly string[]): string | null {
+  const valueFlags = new Set(['--config', '--state', '--orca']);
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (valueFlags.has(token)) {
+      const value = argv[i + 1];
+      if (value !== undefined && !value.startsWith('--')) i += 1;
+      continue;
+    }
     return token;
   }
   return null;
@@ -246,6 +270,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       return { kind: 'error', message: 'gate-register --input 경로가 비어 있다' };
     }
   }
+  if (command === 'daemon') {
+    const unknown = unknownDaemonArg(argv);
+    if (unknown !== null) {
+      return { kind: 'error', message: `daemon이 모르는 인자다: ${unknown}` };
+    }
+  }
   const prLimitRaw = arg(argv, '--pr-limit');
   const prLimit = prLimitRaw === undefined ? 50 : Number.parseInt(prLimitRaw, 10);
   if (!Number.isSafeInteger(prLimit) || prLimit <= 0) {
@@ -271,13 +301,14 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
-const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register>
+const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
 runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
 gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite에 등록한다
+daemon        fixed-option Gate action을 ACK하고 durable resolution을 재조정한다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
@@ -302,10 +333,15 @@ gate-register 전용:
   --input <path>    strict Gate metadata JSON 파일 (필수; stdin/자유 텍스트 입력 없음)
   --state <path>    등록할 durable store 경로
 
+daemon 전용:
+
+  --state <path>    v8 durable store 경로 (dry-run 없음)
+
 snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
 runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
 하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080). gate-register는 Orca Gate를
-read-only로 재조회한 뒤 local SQLite에만 쓰고 Slack/Orca mutation을 하지 않는다.`;
+read-only로 재조회한 뒤 local SQLite에만 쓰고 Slack/Orca mutation을 하지 않는다. daemon은
+Bridge-owned fixed-option action만 처리하며 D3 Coordinator notification transport는 실행하지 않는다.`;
 
 /**
  * summarizer provider를 만든다.
@@ -411,8 +447,8 @@ export function openRunStore(
  * 이 배선을 다시 `null`로 되돌리면 실패하는 테스트가 필요한데, `runRunsCommand`는 실제 `orca`
  * 프로세스를 만들어 그 자리에서 볼 수 없기 때문이다.
  *
- * D2-A부터 같은 concrete poster를 root와 Gate thread 경계에 함께 건다. Gate renderer에는
- * action block이 없고 이 thread 경계는 정적 reply create/update만 소비한다.
+ * 같은 concrete poster를 Run root, Gate thread card, D2-C status projection에 함께 쓴다.
+ * Fixed-option consumption itself is the separate Socket Mode daemon path below.
  */
 export function runsPoster(dryRun: boolean, env: NodeJS.ProcessEnv): SlackWebApiPoster | null {
   if (dryRun) return null;
@@ -565,6 +601,136 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
   }
 }
 
+export type DaemonDependencies = {
+  readonly orca?: OrcaRunner;
+  readonly slack?: SlackPoster;
+  readonly connectionFactory?: SocketConnectionFactory;
+  readonly socketTimeouts?: Partial<SocketTimeouts>;
+  /** Production defaults to fifteen seconds and kills the real Orca subprocess at expiry. */
+  readonly orcaTimeoutMs?: number;
+  /** Production defaults to five seconds; tests may shorten the durable retry cadence. */
+  readonly reconcileIntervalMs?: number;
+  readonly waitForStop?: () => Promise<void>;
+};
+
+function processStop(): Promise<void> {
+  return new Promise((resolve) => {
+    const stop = (): void => {
+      process.off('SIGINT', stop);
+      process.off('SIGTERM', stop);
+      resolve();
+    };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  });
+}
+
+/** Production D2-C path: strict v8 startup → reconcile → Socket Mode fixed-option consumer. */
+export async function runDaemonCommand(
+  parsed: RunArgs,
+  config: BridgeConfig,
+  dependencies: DaemonDependencies = {},
+): Promise<number> {
+  if (parsed.command !== 'daemon' || config.slack === null) {
+    process.stderr.write('daemon은 설정의 slack 섹션이 필요하다\n');
+    return 2;
+  }
+  const token = appToken(process.env);
+  if (token === undefined || !token.startsWith('xapp-')) {
+    process.stderr.write('daemon은 ORCA_SLACK_BRIDGE_APP_TOKEN xapp token이 필요하다\n');
+    return 2;
+  }
+  let store: SqliteDigestStore | null = null;
+  let transport: SlackSocketTransport | null = null;
+  let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
+  let reconciliation: Promise<void> | null = null;
+  const pending = new Set<Promise<void>>();
+  const inbound = new Set<Promise<void>>();
+  try {
+    store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
+    const configuredOrcaTimeout = dependencies.orcaTimeoutMs ?? 15_000;
+    if (!Number.isFinite(configuredOrcaTimeout) || configuredOrcaTimeout < 10) {
+      throw new TypeError('orcaTimeoutMs must be a finite number >= 10');
+    }
+    const orcaTimeoutMs = Math.trunc(configuredOrcaTimeout);
+    const rawOrca = dependencies.orca ?? new OrcaCli(
+      parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca',
+      { timeoutMs: orcaTimeoutMs },
+    );
+    const orca = boundedOrcaRunner(rawOrca, orcaTimeoutMs);
+    const slack = dependencies.slack ?? new SlackWebApiPoster({ token: botToken(process.env) });
+    const engine = new GateResolutionEngine({ store, orca, slack });
+    const handler = new GateActionHandler({
+      config: config.slack,
+      store,
+      engine,
+      schedule: (job) => {
+        const task = job().catch(() => undefined).finally(() => pending.delete(task));
+        pending.add(task);
+      },
+    });
+
+    // No Socket event can race schema validation or startup recovery.
+    await engine.reconcile();
+    const configuredInterval = dependencies.reconcileIntervalMs ?? 5_000;
+    if (!Number.isFinite(configuredInterval) || configuredInterval < 10) {
+      throw new TypeError('reconcileIntervalMs must be a finite number >= 10');
+    }
+    const scheduleReconciliation = (): void => {
+      if (reconciliation !== null) return;
+      const work = engine.reconcile().catch(() => undefined);
+      reconciliation = work;
+      pending.add(work);
+      void work.finally(() => {
+        pending.delete(work);
+        if (reconciliation === work) reconciliation = null;
+      });
+    };
+    // Startup may see a live owner that crashes immediately afterward. Rechecking durable pending
+    // work lets this daemon take over once that owner is no longer live, without stealing it early.
+    reconciliationTimer = setInterval(
+      scheduleReconciliation,
+      Math.trunc(configuredInterval),
+    );
+    reconciliationTimer.unref?.();
+    transport = new SlackSocketTransport({
+      ...(config.slack.apiAppId === undefined ? {} : { expectedApiAppId: config.slack.apiAppId }),
+      connectionFactory: dependencies.connectionFactory ?? slackSdkConnectionFactory(token),
+      ...(dependencies.socketTimeouts === undefined ? {} : { timeouts: dependencies.socketTimeouts }),
+      event: (event) => {
+        const task = handler.handle(event).then(() => undefined).finally(() => inbound.delete(task));
+        inbound.add(task);
+        return task;
+      },
+    });
+    await transport.start();
+    await (dependencies.waitForStop ?? processStop)();
+    clearInterval(reconciliationTimer);
+    reconciliationTimer = null;
+    // Stop accepting new work before store close, then drain already-ACKed durable work.
+    await transport.shutdown();
+    transport = null;
+    return 0;
+  } catch {
+    process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
+    return 1;
+  } finally {
+    if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
+    if (transport !== null) {
+      try {
+        await transport.shutdown();
+      } catch {
+        // Shutdown failure cannot authorize a second daemon or a different external write.
+      }
+    }
+    // The store remains open until both ACK/CAS handlers and already-ACKed jobs settle, even when
+    // Socket close itself rejects or times out.
+    await Promise.allSettled([...inbound]);
+    await Promise.allSettled([...pending]);
+    store?.close();
+  }
+}
+
 async function main(): Promise<number> {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.kind === 'help') {
@@ -601,6 +767,10 @@ async function main(): Promise<number> {
 
   if (parsed.command === 'runs') {
     return await runRunsCommand(parsed, config);
+  }
+
+  if (parsed.command === 'daemon') {
+    return await runDaemonCommand(parsed, config);
   }
 
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';

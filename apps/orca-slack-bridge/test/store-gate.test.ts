@@ -172,14 +172,14 @@ function metadata(over: Partial<GateMetadata> = {}): GateMetadata {
   };
 }
 
-describe('schema v6 → v7', () => {
-  it('migrated v6와 fresh v7의 table_xinfo/index_xinfo가 동형이다', () => {
+describe('schema v6 → current', () => {
+  it('migrated v6와 fresh v8의 table_xinfo/index_xinfo가 동형이다', () => {
     writeV6(dbPath);
     new SqliteDigestStore(dbPath).close();
     const fresh = join(dir, 'fresh', 'state.db');
     new SqliteDigestStore(fresh).close();
 
-    expect(SCHEMA_VERSION).toBe(7);
+    expect(SCHEMA_VERSION).toBe(8);
     expect(gateMasterShape(dbPath)).toEqual(gateMasterShape(fresh));
     expect(schemaShape(dbPath)).toEqual(schemaShape(fresh));
     expect(schemaShape(dbPath).map(({ table }) => table)).toContain('gate_metadata');
@@ -200,7 +200,7 @@ describe('schema v6 → v7', () => {
     store.close();
 
     const db = new DatabaseSync(dbPath);
-    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 7 });
+    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 8 });
     db.close();
   });
 

@@ -1,0 +1,819 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gateActionId, gateBlockId } from '../src/gate/actions.js';
+import { GateResolutionEngine, type GateResolutionFault } from '../src/gate/resolve.js';
+import { projectGateResolutionCard } from '../src/gate/resolution-project.js';
+import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
+import { boundedOrcaRunner, type OrcaRunner } from '../src/orca/client.js';
+import type { PostMessageInput, PostedMessage, SlackPoster, UpdateMessageInput } from '../src/slack/post.js';
+import { SqliteDigestStore } from '../src/store/sqlite.js';
+
+const GATE_ID = 'gate_resolve';
+const RUN_ID = 'run_resolve';
+const TASK_ID = 'task_resolve';
+const GATE = gateKey(GATE_ID);
+const RUN = runKey(RUN_ID);
+const TASK = taskKey(TASK_ID);
+const CHANNEL = 'C0AGENTRUNS';
+const THREAD_TS = '1787554800.000001';
+const MESSAGE_TS = '1787554800.000002';
+const AT = '2026-08-24T10:00:00.000Z';
+const REQUEST = '11111111-1111-4111-8111-111111111111';
+
+let dir: string;
+let engineSequence = 0;
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'orca-gate-resolve-')); });
+afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+function seed(path: string): SqliteDigestStore {
+  const store = new SqliteDigestStore(path);
+  store.insertGateMetadata({
+    gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_resolve'),
+    askMessageId: 'msg_resolve', questionThreadId: 'thread_resolve',
+    options: [
+      { id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' },
+      { id: 'change', label: '변경', description: '새 경로', resolution: '변경' },
+    ],
+    recommendation: { optionId: 'keep', reason: '호환성' }, impact: '후속 방향', registeredAt: AT,
+  });
+  store.insertGateMessage({
+    gateKey: GATE, runKey: RUN, channelId: CHANNEL, threadTs: THREAD_TS,
+    messageTs: MESSAGE_TS, renderFingerprint: 'fp', at: AT,
+  });
+  store.saveGateLocalObservation({
+    gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+    resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+  });
+  const claim = store.claimGateResolution({
+    teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: CHANNEL,
+    threadTs: THREAD_TS, messageTs: MESSAGE_TS, blockId: gateBlockId(GATE),
+    actionId: gateActionId(GATE, 'keep'), actionValue: 'keep', retryRequestId: REQUEST, at: AT,
+  });
+  if (claim.kind !== 'claimed') throw new Error(`seed claim failed: ${claim.kind}`);
+  const acked = store.markGateResolutionAck(GATE, claim.intent.revision, 'acked', AT);
+  if (acked?.ackState !== 'acked') throw new Error('seed ACK state failed');
+  return store;
+}
+
+type ResolveMode =
+  | 'normal'
+  | 'throw_before'
+  | 'hang_before'
+  | 'apply_then_throw'
+  | 'malformed'
+  | 'pending_structured'
+  | 'wrong_structured';
+
+class FakeOrca implements OrcaRunner {
+  status: 'pending' | 'resolved' = 'pending';
+  resolution: string | null = null;
+  resolvedAt: string | null = null;
+  resolveMode: ResolveMode = 'normal';
+  replayed = false;
+  failConfirmationAfterLost = false;
+  failNextLists = 0;
+  resolveExternallyOnListCall: number | null = null;
+  listCount = 0;
+  blockResolveResponse = false;
+  readonly failListCalls = new Set<number>();
+  readonly calls: string[][] = [];
+  readonly retryRequests: string[] = [];
+  readonly resolveStarted: Promise<void>;
+  private signalResolveStarted!: () => void;
+  private releaseResolveResponse!: () => void;
+  private readonly resolveResponseReleased: Promise<void>;
+
+  constructor() {
+    this.resolveStarted = new Promise((resolve) => { this.signalResolveStarted = resolve; });
+    this.resolveResponseReleased = new Promise((resolve) => { this.releaseResolveResponse = resolve; });
+  }
+
+  releaseResolve(): void {
+    this.releaseResolveResponse();
+  }
+
+  resolveExternally(resolution: string, resolvedAt = AT): void {
+    this.status = 'resolved';
+    this.resolution = resolution;
+    this.resolvedAt = resolvedAt;
+  }
+
+  private gate(): Record<string, unknown> {
+    return {
+      id: GATE_ID, run_id: RUN_ID, task_id: TASK_ID, question: '표시용 질문은 파싱하지 않는다',
+      options: JSON.stringify(['현행 유지', '변경']), status: this.status,
+      resolution: this.resolution, created_at: '2026-08-24T09:00:00.000Z',
+      resolved_at: this.resolvedAt,
+    };
+  }
+
+  run(args: readonly string[]): Promise<string> {
+    this.calls.push([...args]);
+    if (args[1] === 'gate-list') {
+      this.listCount += 1;
+      if (this.resolveExternallyOnListCall === this.listCount) {
+        this.resolveExternally('현행 유지', '2026-08-24T10:00:01.000Z');
+      }
+      if (this.failNextLists > 0 || this.failListCalls.has(this.listCount)) {
+        if (this.failNextLists > 0) this.failNextLists -= 1;
+        return Promise.reject(new Error('read unavailable'));
+      }
+      return Promise.resolve(JSON.stringify({
+        id: 'read', ok: true,
+        result: { runId: RUN_ID, gates: [this.gate()], count: 1 },
+      }));
+    }
+    if (args[1] !== 'gate-resolve') return Promise.reject(new Error('unexpected command'));
+    const requestAt = args.indexOf('--retry-request');
+    const resolutionAt = args.indexOf('--resolution');
+    const request = args[requestAt + 1] ?? '';
+    const resolution = args[resolutionAt + 1] ?? '';
+    this.retryRequests.push(request);
+    if (this.resolveMode === 'throw_before') return Promise.reject(new Error('request not sent'));
+    if (this.resolveMode === 'hang_before') return new Promise<string>(() => undefined);
+    if (this.resolveMode === 'pending_structured') {
+      return Promise.resolve(JSON.stringify({
+        id: 'resolve', ok: true,
+        result: { gate: this.gate(), mutation: { requestId: request, replayed: false } },
+      }));
+    }
+    if (this.resolveMode === 'wrong_structured') {
+      this.resolveExternally('외부 결정');
+      return Promise.resolve(JSON.stringify({
+        id: 'resolve', ok: true,
+        result: { gate: this.gate(), mutation: { requestId: request, replayed: false } },
+      }));
+    }
+    this.resolveExternally(resolution);
+    if (this.resolveMode === 'apply_then_throw') {
+      if (this.failConfirmationAfterLost) this.failNextLists = 1;
+      return Promise.reject(new Error('response lost'));
+    }
+    if (this.resolveMode === 'malformed') {
+      return Promise.resolve(JSON.stringify({ id: 'resolve', ok: true, result: { gate: this.gate() } }));
+    }
+    const response = JSON.stringify({
+      id: 'resolve', ok: true,
+      result: { gate: this.gate(), mutation: { requestId: request, replayed: this.replayed } },
+    });
+    this.signalResolveStarted();
+    return this.blockResolveResponse
+      ? this.resolveResponseReleased.then(() => response)
+      : Promise.resolve(response);
+  }
+}
+
+class FakeSlack implements SlackPoster {
+  readonly updates: UpdateMessageInput[] = [];
+  fail = false;
+  post(_input: PostMessageInput): Promise<PostedMessage> {
+    return Promise.reject(new Error('not used'));
+  }
+  update(input: UpdateMessageInput): Promise<PostedMessage> {
+    this.updates.push(input);
+    return this.fail
+      ? Promise.reject(new Error('Slack unavailable'))
+      : Promise.resolve({ channel: input.channel, ts: input.ts });
+  }
+}
+
+class DeferredFirstSlack implements SlackPoster {
+  readonly updates: UpdateMessageInput[] = [];
+  readonly firstStarted: Promise<void>;
+  private signalStarted!: () => void;
+  private release!: () => void;
+  private readonly firstCompletion: Promise<void>;
+
+  constructor() {
+    this.firstStarted = new Promise((resolve) => { this.signalStarted = resolve; });
+    this.firstCompletion = new Promise((resolve) => { this.release = resolve; });
+  }
+
+  releaseFirst(): void {
+    this.release();
+  }
+
+  post(_input: PostMessageInput): Promise<PostedMessage> {
+    return Promise.reject(new Error('not used'));
+  }
+
+  async update(input: UpdateMessageInput): Promise<PostedMessage> {
+    this.updates.push(input);
+    if (this.updates.length === 1) {
+      this.signalStarted();
+      await this.firstCompletion;
+    }
+    return { channel: input.channel, ts: input.ts };
+  }
+}
+
+function engine(
+  store: SqliteDigestStore,
+  orca: OrcaRunner,
+  slack: FakeSlack,
+  fault?: (point: GateResolutionFault) => void | Promise<void>,
+): GateResolutionEngine {
+  return new GateResolutionEngine({
+    store, orca, slack, now: () => new Date(AT), leaseDurationMs: 100,
+    leaseOwner: `t.engine-${++engineSequence}`,
+    ...(fault ? { fault } : {}),
+  });
+}
+
+describe('post-ACK exact Orca resolve and reconciliation', () => {
+  it('pre-read → mutation-edge read → official resolve → post-read confirms and projects pending notification', async () => {
+    const store = seed(join(dir, 'happy.db'));
+    const orca = new FakeOrca();
+    const slack = new FakeSlack();
+    const worker = engine(store, orca, slack);
+    await Promise.all([worker.resolveAndProject(GATE), worker.resolveAndProject(GATE)]);
+    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list', 'gate-list', 'gate-resolve', 'gate-list']);
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'resolved',
+      optionResolution: '현행 유지',
+      resolveResult: { mutation: { requestId: REQUEST, replayed: false } },
+      postRead: { status: 'resolved', resolution: '현행 유지' },
+    });
+    expect(store.listPendingGateOutboxes()).toEqual([]);
+    expect(slack.updates).toHaveLength(2);
+    expect(JSON.stringify(slack.updates[0])).toContain('resolving');
+    const card = JSON.stringify(slack.updates.at(-1));
+    expect(card).toContain('Coordinator 통지 대기');
+    expect(card).not.toContain('작업 재개');
+    store.close();
+  });
+
+  it('mutation.replayed=true를 strict하게 보존하고 같은 logical request만 사용한다', async () => {
+    const store = seed(join(dir, 'replayed.db'));
+    const orca = new FakeOrca();
+    orca.replayed = true;
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)?.resolveResult?.mutation).toEqual({
+      requestId: REQUEST,
+      replayed: true,
+    });
+    expect(new Set(orca.retryRequests)).toEqual(new Set([REQUEST]));
+    store.close();
+  });
+
+  it('response loss after applied resolve is surfaced as ownership-ambiguous without double mutation', async () => {
+    const store = seed(join(dir, 'response-loss.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'apply_then_throw';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded', lastErrorCode: 'mutation_ownership_ambiguous',
+    });
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    store.close();
+  });
+
+  it('response loss plus failed confirmation becomes ownership-ambiguous after restart without replay', async () => {
+    const store = seed(join(dir, 'response-loss-restart.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'apply_then_throw';
+    orca.failConfirmationAfterLost = true;
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('uncertain');
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded', lastErrorCode: 'mutation_ownership_ambiguous',
+    });
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    store.close();
+  });
+
+  it('malformed structured output cannot claim ownership from an equal exact post-read', async () => {
+    const store = seed(join(dir, 'malformed-result.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'malformed';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded',
+      lastErrorCode: 'mutation_ownership_ambiguous',
+      resolveResult: null,
+      postRead: { status: 'resolved', resolution: '현행 유지' },
+    });
+    store.close();
+  });
+
+  it('a structured resolve result that is still pending is rejected and only the same UUID retries', async () => {
+    const store = seed(join(dir, 'pending-structured.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'pending_structured';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'uncertain', resolveResult: null, lastErrorCode: 'response_unknown_pending',
+    });
+    orca.resolveMode = 'normal';
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST, REQUEST]);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('resolved');
+    store.close();
+  });
+
+  it('a structured resolve result with the wrong final resolution is rejected as conflict', async () => {
+    const store = seed(join(dir, 'wrong-structured.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'wrong_structured';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', resolveResult: null, lastErrorCode: 'external_resolution',
+      postRead: { resolution: '외부 결정' },
+    });
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    store.close();
+  });
+
+  it('unresolved uncertainty retries only the original durable UUID on startup', async () => {
+    const store = seed(join(dir, 'uncertain.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'throw_before';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('uncertain');
+    expect(store.listPendingGateOutboxes()[0]?.cardState).toBeUndefined(); // projected degraded
+    orca.resolveMode = 'normal';
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST, REQUEST]);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('resolved');
+    store.close();
+  });
+
+  it('a bounded resolve timeout becomes response-unknown and retries only the durable UUID', async () => {
+    const store = seed(join(dir, 'resolve-timeout.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'hang_before';
+    const bounded = boundedOrcaRunner(orca, 10);
+    await engine(store, bounded, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'uncertain', mutationOwnership: 'unknown',
+      lastErrorCode: 'response_unknown_pending', resolveResult: null,
+    });
+    expect(orca.retryRequests).toEqual([REQUEST]);
+
+    orca.resolveMode = 'normal';
+    await engine(store, bounded, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST, REQUEST]);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('resolved');
+    store.close();
+  });
+
+  it('a later equal winner remains ambiguous after a response-unknown request was observed pending', async () => {
+    const store = seed(join(dir, 'response-unknown-pending-external.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'throw_before';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'uncertain', lastErrorCode: 'response_unknown_pending',
+    });
+    orca.resolveExternally('현행 유지', '2026-08-24T10:00:01.000Z');
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded', lastErrorCode: 'mutation_ownership_ambiguous',
+    });
+    store.close();
+  });
+
+  it('an equal winner appearing at the mutation-edge read remains ownership-ambiguous', async () => {
+    const store = seed(join(dir, 'response-unknown-edge-equal.db'));
+    const orca = new FakeOrca();
+    orca.resolveMode = 'throw_before';
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'uncertain', mutationOwnership: 'unknown', lastErrorCode: 'response_unknown_pending',
+    });
+
+    orca.resolveExternallyOnListCall = orca.listCount + 2;
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded', mutationOwnership: 'unknown',
+      lastErrorCode: 'mutation_ownership_ambiguous',
+      postRead: { status: 'resolved', resolution: '현행 유지' },
+    });
+    store.close();
+  });
+
+  it.each([
+    ['after_ack_before_pre_read', 'claimed'],
+    ['after_pre_read_before_resolve', 'pre_read'],
+    ['after_resolve_before_post_read', 'post_read'],
+    ['after_post_read_before_projection', 'resolved'],
+  ] as const)('%s fault is durably resumed by startup reconciliation', async (point, lifecycle) => {
+    const store = seed(join(dir, `${point}.db`));
+    const orca = new FakeOrca();
+    const slack = new FakeSlack();
+    const crash = engine(store, orca, slack, (at) => {
+      if (at === point) throw new Error('injected crash');
+    });
+    await expect(crash.resolveAndProject(GATE)).rejects.toThrow(/injected crash/);
+    expect(store.findGateResolution(GATE)).toMatchObject({ lifecycle, leaseOwner: null });
+    expect(store.listPendingGateOutboxes()).toHaveLength(1);
+    await engine(store, orca, slack).reconcile();
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('resolved');
+    expect(store.listPendingGateOutboxes()).toEqual([]);
+    store.close();
+  });
+
+  it('restart surfaces ambiguous ownership after Orca succeeds before local result persistence', async () => {
+    const store = seed(join(dir, 'after-response-before-result.db'));
+    const orca = new FakeOrca();
+    const slack = new FakeSlack();
+    await expect(engine(store, orca, slack, (point) => {
+      if (point === 'after_resolve_response_before_result_persist') {
+        throw new Error('process died before result persistence');
+      }
+    }).resolveAndProject(GATE)).rejects.toThrow(/before result persistence/);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'resolving',
+      leaseOwner: null,
+      resolveResult: null,
+    });
+    expect(orca.retryRequests).toEqual([REQUEST]);
+
+    await engine(store, orca, slack).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded',
+      lastErrorCode: 'mutation_ownership_ambiguous',
+      resolveResult: null,
+      postRead: { status: 'resolved', resolution: '현행 유지' },
+    });
+    const degradedCard = JSON.stringify(slack.updates.at(-1));
+    expect(degradedCard).toContain('degraded');
+    expect(degradedCard).toContain('Bridge 요청의 결과인지 확인할 수 없어');
+    expect(degradedCard).not.toContain('sidecar 또는 mapping');
+    store.close();
+  });
+
+  it('repeated read failure cannot erase crossed-mutation ambiguity across restarts', async () => {
+    const store = seed(join(dir, 'sticky-mutation-ambiguity.db'));
+    const orca = new FakeOrca();
+    await expect(engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_resolve_response_before_result_persist') {
+        throw new Error('process died after mutation');
+      }
+    }).resolveAndProject(GATE)).rejects.toThrow(/after mutation/);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'resolving', mutationOwnership: 'unknown', resolveResult: null,
+    });
+
+    orca.failNextLists = 1;
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'uncertain', mutationOwnership: 'unknown', lastErrorCode: 'pre_read_failed',
+    });
+
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'degraded', mutationOwnership: 'unknown',
+      lastErrorCode: 'mutation_ownership_ambiguous',
+    });
+    store.close();
+  });
+
+  it('external resolver during pre-read window is caught before mutation and never overwritten', async () => {
+    const store = seed(join(dir, 'external-before.db'));
+    const orca = new FakeOrca();
+    await engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_pre_read_before_resolve') orca.resolveExternally('외부 결정');
+    }).resolveAndProject(GATE);
+    expect(orca.retryRequests).toEqual([]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', postRead: { resolution: '외부 결정' },
+    });
+    store.close();
+  });
+
+  it('an equal external resolution before the mutation edge is still persisted as a conflict', async () => {
+    const store = seed(join(dir, 'external-equal-before.db'));
+    const orca = new FakeOrca();
+    await engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_pre_read_before_resolve') orca.resolveExternally('현행 유지');
+    }).resolveAndProject(GATE);
+    expect(orca.retryRequests).toEqual([]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', lastErrorCode: 'external_resolution',
+      postRead: { resolution: '현행 유지' },
+    });
+    store.close();
+  });
+
+  it.each([
+    ['pre_read_failed', 1],
+    ['mutation_edge_read_failed', 2],
+  ] as const)('%s uncertainty cannot claim an equal external winner after restart', async (code, listCall) => {
+    const store = seed(join(dir, `${code}-equal-external.db`));
+    const orca = new FakeOrca();
+    orca.failListCalls.add(listCall);
+    await engine(store, orca, new FakeSlack()).resolveAndProject(GATE);
+    expect(store.findGateResolution(GATE)).toMatchObject({ lifecycle: 'uncertain', lastErrorCode: code });
+    orca.resolveExternally('현행 유지', '2026-08-24T10:00:01.000Z');
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', lastErrorCode: 'external_resolution',
+    });
+    store.close();
+  });
+
+  it('external resolver before post-read is persisted as conflict and never overwritten again', async () => {
+    const store = seed(join(dir, 'external-post.db'));
+    const orca = new FakeOrca();
+    await engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_resolve_before_post_read') orca.resolveExternally('외부 최종 결정');
+    }).resolveAndProject(GATE);
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', postRead: { resolution: '외부 최종 결정' },
+    });
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    store.close();
+  });
+
+  it('an equal-text external overwrite with a different resolvedAt is detected before post-read', async () => {
+    const store = seed(join(dir, 'external-equal-post.db'));
+    const orca = new FakeOrca();
+    await engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_resolve_before_post_read') {
+        orca.resolveExternally('현행 유지', '2026-08-24T10:00:01.000Z');
+      }
+    }).resolveAndProject(GATE);
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', lastErrorCode: 'final_state_mismatch',
+      resolveResult: { gate: { resolvedAt: AT } },
+      postRead: { resolution: '현행 유지', resolvedAt: '2026-08-24T10:00:01.000Z' },
+    });
+    store.close();
+  });
+
+  it('restart compares a durable mutation result timestamp before accepting equal text', async () => {
+    const store = seed(join(dir, 'external-equal-restart.db'));
+    const orca = new FakeOrca();
+    await expect(engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_resolve_before_post_read') throw new Error('crash');
+    }).resolveAndProject(GATE)).rejects.toThrow(/crash/);
+    expect(store.findGateResolution(GATE)?.lifecycle).toBe('post_read');
+    orca.resolveExternally('현행 유지', '2026-08-24T10:00:01.000Z');
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'conflict', lastErrorCode: 'external_resolution',
+    });
+    store.close();
+  });
+
+  it('card update failure leaves replayable outbox; restart projects it without another Orca mutation', async () => {
+    const store = seed(join(dir, 'outbox.db'));
+    const orca = new FakeOrca();
+    const failedSlack = new FakeSlack();
+    failedSlack.fail = true;
+    await engine(store, orca, failedSlack).resolveAndProject(GATE);
+    expect(store.listPendingGateOutboxes()).toHaveLength(1);
+    const recoveredSlack = new FakeSlack();
+    await engine(store, orca, recoveredSlack).reconcile();
+    expect(recoveredSlack.updates).toHaveLength(1);
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(store.listPendingGateOutboxes()).toEqual([]);
+    store.close();
+  });
+
+  it('a stale Slack completion converges to the newer durable card instead of clearing it', async () => {
+    const store = seed(join(dir, 'outbox-generation-race.db'));
+    const slack = new DeferredFirstSlack();
+    const projecting = projectGateResolutionCard(store, slack, GATE, () => new Date(AT));
+    await slack.firstStarted;
+    const intent = store.findGateResolution(GATE);
+    if (intent === null) throw new Error('intent missing');
+    const lease = store.acquireGateResolutionLease(
+      GATE, 't.lease-projection-test', AT, '2026-08-24T10:01:00.000Z',
+    );
+    if (lease.kind !== 'acquired') throw new Error('lease failed');
+    expect(store.updateGateResolution(GATE, lease.intent.revision, 't.lease-projection-test', {
+      lifecycle: 'uncertain', errorCode: 'pre_read_failed', at: AT,
+    })).not.toBeNull();
+    slack.releaseFirst();
+    await projecting;
+    expect(slack.updates).toHaveLength(2);
+    expect(JSON.stringify(slack.updates[0])).toContain('resolving');
+    expect(JSON.stringify(slack.updates[1])).toContain('degraded');
+    expect(store.listPendingGateOutboxes()).toEqual([]);
+    expect(store.findGateMessage(GATE)?.renderFingerprint).not.toBe('fp');
+    store.close();
+  });
+
+  it('a lifecycle advance between intent and outbox reads cannot clear a mixed projection snapshot', async () => {
+    const store = seed(join(dir, 'mixed-projection-snapshot.db'));
+    const slack = new FakeSlack();
+    const originalOutbox = store.findGateResolutionOutbox.bind(store);
+    let advanced = false;
+    vi.spyOn(store, 'findGateResolutionOutbox').mockImplementation((gate) => {
+      const snapshot = originalOutbox(gate);
+      if (!advanced) {
+        advanced = true;
+        const lease = store.acquireGateResolutionLease(
+          GATE,
+          't.mixed-projection-fence',
+          AT,
+          '2026-08-24T10:01:00.000Z',
+        );
+        if (lease.kind !== 'acquired') throw new Error('projection fence lease failed');
+        expect(store.updateGateResolution(GATE, lease.intent.revision, 't.mixed-projection-fence', {
+          lifecycle: 'uncertain',
+          errorCode: 'injected_projection_advance',
+          at: AT,
+        })).not.toBeNull();
+      }
+      return snapshot;
+    });
+    await projectGateResolutionCard(store, slack, GATE, () => new Date(AT));
+    expect(slack.updates).toHaveLength(1);
+    expect(JSON.stringify(slack.updates[0])).toContain('degraded');
+    expect(JSON.stringify(slack.updates[0])).not.toContain('resolving');
+    expect(store.listPendingGateOutboxes()).toEqual([]);
+    store.close();
+  });
+
+  it('a durable projection owner prevents a newer projector from clearing while an older call is live', async () => {
+    const store = seed(join(dir, 'concurrent-projection-completion.db'));
+    const slack = new DeferredFirstSlack();
+    const stale = projectGateResolutionCard(store, slack, GATE, () => new Date(AT));
+    await slack.firstStarted;
+    const lease = store.acquireGateResolutionLease(
+      GATE,
+      't.concurrent-projection-fence',
+      AT,
+      '2026-08-24T10:01:00.000Z',
+    );
+    if (lease.kind !== 'acquired') throw new Error('projection lease failed');
+    expect(store.updateGateResolution(GATE, lease.intent.revision, 't.concurrent-projection-fence', {
+      lifecycle: 'uncertain',
+      errorCode: 'injected_newer_projection',
+      at: AT,
+    })).not.toBeNull();
+
+    await projectGateResolutionCard(store, slack, GATE, () => new Date(AT));
+    expect(store.findGateResolutionOutbox(GATE)?.cardPending).toBe(true);
+    expect(slack.updates).toHaveLength(1);
+    slack.releaseFirst();
+    await stale;
+
+    expect(slack.updates).toHaveLength(2);
+    expect(JSON.stringify(slack.updates[0])).toContain('resolving');
+    expect(JSON.stringify(slack.updates[1])).toContain('degraded');
+    expect(store.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+    store.close();
+  });
+
+  it('startup forces the newest card after a stale Slack success crashes before local completion', async () => {
+    const path = join(dir, 'projection-crash-before-local.db');
+    const firstStore = seed(path);
+    const secondStore = new SqliteDigestStore(path);
+    const staleSlack = new DeferredFirstSlack();
+    const stale = projectGateResolutionCard(
+      firstStore,
+      staleSlack,
+      GATE,
+      () => new Date(AT),
+      (point) => {
+        if (point === 'after_slack_success_before_local_completion') {
+          throw new Error('projector died after stale Slack success');
+        }
+      },
+    );
+    await staleSlack.firstStarted;
+    const lease = secondStore.acquireGateResolutionLease(
+      GATE,
+      't.projection-crash-lifecycle',
+      AT,
+      '2026-08-24T10:01:00.000Z',
+    );
+    if (lease.kind !== 'acquired') throw new Error('projection lifecycle lease failed');
+    expect(secondStore.updateGateResolution(
+      GATE,
+      lease.intent.revision,
+      't.projection-crash-lifecycle',
+      { lifecycle: 'uncertain', errorCode: 'injected_newer_generation', at: AT },
+    )).not.toBeNull();
+
+    const blockedSlack = new FakeSlack();
+    expect(await projectGateResolutionCard(
+      secondStore, blockedSlack, GATE, () => new Date(AT),
+    )).toMatchObject({ kind: 'pending' });
+    expect(blockedSlack.updates).toEqual([]);
+    staleSlack.releaseFirst();
+    await expect(stale).rejects.toThrow(/projector died/);
+    expect(secondStore.findGateResolutionOutbox(GATE)?.cardPending).toBe(true);
+
+    // Model process death: closing the abandoned owner's store removes only its live-process
+    // registration; the durable outbox owner remains for takeover fencing.
+    firstStore.close();
+    const recoveredSlack = new FakeSlack();
+    await projectGateResolutionCard(secondStore, recoveredSlack, GATE, () => new Date(AT));
+    expect(recoveredSlack.updates).toHaveLength(1);
+    expect(JSON.stringify(recoveredSlack.updates[0])).toContain('degraded');
+    expect(secondStore.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+    secondStore.close();
+  });
+
+  it('a two-store reconciliation pass skips a live renewable lease without blocking shutdown', async () => {
+    const path = join(dir, 'two-process-lease.db');
+    const firstStore = seed(path);
+    const laterGate = gateKey('z_later');
+    const laterMessageTs = '1787554800.000003';
+    firstStore.insertGateMetadata({
+      gateKey: laterGate, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_later'),
+      askMessageId: 'msg_later', questionThreadId: 'thread_later',
+      options: [{ id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' }],
+      recommendation: { optionId: 'keep', reason: '호환성' }, impact: '후속', registeredAt: AT,
+    });
+    firstStore.insertGateMessage({
+      gateKey: laterGate, runKey: RUN, channelId: CHANNEL, threadTs: THREAD_TS,
+      messageTs: laterMessageTs, renderFingerprint: 'later-fp', at: AT,
+    });
+    firstStore.saveGateLocalObservation({
+      gateKey: laterGate, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+      resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+    });
+    const laterClaim = firstStore.claimGateResolution({
+      teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: CHANNEL,
+      threadTs: THREAD_TS, messageTs: laterMessageTs, blockId: gateBlockId(laterGate),
+      actionId: gateActionId(laterGate, 'keep'), actionValue: 'keep',
+      retryRequestId: '22222222-2222-4222-8222-222222222222', at: AT,
+    });
+    if (laterClaim.kind !== 'claimed') throw new Error('later claim failed');
+    const laterAck = firstStore.markGateResolutionAck(
+      laterGate, laterClaim.intent.revision, 'acked', AT,
+    );
+    if (laterAck === null) throw new Error('later ACK failed');
+    const laterLease = firstStore.acquireGateResolutionLease(
+      laterGate, 't.later-seed', AT, '2026-08-24T10:01:00.000Z',
+    );
+    if (laterLease.kind !== 'acquired') throw new Error('later lease failed');
+    expect(firstStore.updateGateResolution(laterGate, laterLease.intent.revision, 't.later-seed', {
+      lifecycle: 'degraded', errorCode: 'later_pending_projection', at: AT,
+    })).not.toBeNull();
+    const secondStore = new SqliteDigestStore(path);
+    const orca = new FakeOrca();
+    orca.blockResolveResponse = true;
+    const first = engine(firstStore, orca, new FakeSlack());
+    const secondSlack = new FakeSlack();
+    const second = engine(secondStore, orca, secondSlack);
+    const firstRun = first.resolveAndProject(GATE);
+    await orca.resolveStarted;
+    const secondRun = second.reconcile();
+    expect(await Promise.race([
+      secondRun.then(() => 'settled' as const),
+      new Promise<'timed_out'>((resolve) => setTimeout(() => resolve('timed_out'), 50)),
+    ])).toBe('settled');
+    expect(secondSlack.updates.some((update) => update.ts === laterMessageTs)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 180)); // longer than the initial 100 ms lease
+    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list', 'gate-list', 'gate-resolve']);
+    orca.releaseResolve();
+    await firstRun;
+    expect(orca.retryRequests).toEqual([REQUEST]);
+    expect(firstStore.findGateResolution(GATE)).toMatchObject({ lifecycle: 'resolved' });
+    expect(secondStore.findGateResolution(GATE)).toMatchObject({ lifecycle: 'resolved' });
+    firstStore.close();
+    secondStore.close();
+  });
+
+  it('an expired renewal fence aborts before Orca mutation and leaves restart-safe state', async () => {
+    const store = seed(join(dir, 'lease-expired-before-mutation.db'));
+    const orca = new FakeOrca();
+    const base = new Date(AT).valueOf();
+    let leaseClock = base;
+    const worker = new GateResolutionEngine({
+      store,
+      orca,
+      slack: new FakeSlack(),
+      now: () => new Date(AT),
+      leaseNow: () => new Date(leaseClock),
+      leaseDurationMs: 100,
+      leaseOwner: 't.engine-expiry-fence',
+      fault: (point) => {
+        if (point === 'after_pre_read_before_resolve') leaseClock = base + 101;
+      },
+    });
+    await worker.resolveAndProject(GATE);
+    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list']);
+    expect(orca.retryRequests).toEqual([]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'pre_read',
+      leaseOwner: null,
+      resolveResult: null,
+    });
+    store.close();
+  });
+});

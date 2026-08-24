@@ -84,7 +84,7 @@ export type RunCollectionPublishResult = {
   /** 컬렉션 루트. **등록 Run 수와 무관하게 항상 있다.** */
   readonly collection: RunPublishOutcome;
   readonly runs: readonly RunPublishResult[];
-  /** Static replies keyed by Gate; never contains action blocks in D2-A. */
+  /** Replies keyed by Gate; only exactly matched pending sidecars contain fixed-option actions. */
   readonly gates: readonly GatePublishResult[];
 };
 
@@ -318,7 +318,7 @@ export type RunObserveOptions = {
   readonly store: RunStore & GateStore;
   /** Slack write 경계. **null이면 dry-run이다.** */
   readonly slack: SlackPoster | null;
-  /** Static Gate thread reply boundary. Null together with `slack` means dry-run. */
+  /** Gate thread reply boundary. Null together with `slack` means dry-run. */
   readonly thread: ThreadPoster | null;
   readonly now: () => Date;
 };
