@@ -471,6 +471,27 @@ function collect(over: Record<string, unknown> = {}, config = CONFIG): Promise<R
   return collectRunFacts(orca, config, { now: () => new Date('2026-08-24T00:00:00Z') });
 }
 
+/** 이 Run들을 전부 미등록으로 만드는 조회 대역. 정렬 test가 미등록 목록만 보기 위해 쓴다. */
+const UNREGISTERED_ONLY = {
+  'task-list': {
+    tasks: [taskRow({ created_by_process_incarnation: `${OTHER_REPO_ID}::D:/other@@h:i` })],
+    count: 1,
+  },
+  'worker-list': {
+    workers: [workerRow({ resource: { worktreeId: `${OTHER_REPO_ID}::D:/other` } })],
+  },
+};
+
+/** 컬렉션 카드의 렌더 지문. 목록의 순서가 아니라 카드에 실제로 그려지는 축을 본다. */
+function collectionFingerprint(c: RunCollection): string {
+  return renderFingerprint(
+    renderRunCollectionCard({
+      cards: c.runs.length,
+      collection: { degraded: c.degraded, unregistered: c.unregistered },
+    }),
+  );
+}
+
 describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
   it('등록된 repository의 Run만 표시 대상이다', async () => {
     const c = await collect();
@@ -516,37 +537,95 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
    * 걸쳐 닫았다. 이것은 같은 결과를 내는 다른 원인이다.
    *
    * 렌더 지문으로 단언한다. 목록의 순서만 보면 카드에 실제로 그려지는 축을 보지 않는 것이다.
+   *
+   * 정렬 키는 `(created_at DESC, id ASC)`다. 지문 안정만 재면 `id`만으로도 통과하므로 **상위
+   * ENTRY_CAP건이 최신 5건인지**도 함께 단언한다. 그 둘이 이 정렬 키가 지는 계약의 전부다.
    */
-  it('run-list 출력 순서를 뒤집어도 미등록 목록의 렌더 지문이 같다', async () => {
+  it('run-list 출력 순서를 뒤집어도 미등록 목록의 렌더 지문이 같고, 상위 건이 최신순이다', async () => {
     // ENTRY_CAP(5)보다 많아야 "상위 몇 건"이 순서에 따라 갈린다.
-    const ids = ['run_1', 'run_2', 'run_3', 'run_4', 'run_5', 'run_6', 'run_7'];
-    const rows = ids.map((id) => ({ ...RUN_ROW, id }));
-    const unregisteredOnly = {
-      'task-list': {
-        tasks: [taskRow({ created_by_process_incarnation: `${OTHER_REPO_ID}::D:/other@@h:i` })],
-        count: 1,
-      },
-      'worker-list': {
-        workers: [workerRow({ resource: { worktreeId: `${OTHER_REPO_ID}::D:/other` } })],
-      },
-    };
+    // id 오름차순과 created_at 내림차순이 정반대가 되게 둔다 — 두 키를 구분하지 못하면 실패한다.
+    const rows = [
+      { ...RUN_ROW, id: 'run_1', created_at: '2026-08-23T01:00:00Z' },
+      { ...RUN_ROW, id: 'run_2', created_at: '2026-08-23T02:00:00Z' },
+      { ...RUN_ROW, id: 'run_3', created_at: '2026-08-23T03:00:00Z' },
+      { ...RUN_ROW, id: 'run_4', created_at: '2026-08-23T04:00:00Z' },
+      { ...RUN_ROW, id: 'run_5', created_at: '2026-08-23T05:00:00Z' },
+      { ...RUN_ROW, id: 'run_6', created_at: '2026-08-23T06:00:00Z' },
+      { ...RUN_ROW, id: 'run_7', created_at: '2026-08-23T07:00:00Z' },
+    ];
+    const newestFirst = ['run_7', 'run_6', 'run_5', 'run_4', 'run_3', 'run_2', 'run_1'];
 
-    const forward = await collect({ 'run-list': { runs: rows }, ...unregisteredOnly });
-    const reversed = await collect({ 'run-list': { runs: [...rows].reverse() }, ...unregisteredOnly });
-
-    const fingerprint = (c: RunCollection): string =>
-      renderFingerprint(
-        renderRunCollectionCard({
-          cards: c.runs.length,
-          collection: { degraded: c.degraded, unregistered: c.unregistered },
-        }),
-      );
+    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
+    const reversed = await collect({
+      'run-list': { runs: [...rows].reverse() },
+      ...UNREGISTERED_ONLY,
+    });
 
     expect(forward.unregistered.count).toBe(7);
-    expect(fingerprint(reversed)).toBe(fingerprint(forward));
+    expect(collectionFingerprint(reversed)).toBe(collectionFingerprint(forward));
     // 무엇으로 고정했는지도 함께 남긴다. 지문만 보면 "둘 다 비어서 같다"와 구분되지 않는다.
-    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(ids);
-    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(ids);
+    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(newestFirst);
+    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(newestFirst);
+  });
+
+  /*
+   * 회귀 방지 — 1차 키만으로는 total order가 아니다.
+   *
+   * 같은 `created_at`을 가진 Run이 tie로 남으면 그 자리가 다시 `run-list` 출력 순서에 걸리고,
+   * 이 describe가 막으려는 지문 흔들림이 그 자리에 그대로 남는다.
+   */
+  it('created_at이 같은 Run은 runId가 tie를 깬다', async () => {
+    const same = '2026-08-23T00:00:00Z';
+    const rows = ['run_3', 'run_1', 'run_2'].map((id) => ({ ...RUN_ROW, id, created_at: same }));
+
+    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
+    const reversed = await collect({
+      'run-list': { runs: [...rows].reverse() },
+      ...UNREGISTERED_ONLY,
+    });
+
+    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(['run_1', 'run_2', 'run_3']);
+    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(['run_1', 'run_2', 'run_3']);
+  });
+
+  /*
+   * `created_at`을 읽지 못한 행의 자리를 고정한다.
+   *
+   * `parseOrcaTimestamp`의 타임존 없는 갈래는 형식만 맞으면 범위를 보지 않고 Invalid Date를
+   * 돌려준다. 그 행이 정렬에 들어오는데 NaN을 그대로 비교하면 정렬 결과가 엔진 재량이 되고,
+   * 사실이 그대로여도 지문이 흔들린다. **맨 뒤**에 두고 버리지 않는다 — 읽지 못한 시각은
+   * 최신성을 주장할 근거가 아니지만, 그 Run이 미등록이라는 사실은 사라지면 안 된다.
+   */
+  it('created_at이 범위 밖인 Run은 버려지지 않고 맨 뒤로 간다', async () => {
+    const rows = [
+      { ...RUN_ROW, id: 'run_bad', created_at: '2026-13-45 99:99:99' },
+      { ...RUN_ROW, id: 'run_old', created_at: '2026-08-21T00:00:00Z' },
+      { ...RUN_ROW, id: 'run_new', created_at: '2026-08-23T00:00:00Z' },
+    ];
+
+    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
+    const reversed = await collect({
+      'run-list': { runs: [...rows].reverse() },
+      ...UNREGISTERED_ONLY,
+    });
+
+    expect(forward.unregistered.count).toBe(3);
+    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(['run_new', 'run_old', 'run_bad']);
+    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(['run_new', 'run_old', 'run_bad']);
+    expect(collectionFingerprint(reversed)).toBe(collectionFingerprint(forward));
+  });
+
+  /*
+   * `created_at`이 아예 없거나 형식이 어긋난 행은 여기까지 오지 않는다.
+   *
+   * `listRuns`의 `parseOrcaTimestamp`가 던져 **관찰이 통째로 실패한다.** 이 계약을 고정해 두지
+   * 않으면 나중에 그 실패를 삼키는 변경이 들어왔을 때 그 Run이 정렬에서 조용히 사라진다.
+   */
+  it('created_at이 없는 Run은 조용히 사라지지 않고 관찰을 실패시킨다', async () => {
+    const rows = [{ ...RUN_ROW, id: 'run_1', created_at: undefined }];
+    await expect(collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY })).rejects.toThrow(
+      RangeError,
+    );
   });
 
   it('repository id를 exact 비교한다. 경로가 아니라 id다', async () => {

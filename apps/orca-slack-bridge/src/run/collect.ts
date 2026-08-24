@@ -268,6 +268,41 @@ export function projectRun(
 }
 
 /**
+ * Run 목록의 순서. **입력 순서에 tie를 남기지 않는 total order다.**
+ *
+ * `(createdAt DESC, runId ASC)`. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 미등록
+ * 목록의 상위 ENTRY_CAP건과 run-row degraded 줄의 순서가 관찰마다 뒤바뀌고, 사실이 그대로여도
+ * 렌더 지문이 흔들려 `publish.ts`의 `skip`이 컬렉션 카드와 모든 Run 카드에서 발화하지 않는다.
+ * `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 `ORDER BY`로 같은 것을 막는다.
+ *
+ * **1차 키가 `runId`가 아니라 `createdAt`인 이유.** `runId`는 최신성과 무관해서 상위 ENTRY_CAP건이
+ * 임의-안정 부분집합이 된다. 실측(2026-08-24, 미등록 18건)에서 id 순 상위 5건이 폐기용 probe Run을
+ * 싣고 그날 만들어진 Run을 밀어냈다. 지문은 안정됐지만 사람이 보는 5건이 무의미해진 것이다.
+ * `runId`는 tie만 깬다 — 두 키를 합치면 여전히 total order라 지문 안정성은 그대로다.
+ *
+ * **문자열 비교를 쓰지 않는다.** `parseOrcaTimestamp`가 받는 형식이 둘이고(`2026-08-21T14:32:45Z`와
+ * 타임존 없는 `2026-08-21 14:32:45`), 한 응답에 섞여 나온 것이 실측이다. 문자열 비교는 `' ' < 'T'`
+ * 때문에 실제 시각과 무관하게 후자를 앞세운다. 파싱된 `Date`의 epoch로 비교한다.
+ *
+ * **`createdAt`을 읽지 못한 행의 자리는 맨 뒤다.** 두 경우가 다르다.
+ * - `created_at`이 없거나 형식 자체가 어긋나면 `listRuns`의 `parseOrcaTimestamp`가 던져 관찰이
+ *   통째로 실패한다. 그 행은 여기까지 오지 않으므로 정렬에서 조용히 사라질 자리가 없다.
+ * - 형식은 맞고 값이 범위 밖이면(`2026-13-45 99:99:99`) `parseOrcaTimestamp`의 타임존 없는 갈래가
+ *   NaN 검사 없이 Invalid Date를 돌려준다. 그 행은 여기까지 온다. NaN을 그대로 빼면 비교가 NaN이
+ *   되어 정렬 결과가 엔진 재량이 되고 지문이 흔들리므로, epoch를 `-Infinity`로 접어 **맨 뒤**에
+ *   둔다. 읽지 못한 시각은 최신성을 주장할 근거가 아니다. 자리만 정하고 행을 버리지는 않는다.
+ */
+function byRunRecency(a: OrcaRun, b: OrcaRun): number {
+  const at = (r: OrcaRun): number => {
+    const t = r.createdAt.getTime();
+    return Number.isNaN(t) ? -Infinity : t;
+  };
+  const [x, y] = [at(a), at(b)];
+  if (x !== y) return x > y ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
  * 관찰 1회.
  *
  * 미등록 Run을 버리지 않고 센다. OD-078의 열쇠(Orca repository id)가 어긋나면 카드가 조용히
@@ -280,11 +315,7 @@ export async function collectRunFacts(
   options: CollectOptions = {},
 ): Promise<RunCollection> {
   const now = options.now ?? (() => new Date());
-  // `runId`로 고정한다. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 미등록 목록의
-  // 상위 ENTRY_CAP건과 run-row degraded 줄의 순서가 관찰마다 뒤바뀌고, 사실이 그대로여도 렌더
-  // 지문이 흔들려 `publish.ts`의 `skip`이 컬렉션 카드와 모든 Run 카드에서 발화하지 않는다.
-  // `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 `ORDER BY`로 같은 것을 막는다.
-  const runs = [...(await listRuns(orca))].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const runs = [...(await listRuns(orca))].sort(byRunRecency);
 
   const degraded: RunDegraded[] = [
     {

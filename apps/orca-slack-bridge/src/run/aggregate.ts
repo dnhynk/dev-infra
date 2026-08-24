@@ -101,6 +101,22 @@ export type BlockerInput = {
  *
  * **`detail`까지 키에 넣는다.** 앞의 네 ID가 모두 같은 두 entry가 생기면 그 tie가 입력 순서로
  * 갈리고, 그러면 이 함수가 막으려던 것이 그 자리에 그대로 남는다.
+ *
+ * **이 순서는 우선순위가 아니다.** ID 순이라 심각도 순도 최신순도 아니다. `render.ts`가 싣는 상위
+ * ENTRY_CAP건은 그래서 임의-안정 부분집합이다 — 관찰마다 같다는 것만 말하고, 그 badge에서 가장
+ * 급한 것이라고는 말하지 않는다.
+ *
+ * **완전성은 상위 ENTRY_CAP건이 아니라 badge의 수와 "외 N건" 줄이 진다.** 카드에 실린 목록에서
+ * 무엇이 빠졌는지 읽으려 하지 말고 그 둘을 봐라.
+ *
+ * **시간순 키를 쓰지 않은 이유.** entry의 원천은 넷(`task-list`·`gate-list`·`worker-list`·`inbox`)
+ * 이고 `worker-list` 행에는 timestamp가 없다. 없는 사실로 시간순을 만들 수 없으므로 네 원천의
+ * 공통 total key는 ID뿐이다. 원천마다 다른 키를 쓰면 한 badge 안에서 원천 간 순서가 다시 입력
+ * 순서에 걸려 지문이 흔들린다. `collect.ts`의 Run 목록이 `createdAt`을 1차 키로 쓰는 것은 그
+ * 원천(`run-list`)이 하나고 그 행에 `created_at`이 있기 때문이다 — 정렬 키는 원천마다 다르다.
+ *
+ * **심각도 순으로 바꾸지 않는다.** OD-067이 원천들을 같은 개념으로 취급하지 않기로 확정했고 고유
+ * 총합도 금지했다. 원천을 가로지르는 심각도 서열은 그 결정을 우회한다.
  */
 function byEntryKey(a: BlockerEntry, b: BlockerEntry): number {
   const key = (e: BlockerEntry): string =>
