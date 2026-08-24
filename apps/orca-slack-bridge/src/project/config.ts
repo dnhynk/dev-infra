@@ -26,6 +26,8 @@ export type BridgeConfig = {
  */
 export type SlackConfig = {
   readonly teamId: string;
+  /** Socket `hello.connection_info.app_id`와 exact 비교할 선택적 App ID(OD-042). */
+  readonly apiAppId?: string;
   /** Gate 결정 권한이 있는 실제 sender user ID. channel 소속이 아니라 이 목록으로 판정한다. */
   readonly ownerUserIds: readonly string[];
   readonly channels: {
@@ -139,8 +141,13 @@ function parseSlack(raw: unknown): SlackConfig | null {
     }
     return v;
   };
+  const apiAppId = raw['apiAppId'];
+  if (apiAppId !== undefined && (typeof apiAppId !== 'string' || !apiAppId.startsWith('A'))) {
+    throw new TypeError('slack.apiAppId가 A로 시작하는 App ID가 아니다');
+  }
   return {
     teamId: id('teamId', 'T'),
+    ...(typeof apiAppId === 'string' ? { apiAppId } : {}),
     ownerUserIds,
     channels: { prDigest: channel('prDigest'), agentRuns: channel('agentRuns') },
   };

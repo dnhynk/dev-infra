@@ -16,6 +16,7 @@ import {
   type RunObserveOptions,
 } from './run/publish.js';
 import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
+import { verifySocketPreflight } from './slack/socket.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import {
   SlackWebApiPoster,
@@ -53,6 +54,8 @@ export type ParsedArgs =
       readonly pr: number | null;
       /** 참이면 Slack과 store에 쓰지 않는다. */
       readonly dryRun: boolean;
+      /** `verify-slack`에서만 실제 Socket hello를 확인한다. */
+      readonly socket: boolean;
     };
 
 type RunArgs = Extract<ParsedArgs, { readonly kind: 'run' }>;
@@ -84,12 +87,13 @@ const VALUE_FLAGS: readonly string[] = [
   '--state',
   '--input',
 ];
-const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
+const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run', '--socket'];
 
 /**
  * 되돌릴 수 없는 외부 write를 하는 명령.
  *
- * 이 목록의 명령만 모르는 인자를 거부한다. 근거는 `unknownWriteFlag`에 있다.
+ * 이 목록의 명령은 write 안전 때문에 모르는 인자를 거부한다. `verify-slack`은 별도로
+ * Socket preflight 선택 오타를 막기 위해 exact allowlist를 쓴다.
  */
 const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs', 'gate-register'];
 
@@ -97,6 +101,24 @@ const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs', 'gate-register'];
 function unknownGateRegisterArg(argv: readonly string[]): string | null {
   const valueFlags = new Set(['--input', '--state', '--orca']);
   const boolFlags = new Set(['--json']);
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (valueFlags.has(token)) {
+      const value = argv[i + 1];
+      if (value !== undefined && !value.startsWith('--')) i += 1;
+      continue;
+    }
+    if (boolFlags.has(token)) continue;
+    return token;
+  }
+  return null;
+}
+
+/** Socket preflight 선택이 있는 verify-slack은 문서화된 공통 옵션과 --socket만 받는다. */
+function unknownVerifySlackArg(argv: readonly string[]): string | null {
+  const valueFlags = new Set(['--config', '--orca', '--pr-limit']);
+  const boolFlags = new Set(['--json', '--socket']);
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === undefined) continue;
@@ -144,8 +166,8 @@ function missingFlagValue(argv: readonly string[]): string | null {
 /**
  * write하는 명령이 모르는 인자를 찾는다. 없으면 null.
  *
- * 이 파서는 `indexOf`로 아는 이름만 찾으므로 모르는 인자를 조용히 무시한다. `snapshot`과
- * `verify-slack`에서는 무시가 무해하지만 `digest`와 `runs`는 되돌릴 수 없는 외부 write를 한다.
+ * 이 파서는 `indexOf`로 아는 이름만 찾으므로 모르는 인자를 조용히 무시한다. `snapshot`은
+ * 기존 호환 동작을 유지하지만 `digest`와 `runs`는 되돌릴 수 없는 외부 write를 한다.
  * `--dry-run`을 한 글자 틀리면 확인 없이 실제 채널에 게시된다. 그래서 write하는 명령에만
  * 검사를 건다. 다른 명령의 기존 동작은 바꾸지 않는다.
  *
@@ -186,6 +208,15 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   }
   if (command !== 'gate-register' && argv.includes('--input')) {
     return { kind: 'error', message: `${command}가 모르는 인자다: --input` };
+  }
+  if (command !== 'verify-slack' && argv.includes('--socket')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --socket` };
+  }
+  if (command === 'verify-slack') {
+    const unknown = unknownVerifySlackArg(argv);
+    if (unknown !== null) {
+      return { kind: 'error', message: `verify-slack이 모르는 인자다: ${unknown}` };
+    }
   }
   const missing = missingFlagValue(argv);
   if (missing !== null) return { kind: 'error', message: missing };
@@ -236,13 +267,14 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     inputPath: arg(argv, '--input') ?? null,
     pr,
     dryRun: argv.includes('--dry-run'),
+    socket: command === 'verify-slack' && argv.includes('--socket'),
   };
 }
 
 const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
-verify-slack  Slack 토큰과 설정을 확인한다 (메시지를 게시하지 않는다)
+verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
 runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
 gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite에 등록한다
@@ -251,6 +283,10 @@ gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite�
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
   --pr-limit <n>    repository당 조회할 PR 수 (기본 50)
   --json            요약 대신 결과 전체를 JSON으로 출력
+
+verify-slack 전용:
+
+  --socket          Socket에 연결해 hello/App ID를 확인한 뒤 바로 닫는다
 
 digest·runs 전용:
 
@@ -547,7 +583,14 @@ async function main(): Promise<number> {
   const config = await loadConfig(parsed.configPath ?? defaultConfigPath());
 
   if (parsed.command === 'verify-slack') {
-    const result = await verifySlack(config.slack, process.env);
+    let result = await verifySlack(config.slack, process.env);
+    if (parsed.socket && result.ok) {
+      const socketCheck = await verifySocketPreflight(config.slack, process.env);
+      result = {
+        checks: [...result.checks, socketCheck],
+        ok: socketCheck.ok,
+      };
+    }
     process.stdout.write(formatVerify(result) + '\n');
     return result.ok ? 0 : 1;
   }

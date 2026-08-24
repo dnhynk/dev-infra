@@ -15,6 +15,67 @@ describe('명령 분기', () => {
     if (p.kind === 'run') expect(p.command).toBe('verify-slack');
   });
 
+  it('verify-slack은 명시적 --socket에서만 Socket 연결을 요청한다', () => {
+    const normal = parseArgs(['verify-slack']);
+    const socket = parseArgs(['verify-slack', '--socket']);
+    if (normal.kind === 'run') expect(normal.socket).toBe(false);
+    if (socket.kind === 'run') expect(socket.socket).toBe(true);
+  });
+
+  it('verify-slack은 지원하는 플래그만 받고 --socket 오타를 URL-only 검증으로 흘리지 않는다', () => {
+    const supported = parseArgs([
+      'verify-slack',
+      '--config', 'bridge.json',
+      '--orca', 'orca-test',
+      '--pr-limit', '5',
+      '--json',
+      '--socket',
+    ]);
+    expect(supported.kind).toBe('run');
+    if (supported.kind === 'run') {
+      expect(supported).toMatchObject({
+        command: 'verify-slack',
+        configPath: 'bridge.json',
+        orcaBin: 'orca-test',
+        prLimit: 5,
+        json: true,
+        socket: true,
+      });
+    }
+
+    for (const argv of [
+      ['verify-slack', '--sokcet'],
+      ['verify-slack', '-socket'],
+      ['verify-slack', 'socket'],
+      ['verify-slack', '--dry-run'],
+      ['verify-slack', '--state', 'state.db'],
+      ['verify-slack', '--pr', '5'],
+    ]) {
+      const parsed = parseArgs(argv);
+      expect(parsed.kind).toBe('error');
+      if (parsed.kind === 'error') {
+        expect(parsed.message).toContain('verify-slack');
+        expect(parsed.message).toContain(String(argv[1]));
+      }
+    }
+  });
+
+  it('--socket은 verify-slack 외 모든 명령에서 command-scoped unknown이다', () => {
+    for (const argv of [
+      ['snapshot', '--socket'],
+      ['digest', '--socket'],
+      ['runs', '--socket'],
+      ['gate-register', '--input', 'gate.json', '--socket'],
+    ]) {
+      const p = parseArgs(argv);
+      expect(p.kind).toBe('error');
+      if (p.kind === 'error') {
+        expect(p.message).toContain(String(argv[0]));
+        expect(p.message).toContain('--socket');
+      }
+    }
+  });
+
   it('digest를 인식한다', () => {
     const p = parseArgs(['digest']);
     expect(p.kind).toBe('run');
