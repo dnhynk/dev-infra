@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { runInNewContext } from 'node:vm';
 import { SocketModeClient } from '@slack/socket-mode';
 import { Response as UndiciResponse } from 'undici';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -14,6 +15,12 @@ function deferred<T>() {
   let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
+}
+
+function failureCode(error: unknown): string {
+  if (typeof error !== 'object' || error === null) return 'rejected';
+  const code = (error as { readonly code?: unknown }).code;
+  return typeof code === 'string' ? code : 'rejected';
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -110,6 +117,16 @@ function connectionsOpenResponse(url: string): Response {
   });
 }
 
+function crossRealmConnectionsOpenResponse(url: string): Response {
+  const response = connectionsOpenResponse(url);
+  return runInNewContext('({ body, headers, status, statusText })', {
+    body: response.body,
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  }) as Response;
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -199,9 +216,28 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })],
+    ['cross-realm', (url: string) => crossRealmConnectionsOpenResponse(url)],
   ] as const)('%s Response를 같은 fetch 계약으로 수용한다', async (_implementation, response) => {
     const server = await startHelloServer({ replyToClose: true });
-    const fetchMock = vi.fn(async () => response(server.url));
+    const rawResponse = response(server.url);
+    const liveAbortListeners = new Set<Parameters<AbortSignal['addEventListener']>[1]>();
+    const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const requestSignal = init?.signal;
+      if (requestSignal === undefined || requestSignal === null) {
+        throw new Error('request signal missing');
+      }
+      const addEventListener = requestSignal.addEventListener.bind(requestSignal);
+      const removeEventListener = requestSignal.removeEventListener.bind(requestSignal);
+      vi.spyOn(requestSignal, 'addEventListener').mockImplementation((type, listener, options) => {
+        if (type === 'abort') liveAbortListeners.add(listener);
+        addEventListener(type, listener, options);
+      });
+      vi.spyOn(requestSignal, 'removeEventListener').mockImplementation((type, listener, options) => {
+        if (type === 'abort') liveAbortListeners.delete(listener);
+        removeEventListener(type, listener, options);
+      });
+      return rawResponse;
+    });
     vi.stubGlobal('fetch', fetchMock);
     const transport = new SlackSocketTransport({
       expectedApiAppId: 'A01BRIDGE',
@@ -213,7 +249,10 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       await expect(transport.start()).resolves.toBeUndefined();
       expect(fetchMock).toHaveBeenCalledOnce();
       expect(server.upgrades()).toBe(1);
+      expect(rawResponse.body?.locked).toBe(false);
+      expect(liveAbortListeners.size).toBe(0);
       await expect(transport.shutdown()).resolves.toBeUndefined();
+      expect(liveAbortListeners.size).toBe(0);
     } finally {
       await transport.shutdown().catch(() => undefined);
       await server.close();
@@ -484,6 +523,220 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       await expect(transport.shutdown()).resolves.toBeUndefined();
       await flushMicrotasks();
       expect({ cancelCalls, locked: body.locked }).toEqual({ cancelCalls: 0, locked: false });
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it.each([1, 2, 3])(
+    'native Response raw EOF 뒤 9-microtask owner abort가 SDK continuation을 막는다 (%i/3)',
+    async () => {
+      const server = await startHelloServer();
+      const bytes = new TextEncoder().encode(JSON.stringify({ ok: true, url: server.url }));
+      let transport!: SlackSocketTransport;
+      let shutdownPromise: Promise<void> | undefined;
+      let upgradesAtAbort = -1;
+      let listenersBeforeAbort = -1;
+      let listenersAtAbort = -1;
+      let pullCalls = 0;
+      const liveAbortListeners = new Set<Parameters<AbortSignal['addEventListener']>[1]>();
+      const schedule = (remaining: number): void => {
+        if (remaining === 0) {
+          upgradesAtAbort = server.upgrades();
+          listenersBeforeAbort = liveAbortListeners.size;
+          shutdownPromise = transport.shutdown();
+          listenersAtAbort = liveAbortListeners.size;
+        } else {
+          queueMicrotask(() => schedule(remaining - 1));
+        }
+      };
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pullCalls += 1;
+          if (pullCalls === 1) controller.enqueue(bytes);
+          else {
+            controller.close();
+            // reviewer probe의 exact EOF ordering mutation을 보존한다.
+            schedule(9);
+          }
+        },
+      });
+      const response = new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+      vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        const requestSignal = init?.signal;
+        if (requestSignal === undefined || requestSignal === null) {
+          throw new Error('request signal missing');
+        }
+        const addEventListener = requestSignal.addEventListener.bind(requestSignal);
+        const removeEventListener = requestSignal.removeEventListener.bind(requestSignal);
+        vi.spyOn(requestSignal, 'addEventListener').mockImplementation((type, listener, options) => {
+          if (type === 'abort') liveAbortListeners.add(listener);
+          addEventListener(type, listener, options);
+        });
+        vi.spyOn(requestSignal, 'removeEventListener').mockImplementation((type, listener, options) => {
+          if (type === 'abort') liveAbortListeners.delete(listener);
+          removeEventListener(type, listener, options);
+        });
+        return response;
+      }));
+      transport = new SlackSocketTransport({
+        expectedApiAppId: 'A01BRIDGE',
+        connectionFactory: slackSdkConnectionFactory('xapp-test'),
+        timeouts: { startMs: 1_000, closeMs: 100 },
+      });
+
+      try {
+        let startCode = 'fulfilled';
+        try {
+          await transport.start();
+        } catch (error) {
+          startCode = failureCode(error);
+        }
+        for (let index = 0; index < 200 && shutdownPromise === undefined; index += 1) {
+          await Promise.resolve();
+        }
+        if (shutdownPromise === undefined) throw new Error('shutdown was not scheduled');
+
+        let shutdownOutcome = 'resolved';
+        try {
+          await shutdownPromise;
+        } catch {
+          shutdownOutcome = 'rejected';
+        }
+        const atAbort = {
+          upgrades: server.upgrades(),
+          listeners: liveAbortListeners.size,
+          locked: body.locked,
+        };
+        await new Promise<void>((resolve) => setTimeout(resolve, 40));
+
+        expect({
+          startCode,
+          shutdownOutcome,
+          upgradesAtAbort,
+          listenersBeforeAbort,
+          listenersAtAbort,
+          atAbort,
+          afterWait: {
+            upgrades: server.upgrades(),
+            listeners: liveAbortListeners.size,
+            locked: body.locked,
+          },
+          pullCalls,
+        }).toEqual({
+          startCode: 'connect_failed',
+          shutdownOutcome: 'resolved',
+          upgradesAtAbort: 0,
+          listenersBeforeAbort: 1,
+          listenersAtAbort: 0,
+          atAbort: { upgrades: 0, listeners: 0, locked: false },
+          afterWait: { upgrades: 0, listeners: 0, locked: false },
+          pullCalls: 2,
+        });
+      } finally {
+        await transport.shutdown().catch(() => undefined);
+        await server.close();
+      }
+    },
+  );
+
+  it('raw EOF handoff abort는 turn timer와 reader를 exactly once 정리한다', async () => {
+    const server = await startHelloServer();
+    const bytes = new TextEncoder().encode(JSON.stringify({ ok: true, url: server.url }));
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    let transport!: SlackSocketTransport;
+    let shutdownPromise: Promise<void> | undefined;
+    let handoffTimer: unknown;
+    let getReaderCalls = 0;
+    let readCalls = 0;
+    let cancelCalls = 0;
+    let releaseCalls = 0;
+    let locked = false;
+    const liveAbortListeners = new Set<Parameters<AbortSignal['addEventListener']>[1]>();
+    const schedule = (remaining: number): void => {
+      if (remaining === 0) {
+        const timerIndex = setTimeoutSpy.mock.calls.findLastIndex((call) => call[1] === 0);
+        handoffTimer = timerIndex < 0 ? undefined : setTimeoutSpy.mock.results[timerIndex]?.value;
+        shutdownPromise = transport.shutdown();
+      } else {
+        queueMicrotask(() => schedule(remaining - 1));
+      }
+    };
+    const rawResponse = {
+      body: {
+        getReader() {
+          getReaderCalls += 1;
+          locked = true;
+          return {
+            read() {
+              readCalls += 1;
+              if (readCalls === 1) return { done: false, value: bytes };
+              schedule(9);
+              return { done: true, value: undefined };
+            },
+            cancel() { cancelCalls += 1; },
+            releaseLock() {
+              releaseCalls += 1;
+              locked = false;
+            },
+          };
+        },
+      },
+      headers: new Headers({ 'content-type': 'application/json' }),
+      status: 200,
+      statusText: 'OK',
+    } as unknown as Response;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const requestSignal = init?.signal;
+      if (requestSignal === undefined || requestSignal === null) {
+        throw new Error('request signal missing');
+      }
+      const addEventListener = requestSignal.addEventListener.bind(requestSignal);
+      const removeEventListener = requestSignal.removeEventListener.bind(requestSignal);
+      vi.spyOn(requestSignal, 'addEventListener').mockImplementation((type, listener, options) => {
+        if (type === 'abort') liveAbortListeners.add(listener);
+        addEventListener(type, listener, options);
+      });
+      vi.spyOn(requestSignal, 'removeEventListener').mockImplementation((type, listener, options) => {
+        if (type === 'abort') liveAbortListeners.delete(listener);
+        removeEventListener(type, listener, options);
+      });
+      return rawResponse;
+    }));
+    transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 1_000, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      if (shutdownPromise === undefined) throw new Error('shutdown was not scheduled');
+      await expect(shutdownPromise).resolves.toBeUndefined();
+      await flushMicrotasks();
+      expect({
+        getReaderCalls,
+        readCalls,
+        cancelCalls,
+        releaseCalls,
+        locked,
+        abortListeners: liveAbortListeners.size,
+        upgrades: server.upgrades(),
+      }).toEqual({
+        getReaderCalls: 1,
+        readCalls: 2,
+        cancelCalls: 1,
+        releaseCalls: 1,
+        locked: false,
+        abortListeners: 0,
+        upgrades: 0,
+      });
+      expect(handoffTimer).toBeDefined();
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(handoffTimer);
     } finally {
       await transport.shutdown().catch(() => undefined);
       await server.close();
@@ -855,7 +1108,10 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
         connectionFactory: slackSdkConnectionFactory('xapp-test'),
         timeouts: { startMs: 100, closeMs: 20 },
       });
-      await transport.start();
+      const starting = transport.start();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(0);
+      await starting;
       const client = clients[0];
       expect(client).toBeDefined();
       expect(client?.listenerCount('disconnected')).toBe(1);

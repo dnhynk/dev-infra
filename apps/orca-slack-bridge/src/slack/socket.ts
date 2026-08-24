@@ -661,9 +661,17 @@ function fencedSocketResponse(
   const reader = socketBodyReader(rawBody);
   let finished = false;
   let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let eofHandoffTimer: ReturnType<typeof setTimeout> | undefined;
+  let resolveEofHandoff: (() => void) | undefined;
   const finish = (): boolean => {
     if (finished) return false;
     finished = true;
+    if (eofHandoffTimer !== undefined) {
+      clearTimeout(eofHandoffTimer);
+      eofHandoffTimer = undefined;
+    }
+    resolveEofHandoff?.();
+    resolveEofHandoff = undefined;
     signal.removeEventListener('abort', abortBody);
     return true;
   };
@@ -706,9 +714,26 @@ function fencedSocketResponse(
             return;
           }
           if (outcome.value['done']) {
-            if (!finish()) return;
-            releaseSocketBodyReader(reader);
-            controller.close();
+            // raw EOF와 SDK의 response.text()/URL/WebSocket continuation 사이에 한 turn을 둔다.
+            // 이미 queue된 owner abort는 이 cancellable handoff를 이겨 body를 error/cancel한다.
+            // pull을 timer까지 pending으로 유지해 EOF 재-read/재-schedule storm도 막는다.
+            await new Promise<void>((resolve) => {
+              resolveEofHandoff = resolve;
+              eofHandoffTimer = setTimeout(() => {
+                eofHandoffTimer = undefined;
+                if (signal.aborted) {
+                  abortBody();
+                  return;
+                }
+                if (!finish()) return;
+                releaseSocketBodyReader(reader);
+                try {
+                  controller.close();
+                } catch {
+                  // consumer cancel과 겹친 close는 이미 wrapper를 terminal state로 만들었다.
+                }
+              }, 0);
+            });
             return;
           }
           const chunk = outcome.value['value'];
