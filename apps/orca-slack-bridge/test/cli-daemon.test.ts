@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, runDaemonCommand } from '../src/cli.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
@@ -243,6 +244,124 @@ describe('daemon production wiring', () => {
     expect(reopened.findGateResolution(GATE)?.lifecycle).toBe('resolved');
     expect(reopened.listPendingGateOutboxes()).toEqual([]);
     reopened.close();
+  });
+
+  it('shutdown stops intake and drains a contended post-ACK promotion before remote work', async () => {
+    seed();
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const locker = new DatabaseSync(statePath);
+    const probe = new DatabaseSync(statePath, { readOnly: true });
+    const delegatedOrca = new FakeOrca();
+    const remoteAckStates: Array<string | null> = [];
+    const orca: OrcaRunner = {
+      run: (args) => {
+        const row = probe.prepare(
+          'SELECT ack_state FROM gate_resolution WHERE gate_key = ?',
+        ).get(GATE) as { readonly ack_state: string } | undefined;
+        remoteAckStates.push(row?.ack_state ?? null);
+        return delegatedOrca.run(args);
+      },
+    };
+    const slack = new FakeSlack();
+    let hooks: SocketConnectionHooks | null = null;
+    let originalAcks = 0;
+    let lateAcks = 0;
+    let lateDeliveries = 0;
+    let closeCount = 0;
+    let ackStateAtClose: string | null = null;
+    let lockHeld = false;
+    let releaseTimer: ReturnType<typeof setTimeout> | null = null;
+    let signalAck!: () => void;
+    let signalReleased!: () => void;
+    const ackObserved = new Promise<void>((resolve) => { signalAck = resolve; });
+    const lockReleased = new Promise<void>((resolve) => { signalReleased = resolve; });
+    const gateEvent = (ack: () => void) => ({
+      type: 'interactive',
+      ack,
+      body: {
+        type: 'block_actions', api_app_id: 'A0APP', team: { id: 'T0TEAM' },
+        user: { id: 'U0OWNER' }, channel: { id: CHANNEL },
+        container: {
+          type: 'message', channel_id: CHANNEL, message_ts: MESSAGE_TS, is_ephemeral: false,
+        },
+        message: { ts: MESSAGE_TS, thread_ts: THREAD_TS },
+        actions: [{
+          type: 'button', block_id: gateBlockId(GATE), action_id: gateActionId(GATE, 'keep'),
+          value: 'keep', action_ts: '1787554900.000001',
+          text: { type: 'plain_text', text: '현행 유지' },
+        }],
+      },
+    });
+    const connectionFactory: SocketConnectionFactory = (received) => {
+      hooks = received;
+      return {
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => {
+          closeCount += 1;
+          if (closeCount === 1) {
+            const row = probe.prepare(
+              'SELECT ack_state FROM gate_resolution WHERE gate_key = ?',
+            ).get(GATE) as { readonly ack_state: string } | undefined;
+            ackStateAtClose = row?.ack_state ?? null;
+            const late = received.event;
+            if (late !== undefined) {
+              lateDeliveries += 1;
+              void late(gateEvent(() => { lateAcks += 1; }));
+            }
+            releaseTimer = setTimeout(() => {
+              locker.exec('COMMIT');
+              lockHeld = false;
+              signalReleased();
+            }, 25);
+          }
+          return Promise.resolve();
+        },
+      };
+    };
+    const began = performance.now();
+    try {
+      const code = await runDaemonCommand(parsed, CONFIG, {
+        orca,
+        slack,
+        connectionFactory,
+        waitForStop: async () => {
+          const consume = hooks?.event;
+          if (consume === undefined) throw new Error('Socket event consumer was not wired');
+          void consume(gateEvent(() => {
+            originalAcks += 1;
+            locker.exec('BEGIN IMMEDIATE');
+            lockHeld = true;
+            signalAck();
+          }));
+          await ackObserved;
+        },
+      });
+      await lockReleased;
+
+      expect(code).toBe(0);
+      expect(performance.now() - began).toBeLessThan(1_000);
+      expect(closeCount).toBe(1);
+      expect(ackStateAtClose).toBe('pending');
+      expect(lateDeliveries).toBe(1);
+      expect(originalAcks).toBe(1);
+      expect(lateAcks).toBe(0);
+      expect(remoteAckStates.length).toBeGreaterThan(0);
+      expect(remoteAckStates.every((state) => state === 'acked')).toBe(true);
+      expect(probe.prepare(
+        'SELECT ack_state, lifecycle FROM gate_resolution WHERE gate_key = ?',
+      ).get(GATE)).toEqual({ ack_state: 'acked', lifecycle: 'resolved' });
+      expect(probe.prepare(
+        `SELECT event, reason FROM gate_resolution_audit
+          WHERE gate_key = ? ORDER BY id`,
+      ).all(GATE)).toEqual([{ event: 'claimed', reason: 'first_valid_selection' }]);
+      expect(slack.updates).toHaveLength(2);
+    } finally {
+      if (releaseTimer !== null) clearTimeout(releaseTimer);
+      if (lockHeld) locker.exec('COMMIT');
+      probe.close();
+      locker.close();
+    }
   });
 
   it('Socket close failure still drains an already-ACKed resolve before closing SQLite', async () => {

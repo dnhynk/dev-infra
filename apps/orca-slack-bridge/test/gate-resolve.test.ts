@@ -3,11 +3,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { GateActionHandler, type SlackSocketEvent } from '../src/gate/action-handler.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { GateResolutionEngine, type GateResolutionFault } from '../src/gate/resolve.js';
 import { projectGateResolutionCard } from '../src/gate/resolution-project.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { boundedOrcaRunner, type OrcaRunner } from '../src/orca/client.js';
+import type { SlackConfig } from '../src/project/config.js';
 import type { PostMessageInput, PostedMessage, SlackPoster, UpdateMessageInput } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 
@@ -935,6 +937,430 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     expect(JSON.stringify(slack.updates[1])).toContain('degraded');
     expect(store.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
     store.close();
+  });
+
+  it('a late ordinary completion re-arms the terminal D2 card and only corrective projection settles', async () => {
+    const path = join(dir, 'late-ordinary-after-terminal-d2.db');
+    const ordinary = new SqliteDigestStore(path, {
+      observationWriteOwner: `p${process.pid}.late-ordinary-owner`,
+      observationOwnerAlive: () => true,
+    });
+    ordinary.insertGateMetadata({
+      gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_resolve'),
+      askMessageId: 'msg_resolve', questionThreadId: 'thread_resolve',
+      options: [
+        { id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' },
+        { id: 'change', label: '변경', description: '새 경로', resolution: '변경' },
+      ],
+      recommendation: { optionId: 'keep', reason: '호환성' }, impact: '후속 방향', registeredAt: AT,
+    });
+    ordinary.insertGateMessage({
+      gateKey: GATE, runKey: RUN, channelId: CHANNEL, threadTs: THREAD_TS,
+      messageTs: MESSAGE_TS, renderFingerprint: 'initial-ordinary-fingerprint', at: AT,
+    });
+    const staleObservation = ordinary.saveGateLocalObservation({
+      gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+      resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+    });
+    expect(ordinary.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:01.000Z',
+      staleObservation.observation,
+      staleObservation.revision,
+    )).toBe(true);
+    const staleSlack = new DeferredFirstSlack();
+    const staleRemote = staleSlack.update({
+      channel: CHANNEL,
+      ts: MESSAGE_TS,
+      text: 'stale ordinary card with actions',
+      blocks: [{ type: 'actions', elements: [] }],
+    });
+    await staleSlack.firstStarted;
+
+    const current = new SqliteDigestStore(path, { observationOwnerAlive: () => true });
+    const mismatched = current.saveGateLocalObservation({
+      ...staleObservation.observation,
+      mappingState: 'mismatched',
+      observedAt: '2026-08-24T10:00:02.000Z',
+    });
+    expect(mismatched.observation.mappingState).toBe('mismatched');
+    expect(current.findGateLocalObservation(GATE)?.mappingState).toBe('write_pending');
+    const exact = current.saveGateLocalObservation({
+      ...staleObservation.observation,
+      observedAt: '2026-08-24T10:00:03.000Z',
+    });
+    expect(current.findGateLocalObservation(GATE)?.mappingState).toBe('write_pending');
+    expect(current.claimGateResolution({
+      teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: CHANNEL,
+      threadTs: THREAD_TS, messageTs: MESSAGE_TS, blockId: gateBlockId(GATE),
+      actionId: gateActionId(GATE, 'keep'), actionValue: 'keep', retryRequestId: REQUEST,
+      at: '2026-08-24T10:00:03.001Z',
+    })).toEqual({ kind: 'rejected', reason: 'card_mapping_not_matched' });
+    expect(current.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:30.999Z',
+      exact.observation,
+      exact.revision,
+    )).toBe(false);
+    expect(current.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:31.000Z',
+      exact.observation,
+      exact.revision,
+    )).toBe(true);
+    current.updateGateObservation(
+      GATE,
+      'repaired-current-ordinary-fingerprint',
+      '2026-08-24T10:00:31.001Z',
+      exact.observation,
+      exact.revision,
+    );
+    expect(current.findGateLocalObservation(GATE)?.mappingState).toBe('matched');
+
+    const claimed = current.claimGateResolution({
+      teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: CHANNEL,
+      threadTs: THREAD_TS, messageTs: MESSAGE_TS, blockId: gateBlockId(GATE),
+      actionId: gateActionId(GATE, 'keep'), actionValue: 'keep', retryRequestId: REQUEST,
+      at: '2026-08-24T10:00:31.002Z',
+    });
+    if (claimed.kind !== 'claimed') throw new Error(`terminal D2 claim failed: ${claimed.kind}`);
+    const acked = current.markGateResolutionAck(
+      GATE,
+      claimed.intent.revision,
+      'acked',
+      '2026-08-24T10:00:31.003Z',
+    );
+    if (acked === null) throw new Error('terminal D2 ACK failed');
+    expect(current.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:31.004Z',
+      exact.observation,
+      exact.revision,
+    )).toBe(false);
+
+    const lifecycleOwner = 't.late-ordinary-terminal-d2';
+    const leased = current.acquireGateResolutionLease(
+      GATE,
+      lifecycleOwner,
+      '2026-08-24T10:00:31.004Z',
+      '2026-08-24T10:01:31.004Z',
+    );
+    if (leased.kind !== 'acquired') throw new Error(`terminal D2 lease failed: ${leased.kind}`);
+    const pending = {
+      gateId: GATE_ID, runId: RUN_ID, taskId: TASK_ID, options: ['현행 유지', '변경'],
+      status: 'pending' as const, resolution: null, resolvedAt: null,
+    };
+    const selected = {
+      ...pending,
+      status: 'resolved' as const,
+      resolution: '현행 유지',
+      resolvedAt: '2026-08-24T10:00:31.007Z',
+    };
+    const preRead = current.updateGateResolution(GATE, leased.intent.revision, lifecycleOwner, {
+      lifecycle: 'pre_read', preRead: pending, at: '2026-08-24T10:00:31.005Z',
+    });
+    if (preRead === null) throw new Error('terminal D2 pre-read failed');
+    const resolving = current.updateGateResolution(GATE, preRead.revision, lifecycleOwner, {
+      lifecycle: 'resolving', at: '2026-08-24T10:00:31.006Z',
+    });
+    if (resolving === null) throw new Error('terminal D2 resolving failed');
+    const postRead = current.updateGateResolution(GATE, resolving.revision, lifecycleOwner, {
+      lifecycle: 'post_read',
+      resolveResult: {
+        gate: selected,
+        mutation: { requestId: REQUEST, replayed: false },
+      },
+      at: '2026-08-24T10:00:31.007Z',
+    });
+    if (postRead === null) throw new Error('terminal D2 result failed');
+    const resolved = current.updateGateResolution(GATE, postRead.revision, lifecycleOwner, {
+      lifecycle: 'resolved', postRead: selected, at: '2026-08-24T10:00:31.008Z',
+    });
+    if (resolved === null) throw new Error('terminal D2 completion failed');
+    const terminalSlack = new FakeSlack();
+    await projectGateResolutionCard(
+      current,
+      terminalSlack,
+      GATE,
+      () => new Date('2026-08-24T10:00:31.009Z'),
+    );
+    expect(terminalSlack.updates).toHaveLength(1);
+    expect(JSON.stringify(terminalSlack.updates[0])).not.toContain('"type":"actions"');
+    expect(current.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+
+    // A is deliberately released after the exact repair, winner, and terminal D2 projection. Its
+    // remote card is now the last applied Slack state, so local completion must durably re-arm D2.
+    staleSlack.releaseFirst();
+    await staleRemote;
+    expect(() => ordinary.updateGateObservation(
+      GATE,
+      'stale-ordinary-fingerprint',
+      '2026-08-24T10:00:31.010Z',
+      staleObservation.observation,
+      staleObservation.revision,
+    )).toThrow(/owner|더 새 관찰/);
+    expect(current.findGateMessage(GATE)?.renderFingerprint).toBe('stale-ordinary-fingerprint');
+    expect(current.findGateResolutionOutbox(GATE)).toMatchObject({
+      cardState: 'resolved',
+      cardPending: true,
+      projectedAt: null,
+    });
+    expect(current.claimGateResolution({
+      teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: CHANNEL,
+      threadTs: THREAD_TS, messageTs: MESSAGE_TS, blockId: gateBlockId(GATE),
+      actionId: gateActionId(GATE, 'keep'), actionValue: 'keep',
+      retryRequestId: '22222222-2222-4222-8222-222222222222',
+      at: '2026-08-24T10:00:31.011Z',
+    })).toEqual({ kind: 'rejected', reason: 'card_mapping_not_matched' });
+
+    const correctiveSlack = new FakeSlack();
+    await projectGateResolutionCard(
+      current,
+      correctiveSlack,
+      GATE,
+      () => new Date('2026-08-24T10:00:31.012Z'),
+    );
+    expect(correctiveSlack.updates).toHaveLength(1);
+    expect(JSON.stringify(correctiveSlack.updates[0])).toContain('Coordinator 통지 대기');
+    expect(JSON.stringify(correctiveSlack.updates[0])).not.toContain('"type":"actions"');
+    expect(current.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+    const correctedFingerprint = current.findGateMessage(GATE)?.renderFingerprint;
+    expect(correctedFingerprint).not.toBe('stale-ordinary-fingerprint');
+    expect(() => ordinary.updateGateObservation(
+      GATE,
+      'impossible-second-stale-completion',
+      '2026-08-24T10:00:31.013Z',
+      staleObservation.observation,
+      staleObservation.revision,
+    )).toThrow(/owner|active|fence/);
+    expect(current.findGateMessage(GATE)?.renderFingerprint).toBe(correctedFingerprint);
+    expect(current.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+
+    ordinary.close();
+    current.close();
+    expect(() => new SqliteDigestStore(path).close()).not.toThrow();
+  });
+
+  it('an exact Slack redelivery ACKs its pending winner after a late ordinary completion fails mapping closed', async () => {
+    const path = join(dir, 'late-ordinary-before-pending-winner-redelivery.db');
+    const staleOwner = new SqliteDigestStore(path, {
+      observationWriteOwner: `p${process.pid}.audit-b-stale-owner`,
+      observationOwnerAlive: () => true,
+    });
+    staleOwner.insertGateMetadata({
+      gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_resolve'),
+      askMessageId: 'msg_resolve', questionThreadId: 'thread_resolve',
+      options: [
+        { id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' },
+        { id: 'change', label: '변경', description: '새 경로', resolution: '변경' },
+      ],
+      recommendation: { optionId: 'keep', reason: '호환성' }, impact: '후속 방향', registeredAt: AT,
+    });
+    staleOwner.insertGateMessage({
+      gateKey: GATE, runKey: RUN, channelId: CHANNEL, threadTs: THREAD_TS,
+      messageTs: MESSAGE_TS, renderFingerprint: 'audit-b-initial-fingerprint', at: AT,
+    });
+    const staleGeneration = staleOwner.saveGateLocalObservation({
+      gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+      resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+    });
+    expect(staleOwner.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:01.000Z',
+      staleGeneration.observation,
+      staleGeneration.revision,
+      { channelId: CHANNEL, threadTs: THREAD_TS },
+    )).toBe(true);
+    const staleSlack = new DeferredFirstSlack();
+    const staleRemote = staleSlack.update({
+      channel: CHANNEL,
+      ts: MESSAGE_TS,
+      text: 'stale ordinary generation g with controls',
+      blocks: [{ type: 'actions', elements: [] }],
+    });
+    await staleSlack.firstStarted;
+
+    const winnerStore = new SqliteDigestStore(path, { observationOwnerAlive: () => true });
+    const currentGeneration = winnerStore.saveGateLocalObservation({
+      ...staleGeneration.observation,
+      observedAt: '2026-08-24T10:00:02.000Z',
+    });
+    expect(winnerStore.findGateLocalObservation(GATE)?.mappingState).toBe('write_pending');
+    expect(winnerStore.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:31.000Z',
+      currentGeneration.observation,
+      currentGeneration.revision,
+      { channelId: CHANNEL, threadTs: THREAD_TS },
+    )).toBe(true);
+    const currentSlack = new FakeSlack();
+    await currentSlack.update({
+      channel: CHANNEL,
+      ts: MESSAGE_TS,
+      text: 'current ordinary generation g+1 with controls',
+      blocks: [{ type: 'actions', elements: [] }],
+    });
+    winnerStore.updateGateObservation(
+      GATE,
+      'audit-b-current-fingerprint',
+      '2026-08-24T10:00:31.001Z',
+      currentGeneration.observation,
+      currentGeneration.revision,
+    );
+    expect(winnerStore.findGateLocalObservation(GATE)?.mappingState).toBe('matched');
+
+    const pendingWinner = winnerStore.claimGateResolution({
+      teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: CHANNEL,
+      threadTs: THREAD_TS, messageTs: MESSAGE_TS, blockId: gateBlockId(GATE),
+      actionId: gateActionId(GATE, 'keep'), actionValue: 'keep', retryRequestId: REQUEST,
+      at: '2026-08-24T10:00:31.002Z',
+    });
+    if (pendingWinner.kind !== 'claimed') {
+      throw new Error(`Audit B pending winner failed: ${pendingWinner.kind}`);
+    }
+    expect(pendingWinner.intent).toMatchObject({ retryRequestId: REQUEST, ackState: 'pending' });
+    expect(winnerStore.findGateResolutionOutbox(GATE)?.cardPending).toBe(true);
+
+    // A lands last. Its old generation is now the physical Slack card, while its local completion
+    // must record that fingerprint, fail mapping closed, and re-arm the pending winner's outbox.
+    staleSlack.releaseFirst();
+    await staleRemote;
+    expect(() => staleOwner.updateGateObservation(
+      GATE,
+      'audit-b-stale-fingerprint',
+      '2026-08-24T10:00:31.003Z',
+      staleGeneration.observation,
+      staleGeneration.revision,
+    )).toThrow(/더 새 관찰/);
+    expect(winnerStore.findGateMessage(GATE)?.renderFingerprint).toBe('audit-b-stale-fingerprint');
+    expect(winnerStore.findGateLocalObservation(GATE)?.mappingState).toBe('mismatched');
+    expect(winnerStore.findGateResolutionOutbox(GATE)).toMatchObject({
+      cardPending: true,
+      projectedAt: null,
+    });
+    expect(winnerStore.findGateResolution(GATE)).toMatchObject({
+      retryRequestId: REQUEST,
+      ackState: 'pending',
+      lifecycle: 'claimed',
+    });
+    staleOwner.close();
+    winnerStore.close();
+
+    const reopened = new SqliteDigestStore(path);
+    try {
+      const config: SlackConfig = {
+        teamId: 'T0TEAM',
+        apiAppId: 'A0APP',
+        ownerUserIds: ['U0OWNER'],
+        channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+      };
+      const actionBody = (
+        optionId: 'keep' | 'change',
+        ownerUserId = 'U0OWNER',
+        threadTs = THREAD_TS,
+      ): Record<string, unknown> => ({
+        type: 'block_actions',
+        api_app_id: 'A0APP',
+        team: { id: 'T0TEAM' },
+        user: { id: ownerUserId },
+        container: {
+          type: 'message', channel_id: CHANNEL, message_ts: MESSAGE_TS, is_ephemeral: false,
+        },
+        channel: { id: CHANNEL },
+        message: { ts: MESSAGE_TS, thread_ts: threadTs, text: 'never parse Gate prose' },
+        actions: [{
+          type: 'button',
+          block_id: gateBlockId(GATE),
+          action_id: gateActionId(GATE, optionId),
+          value: optionId,
+          action_ts: '1787554900.000001',
+          text: { type: 'plain_text', text: optionId },
+        }],
+      });
+      const actionEvent = (
+        body: Record<string, unknown>,
+        ack: () => void,
+      ): SlackSocketEvent => ({ type: 'interactive', body, ack });
+      const orca = new FakeOrca();
+      const resolutionSlack = new FakeSlack();
+      const resolver = new GateResolutionEngine({
+        store: reopened,
+        orca,
+        slack: resolutionSlack,
+        now: () => new Date('2026-08-24T10:00:32.000Z'),
+        leaseOwner: 't.audit-b-redelivery-resolution',
+      });
+      const scheduled: Array<() => Promise<void>> = [];
+      const consumer = new GateActionHandler({
+        config,
+        store: reopened,
+        engine: resolver,
+        now: () => new Date('2026-08-24T10:00:31.004Z'),
+        requestId: () => '33333333-3333-4333-8333-333333333333',
+        schedule: (job) => { scheduled.push(job); },
+      });
+
+      let unauthorizedAcks = 0;
+      expect(await consumer.handle(actionEvent(
+        actionBody('keep', 'U0INTRUDER'),
+        () => { unauthorizedAcks += 1; },
+      ))).toBe('rejected');
+      expect(unauthorizedAcks).toBe(1);
+      expect(reopened.findGateResolution(GATE)?.ackState).toBe('pending');
+
+      let wrongThreadAcks = 0;
+      expect(await consumer.handle(actionEvent(
+        actionBody('keep', 'U0OWNER', '1787554800.999999'),
+        () => { wrongThreadAcks += 1; },
+      ))).toBe('rejected');
+      expect(wrongThreadAcks).toBe(1);
+      expect(reopened.findGateResolution(GATE)?.ackState).toBe('pending');
+      expect(scheduled).toEqual([]);
+
+      let lostAcks = 0;
+      expect(await consumer.handle(actionEvent(
+        actionBody('change'),
+        () => { lostAcks += 1; },
+      ))).toBe('lost');
+      expect(lostAcks).toBe(1);
+      expect(reopened.findGateResolution(GATE)).toMatchObject({
+        retryRequestId: REQUEST,
+        ackState: 'pending',
+      });
+      expect(scheduled).toEqual([]);
+
+      let duplicateAcks = 0;
+      expect(await consumer.handle(actionEvent(
+        actionBody('keep'),
+        () => { duplicateAcks += 1; },
+      ))).toBe('duplicate');
+      expect(duplicateAcks).toBe(1);
+      expect(reopened.findGateResolution(GATE)).toMatchObject({
+        retryRequestId: REQUEST,
+        ackState: 'acked',
+        lifecycle: 'claimed',
+      });
+      expect(scheduled).toHaveLength(1);
+      expect(reopened.findGateResolution(GATE)?.retryRequestId).toBe(REQUEST);
+
+      const scheduledResolution = scheduled[0];
+      if (scheduledResolution === undefined) throw new Error('Audit B resolution was not scheduled');
+      await scheduledResolution();
+      expect(orca.retryRequests).toEqual([REQUEST]);
+      expect(reopened.findGateResolution(GATE)).toMatchObject({
+        retryRequestId: REQUEST,
+        ackState: 'acked',
+        lifecycle: 'resolved',
+        optionId: 'keep',
+        optionResolution: '현행 유지',
+      });
+      expect(resolutionSlack.updates.length).toBeGreaterThanOrEqual(1);
+      expect(JSON.stringify(resolutionSlack.updates.at(-1))).not.toContain('"type":"actions"');
+      expect(reopened.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);
+      expect(reopened.findGateMessage(GATE)?.renderFingerprint).not.toBe('audit-b-stale-fingerprint');
+    } finally {
+      reopened.close();
+    }
   });
 
   it('startup forces the newest card after a stale Slack success crashes before local completion', async () => {

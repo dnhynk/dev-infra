@@ -649,6 +649,7 @@ export async function runDaemonCommand(
   const pending = new Set<Promise<void>>();
   const inbound = new Set<Promise<void>>();
   const inboundAbort = new AbortController();
+  let acceptingInbound = false;
   try {
     store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
     const configuredOrcaTimeout = dependencies.orcaTimeoutMs ?? 15_000;
@@ -709,17 +710,22 @@ export async function runDaemonCommand(
       connectionFactory: dependencies.connectionFactory ?? slackSdkConnectionFactory(token),
       ...(dependencies.socketTimeouts === undefined ? {} : { timeouts: dependencies.socketTimeouts }),
       event: (event) => {
+        // A connection may invoke a retained callback while its bounded close is still draining.
+        // Leave that envelope unACKed for Slack redelivery instead of starting work after stop.
+        if (!acceptingInbound) return Promise.resolve();
         const task = handler.handle(event).then(() => undefined).finally(() => inbound.delete(task));
         inbound.add(task);
         return task;
       },
     });
+    acceptingInbound = true;
     await transport.start();
     await (dependencies.waitForStop ?? processStop)();
-    inboundAbort.abort();
+    acceptingInbound = false;
     clearInterval(reconciliationTimer);
     reconciliationTimer = null;
-    // Stop accepting new work before store close, then drain already-ACKed durable work.
+    // Stop accepting new work before store close. Accepted handlers retain their existing bounded
+    // ACK deadline and are drained in finally before their local retry signal is aborted.
     await transport.shutdown();
     transport = null;
     return 0;
@@ -727,7 +733,7 @@ export async function runDaemonCommand(
     process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
     return 1;
   } finally {
-    inboundAbort.abort();
+    acceptingInbound = false;
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
     if (transport !== null) {
       try {
@@ -737,8 +743,10 @@ export async function runDaemonCommand(
       }
     }
     // The store remains open until both ACK/CAS handlers and already-ACKed jobs settle, even when
-    // Socket close itself rejects or times out.
+    // Socket close itself rejects or times out. Only after accepted handlers have promoted or
+    // failed within their existing deadline do we abort the now-idle ingress signal.
     await Promise.allSettled([...inbound]);
+    inboundAbort.abort();
     await Promise.allSettled([...pending]);
     store?.close();
   }

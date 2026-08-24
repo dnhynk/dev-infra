@@ -10,7 +10,7 @@ import type { GateStore } from '../store/schema.js';
 import { renderGateDecisionCard } from './render.js';
 import { projectGateResolutionCard } from './resolution-project.js';
 import { renderGateResolutionCard } from './resolution-render.js';
-import type { GateLocalObservation } from './resolution-types.js';
+import type { GateLocalObservation, GateObservationSaveResult } from './resolution-types.js';
 import type { GateDecisionFacts } from './types.js';
 
 export type GatePublishAction =
@@ -40,7 +40,8 @@ export type GatePublishOptions = {
   readonly slackTimeoutMs?: number;
   readonly fault?: (
     point:
-      | 'after_gate_message_snapshot_before_observation'
+      | 'after_gate_observation_reservation_before_confirmation'
+      | 'after_gate_observation_confirmation_before_write'
       | 'after_staged_first_reply_before_mapping'
       | 'after_staged_first_mapping_before_action_update'
       | 'after_static_slack_before_observation'
@@ -105,18 +106,32 @@ export async function publishGateCard(
   // This is the only pre-ACK Gate-state source. It is written by the production observer, never
   // inferred from Slack prose. A newer unsupported/inconsistent state replaces an older pending
   // row so unknown future Orca states cannot leave stale buttons actionable.
+  let savedObservation: GateObservationSaveResult | null = null;
   if (!isDryRun) {
-    await options.fault?.('after_gate_message_snapshot_before_observation', gate.key);
-    // When this publisher observed no message, recheck that fact inside the SQLite write. A
-    // concurrent first publisher may have mapped and exposed the canonical card while this task
-    // was paused; persist the current facts without downgrading that established mapping.
-    options.store.saveGateLocalObservation(
+    // Reserve the logical generation before any asynchronous pause. Confirmation below prevents a
+    // same-timestamp publisher that started first but resumed last from becoming current merely
+    // because it reached SQLite later.
+    const reservedObservation = options.store.saveGateLocalObservation(
       localObservation,
       existing === null ? { channelId: options.channel, threadTs: rootMessageTs } : undefined,
     );
+    await options.fault?.('after_gate_observation_reservation_before_confirmation', gate.key);
+    // When this publisher observed no message, recheck that fact inside the SQLite write. A
+    // concurrent first publisher may have mapped and exposed the canonical card while this task
+    // was paused; persist the current facts without downgrading that established mapping.
+    savedObservation = options.store.saveGateLocalObservation(
+      localObservation,
+      existing === null ? { channelId: options.channel, threadTs: rootMessageTs } : undefined,
+      reservedObservation.revision,
+    );
+  }
+  if (existing === null && savedObservation?.current === false) {
+    // A first-publisher snapshot can become stale while paused before its observation save. It may
+    // persist a fail-closed correlation result, but must not create even an inert remote orphan.
+    return { ...base, action: 'skip', messageTs: null };
   }
   const recoveringOrdinaryWrite =
-    !isDryRun && options.store.findGateLocalObservation(gate.key)?.mappingState === 'write_pending';
+    !isDryRun && options.store.findGateLocalObservation(gate.key)?.mappingState !== 'matched';
 
   if (rootMessageTs === null && !isDryRun) {
     return { ...base, action: 'root_unavailable', messageTs: existing?.messageTs ?? null };
@@ -166,6 +181,11 @@ export async function publishGateCard(
       messageTs: existing?.messageTs ?? null,
     };
   }
+  if (existing !== null && savedObservation?.current === false) {
+    // The durable save observed a later/terminal generation than this caller rendered. It may
+    // record fail-closed correlation, but it may not start an older ordinary Slack card.
+    return { ...base, action: 'skip', messageTs: existing.messageTs };
+  }
   if (existing !== null && existing.renderFingerprint === fingerprint && !recoveringOrdinaryWrite) {
     return { ...base, action: 'skip', messageTs: existing.messageTs };
   }
@@ -214,7 +234,17 @@ export async function publishGateCard(
     return { ...base, action: 'create', messageTs: posted.ts };
   }
 
-  if (!options.store.beginGateObservationWrite(gate.key, at)) {
+  if (savedObservation === null) {
+    throw new Error(`${gate.key}의 ordinary write observation generation이 없다`);
+  }
+  await options.fault?.('after_gate_observation_confirmation_before_write', gate.key);
+  if (!options.store.beginGateObservationWrite(
+    gate.key,
+    at,
+    savedObservation.observation,
+    savedObservation.revision,
+    { channelId: options.channel, threadTs: rootMessageTs },
+  )) {
     // The fence and Gate claim use the same BEGIN IMMEDIATE boundary. If a winner committed after
     // the earlier read, never start the ordinary Slack update; render/project that durable state.
     const racedIntent = options.store.findGateResolution(gate.key);
@@ -258,7 +288,8 @@ export async function publishGateCard(
       gate.key,
       fingerprint,
       options.now().toISOString(),
-      localObservation,
+      savedObservation.observation,
+      savedObservation.revision,
     );
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);

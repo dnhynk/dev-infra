@@ -28,6 +28,18 @@ export type GateLocalObservation = {
   readonly observedAt: string;
 };
 
+/**
+ * Logical write candidate returned by the durable pre-Slack observation transaction. Its matched
+ * correlation is revalidated by `beginGateObservationWrite`; the stored row may deliberately stay
+ * `write_pending` or fail-closed until that atomic owner transition.
+ */
+export type GateObservationSaveResult = {
+  readonly observation: GateLocalObservation;
+  readonly revision: number;
+  /** False means a newer/terminal snapshot won, so this caller may not render to Slack. */
+  readonly current: boolean;
+};
+
 export type GateResolutionLifecycle =
   | 'claimed'
   | 'pre_read'
@@ -160,7 +172,13 @@ export interface GateResolutionStore {
       readonly channelId: string;
       readonly threadTs: string | null;
     },
-  ): void;
+    /**
+     * When present, confirm an earlier reservation without allocating a second generation. A
+     * different current revision makes this caller stale; only a newly discovered fail-closed
+     * correlation may still be persisted.
+     */
+    expectedRevision?: number,
+  ): GateObservationSaveResult;
   findGateLocalObservation(gateKey: GateKey): GateLocalObservation | null;
   claimGateResolution(input: GateClaimInput): GateClaimResult;
   findGateResolution(gateKey: GateKey): GateResolutionIntent | null;
@@ -195,7 +213,16 @@ export interface GateResolutionStore {
   /** Includes completed terminal cards so deterministic renderer drift is checked on reconcile. */
   listAcknowledgedGateOutboxes(): readonly GateResolutionOutbox[];
   /** Persisted before an ordinary Slack update so crash recovery cannot trust an older D2 fingerprint. */
-  beginGateObservationWrite(gateKey: GateKey, at: string): boolean;
+  beginGateObservationWrite(
+    gateKey: GateKey,
+    at: string,
+    expectedObservation: GateLocalObservation,
+    expectedRevision: number,
+    expectedMessageIdentity?: {
+      readonly channelId: string;
+      readonly threadTs: string | null;
+    },
+  ): boolean;
   /** A catchable local unwind ended; keep the durable fence but permit this owner to retry. */
   abandonGateObservationWrite(gateKey: GateKey): void;
   /** Serialize the remote Slack update for one outbox generation across daemon processes. */

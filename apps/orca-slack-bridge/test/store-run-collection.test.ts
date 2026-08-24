@@ -260,7 +260,7 @@ describe('v5 → current migration (v6 collection step 포함)', () => {
     const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
     raw.close();
     expect(version).toEqual({ version: SCHEMA_VERSION });
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBe(9);
   });
 
   it('기존 여섯 표의 행을 그대로 둔다', () => {

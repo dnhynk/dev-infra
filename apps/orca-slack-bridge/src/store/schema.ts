@@ -61,12 +61,13 @@ import type { GateLocalObservation, GateResolutionStore } from '../gate/resoluti
  * - 이전 관측의 terminal과 check resource를 다음 관측이 읽을 수 있다 → `pr_state`가 PR당 한 행이다.
  *
  * D2-C는 v7 sidecar/thread mapping 위에 local Gate observation, immutable winner intent,
- * bounded evidence와 card/notification outbox를 additive v8로 덧붙인다. D3 notification
- * transport는 여전히 구현하지 않고 notification state는 pending으로만 보존한다.
+ * bounded evidence와 card/notification outbox를 additive v8로 덧붙인다. v9는 그 v8 행을
+ * 재작성하지 않고 ordinary Slack completion을 fence하는 monotonic generation 표만 덧붙인다.
+ * D3 notification transport는 여전히 구현하지 않고 notification state는 pending으로만 보존한다.
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -349,6 +350,13 @@ CREATE TABLE gate_local_observation (
       OR (status = 'unsupported' AND resolution IS NULL AND resolved_at IS NULL))
 )`;
 
+/** Additive v9 CAS token. Existing v8 observations lazily receive a row on their next save. */
+const GATE_OBSERVATION_GENERATION_TABLE = `
+CREATE TABLE gate_observation_generation (
+  gate_key  TEXT PRIMARY KEY,
+  revision  INTEGER NOT NULL CHECK (revision >= 0)
+)`;
+
 const GATE_RESOLUTION_TABLE = `
 CREATE TABLE gate_resolution (
   gate_key             TEXT PRIMARY KEY,
@@ -452,6 +460,11 @@ export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_resolution_audit_gate: GATE_RESOLUTION_AUDIT_INDEX,
 };
 
+/** v9 stays separate so the exact deployed v8 table DDL remains byte-for-byte authoritative. */
+export const GATE_V9_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  gate_observation_generation: GATE_OBSERVATION_GENERATION_TABLE,
+};
+
 /**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
  *
@@ -507,6 +520,7 @@ ${GATE_METADATA_RUN_INDEX};
 ${GATE_MESSAGE_TABLE};
 ${GATE_MESSAGE_INDEX};
 ${GATE_LOCAL_OBSERVATION_TABLE};
+${GATE_OBSERVATION_GENERATION_TABLE};
 ${GATE_RESOLUTION_TABLE};
 ${GATE_RESOLUTION_LIFECYCLE_INDEX};
 ${GATE_RESOLUTION_OUTBOX_TABLE};
@@ -574,6 +588,9 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     GATE_RESOLUTION_AUDIT_TABLE,
     GATE_RESOLUTION_AUDIT_INDEX,
   ],
+  // v8 → v9: monotonic ordinary-write generations fence identical/same-timestamp observations.
+  // Existing v8 rows are not inferred or rewritten; the next observation save creates revision 0.
+  [GATE_OBSERVATION_GENERATION_TABLE],
 ];
 
 /**
@@ -923,6 +940,7 @@ export interface GateStore extends GateResolutionStore {
     renderFingerprint: string,
     at: string,
     observation?: GateLocalObservation,
+    expectedRevision?: number,
   ): void;
 }
 

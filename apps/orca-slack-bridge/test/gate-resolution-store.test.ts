@@ -30,6 +30,23 @@ beforeEach(() => {
 
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
+function localObservation(
+  status: 'pending' | 'resolved' = 'pending',
+  observedAt = AT,
+) {
+  return {
+    gateKey: GATE,
+    runKey: RUN,
+    taskKey: TASK,
+    status,
+    resolution: status === 'resolved' ? '외부 결정' : null,
+    resolvedAt: status === 'resolved' ? AT : null,
+    metadataState: 'matched' as const,
+    mappingState: 'matched' as const,
+    observedAt,
+  };
+}
+
 function seed(store: SqliteDigestStore, status: 'pending' | 'resolved' = 'pending'): void {
   store.insertGateMetadata({
     gateKey: GATE,
@@ -55,17 +72,7 @@ function seed(store: SqliteDigestStore, status: 'pending' | 'resolved' = 'pendin
     renderFingerprint: 'fp',
     at: AT,
   });
-  store.saveGateLocalObservation({
-    gateKey: GATE,
-    runKey: RUN,
-    taskKey: TASK,
-    status,
-    resolution: status === 'resolved' ? '외부 결정' : null,
-    resolvedAt: status === 'resolved' ? AT : null,
-    metadataState: 'matched',
-    mappingState: 'matched',
-    observedAt: AT,
-  });
+  store.saveGateLocalObservation(localObservation(status));
 }
 
 function claim(store: SqliteDigestStore, option = 'keep', request = REQUEST) {
@@ -90,8 +97,8 @@ function lease(store: SqliteDigestStore) {
   return result.intent;
 }
 
-describe('schema v8 strict persisted shape', () => {
-  it('fresh v8와 v7→v8가 같은 additive resolution tables를 만든다', () => {
+describe('strict persisted Gate schema', () => {
+  it('fresh v9와 v7→v8→v9가 같은 additive resolution tables를 만든다', () => {
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path);
     raw.exec(`
@@ -99,6 +106,7 @@ describe('schema v8 strict persisted shape', () => {
       DROP TABLE gate_resolution_attempt;
       DROP TABLE gate_resolution_outbox;
       DROP TABLE gate_resolution;
+      DROP TABLE gate_observation_generation;
       DROP TABLE gate_local_observation;
     `);
     raw.prepare('UPDATE schema_version SET version = 7 WHERE id = 1').run();
@@ -109,8 +117,8 @@ describe('schema v8 strict persisted shape', () => {
     const tables = (migrated.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'gate_resolution%' ORDER BY name",
     ).all() as { readonly name: string }[]).map((row) => row.name);
-    expect(SCHEMA_VERSION).toBe(8);
-    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 8 });
+    expect(SCHEMA_VERSION).toBe(9);
+    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 9 });
     expect(tables).toEqual([
       'gate_resolution',
       'gate_resolution_attempt',
@@ -118,6 +126,88 @@ describe('schema v8 strict persisted shape', () => {
       'gate_resolution_outbox',
     ]);
     migrated.close();
+  });
+
+  it('upgrades an exact populated v8 without rewriting observations and lazily starts generation 0', () => {
+    const v8Store = new SqliteDigestStore(path);
+    seed(v8Store);
+    v8Store.close();
+    const raw = new DatabaseSync(path);
+    raw.exec('DROP TABLE gate_observation_generation');
+    raw.prepare('UPDATE schema_version SET version = 8 WHERE id = 1').run();
+    raw.close();
+
+    const migrated = new SqliteDigestStore(path);
+    expect(migrated.findGateLocalObservation(GATE)).toEqual(localObservation());
+    const beforeSave = new DatabaseSync(path, { readOnly: true });
+    expect(beforeSave.prepare(
+      'SELECT COUNT(*) AS count FROM gate_observation_generation',
+    ).get()).toEqual({ count: 0 });
+    beforeSave.close();
+    expect(migrated.saveGateLocalObservation(localObservation())).toMatchObject({
+      current: true,
+      revision: 0,
+    });
+    migrated.close();
+    expect(() => new SqliteDigestStore(path).close()).not.toThrow();
+  });
+
+  it('rejects an orphan observation generation row on reopen', () => {
+    new SqliteDigestStore(path).close();
+    const raw = new DatabaseSync(path);
+    raw.prepare(
+      'INSERT INTO gate_observation_generation (gate_key, revision) VALUES (?, 0)',
+    ).run(GATE);
+    raw.close();
+
+    expect(() => new SqliteDigestStore(path)).toThrow(/local observation 없는 generation/);
+  });
+
+  it('rejects a negative observation generation revision on reopen', () => {
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    store.close();
+    const raw = new DatabaseSync(path);
+    raw.exec('PRAGMA ignore_check_constraints = ON');
+    raw.prepare('UPDATE gate_observation_generation SET revision = -1 WHERE gate_key = ?').run(GATE);
+    raw.close();
+
+    expect(() => new SqliteDigestStore(path)).toThrow(/integrity|observation revision|non-negative safe integer/);
+  });
+
+  it('keeps startup cross-table membership checks free of nested full-table scans', () => {
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    expect(claim(store).kind).toBe('claimed');
+    store.close();
+
+    const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'some');
+    if (descriptor === undefined || typeof descriptor.value !== 'function') {
+      throw new Error('Array.prototype.some descriptor is unavailable');
+    }
+    const originalSome = descriptor.value as (...args: unknown[]) => boolean;
+    let activeSomeCalls = 0;
+    let maximumSomeDepth = 0;
+    Object.defineProperty(Array.prototype, 'some', {
+      ...descriptor,
+      value: function instrumentedSome(this: unknown, ...args: unknown[]): boolean {
+        activeSomeCalls += 1;
+        maximumSomeDepth = Math.max(maximumSomeDepth, activeSomeCalls);
+        try {
+          return Reflect.apply(originalSome, this, args) as boolean;
+        } finally {
+          activeSomeCalls -= 1;
+        }
+      },
+    });
+    try {
+      new SqliteDigestStore(path).close();
+    } finally {
+      // A structural guard is deterministic on slow CI; wall-clock startup budgets are not.
+      Object.defineProperty(Array.prototype, 'some', descriptor);
+    }
+
+    expect(maximumSomeDepth).toBe(1);
   });
 
   it('unknown column shape와 malformed lifecycle row를 모두 startup에서 거부한다', () => {
@@ -212,7 +302,7 @@ describe('schema v8 strict persisted shape', () => {
         name: 'ordinary-owner-without-expiry',
         prepare: (store: SqliteDigestStore) => {
           seed(store);
-          expect(store.beginGateObservationWrite(GATE, AT)).toBe(true);
+          expect(store.beginGateObservationWrite(GATE, AT, localObservation(), 0)).toBe(true);
         },
         sql: 'UPDATE gate_local_observation SET write_expires_at = NULL',
         ignoreChecks: true,
@@ -227,7 +317,7 @@ describe('schema v8 strict persisted shape', () => {
         name: 'ordinary-malformed-expiry',
         prepare: (store: SqliteDigestStore) => {
           seed(store);
-          expect(store.beginGateObservationWrite(GATE, AT)).toBe(true);
+          expect(store.beginGateObservationWrite(GATE, AT, localObservation(), 0)).toBe(true);
         },
         sql: "UPDATE gate_local_observation SET write_expires_at = 'not-an-iso-date'",
         ignoreChecks: false,
@@ -284,7 +374,7 @@ describe('schema v8 strict persisted shape', () => {
     const ordinaryPath = join(dir, 'expired-ordinary-owner.db');
     const ordinary = new SqliteDigestStore(ordinaryPath);
     seed(ordinary);
-    expect(ordinary.beginGateObservationWrite(GATE, AT)).toBe(true);
+    expect(ordinary.beginGateObservationWrite(GATE, AT, localObservation(), 0)).toBe(true);
     ordinary.close();
     const reopenedOrdinary = new SqliteDigestStore(ordinaryPath, {
       observationOwnerAlive: () => true,
@@ -406,7 +496,7 @@ describe('schema v8 strict persisted shape', () => {
   it('rejects a malformed ordinary completion before either correlated row can commit', () => {
     const store = new SqliteDigestStore(path);
     seed(store);
-    expect(store.beginGateObservationWrite(GATE, AT)).toBe(true);
+    expect(store.beginGateObservationWrite(GATE, AT, localObservation(), 0)).toBe(true);
 
     expect(() => store.updateGateObservation(GATE, 'malformed-fingerprint', AT, {
       gateKey: GATE,
@@ -418,7 +508,7 @@ describe('schema v8 strict persisted shape', () => {
       metadataState: 'matched',
       mappingState: 'matched',
       observedAt: AT,
-    } as never)).toThrow(/resolved|resolution/);
+    } as never, 0)).toThrow(/resolved|resolution/);
     expect(store.findGateMessage(GATE)?.renderFingerprint).toBe('fp');
     expect(store.findGateLocalObservation(GATE)).toMatchObject({
       status: 'pending', mappingState: 'write_pending',
@@ -841,12 +931,12 @@ describe('Gate-local durable CAS and outbox', () => {
       observationWriteOwner: `p${process.pid}.ordinary-two`,
       observationOwnerAlive: () => true,
     });
-    expect(firstOrdinary.beginGateObservationWrite(GATE, AT)).toBe(true);
+    expect(firstOrdinary.beginGateObservationWrite(GATE, AT, localObservation(), 0)).toBe(true);
     expect(secondOrdinary.beginGateObservationWrite(
-      GATE, '2026-08-24T10:00:29.999Z',
+      GATE, '2026-08-24T10:00:29.999Z', localObservation(), 0,
     )).toBe(false);
     expect(secondOrdinary.beginGateObservationWrite(
-      GATE, '2026-08-24T10:00:30.000Z',
+      GATE, '2026-08-24T10:00:30.000Z', localObservation(), 0,
     )).toBe(true);
     expect(() => firstOrdinary.updateGateObservation(
       GATE,
@@ -856,8 +946,42 @@ describe('Gate-local durable CAS and outbox', () => {
         gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
         resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
       },
-    )).toThrow(/owner/);
-    expect(secondOrdinary.findGateMessage(GATE)?.renderFingerprint).toBe('fp');
+      0,
+    )).toThrow(/더 새 관찰/);
+    expect(secondOrdinary.findGateMessage(GATE)?.renderFingerprint).toBe(
+      'stale-ordinary-fingerprint',
+    );
+    expect(secondOrdinary.findGateLocalObservation(GATE)?.mappingState).toBe('write_pending');
+    // The replacement Slack call was rendered before A landed last, so its completion is fenced as
+    // well. A fresh same-owner save/reacquisition is the only generation that may settle.
+    expect(() => secondOrdinary.updateGateObservation(
+      GATE,
+      'superseded-replacement-fingerprint',
+      '2026-08-24T10:00:30.002Z',
+      localObservation(),
+      0,
+    )).toThrow(/더 새 관찰/);
+    expect(secondOrdinary.findGateMessage(GATE)?.renderFingerprint).toBe(
+      'superseded-replacement-fingerprint',
+    );
+    const repaired = secondOrdinary.saveGateLocalObservation(localObservation());
+    expect(secondOrdinary.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:30.003Z',
+      repaired.observation,
+      repaired.revision,
+    )).toBe(true);
+    secondOrdinary.updateGateObservation(
+      GATE,
+      'current-ordinary-fingerprint',
+      '2026-08-24T10:00:30.004Z',
+      repaired.observation,
+      repaired.revision,
+    );
+    expect(secondOrdinary.findGateMessage(GATE)?.renderFingerprint).toBe(
+      'current-ordinary-fingerprint',
+    );
+    expect(secondOrdinary.findGateLocalObservation(GATE)?.mappingState).toBe('matched');
     firstOrdinary.close();
     secondOrdinary.close();
 
@@ -897,6 +1021,63 @@ describe('Gate-local durable CAS and outbox', () => {
     expect(secondProjection.findGateMessage(GATE)?.renderFingerprint).toBe('fp');
     firstProjection.close();
     secondProjection.close();
+  });
+
+  it('same-time observation generation fences stale success until exact-expiry owner repair', () => {
+    const first = new SqliteDigestStore(path, {
+      observationWriteOwner: `p${process.pid}.generation-one`,
+      observationOwnerAlive: () => true,
+    });
+    seed(first);
+    const second = new SqliteDigestStore(path, {
+      observationWriteOwner: `p${process.pid}.generation-two`,
+      observationOwnerAlive: () => true,
+    });
+    expect(first.beginGateObservationWrite(GATE, AT, localObservation(), 0)).toBe(true);
+    const current = second.saveGateLocalObservation(localObservation());
+    expect(current).toMatchObject({ current: true, revision: 1 });
+
+    expect(() => first.updateGateObservation(
+      GATE,
+      'stale-generation-fingerprint',
+      '2026-08-24T10:00:01.000Z',
+      localObservation(),
+      0,
+    )).toThrow(/더 새 관찰/);
+    expect(first.findGateMessage(GATE)?.renderFingerprint).toBe('stale-generation-fingerprint');
+    expect(first.findGateLocalObservation(GATE)?.mappingState).toBe('write_pending');
+    expect(second.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:29.999Z',
+      current.observation,
+      current.revision,
+    )).toBe(false);
+    expect(second.beginGateObservationWrite(
+      GATE,
+      '2026-08-24T10:00:30.000Z',
+      current.observation,
+      current.revision,
+    )).toBe(true);
+    expect(() => first.updateGateObservation(
+      GATE,
+      'later-stale-generation-fingerprint',
+      '2026-08-24T10:00:30.001Z',
+      localObservation(),
+      0,
+    )).toThrow(/active ordinary write/);
+    expect(second.findGateMessage(GATE)?.renderFingerprint).toBe('stale-generation-fingerprint');
+    second.updateGateObservation(
+      GATE,
+      'current-generation-fingerprint',
+      '2026-08-24T10:00:30.001Z',
+      current.observation,
+      current.revision,
+    );
+    expect(second.findGateMessage(GATE)?.renderFingerprint).toBe('current-generation-fingerprint');
+    expect(second.findGateLocalObservation(GATE)?.mappingState).toBe('matched');
+    expect(claim(second).kind).toBe('claimed');
+    first.close();
+    second.close();
   });
 
   it('attempt/audit facts are append-only bounded and redact URL/token details', () => {
