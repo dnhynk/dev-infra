@@ -87,7 +87,7 @@ const VALUE_FLAGS: readonly string[] = [
   '--state',
   '--input',
 ];
-const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
+const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run', '--socket'];
 
 /**
  * 되돌릴 수 없는 외부 write를 하는 명령.
@@ -189,6 +189,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   }
   if (command !== 'gate-register' && argv.includes('--input')) {
     return { kind: 'error', message: `${command}가 모르는 인자다: --input` };
+  }
+  if (command !== 'verify-slack' && argv.includes('--socket')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --socket` };
   }
   const missing = missingFlagValue(argv);
   if (missing !== null) return { kind: 'error', message: missing };

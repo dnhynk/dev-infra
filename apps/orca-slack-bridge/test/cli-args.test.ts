@@ -22,6 +22,22 @@ describe('명령 분기', () => {
     if (socket.kind === 'run') expect(socket.socket).toBe(true);
   });
 
+  it('--socket은 verify-slack 외 모든 명령에서 command-scoped unknown이다', () => {
+    for (const argv of [
+      ['snapshot', '--socket'],
+      ['digest', '--socket'],
+      ['runs', '--socket'],
+      ['gate-register', '--input', 'gate.json', '--socket'],
+    ]) {
+      const p = parseArgs(argv);
+      expect(p.kind).toBe('error');
+      if (p.kind === 'error') {
+        expect(p.message).toContain(String(argv[0]));
+        expect(p.message).toContain('--socket');
+      }
+    }
+  });
+
   it('digest를 인식한다', () => {
     const p = parseArgs(['digest']);
     expect(p.kind).toBe('run');
