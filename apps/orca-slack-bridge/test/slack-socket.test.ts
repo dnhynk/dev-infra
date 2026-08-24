@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseConfig, type SlackConfig } from '../src/project/config.js';
 import {
   SlackSocketTransport,
@@ -20,13 +20,22 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
+}
+
+afterEach(() => vi.useRealTimers());
+
 class FakeConnection implements SocketConnection {
   hooks: SocketConnectionHooks | null = null;
   startCalls = 0;
   closeCalls = 0;
-  constructor(private readonly result: () => Promise<SocketHello>) {}
+  constructor(
+    private readonly result: () => Promise<SocketHello>,
+    private readonly closeResult: () => Promise<void> = () => Promise.resolve(),
+  ) {}
   start(): Promise<SocketHello> { this.startCalls += 1; return this.result(); }
-  async close(): Promise<void> { this.closeCalls += 1; }
+  close(): Promise<void> { this.closeCalls += 1; return this.closeResult(); }
   refresh(reason: SocketRefreshReason): void { this.hooks?.refresh(reason); }
   disconnected(): void { this.hooks?.disconnected(); }
 }
@@ -90,6 +99,116 @@ describe('Socket hello와 명시적 preflight', () => {
       expect(connection.closeCalls).toBe(1);
     }
   });
+
+  it('끝나지 않는 start/hello를 deadline 뒤 닫고 candidate를 남기지 않는다', async () => {
+    vi.useFakeTimers();
+    const neverHello = deferred<SocketHello>();
+    const hanging = new FakeConnection(() => neverHello.promise);
+    const healthy = new FakeConnection(() => hello());
+    const create = vi.fn(factory([hanging, healthy]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      timeouts: { startMs: 25, closeMs: 10 },
+    });
+
+    let settled = false;
+    let failure: unknown;
+    const firstStart = transport.start().then(
+      () => { settled = true; },
+      (error: unknown) => { settled = true; failure = error; },
+    );
+    await vi.advanceTimersByTimeAsync(25);
+
+    expect(settled).toBe(true);
+    await firstStart;
+    expect(failure).toMatchObject({ code: 'connect_timeout' });
+    expect(hanging.closeCalls).toBe(1);
+
+    await transport.start();
+    neverHello.resolve({ appId: 'A01LATE' });
+    await flushMicrotasks();
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(healthy.closeCalls).toBe(0);
+
+    await transport.shutdown();
+    expect(healthy.closeCalls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('verifySocketPreflight도 끝나지 않는 hello에서 bounded failure를 반환한다', async () => {
+    vi.useFakeTimers();
+    const config: SlackConfig = {
+      teamId: 'T01TEAM', ownerUserIds: ['U01OWNER'],
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+    };
+    const connection = new FakeConnection(() => deferred<SocketHello>().promise);
+    let result: Awaited<ReturnType<typeof verifySocketPreflight>> | undefined;
+    const check = verifySocketPreflight(
+      config,
+      { [APP_TOKEN_VAR]: ['xapp', 'FAKE', 'PRIVATE'].join('-') } as NodeJS.ProcessEnv,
+      factory([connection]),
+      { startMs: 25, closeMs: 10 },
+    ).then((value) => { result = value; });
+
+    await vi.advanceTimersByTimeAsync(25);
+    expect(result).toMatchObject({ name: 'socket.hello', ok: false });
+    await check;
+    expect(result?.detail).toBe('Socket Mode hello 제한 시간을 넘었다');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE');
+    expect(connection.closeCalls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('verifySocketPreflight는 끝나지 않는 close도 bounded failure로 바꾼다', async () => {
+    vi.useFakeTimers();
+    const config: SlackConfig = {
+      teamId: 'T01TEAM', ownerUserIds: ['U01OWNER'],
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+    };
+    const connection = new FakeConnection(
+      () => hello(),
+      () => deferred<void>().promise,
+    );
+    let result: Awaited<ReturnType<typeof verifySocketPreflight>> | undefined;
+    const check = verifySocketPreflight(
+      config,
+      { [APP_TOKEN_VAR]: ['xapp', 'FAKE', 'PRIVATE'].join('-') } as NodeJS.ProcessEnv,
+      factory([connection]),
+      { startMs: 25, closeMs: 20 },
+    ).then((value) => { result = value; });
+    await flushMicrotasks();
+    expect(connection.closeCalls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(20);
+    await check;
+    expect(result).toEqual({
+      name: 'socket.hello',
+      ok: false,
+      detail: 'Socket Mode 연결 종료 제한 시간을 넘었다',
+    });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('shutdown은 진행 중인 start deadline을 취소하고 candidate를 한 번만 닫는다', async () => {
+    vi.useFakeTimers();
+    const connection = new FakeConnection(() => deferred<SocketHello>().promise);
+    const create = vi.fn(factory([connection]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      timeouts: { startMs: 100, closeMs: 20 },
+    });
+    let failure: unknown;
+    const starting = transport.start().catch((error: unknown) => { failure = error; });
+    await flushMicrotasks();
+
+    await transport.shutdown();
+    await starting;
+    expect(failure).toMatchObject({ code: 'connect_failed' });
+    expect(connection.closeCalls).toBe(1);
+    expect(create).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 describe('Socket lifecycle', () => {
@@ -133,11 +252,112 @@ describe('Socket lifecycle', () => {
     await transport.shutdown();
   });
 
+  it('refresh handoff의 old close 중 replacement disconnect를 유실하지 않는다', async () => {
+    const oldClose = deferred<void>();
+    const oldConnection = new FakeConnection(() => hello(), () => oldClose.promise);
+    const replacement = new FakeConnection(() => hello());
+    const recovered = new FakeConnection(() => hello());
+    const delays: number[] = [];
+    const create = vi.fn(factory([oldConnection, replacement, recovered]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      backoff: { initialMs: 10, maxMs: 40 },
+      sleep: async (delay) => { delays.push(delay); },
+    });
+
+    await transport.start();
+    oldConnection.refresh('refresh_requested');
+    await flushMicrotasks();
+    expect(oldConnection.closeCalls).toBe(1);
+
+    replacement.disconnected();
+    oldClose.resolve();
+    await flushMicrotasks();
+
+    expect(delays).toEqual([10]);
+    expect(recovered.startCalls).toBe(1);
+    expect(create).toHaveBeenCalledTimes(3);
+    oldConnection.disconnected();
+    replacement.disconnected();
+    await flushMicrotasks();
+    expect(create).toHaveBeenCalledTimes(3);
+    await transport.shutdown();
+    expect(recovered.closeCalls).toBe(1);
+  });
+
+  it('refresh의 끝나지 않는 old close를 deadline에서 놓고 lifecycle을 계속한다', async () => {
+    vi.useFakeTimers();
+    const oldClose = deferred<void>();
+    const oldConnection = new FakeConnection(() => hello(), () => oldClose.promise);
+    const replacement = new FakeConnection(() => hello());
+    const recovered = new FakeConnection(() => hello());
+    const create = vi.fn(factory([oldConnection, replacement, recovered]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      backoff: { initialMs: 10, maxMs: 40 },
+      timeouts: { startMs: 25, closeMs: 20 },
+    });
+
+    await transport.start();
+    oldConnection.refresh('warning');
+    await flushMicrotasks();
+    expect(oldConnection.closeCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(20);
+
+    replacement.disconnected();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(recovered.startCalls).toBe(1);
+    expect(create).toHaveBeenCalledTimes(3);
+
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_timeout' });
+    oldClose.resolve();
+    oldConnection.disconnected();
+    replacement.disconnected();
+    await flushMicrotasks();
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('shutdown의 끝나지 않는 close는 bounded fixed error이고 반복 호출해도 한 번만 닫는다', async () => {
+    vi.useFakeTimers();
+    const neverClose = deferred<void>();
+    const connection = new FakeConnection(() => hello(), () => neverClose.promise);
+    const create = vi.fn(factory([connection]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      timeouts: { startMs: 25, closeMs: 20 },
+    });
+    await transport.start();
+
+    let settled = false;
+    let failure: unknown;
+    const firstStop = transport.shutdown().then(
+      () => { settled = true; },
+      (error: unknown) => { settled = true; failure = error; },
+    );
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(settled).toBe(true);
+    await firstStop;
+    expect(failure).toMatchObject({ code: 'close_timeout' });
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_timeout' });
+    expect(connection.closeCalls).toBe(1);
+    expect(create).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+
+    neverClose.resolve();
+    connection.disconnected();
+    await flushMicrotasks();
+    expect(create).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('shutdown은 clean close하고 reconnect하지 않는다', async () => {
     const active = new FakeConnection(() => hello());
     const create = vi.fn(factory([active]));
     const transport = new SlackSocketTransport({ connectionFactory: create });
     await transport.start();
+    await transport.shutdown();
     await transport.shutdown();
     active.disconnected();
     expect(active.closeCalls).toBe(1);
