@@ -220,6 +220,95 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     }
   });
 
+  it('fetch rejection을 고정 connect_failed로 바꾸고 bounded shutdown한다', async () => {
+    const server = await startHelloServer();
+    const fetchMock = vi.fn(async () => {
+      throw new Error('raw fetch failure');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(server.upgrades()).toBe(0);
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('null body Response도 자원 취급 없이 fail closed하고 bounded shutdown한다', async () => {
+    const server = await startHelloServer();
+    const response = new Response(null, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    const fetchMock = vi.fn(async () => response);
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect({ body: response.body, upgrades: server.upgrades() }).toEqual({
+        body: null,
+        upgrades: 0,
+      });
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('fetch 반환 전 owner abort로 settle 진입 시 already-aborted여도 body를 cancel한다', async () => {
+    const server = await startHelloServer();
+    let cancelCalls = 0;
+    let resourceActive = true;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalls += 1;
+        resourceActive = false;
+      },
+    });
+    const response = new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    let transport!: SlackSocketTransport;
+    let shutdown: Promise<void> | undefined;
+    const fetchMock = vi.fn(() => {
+      shutdown = transport.shutdown();
+      return Promise.resolve(response);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(shutdown).toBeDefined();
+      await expect(shutdown).resolves.toBeUndefined();
+      await flushMicrotasks();
+      expect({ cancelCalls, resourceActive, locked: body.locked, upgrades: server.upgrades() })
+        .toEqual({ cancelCalls: 1, resourceActive: false, locked: false, upgrades: 0 });
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
   it('malformed fetch response는 WebSocket 전에 fail closed한다', async () => {
     const server = await startHelloServer();
     let cancelCalls = 0;
@@ -391,9 +480,10 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     try {
       await expect(transport.start()).resolves.toBeUndefined();
       expect(server.upgrades()).toBe(1);
+      expect(body.locked).toBe(false);
       await expect(transport.shutdown()).resolves.toBeUndefined();
       await flushMicrotasks();
-      expect(cancelCalls).toBe(0);
+      expect({ cancelCalls, locked: body.locked }).toEqual({ cancelCalls: 0, locked: false });
     } finally {
       await transport.shutdown().catch(() => undefined);
       await server.close();
@@ -427,9 +517,10 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
         cancelCalls: 1,
         upgrades: 1,
       });
+      expect(body.locked).toBe(false);
       await expect(transport.shutdown()).resolves.toBeUndefined();
       await flushMicrotasks();
-      expect(cancelCalls).toBe(1);
+      expect({ cancelCalls, locked: body.locked }).toEqual({ cancelCalls: 1, locked: false });
     } finally {
       await transport.shutdown().catch(() => undefined);
       await server.close();
@@ -463,7 +554,7 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       const rejected = expect(starting).rejects.toMatchObject({ code: 'connect_failed' });
       await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
 
-      // settleOperation의 fetch reaction 뒤, fencedSocketResponse continuation 앞에서 abort한다.
+      // fetch 소유권 reaction 뒤, adapter 반환 continuation 앞에서 abort한다.
       const shutdownAfterFulfillment = request.promise.then(() => transport.shutdown());
       request.resolve(response);
 
@@ -475,6 +566,7 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
         resourceActive: false,
         upgrades: 0,
       });
+      expect(body.locked).toBe(false);
     } finally {
       request.resolve(response);
       await transport.shutdown().catch(() => undefined);
@@ -482,11 +574,116 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     }
   });
 
-  it('close 완료 뒤 late connections.open fulfillment이 WebSocket을 만들지 않는다', async () => {
+  it.each([1, 2, 3])(
+    'fetch fulfillment observer가 owner abort를 먼저 queue해도 body resource를 cancel한다 (%i/3)',
+    async () => {
+      const server = await startHelloServer();
+      const request = deferred<Response>();
+      let cancelCalls = 0;
+      let resourceActive = true;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelCalls += 1;
+          resourceActive = false;
+        },
+      });
+      const response = new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+      let transport!: SlackSocketTransport;
+      const liveAbortListeners = new Set<Parameters<AbortSignal['addEventListener']>[1]>();
+      // fetch adapter가 reaction을 등록하기 전에 owner abort reaction을 먼저 등록한다.
+      const shutdownAfterFulfillment = request.promise.then(() => transport.shutdown());
+      const fetchMock = vi.fn((_url: string | URL, init?: RequestInit) => {
+        const requestSignal = init?.signal;
+        if (requestSignal === undefined || requestSignal === null) {
+          throw new Error('request signal missing');
+        }
+        const addEventListener = requestSignal.addEventListener.bind(requestSignal);
+        const removeEventListener = requestSignal.removeEventListener.bind(requestSignal);
+        vi.spyOn(requestSignal, 'addEventListener').mockImplementation((type, listener, options) => {
+          if (type === 'abort') liveAbortListeners.add(listener);
+          addEventListener(type, listener, options);
+        });
+        vi.spyOn(requestSignal, 'removeEventListener').mockImplementation((type, listener, options) => {
+          if (type === 'abort') liveAbortListeners.delete(listener);
+          removeEventListener(type, listener, options);
+        });
+        return request.promise;
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      transport = new SlackSocketTransport({
+        connectionFactory: slackSdkConnectionFactory('xapp-test'),
+        timeouts: { startMs: 500, closeMs: 100 },
+      });
+
+      try {
+        const starting = transport.start();
+        const rejected = expect(starting).rejects.toMatchObject({ code: 'connect_failed' });
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+        request.resolve(response);
+
+        await rejected;
+        await expect(shutdownAfterFulfillment).resolves.toBeUndefined();
+        await flushMicrotasks();
+        expect({
+          cancelCalls,
+          resourceActive,
+          locked: body.locked,
+          abortListeners: liveAbortListeners.size,
+          upgrades: server.upgrades(),
+        }).toEqual({
+          cancelCalls: 1,
+          resourceActive: false,
+          locked: false,
+          abortListeners: 0,
+          upgrades: 0,
+        });
+      } finally {
+        request.resolve(response);
+        await transport.shutdown().catch(() => undefined);
+        await server.close();
+      }
+    },
+  );
+
+  it('abort 뒤 late connections.open fulfillment을 cancel/release하고 WebSocket을 만들지 않는다', async () => {
     const server = await startHelloServer();
     vi.useFakeTimers();
     const request = deferred<Response>();
     const requestSignals: Array<AbortSignal | undefined> = [];
+    let getReaderCalls = 0;
+    let readCalls = 0;
+    let cancelCalls = 0;
+    let releaseCalls = 0;
+    let resourceActive = true;
+    let locked = false;
+    const lateResponse = {
+      body: {
+        getReader() {
+          getReaderCalls += 1;
+          locked = true;
+          return {
+            read() {
+              readCalls += 1;
+              return new Promise(() => undefined);
+            },
+            cancel() {
+              cancelCalls += 1;
+              resourceActive = false;
+            },
+            releaseLock() {
+              releaseCalls += 1;
+              locked = false;
+            },
+          };
+        },
+      },
+      headers: new Headers({ 'content-type': 'application/json' }),
+      status: 200,
+      statusText: 'OK',
+    } as unknown as Response;
     vi.stubGlobal('fetch', vi.fn((_url: string | URL, init?: RequestInit) => {
       requestSignals.push(init?.signal ?? undefined);
       return request.promise;
@@ -514,11 +711,27 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       await rejected;
       await expect(transport.shutdown()).resolves.toBeUndefined();
 
-      request.resolve(connectionsOpenResponse(server.url));
+      request.resolve(lateResponse);
       await flushMicrotasks();
       vi.useRealTimers();
       await new Promise((resolve) => setTimeout(resolve, 30));
-      expect(server.upgrades()).toBe(0);
+      expect({
+        getReaderCalls,
+        readCalls,
+        cancelCalls,
+        releaseCalls,
+        resourceActive,
+        locked,
+        upgrades: server.upgrades(),
+      }).toEqual({
+        getReaderCalls: 1,
+        readCalls: 0,
+        cancelCalls: 1,
+        releaseCalls: 1,
+        resourceActive: false,
+        locked: false,
+        upgrades: 0,
+      });
       expect(clients[0]?.websocket).toBeUndefined();
       expect(clients[0]?.listenerCount('disconnected')).toBe(0);
       expect(requestSignals[0]?.aborted).toBe(true);

@@ -734,6 +734,41 @@ function fencedSocketResponse(
 }
 
 /**
+ * fetch fulfillment reaction이 Response body 소유권을 즉시 인수한다. abort가 먼저
+ * settle해도 같은 reaction이 late Response를 fence하며 body를 cancel/release한다.
+ */
+function settleSocketFetch(
+  operation: Promise<SocketHttpResponse>,
+  signal: AbortSignal,
+): Promise<OperationOutcome<SocketHttpResponse>> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const onAbort = (): void => finish({ status: 'aborted' });
+    const finish = (outcome: OperationOutcome<SocketHttpResponse>): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve(outcome);
+    };
+
+    if (signal.aborted) finish({ status: 'aborted' });
+    else signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(
+      (response) => {
+        try {
+          // settled 검사보다 먼저 소유권을 인수해 abort-lost Response도 반드시 폐기한다.
+          const fenced = fencedSocketResponse(response, signal);
+          finish({ status: 'fulfilled', value: fenced });
+        } catch {
+          finish({ status: 'rejected' });
+        }
+      },
+      () => finish({ status: 'rejected' }),
+    );
+  });
+}
+
+/**
  * SDK의 documented clientOptions.fetch seam에 owner abort를 결합한다. 실제 fetch promise와
  * 반환된 표준 Response body 모두 owner가 살아 있는 동안에만 SDK가 소비할 수 있다.
  */
@@ -745,17 +780,13 @@ function fencedSocketFetch(ownerSignal: AbortSignal): SocketHttpFetch {
     if (signal.aborted) throw new SocketTransportError('connect_failed');
     let fetching: Promise<SocketHttpResponse>;
     try {
-      fetching = globalThis.fetch(url, { ...init, signal });
+      fetching = Promise.resolve(globalThis.fetch(url, { ...init, signal }));
     } catch {
       throw new SocketTransportError('connect_failed');
     }
-    const outcome = await settleOperation(fetching, { signal });
+    const outcome = await settleSocketFetch(fetching, signal);
     if (outcome.status !== 'fulfilled') throw new SocketTransportError('connect_failed');
-    try {
-      return fencedSocketResponse(outcome.value, signal);
-    } catch {
-      throw new SocketTransportError('connect_failed');
-    }
+    return outcome.value;
   };
 }
 
