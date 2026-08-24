@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { SocketModeClient } from '@slack/socket-mode';
+import { Response as UndiciResponse } from 'undici';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SlackSocketTransport,
@@ -22,18 +23,34 @@ async function flushMicrotasks(): Promise<void> {
 type HelloServer = {
   readonly url: string;
   readonly upgrades: () => number;
+  readonly send: (index: number, payload: object) => void;
+  readonly disconnect: (index: number) => void;
   readonly close: () => Promise<void>;
 };
 
-/** 실제 SDK/undici WebSocket을 열되 close frame에는 답하지 않는 local protocol seam이다. */
-async function startHelloServer(): Promise<HelloServer> {
+function textFrame(payload: object): Buffer {
+  const encoded = Buffer.from(JSON.stringify(payload));
+  if (encoded.length > 125) throw new Error('test WebSocket frame is too large');
+  return Buffer.concat([Buffer.from([0x81, encoded.length]), encoded]);
+}
+
+const CLOSE_FRAME = Buffer.from([0x88, 0x02, 0x03, 0xe8]);
+
+/** 실제 SDK/undici WebSocket을 열고 필요할 때만 최소 close handshake를 수행하는 seam이다. */
+async function startHelloServer(options: {
+  readonly autoHello?: boolean;
+  readonly replyToClose?: boolean;
+} = {}): Promise<HelloServer> {
   const server = createServer();
-  const sockets = new Set<Duplex>();
+  const liveSockets = new Set<Duplex>();
+  const sockets: Duplex[] = [];
+  const serverClosing = new WeakSet<Duplex>();
   let upgradeCount = 0;
   server.on('upgrade', (request, socket) => {
     upgradeCount += 1;
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
+    sockets.push(socket);
+    liveSockets.add(socket);
+    socket.once('close', () => liveSockets.delete(socket));
     const key = request.headers['sec-websocket-key'];
     if (typeof key !== 'string') {
       socket.destroy();
@@ -48,11 +65,19 @@ async function startHelloServer(): Promise<HelloServer> {
       + 'Connection: Upgrade\r\n'
       + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
-    const payload = Buffer.from(JSON.stringify({
-      type: 'hello',
-      connection_info: { app_id: 'A01BRIDGE' },
-    }));
-    socket.write(Buffer.concat([Buffer.from([0x81, payload.length]), payload]));
+    if (options.replyToClose === true) {
+      socket.on('data', (chunk: Buffer) => {
+        if (chunk.length === 0 || (chunk[0]! & 0x0f) !== 0x08) return;
+        if (!serverClosing.has(socket) && !socket.destroyed) socket.write(CLOSE_FRAME);
+        socket.end();
+      });
+    }
+    if (options.autoHello !== false) {
+      socket.write(textFrame({
+        type: 'hello',
+        connection_info: { app_id: 'A01BRIDGE' },
+      }));
+    }
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -60,8 +85,19 @@ async function startHelloServer(): Promise<HelloServer> {
   return {
     url: `ws://127.0.0.1:${address.port}/socket`,
     upgrades: () => upgradeCount,
+    send: (index, payload) => {
+      const socket = sockets[index];
+      if (socket === undefined || socket.destroyed) throw new Error('test WebSocket is not open');
+      socket.write(textFrame(payload));
+    },
+    disconnect: (index) => {
+      const socket = sockets[index];
+      if (socket === undefined || socket.destroyed) throw new Error('test WebSocket is not open');
+      serverClosing.add(socket);
+      socket.write(CLOSE_FRAME);
+    },
     close: async () => {
-      for (const socket of sockets) socket.destroy();
+      for (const socket of liveSockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
@@ -81,6 +117,135 @@ afterEach(() => {
 });
 
 describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
+  it.each([
+    ['missing', {}],
+    ['mismatch', { app_id: 'A01OTHER' }],
+  ] as const)('current disconnect와 candidate App ID %s가 겹쳐도 backoff 뒤 회복하고 restart한다', async (
+    _identityFailure,
+    candidateInfo,
+  ) => {
+    const server = await startHelloServer({ autoHello: false, replyToClose: true });
+    const retryRelease = deferred<void>();
+    const delays: number[] = [];
+    const fetchMock = vi.fn(async () => connectionsOpenResponse(server.url));
+    vi.stubGlobal('fetch', fetchMock);
+    const clients: SocketModeClient[] = [];
+    const sdkStart = SocketModeClient.prototype.start;
+    vi.spyOn(SocketModeClient.prototype, 'start').mockImplementation(function startSdk(
+      this: SocketModeClient,
+    ) {
+      clients.push(this);
+      return sdkStart.call(this);
+    });
+    const transport = new SlackSocketTransport({
+      expectedApiAppId: 'A01BRIDGE',
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      backoff: { initialMs: 10, maxMs: 40 },
+      timeouts: { startMs: 500, closeMs: 100 },
+      sleep: async (delay) => {
+        delays.push(delay);
+        await retryRelease.promise;
+      },
+    });
+
+    try {
+      const starting = transport.start();
+      await vi.waitFor(() => expect(server.upgrades()).toBe(1));
+      server.send(0, { type: 'hello', connection_info: { app_id: 'A01BRIDGE' } });
+      await starting;
+
+      server.send(0, { type: 'disconnect', reason: 'refresh_requested' });
+      await vi.waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(server.upgrades()).toBe(2);
+      });
+      let currentDisconnected = false;
+      clients[0]?.once('disconnected', () => { currentDisconnected = true; });
+      server.disconnect(0);
+      await vi.waitFor(() => expect(currentDisconnected).toBe(true));
+      server.send(1, { type: 'hello', connection_info: candidateInfo });
+
+      await vi.waitFor(() => expect({
+        delays,
+        fetches: fetchMock.mock.calls.length,
+        upgrades: server.upgrades(),
+      }).toEqual({ delays: [20], fetches: 2, upgrades: 2 }));
+
+      retryRelease.resolve();
+      await vi.waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(server.upgrades()).toBe(3);
+      });
+      server.send(2, { type: 'hello', connection_info: { app_id: 'A01BRIDGE' } });
+      await vi.waitFor(() => expect(clients[2]?.websocket?.readyState).toBe(1));
+
+      await transport.shutdown();
+      const restarting = transport.start();
+      await vi.waitFor(() => expect(server.upgrades()).toBe(4));
+      server.send(3, { type: 'hello', connection_info: { app_id: 'A01BRIDGE' } });
+      await restarting;
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      await transport.shutdown();
+    } finally {
+      retryRelease.resolve();
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it.each([
+    ['native', (url: string) => connectionsOpenResponse(url)],
+    ['undici', (url: string) => new UndiciResponse(JSON.stringify({ ok: true, url }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })],
+  ] as const)('%s Response를 같은 fetch 계약으로 수용한다', async (_implementation, response) => {
+    const server = await startHelloServer({ replyToClose: true });
+    const fetchMock = vi.fn(async () => response(server.url));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      expectedApiAppId: 'A01BRIDGE',
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(server.upgrades()).toBe(1);
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('malformed fetch response는 WebSocket 전에 fail closed한다', async () => {
+    const server = await startHelloServer();
+    const malformed = {
+      body: {},
+      headers: new Headers({ 'content-type': 'application/json' }),
+      status: 200,
+      statusText: 'OK',
+    };
+    const fetchMock = vi.fn(async () => malformed);
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(server.upgrades()).toBe(0);
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
   it('close 완료 뒤 late connections.open fulfillment이 WebSocket을 만들지 않는다', async () => {
     const server = await startHelloServer();
     vi.useFakeTimers();

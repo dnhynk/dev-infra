@@ -233,6 +233,70 @@ describe('Socket lifecycle', () => {
     },
   );
 
+  it.each([
+    ['missing', null],
+    ['mismatch', 'A01OTHER'],
+  ] as const)('살아 있는 current의 candidate App ID %s는 재시도하지 않는다', async (
+    _identityFailure,
+    appId,
+  ) => {
+    const delays: number[] = [];
+    const current = new FakeConnection(() => hello());
+    const invalid = new FakeConnection(() => Promise.resolve({ appId }));
+    const unexpected = new FakeConnection(() => hello());
+    const create = vi.fn(factory([current, invalid, unexpected]));
+    const transport = new SlackSocketTransport({
+      expectedApiAppId: 'A01BRIDGE',
+      connectionFactory: create,
+      backoff: { initialMs: 10, maxMs: 40 },
+      sleep: async (delay) => { delays.push(delay); },
+    });
+
+    await transport.start();
+    current.refresh('refresh_requested');
+    await vi.waitFor(() => expect(invalid.closeCalls).toBe(1));
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([]);
+    expect(current.closeCalls).toBe(0);
+    expect(unexpected.startCalls).toBe(0);
+    await transport.shutdown();
+    expect(current.closeCalls).toBe(1);
+  });
+
+  it('identity failure의 recovery backoff를 shutdown하면 새 start가 가능하다', async () => {
+    const candidateHello = deferred<SocketHello>();
+    const sleepRelease = deferred<void>();
+    const delays: number[] = [];
+    const current = new FakeConnection(() => hello());
+    const invalid = new FakeConnection(() => candidateHello.promise);
+    const restarted = new FakeConnection(() => hello());
+    const create = vi.fn(factory([current, invalid, restarted]));
+    const transport = new SlackSocketTransport({
+      expectedApiAppId: 'A01BRIDGE',
+      connectionFactory: create,
+      backoff: { initialMs: 10, maxMs: 40 },
+      sleep: async (delay) => {
+        delays.push(delay);
+        await sleepRelease.promise;
+      },
+    });
+
+    await transport.start();
+    current.refresh('refresh_requested');
+    current.disconnected();
+    candidateHello.resolve({ appId: 'A01OTHER' });
+    await vi.waitFor(() => expect(delays).toEqual([20]));
+    expect(create).toHaveBeenCalledTimes(2);
+
+    await transport.shutdown();
+    sleepRelease.resolve();
+    await transport.start();
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(restarted.startCalls).toBe(1);
+    await transport.shutdown();
+  });
+
   it('disconnect 뒤 capped exponential backoff로 재연결한다', async () => {
     const delays: number[] = [];
     const first = new FakeConnection(() => hello());

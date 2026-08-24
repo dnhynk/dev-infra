@@ -376,13 +376,21 @@ export class SlackSocketTransport {
         return;
       } catch (error) {
         if (this.stopped || this.generation !== generation) return;
-        if (
+        const nonretryable =
           error instanceof SocketTransportError
           && error.code !== 'connect_failed'
-          && error.code !== 'connect_timeout'
-        ) {
+          && error.code !== 'connect_timeout';
+        if (nonretryable) {
+          const identityFailure =
+            error.code === 'hello_app_id_missing'
+            || error.code === 'hello_app_id_mismatch';
+          const disconnectRecoveryRequired =
+            this.current === null
+            || this.pendingReconnect?.immediate === false;
+          // 살아 있는 current가 identity 실패를 대신할 수 있을 때는 one-shot으로 끝낸다.
+          // candidate 동안 current가 끊겼다면 pending을 이 loop로 흡수하고 backoff 복구한다.
           this.pendingReconnect = null;
-          return;
+          if (!identityFailure || !disconnectRecoveryRequired) return;
         }
         delayMs = reconnectDelay(++attempt, this.options.backoff);
       }
@@ -477,18 +485,79 @@ const SILENT_LOGGER: Logger = {
 
 type SocketHttpFetch = NonNullable<NonNullable<SocketModeOptions['clientOptions']>['fetch']>;
 type SocketHttpResponse = Awaited<ReturnType<SocketHttpFetch>>;
+type SocketBodyReader = {
+  readonly read: () => Promise<unknown>;
+  readonly cancel: (reason?: unknown) => unknown;
+};
+
+function socketBodyReader(body: unknown): SocketBodyReader {
+  if (!isRecord(body) || typeof body['getReader'] !== 'function') {
+    throw new SocketTransportError('connect_failed');
+  }
+  const reader: unknown = body['getReader']();
+  if (
+    !isRecord(reader)
+    || typeof reader['read'] !== 'function'
+    || typeof reader['cancel'] !== 'function'
+  ) {
+    throw new SocketTransportError('connect_failed');
+  }
+  return reader as SocketBodyReader;
+}
+
+function isUint8ArrayChunk(value: unknown): value is Uint8Array {
+  return ArrayBuffer.isView(value)
+    && Object.prototype.toString.call(value) === '[object Uint8Array]';
+}
+
+function socketHeaders(value: unknown): Headers {
+  if (
+    !isRecord(value)
+    || typeof value['get'] !== 'function'
+    || typeof value['entries'] !== 'function'
+  ) {
+    throw new SocketTransportError('connect_failed');
+  }
+  try {
+    const rawEntries = (value['entries'] as () => Iterable<unknown>).call(value);
+    const entries = Array.from(rawEntries);
+    if (!entries.every((entry): entry is [string, string] => (
+      Array.isArray(entry)
+      && entry.length === 2
+      && typeof entry[0] === 'string'
+      && typeof entry[1] === 'string'
+    ))) {
+      throw new SocketTransportError('connect_failed');
+    }
+    return new Headers(entries);
+  } catch {
+    throw new SocketTransportError('connect_failed');
+  }
+}
 
 /** Response body reader도 owner abort에 묶어 SDK가 late URL을 파싱하지 못하게 한다. */
 function fencedSocketResponse(
   response: SocketHttpResponse,
   signal: AbortSignal,
 ): SocketHttpResponse {
-  if (!(response instanceof Response)) throw new SocketTransportError('connect_failed');
-  if (response.body === null) {
-    if (signal.aborted) throw new SocketTransportError('connect_failed');
-    return response;
+  if (!isRecord(response) || signal.aborted) {
+    throw new SocketTransportError('connect_failed');
   }
-  const reader = response.body.getReader();
+  const { body: rawBody, status, statusText } = response;
+  if (
+    !Number.isInteger(status)
+    || status < 200
+    || status > 599
+    || typeof statusText !== 'string'
+  ) {
+    throw new SocketTransportError('connect_failed');
+  }
+  const headers = socketHeaders(response.headers);
+  const responseInit = { status, statusText, headers };
+  if (rawBody === null) {
+    return new Response(null, responseInit);
+  }
+  const reader = socketBodyReader(rawBody);
   let finished = false;
   let streamController!: ReadableStreamDefaultController<Uint8Array>;
   const finish = (): boolean => {
@@ -500,9 +569,9 @@ function fencedSocketResponse(
   const abortBody = (): void => {
     if (!finish()) return;
     streamController.error(new SocketTransportError('connect_failed'));
-    observeOperation(() => reader.cancel());
+    observeOperation(() => Promise.resolve(reader.cancel()));
   };
-  const body = new ReadableStream<Uint8Array>({
+  const fencedBody = new ReadableStream<Uint8Array>({
     start(controller) {
       streamController = controller;
       if (signal.aborted) abortBody();
@@ -510,9 +579,9 @@ function fencedSocketResponse(
     },
     async pull(controller) {
       if (finished) return;
-      let reading: ReturnType<typeof reader.read>;
+      let reading: Promise<unknown>;
       try {
-        reading = reader.read();
+        reading = Promise.resolve(reader.read());
       } catch {
         abortBody();
         return;
@@ -523,12 +592,25 @@ function fencedSocketResponse(
         abortBody();
         return;
       }
-      if (outcome.value.done) {
-        finish();
-        controller.close();
-        return;
+      try {
+        if (!isRecord(outcome.value) || typeof outcome.value['done'] !== 'boolean') {
+          abortBody();
+          return;
+        }
+        if (outcome.value['done']) {
+          finish();
+          controller.close();
+          return;
+        }
+        const chunk = outcome.value['value'];
+        if (!isUint8ArrayChunk(chunk)) {
+          abortBody();
+          return;
+        }
+        controller.enqueue(chunk);
+      } catch {
+        abortBody();
       }
-      controller.enqueue(outcome.value.value);
     },
     async cancel(reason) {
       if (!finish()) return;
@@ -539,11 +621,7 @@ function fencedSocketResponse(
       }
     },
   });
-  return new Response(body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
+  return new Response(fencedBody, responseInit);
 }
 
 /**
