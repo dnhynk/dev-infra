@@ -286,6 +286,40 @@ describe('Socket lifecycle', () => {
     expect(recovered.closeCalls).toBe(1);
   });
 
+  it('replacement hello 직후 current handoff 전 disconnect도 후속 reconnect로 회복한다', async () => {
+    const oldConnection = new FakeConnection(() => hello());
+    let disconnectedCandidate!: FakeConnection;
+    disconnectedCandidate = new FakeConnection(() => Promise.resolve({
+      get appId() {
+        queueMicrotask(() => disconnectedCandidate.disconnected());
+        return 'A01BRIDGE';
+      },
+    }));
+    const recovered = new FakeConnection(() => hello());
+    const delays: number[] = [];
+    const create = vi.fn(factory([oldConnection, disconnectedCandidate, recovered]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      backoff: { initialMs: 10, maxMs: 40 },
+      sleep: async (delay) => { delays.push(delay); },
+    });
+
+    await transport.start();
+    oldConnection.refresh('refresh_requested');
+    await vi.waitFor(() => expect(recovered.startCalls).toBe(1));
+
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(disconnectedCandidate.closeCalls).toBe(1);
+    expect(delays).toEqual([20]);
+    oldConnection.disconnected();
+    disconnectedCandidate.disconnected();
+    await flushMicrotasks();
+    expect(create).toHaveBeenCalledTimes(3);
+
+    await transport.shutdown();
+    expect(recovered.closeCalls).toBe(1);
+  });
+
   it('refresh의 끝나지 않는 old close를 deadline에서 놓고 lifecycle을 계속한다', async () => {
     vi.useFakeTimers();
     const oldClose = deferred<void>();

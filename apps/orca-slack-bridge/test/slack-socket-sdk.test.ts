@@ -127,6 +127,67 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     }
   });
 
+  it('shutdown 뒤 delayed response body가 풀려도 URL을 소비하거나 WebSocket을 만들지 않는다', async () => {
+    const server = await startHelloServer();
+    vi.useFakeTimers();
+    const bodyRelease = deferred<void>();
+    const requestSignals: Array<AbortSignal | undefined> = [];
+    let bodyCancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await bodyRelease.promise;
+        if (bodyCancelled) return;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true, url: server.url })));
+        controller.close();
+      },
+      cancel() { bodyCancelled = true; },
+    });
+    vi.stubGlobal('fetch', vi.fn((_url: string | URL, init?: RequestInit) => {
+      requestSignals.push(init?.signal ?? undefined);
+      return Promise.resolve(new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    }));
+    const clients: SocketModeClient[] = [];
+    const sdkStart = SocketModeClient.prototype.start;
+    vi.spyOn(SocketModeClient.prototype, 'start').mockImplementation(function startSdk(
+      this: SocketModeClient,
+    ) {
+      clients.push(this);
+      return sdkStart.call(this);
+    });
+
+    try {
+      const transport = new SlackSocketTransport({
+        connectionFactory: slackSdkConnectionFactory('xapp-test'),
+        timeouts: { startMs: 25, closeMs: 10 },
+      });
+      const starting = transport.start();
+      const rejected = expect(starting).rejects.toMatchObject({ code: 'connect_timeout' });
+      await flushMicrotasks();
+      expect(requestSignals).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+      expect(requestSignals[0]?.aborted).toBe(true);
+
+      bodyRelease.resolve();
+      await flushMicrotasks();
+      vi.useRealTimers();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(server.upgrades()).toBe(0);
+      expect(bodyCancelled).toBe(true);
+      expect(clients[0]?.websocket).toBeUndefined();
+      expect(clients[0]?.listenerCount('disconnected')).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      bodyRelease.resolve();
+      await server.close();
+    }
+  });
+
   it('fence 뒤 underlying fetch의 late rejection도 unhandled로 새지 않는다', async () => {
     vi.useFakeTimers();
     const request = deferred<Response>();

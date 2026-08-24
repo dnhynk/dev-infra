@@ -140,6 +140,7 @@ type PendingReconnect = {
 export class SlackSocketTransport {
   private current: SocketConnection | null = null;
   private candidate: SocketConnection | null = null;
+  private previous: SocketConnection | null = null;
   private reconnectTask: Promise<void> | null = null;
   private pendingReconnect: PendingReconnect | null = null;
   private stopped = true;
@@ -148,6 +149,7 @@ export class SlackSocketTransport {
   private abort = new AbortController();
   private shutdownTask: Promise<void> | null = null;
   private readonly closeTasks = new WeakMap<SocketConnection, Promise<CloseOutcome>>();
+  private candidateDisconnected = false;
   private closeTimeoutObserved = false;
   private readonly timeouts: SocketTimeouts;
 
@@ -159,7 +161,13 @@ export class SlackSocketTransport {
   }
 
   async start(): Promise<void> {
-    if (!this.stopped || this.stopping || this.current !== null || this.candidate !== null) {
+    if (
+      !this.stopped
+      || this.stopping
+      || this.current !== null
+      || this.candidate !== null
+      || this.previous !== null
+    ) {
       throw new SocketTransportError('connect_failed');
     }
     const generation = ++this.generation;
@@ -171,11 +179,15 @@ export class SlackSocketTransport {
     this.stopped = false;
     try {
       const connection = await this.openConnection(abort.signal);
-      if (this.stopped || this.generation !== generation) {
+      if (
+        this.stopped
+        || this.generation !== generation
+        || !this.promoteCandidate(connection, null)
+      ) {
+        this.clearCandidate(connection);
         await this.closeConnection(connection);
         throw new SocketTransportError('connect_failed');
       }
-      this.current = connection;
     } catch (error) {
       if (this.generation === generation) {
         this.stopped = true;
@@ -189,7 +201,12 @@ export class SlackSocketTransport {
 
   shutdown(): Promise<void> {
     if (this.shutdownTask !== null) return this.shutdownTask;
-    if (this.stopped && this.current === null && this.candidate === null) {
+    if (
+      this.stopped
+      && this.current === null
+      && this.candidate === null
+      && this.previous === null
+    ) {
       this.shutdownTask = this.closeTimeoutObserved
         ? Promise.reject(new SocketTransportError('close_timeout'))
         : Promise.resolve();
@@ -206,10 +223,12 @@ export class SlackSocketTransport {
     this.abort.abort();
     this.pendingReconnect = null;
     const reconnectTask = this.reconnectTask;
-    const connections = [...new Set([this.current, this.candidate])]
+    const connections = [...new Set([this.current, this.candidate, this.previous])]
       .filter((connection): connection is SocketConnection => connection !== null);
     this.current = null;
     this.candidate = null;
+    this.candidateDisconnected = false;
+    this.previous = null;
     try {
       await Promise.all(connections.map((connection) => this.closeConnection(connection)));
       if (reconnectTask !== null) await reconnectTask;
@@ -222,6 +241,7 @@ export class SlackSocketTransport {
   private async openConnection(signal: AbortSignal): Promise<SocketConnection> {
     let ref: SocketConnection | null = null;
     let connection: SocketConnection;
+    let ready = false;
     try {
       connection = this.options.connectionFactory({
         refresh: (reason) => ref !== null && this.handleRefresh(ref, reason),
@@ -232,6 +252,7 @@ export class SlackSocketTransport {
       throw new SocketTransportError('connect_failed');
     }
     this.candidate = connection;
+    this.candidateDisconnected = false;
     try {
       let starting: Promise<SocketHello>;
       try {
@@ -250,6 +271,10 @@ export class SlackSocketTransport {
       if (this.options.expectedApiAppId !== undefined && appId !== this.options.expectedApiAppId) {
         throw new SocketTransportError('hello_app_id_mismatch');
       }
+      if (signal.aborted || this.candidateDisconnected) {
+        throw new SocketTransportError('connect_failed');
+      }
+      ready = true;
       return connection;
     } catch (error) {
       await this.closeConnection(connection);
@@ -257,7 +282,9 @@ export class SlackSocketTransport {
         ? error
         : new SocketTransportError('connect_failed');
     } finally {
-      if (this.candidate === connection) this.candidate = null;
+      // 성공한 candidate는 caller가 current로 원자적으로 promote할 때까지 소유한다.
+      // openConnection promise와 caller continuation 사이의 disconnect도 이 role로 관측한다.
+      if (!ready) this.clearCandidate(connection);
     }
   }
 
@@ -271,7 +298,13 @@ export class SlackSocketTransport {
   }
 
   private handleDisconnected(connection: SocketConnection): void {
-    if (this.stopped || connection !== this.current) return;
+    if (this.stopped) return;
+    if (connection === this.candidate) {
+      this.candidateDisconnected = true;
+      return;
+    }
+    // previous와 이미 retire된 stale connection은 새 current의 lifecycle을 바꾸지 않는다.
+    if (connection === this.previous || connection !== this.current) return;
     this.current = null;
     if (this.reconnectTask !== null) {
       this.pendingReconnect = { connection, immediate: false };
@@ -320,13 +353,26 @@ export class SlackSocketTransport {
       const previous = this.current;
       try {
         const replacement = await this.openConnection(this.abort.signal);
-        if (this.stopped || this.generation !== generation) {
+        if (
+          this.stopped
+          || this.generation !== generation
+          || !this.promoteCandidate(replacement, previous)
+        ) {
+          this.clearCandidate(replacement);
           await this.closeConnection(replacement);
-          return;
+          if (this.stopped || this.generation !== generation) return;
+          throw new SocketTransportError('connect_failed');
         }
-        this.current = replacement;
         if (this.pendingReconnect?.connection !== replacement) this.pendingReconnect = null;
-        if (previous !== null && previous !== replacement) await this.closeConnection(previous);
+        if (previous !== null && previous !== replacement) {
+          try {
+            await this.closeConnection(previous);
+          } finally {
+            if (this.previous === previous) this.previous = null;
+          }
+        } else if (this.previous === previous) {
+          this.previous = null;
+        }
         return;
       } catch (error) {
         if (this.stopped || this.generation !== generation) return;
@@ -341,6 +387,26 @@ export class SlackSocketTransport {
         delayMs = reconnectDelay(++attempt, this.options.backoff);
       }
     }
+  }
+
+  private promoteCandidate(
+    connection: SocketConnection,
+    previous: SocketConnection | null,
+  ): boolean {
+    if (
+      this.candidate !== connection
+      || this.candidateDisconnected
+    ) return false;
+    this.previous = previous;
+    this.current = connection;
+    this.clearCandidate(connection);
+    return true;
+  }
+
+  private clearCandidate(connection: SocketConnection): void {
+    if (this.candidate !== connection) return;
+    this.candidate = null;
+    this.candidateDisconnected = false;
   }
 
   private closeConnection(connection: SocketConnection): Promise<CloseOutcome> {
@@ -412,9 +478,77 @@ const SILENT_LOGGER: Logger = {
 type SocketHttpFetch = NonNullable<NonNullable<SocketModeOptions['clientOptions']>['fetch']>;
 type SocketHttpResponse = Awaited<ReturnType<SocketHttpFetch>>;
 
+/** Response body reader도 owner abort에 묶어 SDK가 late URL을 파싱하지 못하게 한다. */
+function fencedSocketResponse(
+  response: SocketHttpResponse,
+  signal: AbortSignal,
+): SocketHttpResponse {
+  if (!(response instanceof Response)) throw new SocketTransportError('connect_failed');
+  if (response.body === null) {
+    if (signal.aborted) throw new SocketTransportError('connect_failed');
+    return response;
+  }
+  const reader = response.body.getReader();
+  let finished = false;
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  const finish = (): boolean => {
+    if (finished) return false;
+    finished = true;
+    signal.removeEventListener('abort', abortBody);
+    return true;
+  };
+  const abortBody = (): void => {
+    if (!finish()) return;
+    streamController.error(new SocketTransportError('connect_failed'));
+    observeOperation(() => reader.cancel());
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      if (signal.aborted) abortBody();
+      else signal.addEventListener('abort', abortBody, { once: true });
+    },
+    async pull(controller) {
+      if (finished) return;
+      let reading: ReturnType<typeof reader.read>;
+      try {
+        reading = reader.read();
+      } catch {
+        abortBody();
+        return;
+      }
+      const outcome = await settleOperation(reading, { signal });
+      if (finished) return;
+      if (outcome.status !== 'fulfilled') {
+        abortBody();
+        return;
+      }
+      if (outcome.value.done) {
+        finish();
+        controller.close();
+        return;
+      }
+      controller.enqueue(outcome.value.value);
+    },
+    async cancel(reason) {
+      if (!finish()) return;
+      try {
+        await reader.cancel(reason);
+      } catch {
+        // raw body cancellation failures never cross the adapter boundary.
+      }
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 /**
- * SDK의 documented clientOptions.fetch seam에 owner abort를 결합한다. 실제 fetch가 signal을
- * 무시하고 늦게 settle해도 SDK start에는 더 이상 URL을 넘기지 않고 late reject도 소비한다.
+ * SDK의 documented clientOptions.fetch seam에 owner abort를 결합한다. 실제 fetch promise와
+ * 반환된 표준 Response body 모두 owner가 살아 있는 동안에만 SDK가 소비할 수 있다.
  */
 function fencedSocketFetch(ownerSignal: AbortSignal): SocketHttpFetch {
   return async (url, init) => {
@@ -430,7 +564,11 @@ function fencedSocketFetch(ownerSignal: AbortSignal): SocketHttpFetch {
     }
     const outcome = await settleOperation(fetching, { signal });
     if (outcome.status !== 'fulfilled') throw new SocketTransportError('connect_failed');
-    return outcome.value;
+    try {
+      return fencedSocketResponse(outcome.value, signal);
+    } catch {
+      throw new SocketTransportError('connect_failed');
+    }
   };
 }
 
