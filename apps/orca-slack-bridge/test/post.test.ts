@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
+  boundedSlackUpdate,
   SlackApiError,
+  SlackUpdateTimeoutError,
   SlackWebApiPoster,
   botToken,
   type SlackBlock,
+  type SlackPoster,
 } from '../src/slack/post.js';
 import { BOT_TOKEN_VAR, maskToken } from '../src/slack/verify.js';
 
@@ -55,6 +58,62 @@ const replyInput = {
 const updateInput = { channel: 'C1', ts: '1.1', text: '대체 텍스트', blocks: BLOCKS };
 
 describe('SlackWebApiPoster', () => {
+  it('bounds an injected card updater that ignores cancellation and never settles', async () => {
+    const hanging: SlackPoster = {
+      post: () => Promise.reject(new Error('unused')),
+      update: () => new Promise(() => undefined),
+    };
+    const began = Date.now();
+    await expect(boundedSlackUpdate(hanging, updateInput, 10)).rejects.toBeInstanceOf(
+      SlackUpdateTimeoutError,
+    );
+    expect(Date.now() - began).toBeLessThan(1_000);
+  });
+
+  it('aborts the production fetch at the card deadline without retrying', async () => {
+    let calls = 0;
+    let aborted = false;
+    let sleeps = 0;
+    const fetchImpl: typeof fetch = (_url, init) => {
+      calls += 1;
+      return new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal === null || signal === undefined) {
+          reject(new Error('missing abort signal'));
+          return;
+        }
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('aborted by deadline'));
+        }, { once: true });
+      });
+    };
+    const raw = new SlackWebApiPoster({
+      token: TOKEN,
+      fetchImpl,
+      sleep: async () => { sleeps += 1; },
+    });
+    await expect(boundedSlackUpdate(raw, updateInput, 10)).rejects.toBeInstanceOf(
+      SlackUpdateTimeoutError,
+    );
+    expect({ calls, aborted, sleeps }).toEqual({ calls: 1, aborted: true, sleeps: 0 });
+  });
+
+  it('a deadline during retry sleep prevents a second Slack request', async () => {
+    let calls = 0;
+    const raw = new SlackWebApiPoster({
+      token: TOKEN,
+      fetchImpl: async () => {
+        calls += 1;
+        throw new Error('delivery unknown before retry sleep');
+      },
+    });
+    await expect(boundedSlackUpdate(raw, updateInput, 10)).rejects.toBeInstanceOf(
+      SlackUpdateTimeoutError,
+    );
+    expect(calls).toBe(1);
+  });
+
   it('post는 chat.postMessage를 호출하고 channel/ts를 돌려준다', async () => {
     const fake = new FakeFetch([{ body: { ok: true, channel: 'C9', ts: '1700000000.000100' } }]);
     const result = await poster(fake).post(postInput);

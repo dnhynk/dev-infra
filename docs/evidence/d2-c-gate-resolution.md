@@ -21,13 +21,17 @@ Base: `origin/main@d26be4db4943a67ff7caaabd35a5391c22eaca5a`
   Gates and daemon shutdown cannot starve, while a periodic production pass takes over durable
   pending work after a live owner disappears. Orca subprocesses and injected runners have a
   bounded deadline; read timeouts become durable uncertainty and resolve timeouts follow the same
-  response-unknown path with the original retry UUID.
+  response-unknown path with the original retry UUID. Every Gate card update has a fifteen-second
+  lifecycle bound and aborts the production fetch, strictly below its thirty-second durable owner
+  expiry, so startup reconciliation and daemon draining cannot wait forever on Slack.
 - Status projection distinguishes resolving, resolved, conflict, and degraded states and always
   preserves `Coordinator 통지 대기`; D2-C never claims that work resumed. Monotonic intent/outbox
   revisions, terminal-state dominance, and a durable projection owner prevent stale reconcilers or
-  Slack completions from clearing newer state. A separately owned ordinary-card write fence is
-  serialized against Gate claims and survives restart; its next production observer pass safely
-  reprojects and settles the exact stored message.
+  Slack completions from clearing newer state. Projection and ordinary-card owners carry strict
+  persisted expiries, so an unrelated process reusing a crashed owner's PID cannot block recovery;
+  stale completions are fenced after expiry. The separately owned ordinary-card write fence is
+  serialized against Gate claims and survives restart, and its next production observer pass
+  safely reprojects and settles the exact stored message.
 
 ## Adversarial and fault evidence
 
@@ -42,17 +46,20 @@ projector-success-before-local crash recovery, two-store observer/card races,
 first-reply and ordinary-write restart settlement (including catchable same-daemon retry),
 v7-to-v8 migration, a shared write/startup lifecycle-evidence matrix, unknown D2 schema objects,
 corrupt persisted shapes and atomic malformed-write rollback, bounded redacted audit facts with a
-reserved winner slot plus exact winner-audit correlation, lease renewal and nonblocking busy-owner
-passes across two store instances, forced expiry before mutation, fixed-option-only empty input
+reserved winner slot plus exact winner-audit correlation, mandatory terminal pre-read evidence,
+malformed/missing owner-expiry pairs, PID-reuse takeover at exact expiry with stale-completion
+fencing, lease renewal and nonblocking busy-owner passes across two store instances, forced expiry
+before mutation, never-settling injected Slack updates, production fetch abort, and a
+deadline-during-retry-sleep case proving no later request starts, fixed-option-only empty input
 state, and the production
 CLI/Socket-to-Orca path including Socket-close failure draining and periodic owner-death takeover.
 
 Focused command:
 
 ```text
-pnpm --dir apps/orca-slack-bridge exec vitest run test/gate-resolution-store.test.ts test/gate-action-handler.test.ts test/gate-resolve.test.ts test/gate-publish.test.ts test/cli-daemon.test.ts
+pnpm --dir apps/orca-slack-bridge exec vitest run test/gate-resolution-store.test.ts test/gate-action-handler.test.ts test/gate-resolve.test.ts test/gate-publish.test.ts test/cli-daemon.test.ts test/post.test.ts
 
-5 test files passed; 77 tests passed.
+6 test files passed; 116 tests passed.
 ```
 
 Full local suite at the implementation checkpoint:
@@ -60,7 +67,7 @@ Full local suite at the implementation checkpoint:
 ```text
 pnpm test
 
-39 test files passed; 907 tests passed.
+39 test files passed; 918 tests passed.
 ```
 
 ## Base-fails / head-passes contract evidence
@@ -105,6 +112,17 @@ promotion can strand the intent until Slack redelivers. The CAS starts only with
 headroom, but an uninterruptible storage stall can still consume the remaining budget; such a late
 completion gets exactly one ACK attempt, is audited, and is kept non-runnable rather than silently
 mutating Orca.
+
+A Slack update timeout is delivery-unknown. The Bridge releases its local owner and keeps the
+durable card outbox pending for replay; the production Web API fetch observes cancellation, but an
+injected third-party `SlackPoster` that ignores `AbortSignal` can still physically settle late.
+Local owner/revision fencing only prevents that timed-out call from committing local projection
+state. If its remote write applies after a newer successful projection, Slack exposes no CAS or
+readback fence here: the older card can overwrite the newer one while the local fingerprint/outbox
+already says current, so automatic reconciliation may skip it until another generation or forced
+reprojection. Production cancellation narrows this interval but cannot prove server-side
+non-application once delivery is unknown; Slack's remote-write ordering cannot be made atomic with
+the SQLite timeout transition.
 
 An ordinary Run observer holds a durable pre-Slack write fence while it updates the shared Gate
 card. A click during that short interval is still ACKed exactly once but is rejected fail-closed;

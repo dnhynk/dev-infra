@@ -197,12 +197,117 @@ describe('schema v8 strict persisted shape', () => {
     projectionStore.close();
     const invalidProjectionOwner = new DatabaseSync(invalidProjectionOwnerPath);
     invalidProjectionOwner.prepare(
-      "UPDATE gate_resolution_outbox SET projection_owner = 'https://secret.invalid/token'",
-    ).run();
+      `UPDATE gate_resolution_outbox
+          SET projection_owner = 'https://secret.invalid/token', projection_expires_at = ?`,
+    ).run(LEASE_EXPIRY);
     invalidProjectionOwner.close();
     expect(() => new SqliteDigestStore(invalidProjectionOwnerPath)).toThrow(
       /projection_owner|projection owner/,
     );
+  });
+
+  it('rejects malformed durable ordinary/projection owner expiry shapes on reopen', () => {
+    const cases = [
+      {
+        name: 'ordinary-owner-without-expiry',
+        prepare: (store: SqliteDigestStore) => {
+          seed(store);
+          expect(store.beginGateObservationWrite(GATE, AT)).toBe(true);
+        },
+        sql: 'UPDATE gate_local_observation SET write_expires_at = NULL',
+        ignoreChecks: true,
+      },
+      {
+        name: 'ordinary-expiry-without-owner',
+        prepare: (store: SqliteDigestStore) => seed(store),
+        sql: "UPDATE gate_local_observation SET write_expires_at = '2026-08-24T10:01:00.000Z'",
+        ignoreChecks: true,
+      },
+      {
+        name: 'ordinary-malformed-expiry',
+        prepare: (store: SqliteDigestStore) => {
+          seed(store);
+          expect(store.beginGateObservationWrite(GATE, AT)).toBe(true);
+        },
+        sql: "UPDATE gate_local_observation SET write_expires_at = 'not-an-iso-date'",
+        ignoreChecks: false,
+      },
+      {
+        name: 'projection-owner-without-expiry',
+        prepare: (store: SqliteDigestStore) => {
+          seed(store);
+          expect(claim(store).kind).toBe('claimed');
+        },
+        sql: "UPDATE gate_resolution_outbox SET projection_owner = 't.corrupt-owner'",
+        ignoreChecks: true,
+      },
+      {
+        name: 'projection-expiry-without-owner',
+        prepare: (store: SqliteDigestStore) => {
+          seed(store);
+          expect(claim(store).kind).toBe('claimed');
+        },
+        sql: "UPDATE gate_resolution_outbox SET projection_expires_at = '2026-08-24T10:01:00.000Z'",
+        ignoreChecks: true,
+      },
+      {
+        name: 'projection-malformed-expiry',
+        prepare: (store: SqliteDigestStore) => {
+          seed(store);
+          const claimed = claim(store);
+          if (claimed.kind !== 'claimed') throw new Error('claim failed');
+          const outbox = store.findGateResolutionOutbox(GATE);
+          if (outbox === null) throw new Error('outbox missing');
+          expect(store.acquireGateOutboxProjection(
+            GATE, outbox.revision, PROJECTION_OWNER, AT,
+          )).toBe('acquired');
+        },
+        sql: "UPDATE gate_resolution_outbox SET projection_expires_at = 'not-an-iso-date'",
+        ignoreChecks: false,
+      },
+    ];
+
+    for (const corruption of cases) {
+      const corruptPath = join(dir, `${corruption.name}.db`);
+      const store = new SqliteDigestStore(corruptPath);
+      corruption.prepare(store);
+      store.close();
+      const raw = new DatabaseSync(corruptPath);
+      if (corruption.ignoreChecks) raw.exec('PRAGMA ignore_check_constraints = ON');
+      raw.exec(corruption.sql);
+      raw.close();
+      expect(() => new SqliteDigestStore(corruptPath)).toThrow(/integrity|owner|expiry|ISO/);
+    }
+  });
+
+  it('accepts well-shaped expired owners on reopen so reconciliation can recover them', () => {
+    const ordinaryPath = join(dir, 'expired-ordinary-owner.db');
+    const ordinary = new SqliteDigestStore(ordinaryPath);
+    seed(ordinary);
+    expect(ordinary.beginGateObservationWrite(GATE, AT)).toBe(true);
+    ordinary.close();
+    const reopenedOrdinary = new SqliteDigestStore(ordinaryPath, {
+      observationOwnerAlive: () => true,
+    });
+    expect(reopenedOrdinary.findGateLocalObservation(GATE)?.mappingState).toBe('write_pending');
+    reopenedOrdinary.close();
+
+    const projectionPath = join(dir, 'expired-projection-owner.db');
+    const projection = new SqliteDigestStore(projectionPath);
+    seed(projection);
+    const claimed = claim(projection);
+    if (claimed.kind !== 'claimed') throw new Error('claim failed');
+    const outbox = projection.findGateResolutionOutbox(GATE);
+    if (outbox === null) throw new Error('outbox missing');
+    expect(projection.acquireGateOutboxProjection(
+      GATE, outbox.revision, PROJECTION_OWNER, AT,
+    )).toBe('acquired');
+    projection.close();
+    const reopenedProjection = new SqliteDigestStore(projectionPath, {
+      observationOwnerAlive: () => true,
+    });
+    expect(reopenedProjection.findGateResolutionOutbox(GATE)?.cardPending).toBe(true);
+    reopenedProjection.close();
   });
 
   it('rejects unknown triggers and indexes on every code-owned D2 table', () => {
@@ -392,6 +497,73 @@ describe('schema v8 strict persisted shape', () => {
     staleRaw.prepare('UPDATE gate_resolution SET post_read_json = ?').run(JSON.stringify(snapshot));
     staleRaw.close();
     expect(() => new SqliteDigestStore(stalePostPath)).toThrow(/lifecycle evidence/);
+  });
+
+  it('rejects resolved and conflict rows whose mandatory pre-read evidence is missing on reopen', () => {
+    const pending = {
+      gateId: 'gate_d2c', runId: 'run_d2c', taskId: 'task_d2c',
+      options: ['현행 유지', '변경'], status: 'pending' as const,
+      resolution: null, resolvedAt: null,
+    };
+    const selected = {
+      ...pending,
+      status: 'resolved' as const,
+      resolution: '현행 유지',
+      resolvedAt: '2026-08-24T10:00:01.000Z',
+    };
+    const external = {
+      ...pending,
+      status: 'resolved' as const,
+      resolution: '외부 결정',
+      resolvedAt: '2026-08-24T10:00:01.000Z',
+    };
+
+    for (const lifecycle of ['resolved', 'conflict'] as const) {
+      const corruptPath = join(dir, `terminal-missing-pre-${lifecycle}.db`);
+      const store = new SqliteDigestStore(corruptPath);
+      seed(store);
+      const claimed = claim(store);
+      if (claimed.kind !== 'claimed') throw new Error(`${lifecycle} claim failed`);
+      if (store.markGateResolutionAck(GATE, claimed.intent.revision, 'acked', AT) === null) {
+        throw new Error(`${lifecycle} ACK failed`);
+      }
+      const leased = lease(store);
+      const preRead = store.updateGateResolution(GATE, leased.revision, LEASE, {
+        lifecycle: 'pre_read', preRead: pending, at: AT,
+      });
+      if (preRead === null) throw new Error(`${lifecycle} pre-read failed`);
+      if (lifecycle === 'conflict') {
+        expect(store.updateGateResolution(GATE, preRead.revision, LEASE, {
+          lifecycle: 'conflict',
+          postRead: external,
+          errorCode: 'external_resolution',
+          at: AT,
+        })?.lifecycle).toBe('conflict');
+      } else {
+        const resolving = store.updateGateResolution(GATE, preRead.revision, LEASE, {
+          lifecycle: 'resolving', at: AT,
+        });
+        if (resolving === null) throw new Error('resolving transition failed');
+        const result = store.updateGateResolution(GATE, resolving.revision, LEASE, {
+          lifecycle: 'post_read',
+          resolveResult: {
+            gate: selected,
+            mutation: { requestId: REQUEST, replayed: false },
+          },
+          at: AT,
+        });
+        if (result === null) throw new Error('result persistence failed');
+        expect(store.updateGateResolution(GATE, result.revision, LEASE, {
+          lifecycle: 'resolved', postRead: selected, at: AT,
+        })?.lifecycle).toBe('resolved');
+      }
+      store.close();
+
+      const raw = new DatabaseSync(corruptPath);
+      raw.prepare('UPDATE gate_resolution SET pre_read_json = NULL').run();
+      raw.close();
+      expect(() => new SqliteDigestStore(corruptPath)).toThrow(/lifecycle evidence/);
+    }
   });
 
   it('requires exactly one canonical winner audit and rejects orphan claimed audits', () => {
@@ -601,6 +773,74 @@ describe('Gate-local durable CAS and outbox', () => {
       GATE, secondOwner, '2026-08-24T10:02:00.000Z', '2026-08-24T10:03:00.000Z',
     ).kind).toBe('acquired');
     store.close();
+  });
+
+  it('ordinary and projection owner expiry overrides a reused live PID and fences stale completion', () => {
+    const firstOrdinary = new SqliteDigestStore(path, {
+      observationWriteOwner: `p${process.pid}.ordinary-one`,
+      observationOwnerAlive: () => true,
+    });
+    seed(firstOrdinary);
+    const secondOrdinary = new SqliteDigestStore(path, {
+      observationWriteOwner: `p${process.pid}.ordinary-two`,
+      observationOwnerAlive: () => true,
+    });
+    expect(firstOrdinary.beginGateObservationWrite(GATE, AT)).toBe(true);
+    expect(secondOrdinary.beginGateObservationWrite(
+      GATE, '2026-08-24T10:00:29.999Z',
+    )).toBe(false);
+    expect(secondOrdinary.beginGateObservationWrite(
+      GATE, '2026-08-24T10:00:30.000Z',
+    )).toBe(true);
+    expect(() => firstOrdinary.updateGateObservation(
+      GATE,
+      'stale-ordinary-fingerprint',
+      '2026-08-24T10:00:30.001Z',
+      {
+        gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+        resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+      },
+    )).toThrow(/owner/);
+    expect(secondOrdinary.findGateMessage(GATE)?.renderFingerprint).toBe('fp');
+    firstOrdinary.close();
+    secondOrdinary.close();
+
+    const projectionPath = join(dir, 'projection-owner-expiry.db');
+    const firstProjection = new SqliteDigestStore(projectionPath, {
+      observationOwnerAlive: () => true,
+    });
+    seed(firstProjection);
+    const claimed = claim(firstProjection);
+    if (claimed.kind !== 'claimed') throw new Error('projection claim failed');
+    if (firstProjection.markGateResolutionAck(GATE, claimed.intent.revision, 'acked', AT) === null) {
+      throw new Error('projection ACK failed');
+    }
+    const secondProjection = new SqliteDigestStore(projectionPath, {
+      observationOwnerAlive: () => true,
+    });
+    const firstOutbox = firstProjection.findGateResolutionOutbox(GATE);
+    if (firstOutbox === null) throw new Error('projection outbox missing');
+    const firstOwner = `p${process.pid}.projection-one`;
+    const secondOwner = `p${process.pid}.projection-two`;
+    expect(firstProjection.acquireGateOutboxProjection(
+      GATE, firstOutbox.revision, firstOwner, AT,
+    )).toBe('acquired');
+    expect(secondProjection.acquireGateOutboxProjection(
+      GATE, firstOutbox.revision, secondOwner, '2026-08-24T10:00:29.999Z',
+    )).toBe('busy');
+    expect(secondProjection.acquireGateOutboxProjection(
+      GATE, firstOutbox.revision, secondOwner, '2026-08-24T10:00:30.000Z',
+    )).toBe('recovered');
+    expect(firstProjection.markGateOutboxProjected(
+      GATE,
+      firstOutbox.revision,
+      'stale-projection-fingerprint',
+      firstOwner,
+      '2026-08-24T10:00:30.001Z',
+    )).toBe(false);
+    expect(secondProjection.findGateMessage(GATE)?.renderFingerprint).toBe('fp');
+    firstProjection.close();
+    secondProjection.close();
   });
 
   it('attempt/audit facts are append-only bounded and redact URL/token details', () => {

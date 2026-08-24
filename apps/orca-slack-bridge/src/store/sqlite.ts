@@ -326,8 +326,8 @@ UPDATE gate_message SET render_fingerprint = ?, updated_at = ? WHERE gate_key = 
 const UPSERT_GATE_LOCAL_OBSERVATION = `
 INSERT INTO gate_local_observation
   (gate_key, run_key, task_key, status, resolution, resolved_at, metadata_state, mapping_state,
-   write_owner, observed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+   write_owner, write_expires_at, observed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
 ON CONFLICT (gate_key) DO UPDATE SET
   run_key = excluded.run_key,
   task_key = excluded.task_key,
@@ -337,12 +337,13 @@ ON CONFLICT (gate_key) DO UPDATE SET
   metadata_state = excluded.metadata_state,
   mapping_state = excluded.mapping_state,
   write_owner = NULL,
+  write_expires_at = NULL,
   observed_at = excluded.observed_at
 WHERE gate_local_observation.mapping_state <> 'write_pending'`;
 
 const SELECT_GATE_LOCAL_OBSERVATION = `
 SELECT gate_key, run_key, task_key, status, resolution, resolved_at, metadata_state, mapping_state,
-       write_owner, observed_at
+       write_owner, write_expires_at, observed_at
   FROM gate_local_observation WHERE gate_key = ?`;
 
 const SELECT_GATE_MESSAGE_BY_SLACK = `
@@ -416,14 +417,14 @@ UPDATE gate_resolution
 const INSERT_GATE_OUTBOX = `
 INSERT INTO gate_resolution_outbox
   (gate_key, revision, card_state, card_pending, notification_state, projected_at,
-   projection_owner, last_error_code, created_at, updated_at)
-VALUES (?, 0, 'resolving', 1, 'pending', NULL, NULL, NULL, ?, ?)`;
+   projection_owner, projection_expires_at, last_error_code, created_at, updated_at)
+VALUES (?, 0, 'resolving', 1, 'pending', NULL, NULL, NULL, NULL, ?, ?)`;
 
 const UPSERT_GATE_OUTBOX_PROGRESS = `
 INSERT INTO gate_resolution_outbox
   (gate_key, revision, card_state, card_pending, notification_state, projected_at,
-   projection_owner, last_error_code, created_at, updated_at)
-VALUES (?, 0, ?, 1, 'pending', NULL, NULL, ?, ?, ?)
+   projection_owner, projection_expires_at, last_error_code, created_at, updated_at)
+VALUES (?, 0, ?, 1, 'pending', NULL, NULL, NULL, ?, ?, ?)
 ON CONFLICT (gate_key) DO UPDATE SET
   revision = gate_resolution_outbox.revision + 1,
   card_state = excluded.card_state,
@@ -435,21 +436,22 @@ ON CONFLICT (gate_key) DO UPDATE SET
 
 const SELECT_PENDING_GATE_OUTBOXES = `
 SELECT o.gate_key, o.revision, o.card_state, o.card_pending, o.notification_state, o.projected_at,
-       o.projection_owner, o.last_error_code, o.created_at, o.updated_at
+       o.projection_owner, o.projection_expires_at, o.last_error_code, o.created_at, o.updated_at
   FROM gate_resolution_outbox o
  WHERE o.card_pending = 1
  ORDER BY o.gate_key`;
 
 const SELECT_GATE_OUTBOX = `
 SELECT gate_key, revision, card_state, card_pending, notification_state, projected_at,
-       projection_owner, last_error_code, created_at, updated_at
+       projection_owner, projection_expires_at, last_error_code, created_at, updated_at
   FROM gate_resolution_outbox WHERE gate_key = ?`;
 
 const MARK_GATE_OUTBOX_PROJECTED = `
 UPDATE gate_resolution_outbox
    SET revision = revision + 1, card_pending = 0, projected_at = ?, projection_owner = NULL,
+       projection_expires_at = NULL,
        updated_at = ?
- WHERE gate_key = ? AND revision = ? AND projection_owner = ?`;
+ WHERE gate_key = ? AND revision = ? AND projection_owner = ? AND projection_expires_at > ?`;
 
 const INSERT_GATE_AUDIT_BOUNDED = `
 INSERT INTO gate_resolution_audit (gate_key, event, reason, created_at)
@@ -559,6 +561,7 @@ type GateLocalObservationRow = {
   readonly metadata_state: string;
   readonly mapping_state: string;
   readonly write_owner: string | null;
+  readonly write_expires_at: string | null;
   readonly observed_at: string;
 };
 
@@ -603,6 +606,7 @@ type GateOutboxRow = {
   readonly notification_state: string;
   readonly projected_at: string | null;
   readonly projection_owner: string | null;
+  readonly projection_expires_at: string | null;
   readonly last_error_code: string | null;
   readonly created_at: string;
   readonly updated_at: string;
@@ -665,8 +669,14 @@ function storedLeaseOwner(value: unknown, at: string): string {
   return owner;
 }
 
-/** Fail closed unless a persisted process owner is provably gone. */
+/** Process liveness permits early recovery; persisted expiry is always authoritative. */
 const LIVE_OBSERVATION_WRITE_OWNERS = new Set<string>();
+/** Longer than the bounded production Slack update; expiry wins even if an owner PID is reused. */
+const OBSERVATION_WRITE_LEASE_MS = 30_000;
+
+function observationWriteExpiry(at: string): string {
+  return new Date(new Date(at).valueOf() + OBSERVATION_WRITE_LEASE_MS).toISOString();
+}
 
 function observationOwnerAlive(owner: string): boolean {
   const match = /^p([1-9]\d{0,9})\./.exec(owner);
@@ -771,10 +781,19 @@ function toGateLocalObservation(row: GateLocalObservationRow): GateLocalObservat
   ) {
     throw new TypeError(`${row.gate_key}의 local observation mapping_state가 잘못됐다`);
   }
-  if ((row.mapping_state === 'write_pending') !== (row.write_owner !== null)) {
+  if (
+    (row.mapping_state === 'write_pending') !== (row.write_owner !== null) ||
+    (row.write_owner === null) !== (row.write_expires_at === null)
+  ) {
     throw new TypeError(`${row.gate_key}의 local observation write owner shape가 잘못됐다`);
   }
-  if (row.write_owner !== null) storedLeaseOwner(row.write_owner, `${row.gate_key}.write_owner`);
+  if (row.write_owner !== null) {
+    storedLeaseOwner(row.write_owner, `${row.gate_key}.write_owner`);
+    const expiresAt = storedIso(row.write_expires_at, `${row.gate_key}.write_expires_at`);
+    if (expiresAt <= storedIso(row.observed_at, `${row.gate_key}.observed_at`)) {
+      throw new TypeError(`${row.gate_key}의 ordinary write expiry가 시작 시각 뒤가 아니다`);
+    }
+  }
   if (row.status === 'pending' && (row.resolution !== null || row.resolved_at !== null)) {
     throw new TypeError(`${row.gate_key}의 pending local observation이 모순된다`);
   }
@@ -837,7 +856,8 @@ function validateGateLifecycleEvidence(intent: GateResolutionIntent, at: string)
         ['resolved', 'conflict', 'degraded'].includes(intent.lifecycle))) ||
     (intent.lifecycle === 'claimed' &&
       (intent.preRead !== null || intent.resolveResult !== null || intent.postRead !== null)) ||
-    (['pre_read', 'resolving', 'post_read'].includes(intent.lifecycle) && intent.preRead === null) ||
+    (['pre_read', 'resolving', 'post_read', 'resolved', 'conflict'].includes(intent.lifecycle) &&
+      intent.preRead === null) ||
     (intent.lifecycle === 'post_read' && intent.resolveResult === null) ||
     (intent.lifecycle === 'conflict' && intent.postRead === null) ||
     (intent.lifecycle === 'uncertain' && intent.lastErrorCode === null) ||
@@ -930,8 +950,15 @@ function toGateOutbox(row: GateOutboxRow): GateResolutionOutbox {
   if (row.notification_state !== 'pending') {
     throw new TypeError(`${row.gate_key}의 D2 notification state가 pending이 아니다`);
   }
+  if ((row.projection_owner === null) !== (row.projection_expires_at === null)) {
+    throw new TypeError(`${row.gate_key}의 projection owner expiry shape가 잘못됐다`);
+  }
   if (row.projection_owner !== null) {
     storedLeaseOwner(row.projection_owner, `${row.gate_key}.projection_owner`);
+    storedIso(
+      row.projection_expires_at,
+      `${row.gate_key}.projection_expires_at`,
+    );
     if (row.card_pending !== 1) {
       throw new TypeError(`${row.gate_key}의 projected outbox에 projection owner가 남아 있다`);
     }
@@ -1573,6 +1600,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           metadata_state: settledMetadataState,
           mapping_state: 'matched',
           write_owner: null,
+          write_expires_at: null,
           observed_at: at,
         });
       }
@@ -1585,8 +1613,10 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           `UPDATE gate_local_observation
               SET run_key = ?, task_key = ?, status = ?, resolution = ?, resolved_at = ?,
                   metadata_state = ?, mapping_state = 'matched', write_owner = NULL,
+                  write_expires_at = NULL,
                   observed_at = ?
-            WHERE gate_key = ? AND mapping_state = 'write_pending' AND write_owner = ?`,
+            WHERE gate_key = ? AND mapping_state = 'write_pending' AND write_owner = ?
+              AND write_expires_at > ?`,
         ).run(
           observation.runKey,
           observation.taskKey,
@@ -1597,6 +1627,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           at,
           gateKey,
           this.observationWriteOwner,
+          at,
         );
         if (Number(settled.changes) !== 1) {
           throw new Error(`${gateKey}의 ordinary write fence를 원자적으로 확정하지 못했다`);
@@ -1648,6 +1679,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       metadata_state: metadataState,
       mapping_state: observation.mappingState,
       write_owner: null,
+      write_expires_at: null,
       observed_at: observation.observedAt,
       });
       // A generic observer snapshot may never clear/replace an in-flight remote-write fence.
@@ -2034,6 +2066,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
 
   beginGateObservationWrite(gateKey: GateKey, at: string): boolean {
     storedIso(at, `${gateKey}.ordinary Gate write fence at`);
+    const expiresAt = observationWriteExpiry(at);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const intent = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as
@@ -2056,22 +2089,32 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           previousOwner === this.observationWriteOwner &&
           !this.activeObservationWrites.has(gateKey)
         ) {
+          const renewed = this.db.prepare(
+            `UPDATE gate_local_observation SET write_expires_at = ?, observed_at = ?
+              WHERE gate_key = ? AND mapping_state = 'write_pending' AND write_owner = ?`,
+          ).run(expiresAt, at, gateKey, previousOwner);
+          if (Number(renewed.changes) !== 1) {
+            this.db.exec('COMMIT');
+            return false;
+          }
           this.activeObservationWrites.add(gateKey);
           this.db.exec('COMMIT');
           return true;
         }
+        const previousExpiry = observation.write_expires_at;
         if (
           previousOwner === null ||
+          previousExpiry === null ||
           this.activeObservationWrites.has(gateKey) ||
-          this.isObservationOwnerAlive(previousOwner)
+          (previousExpiry > at && this.isObservationOwnerAlive(previousOwner))
         ) {
           this.db.exec('COMMIT');
           return false;
         }
         const recovered = this.db.prepare(
-          `UPDATE gate_local_observation SET write_owner = ?, observed_at = ?
+          `UPDATE gate_local_observation SET write_owner = ?, write_expires_at = ?, observed_at = ?
             WHERE gate_key = ? AND mapping_state = 'write_pending' AND write_owner = ?`,
-        ).run(this.observationWriteOwner, at, gateKey, previousOwner);
+        ).run(this.observationWriteOwner, expiresAt, at, gateKey, previousOwner);
         if (Number(recovered.changes) !== 1) {
           this.db.exec('COMMIT');
           return false;
@@ -2082,9 +2125,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       }
       const result = this.db.prepare(
         `UPDATE gate_local_observation
-            SET mapping_state = 'write_pending', write_owner = ?, observed_at = ?
+            SET mapping_state = 'write_pending', write_owner = ?, write_expires_at = ?, observed_at = ?
           WHERE gate_key = ? AND mapping_state = 'matched' AND write_owner IS NULL`,
-      ).run(this.observationWriteOwner, at, gateKey);
+      ).run(this.observationWriteOwner, expiresAt, at, gateKey);
       if (Number(result.changes) !== 1) {
         this.db.exec('COMMIT');
         return false;
@@ -2111,6 +2154,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     storedRevision(expectedRevision, `${gateKey}.projection expected revision`);
     const safeOwner = storedLeaseOwner(owner, `${gateKey}.projection owner`);
     storedIso(at, `${gateKey}.projection acquire at`);
+    const expiresAt = observationWriteExpiry(at);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const row = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as GateOutboxRow | undefined;
@@ -2118,12 +2162,22 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         this.db.exec('COMMIT');
         return 'superseded';
       }
-      if (row.projection_owner === safeOwner) {
+      if (
+        row.projection_owner === safeOwner &&
+        row.projection_expires_at !== null &&
+        row.projection_expires_at > at
+      ) {
         this.db.exec('COMMIT');
         return 'acquired';
       }
       if (row.projection_owner !== null) {
-        if (this.isObservationOwnerAlive(row.projection_owner)) {
+        if (row.projection_expires_at === null) {
+          throw new Error(`${gateKey}의 projection owner expiry가 없다`);
+        }
+        if (
+          row.projection_expires_at > at &&
+          this.isObservationOwnerAlive(row.projection_owner)
+        ) {
           this.db.exec('COMMIT');
           return 'busy';
         }
@@ -2132,9 +2186,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         const recovered = this.db.prepare(
           `UPDATE gate_resolution_outbox
               SET revision = revision + 1, card_pending = 1, projected_at = NULL,
-                  projection_owner = ?, updated_at = ?
+                  projection_owner = ?, projection_expires_at = ?, updated_at = ?
             WHERE gate_key = ? AND revision = ? AND projection_owner = ?`,
-        ).run(safeOwner, at, gateKey, expectedRevision, row.projection_owner);
+        ).run(safeOwner, expiresAt, at, gateKey, expectedRevision, row.projection_owner);
         if (Number(recovered.changes) !== 1) {
           this.db.exec('COMMIT');
           return 'superseded';
@@ -2145,9 +2199,10 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         return 'recovered';
       }
       const acquired = this.db.prepare(
-        `UPDATE gate_resolution_outbox SET projection_owner = ?, updated_at = ?
+        `UPDATE gate_resolution_outbox
+            SET projection_owner = ?, projection_expires_at = ?, updated_at = ?
           WHERE gate_key = ? AND revision = ? AND projection_owner IS NULL`,
-      ).run(safeOwner, at, gateKey, expectedRevision);
+      ).run(safeOwner, expiresAt, at, gateKey, expectedRevision);
       if (Number(acquired.changes) !== 1) {
         this.db.exec('COMMIT');
         return 'superseded';
@@ -2181,6 +2236,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         gateKey,
         expectedRevision,
         safeOwner,
+        at,
       );
       if (Number(result.changes) !== 1) {
         this.db.exec('COMMIT');
@@ -2206,7 +2262,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     const result = this.db.prepare(
       `UPDATE gate_resolution_outbox
           SET revision = revision + 1, card_pending = 1, projected_at = NULL,
-              projection_owner = NULL, updated_at = ?
+              projection_owner = NULL, projection_expires_at = NULL, updated_at = ?
         WHERE gate_key = ? AND projection_owner = ?`,
     ).run(at, gateKey, safeOwner);
     LIVE_OBSERVATION_WRITE_OWNERS.delete(safeOwner);
@@ -2640,7 +2696,7 @@ const V8_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   ],
   gate_local_observation: [
     'gate_key', 'run_key', 'task_key', 'status', 'resolution', 'resolved_at',
-    'metadata_state', 'mapping_state', 'write_owner', 'observed_at',
+    'metadata_state', 'mapping_state', 'write_owner', 'write_expires_at', 'observed_at',
   ],
   gate_resolution: [
     'gate_key', 'revision', 'ack_state', 'lease_owner', 'lease_expires_at',
@@ -2653,7 +2709,7 @@ const V8_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   ],
   gate_resolution_outbox: [
     'gate_key', 'revision', 'card_state', 'card_pending', 'notification_state', 'projected_at',
-    'projection_owner', 'last_error_code', 'created_at', 'updated_at',
+    'projection_owner', 'projection_expires_at', 'last_error_code', 'created_at', 'updated_at',
   ],
   gate_resolution_attempt: ['id', 'gate_key', 'phase', 'outcome', 'detail', 'created_at'],
   gate_resolution_audit: ['id', 'gate_key', 'event', 'reason', 'created_at'],
@@ -2724,7 +2780,7 @@ function validateV8Store(
   ).all() as GateMessageRow[]).map(toGateMessage);
   const observations = (db.prepare(
     `SELECT gate_key, run_key, task_key, status, resolution, resolved_at,
-            metadata_state, mapping_state, write_owner, observed_at
+            metadata_state, mapping_state, write_owner, write_expires_at, observed_at
        FROM gate_local_observation ORDER BY gate_key`,
   ).all() as GateLocalObservationRow[]).map(toGateLocalObservation);
   const intents = (db.prepare(SELECT_ALL_GATE_RESOLUTIONS).all() as GateResolutionRow[]).map(
@@ -2733,7 +2789,7 @@ function validateV8Store(
   fault?.('after_resolution_rows');
   const outboxes = (db.prepare(
     `SELECT gate_key, revision, card_state, card_pending, notification_state, projected_at,
-            projection_owner, last_error_code, created_at, updated_at
+            projection_owner, projection_expires_at, last_error_code, created_at, updated_at
        FROM gate_resolution_outbox ORDER BY gate_key`,
   ).all() as GateOutboxRow[]).map(toGateOutbox);
   const observationByGate = new Map(observations.map((row) => [row.gateKey, row]));

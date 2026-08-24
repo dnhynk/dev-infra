@@ -155,6 +155,36 @@ describe('Run 루트 재사용', () => {
     expect(mapped?.renderFingerprint).not.toBe(first.fingerprint);
   });
 
+  it('Run root update가 응답하지 않아도 deadline 뒤 durable 관찰을 전진시키지 않는다', async () => {
+    const store = new SqliteDigestStore(dbPath);
+    const firstSlack = new FakeSlack();
+    const first = await publishRunCard(options(store, firstSlack), input());
+    const hanging: SlackPoster = {
+      async post(): Promise<PostedMessage> {
+        throw new Error('부르면 안 된다');
+      },
+      async update(): Promise<PostedMessage> {
+        return await new Promise<PostedMessage>(() => undefined);
+      },
+    };
+    const changed = facts({ tasks: { total: 11, byStatus: [{ status: 'ready', count: 11 }] } });
+    const began = Date.now();
+
+    await expect(
+      publishRunCard(
+        { ...options(store, hanging), slackTimeoutMs: 10 },
+        input(changed),
+      ),
+    ).rejects.toThrow('Slack card update deadline exceeded');
+    const elapsed = Date.now() - began;
+    const mapped = store.findRunMessage(runKey(RUN_ID));
+    store.close();
+
+    expect(elapsed).toBeLessThan(1_000);
+    expect(mapped?.messageTs).toBe(first.messageTs);
+    expect(mapped?.renderFingerprint).toBe(first.fingerprint);
+  });
+
   // 판정 근거가 프로세스 메모리가 아니라 durable 파일이라는 것을 store를 닫았다 여는 것으로 본다.
   it('재시작 뒤에도 같은 루트를 재사용한다', async () => {
     const firstStore = new SqliteDigestStore(dbPath);

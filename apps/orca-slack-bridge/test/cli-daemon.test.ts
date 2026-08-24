@@ -94,7 +94,7 @@ function ownTerminalProjection(): SqliteDigestStore {
     GATE,
     outbox.revision,
     `p${process.pid}.startup-projector`,
-    AT,
+    new Date().toISOString(),
   );
   if (acquired !== 'acquired') throw new Error(`projection seed failed: ${acquired}`);
   return store;
@@ -176,6 +176,17 @@ class NeverSettlingOrca implements OrcaRunner {
   run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
     return new Promise<string>(() => undefined);
+  }
+}
+
+class NeverSettlingSlack implements SlackPoster {
+  readonly updates: UpdateMessageInput[] = [];
+  post(_input: PostMessageInput): Promise<PostedMessage> {
+    return Promise.reject(new Error('unused'));
+  }
+  update(input: UpdateMessageInput): Promise<PostedMessage> {
+    this.updates.push(input);
+    return new Promise(() => undefined);
   }
 }
 
@@ -350,6 +361,40 @@ describe('daemon production wiring', () => {
     expect(reopened.findGateResolution(GATE)).toMatchObject({
       lifecycle: 'uncertain', lastErrorCode: 'pre_read_failed', leaseOwner: null,
     });
+    reopened.close();
+  });
+
+  it('never-settling startup Slack projections are bounded and leave a replayable card', async () => {
+    seed();
+    claimPendingIntent();
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const orca = new FakeOrca();
+    const slack = new NeverSettlingSlack();
+    let starts = 0;
+    const began = Date.now();
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      orca,
+      slack,
+      slackTimeoutMs: 10,
+      connectionFactory: () => ({
+        start: () => { starts += 1; return Promise.resolve({ appId: 'A0APP' }); },
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+    });
+    expect(Date.now() - began).toBeLessThan(1_000);
+    expect(code).toBe(0);
+    expect(starts).toBe(1);
+    expect(slack.updates).toHaveLength(3);
+    expect(orca.calls.map((call) => call[1])).toEqual([
+      'gate-list', 'gate-list', 'gate-resolve', 'gate-list',
+    ]);
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'resolved', leaseOwner: null,
+    });
+    expect(reopened.listPendingGateOutboxes()).toHaveLength(1);
     reopened.close();
   });
 

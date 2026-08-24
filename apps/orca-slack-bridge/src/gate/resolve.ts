@@ -6,7 +6,7 @@ import {
   type ExactGateIdentity,
   type OrcaRunner,
 } from '../orca/client.js';
-import type { SlackPoster } from '../slack/post.js';
+import { DEFAULT_SLACK_UPDATE_TIMEOUT_MS, type SlackPoster } from '../slack/post.js';
 import type { GateStore } from '../store/schema.js';
 import { projectGateResolutionCard } from './resolution-project.js';
 import type { GateResolutionIntent, GateResolveResult, GateSnapshot } from './resolution-types.js';
@@ -26,6 +26,7 @@ export type GateResolutionEngineOptions = {
   readonly leaseNow?: () => Date;
   readonly leaseOwner?: string;
   readonly leaseDurationMs?: number;
+  readonly slackTimeoutMs?: number;
   readonly fault?: (point: GateResolutionFault, gateKey: GateKey) => void | Promise<void>;
 };
 
@@ -84,6 +85,7 @@ export class GateResolutionEngine {
   private readonly leaseNow: () => Date;
   private readonly leaseOwner: string;
   private readonly leaseDurationMs: number;
+  private readonly slackTimeoutMs: number;
 
   constructor(private readonly options: GateResolutionEngineOptions) {
     this.now = options.now ?? (() => new Date());
@@ -95,6 +97,17 @@ export class GateResolutionEngine {
       100,
       'leaseDurationMs',
     );
+    this.slackTimeoutMs = boundedDuration(
+      options.slackTimeoutMs,
+      DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+      10,
+      'slackTimeoutMs',
+    );
+    if (this.slackTimeoutMs > DEFAULT_SLACK_UPDATE_TIMEOUT_MS) {
+      throw new TypeError(
+        `slackTimeoutMs must be <= ${DEFAULT_SLACK_UPDATE_TIMEOUT_MS} so the durable projection lease stays live`,
+      );
+    }
   }
 
   resolveAndProject(gateKey: GateKey): Promise<void> {
@@ -349,7 +362,14 @@ export class GateResolutionEngine {
   }
 
   private async project(gateKey: GateKey): Promise<void> {
-    await projectGateResolutionCard(this.options.store, this.options.slack, gateKey, this.now);
+    await projectGateResolutionCard(
+      this.options.store,
+      this.options.slack,
+      gateKey,
+      this.now,
+      undefined,
+      this.slackTimeoutMs,
+    );
   }
 
   private async acquireLease(gateKey: GateKey): Promise<GateResolutionIntent | null> {

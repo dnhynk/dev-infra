@@ -2,7 +2,12 @@ import { renderFingerprint, type RenderedCard } from '../digest/render.js';
 import { publishGateCard, type GatePublishResult } from '../gate/publish.js';
 import type { OrcaRunner } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
-import type { SlackPoster, ThreadPoster } from '../slack/post.js';
+import {
+  boundedSlackUpdate,
+  DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  type SlackPoster,
+  type ThreadPoster,
+} from '../slack/post.js';
 import type { GateStore, RunStore } from '../store/schema.js';
 import { collectRunFacts } from './collect.js';
 import {
@@ -102,6 +107,7 @@ export type RunPublishOptions = {
   /** 대상 채널 ID. 설정의 `slack.channels.agentRuns`에서 온다. */
   readonly channel: string;
   readonly now: () => Date;
+  readonly slackTimeoutMs?: number;
 };
 
 /**
@@ -173,12 +179,12 @@ export async function publishRunCard(
     return { ...base, action: 'create', messageTs: posted.ts };
   }
 
-  const updated = await options.slack.update({
+  const updated = await boundedSlackUpdate(options.slack, {
     channel: existing.channelId,
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
-  });
+  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateRunObservation(runKey, fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
 }
@@ -239,12 +245,12 @@ export async function publishRunCollectionCard(
     return { ...base, action: 'create', messageTs: posted.ts };
   }
 
-  const updated = await options.slack.update({
+  const updated = await boundedSlackUpdate(options.slack, {
     channel: existing.channelId,
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
-  });
+  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateRunCollectionObservation(fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
 }
@@ -293,6 +299,9 @@ export async function publishRunCollection(
             thread: options.thread,
             channel: options.channel,
             now: options.now,
+            ...(options.slackTimeoutMs === undefined
+              ? {}
+              : { slackTimeoutMs: options.slackTimeoutMs }),
           },
           run.identity.key,
           rootMessageTs,
@@ -321,6 +330,7 @@ export type RunObserveOptions = {
   /** Gate thread reply boundary. Null together with `slack` means dry-run. */
   readonly thread: ThreadPoster | null;
   readonly now: () => Date;
+  readonly slackTimeoutMs?: number;
 };
 
 /**

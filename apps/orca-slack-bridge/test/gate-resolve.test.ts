@@ -589,6 +589,33 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     store.close();
   });
 
+  it('a never-settling Slack projection times out, releases ownership, and remains replayable', async () => {
+    const store = seed(join(dir, 'outbox-timeout.db'));
+    const hanging: SlackPoster = {
+      post: () => Promise.reject(new Error('unused')),
+      update: () => new Promise(() => undefined),
+    };
+    const began = Date.now();
+    expect(await projectGateResolutionCard(
+      store,
+      hanging,
+      GATE,
+      () => new Date(AT),
+      undefined,
+      10,
+    )).toMatchObject({ kind: 'pending' });
+    expect(Date.now() - began).toBeLessThan(1_000);
+    expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: true });
+
+    const replay = new FakeSlack();
+    expect(await projectGateResolutionCard(
+      store, replay, GATE, () => new Date(AT), undefined, 10,
+    )).toMatchObject({ kind: 'projected' });
+    expect(replay.updates).toHaveLength(1);
+    expect(store.listPendingGateOutboxes()).toEqual([]);
+    store.close();
+  });
+
   it('a stale Slack completion converges to the newer durable card instead of clearing it', async () => {
     const store = seed(join(dir, 'outbox-generation-race.db'));
     const slack = new DeferredFirstSlack();
@@ -679,7 +706,7 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
   it('startup forces the newest card after a stale Slack success crashes before local completion', async () => {
     const path = join(dir, 'projection-crash-before-local.db');
     const firstStore = seed(path);
-    const secondStore = new SqliteDigestStore(path);
+    const secondStore = new SqliteDigestStore(path, { observationOwnerAlive: () => true });
     const staleSlack = new DeferredFirstSlack();
     const stale = projectGateResolutionCard(
       firstStore,
@@ -716,11 +743,23 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     await expect(stale).rejects.toThrow(/projector died/);
     expect(secondStore.findGateResolutionOutbox(GATE)?.cardPending).toBe(true);
 
-    // Model process death: closing the abandoned owner's store removes only its live-process
-    // registration; the durable outbox owner remains for takeover fencing.
+    // Model PID reuse after process death: liveness alone remains true, but durable expiry wins.
     firstStore.close();
+    const reusedPidSlack = new FakeSlack();
+    expect(await projectGateResolutionCard(
+      secondStore,
+      reusedPidSlack,
+      GATE,
+      () => new Date('2026-08-24T10:00:29.999Z'),
+    )).toMatchObject({ kind: 'pending' });
+    expect(reusedPidSlack.updates).toEqual([]);
     const recoveredSlack = new FakeSlack();
-    await projectGateResolutionCard(secondStore, recoveredSlack, GATE, () => new Date(AT));
+    await projectGateResolutionCard(
+      secondStore,
+      recoveredSlack,
+      GATE,
+      () => new Date('2026-08-24T10:00:30.000Z'),
+    );
     expect(recoveredSlack.updates).toHaveLength(1);
     expect(JSON.stringify(recoveredSlack.updates[0])).toContain('degraded');
     expect(secondStore.findGateResolutionOutbox(GATE)?.cardPending).toBe(false);

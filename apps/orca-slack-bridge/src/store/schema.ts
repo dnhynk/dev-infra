@@ -340,9 +340,10 @@ CREATE TABLE gate_local_observation (
   metadata_state TEXT NOT NULL CHECK (metadata_state IN ('matched', 'missing', 'mismatched')),
   mapping_state  TEXT NOT NULL CHECK (mapping_state IN ('matched', 'missing', 'mismatched', 'write_pending')),
   write_owner    TEXT CHECK (write_owner IS NULL OR length(write_owner) BETWEEN 1 AND 80),
+  write_expires_at TEXT,
   observed_at    TEXT NOT NULL,
-  CHECK ((mapping_state = 'write_pending' AND write_owner IS NOT NULL)
-      OR (mapping_state <> 'write_pending' AND write_owner IS NULL)),
+  CHECK ((mapping_state = 'write_pending' AND write_owner IS NOT NULL AND write_expires_at IS NOT NULL)
+      OR (mapping_state <> 'write_pending' AND write_owner IS NULL AND write_expires_at IS NULL)),
   CHECK ((status = 'pending' AND resolution IS NULL AND resolved_at IS NULL)
       OR (status = 'resolved' AND resolution IS NOT NULL AND resolved_at IS NOT NULL)
       OR (status = 'unsupported' AND resolution IS NULL AND resolved_at IS NULL))
@@ -397,10 +398,13 @@ CREATE TABLE gate_resolution_outbox (
   notification_state  TEXT NOT NULL CHECK (notification_state = 'pending'),
   projected_at        TEXT,
   projection_owner    TEXT CHECK (projection_owner IS NULL OR length(projection_owner) BETWEEN 1 AND 80),
+  projection_expires_at TEXT,
   last_error_code     TEXT CHECK (last_error_code IS NULL OR length(last_error_code) <= 80),
   created_at          TEXT NOT NULL,
   updated_at          TEXT NOT NULL,
-  CHECK (card_pending = 1 OR projection_owner IS NULL)
+  CHECK ((projection_owner IS NULL AND projection_expires_at IS NULL)
+      OR (projection_owner IS NOT NULL AND projection_expires_at IS NOT NULL)),
+  CHECK (card_pending = 1 OR (projection_owner IS NULL AND projection_expires_at IS NULL))
 )`;
 
 const GATE_RESOLUTION_OUTBOX_INDEX = `

@@ -212,6 +212,15 @@ class FailOnceGateUpdateSlack extends FakeSlack {
   }
 }
 
+class NeverSettlingGateUpdateSlack extends FakeSlack {
+  override update(input: UpdateMessageInput): Promise<PostedMessage> {
+    this.updates.push(input);
+    return input.ts === FIRST_GATE_TS
+      ? new Promise(() => undefined)
+      : Promise.resolve({ channel: input.channel, ts: input.ts });
+  }
+}
+
 function insertSidecar(store: SqliteDigestStore): void {
   store.insertGateMetadata({
     gateKey: gateKey(GATE_ID),
@@ -563,11 +572,22 @@ describe('collect → project → render → existing Run thread publish', () =>
     } finally {
       store.close();
     }
-    const reopened = new SqliteDigestStore(dbPath);
+    const reopened = new SqliteDigestStore(dbPath, { observationOwnerAlive: () => true });
     try {
       const gate = gateKey(GATE_ID);
       expect(reopened.findGateLocalObservation(gate)?.mappingState).toBe('write_pending');
       orca.gateQuestion = 'ordinary update applied before process death';
+      const reusedPidSlack = new FakeSlack();
+      await runRunObserver(orca, {
+        config: CONFIG,
+        channel: CHANNEL,
+        store: reopened,
+        slack: reusedPidSlack,
+        thread: reusedPidSlack,
+        now: () => new Date('2026-08-24T08:00:29.999Z'),
+      });
+      expect(reusedPidSlack.updates.filter((update) => update.ts === FIRST_GATE_TS)).toEqual([]);
+      expect(reopened.findGateLocalObservation(gate)?.mappingState).toBe('write_pending');
       const recoverySlack = new FakeSlack();
       await runRunObserver(orca, {
         config: CONFIG,
@@ -575,7 +595,7 @@ describe('collect → project → render → existing Run thread publish', () =>
         store: reopened,
         slack: recoverySlack,
         thread: recoverySlack,
-        now: () => new Date('2026-08-24T08:01:00.000Z'),
+        now: () => new Date('2026-08-24T08:00:30.000Z'),
       });
       const gateUpdates = recoverySlack.updates.filter((update) => update.ts === FIRST_GATE_TS);
       expect(gateUpdates).toHaveLength(1);
@@ -619,6 +639,50 @@ describe('collect → project → render → existing Run thread publish', () =>
       const gateUpdates = retrySlack.updates.filter((update) => update.ts === FIRST_GATE_TS);
       expect(gateUpdates).toHaveLength(1);
       expect(JSON.stringify(gateUpdates[0])).toContain('catchable failure must be retried');
+      expect(store.findGateLocalObservation(gate)?.mappingState).toBe('matched');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a never-settling ordinary Gate update times out before its lease and can retry', async () => {
+    const orca = new MutableFakeOrca();
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const initialSlack = new FakeSlack();
+    try {
+      const initial = await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack: initialSlack, thread: initialSlack,
+        now: () => new Date(AT),
+      });
+      const observedGate = initial.facts.runs[0]?.gates.find((gate) => gate.gateId === GATE_ID);
+      if (observedGate === undefined) throw new Error('observed Gate missing');
+      const gate = gateKey(GATE_ID);
+      const hanging = new NeverSettlingGateUpdateSlack();
+      const began = Date.now();
+      await expect(publishGateCard(
+        {
+          store, slack: hanging, thread: hanging, channel: CHANNEL,
+          now: () => new Date('2026-08-24T08:00:00.000Z'), slackTimeoutMs: 10,
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        { ...observedGate, question: 'bounded ordinary update' },
+      )).rejects.toThrow(/deadline/);
+      expect(Date.now() - began).toBeLessThan(1_000);
+      expect(store.findGateLocalObservation(gate)?.mappingState).toBe('write_pending');
+
+      const retry = new FakeSlack();
+      await publishGateCard(
+        {
+          store, slack: retry, thread: retry, channel: CHANNEL,
+          now: () => new Date('2026-08-24T08:00:01.000Z'), slackTimeoutMs: 10,
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        { ...observedGate, question: 'bounded ordinary update' },
+      );
+      expect(retry.updates.filter((update) => update.ts === FIRST_GATE_TS)).toHaveLength(1);
       expect(store.findGateLocalObservation(gate)?.mappingState).toBe('matched');
     } finally {
       store.close();

@@ -1,6 +1,11 @@
 import { renderFingerprint, type RenderedCard } from '../digest/render.js';
 import { taskKey, type RunKey } from '../identity/keys.js';
-import type { SlackPoster, ThreadPoster } from '../slack/post.js';
+import {
+  boundedSlackUpdate,
+  DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  type SlackPoster,
+  type ThreadPoster,
+} from '../slack/post.js';
 import type { GateStore } from '../store/schema.js';
 import { renderGateDecisionCard } from './render.js';
 import { projectGateResolutionCard } from './resolution-project.js';
@@ -32,6 +37,7 @@ export type GatePublishOptions = {
   readonly thread: ThreadPoster | null;
   readonly channel: string;
   readonly now: () => Date;
+  readonly slackTimeoutMs?: number;
   readonly fault?: (
     point:
       | 'after_static_slack_before_observation'
@@ -133,6 +139,8 @@ export async function publishGateCard(
       options.slack,
       gate.key,
       options.now,
+      undefined,
+      options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
     );
     return {
       gate,
@@ -192,6 +200,8 @@ export async function publishGateCard(
         options.slack,
         gate.key,
         options.now,
+        undefined,
+        options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
       );
       return {
         gate,
@@ -205,19 +215,24 @@ export async function publishGateCard(
   }
   let updated: Awaited<ReturnType<SlackPoster['update']>>;
   try {
-    updated = await options.slack.update({
+    updated = await boundedSlackUpdate(options.slack, {
       channel: existing.channelId,
       ts: existing.messageTs,
       text: card.text,
       blocks: card.blocks,
-    });
+    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);
     throw e;
   }
   await options.fault?.('after_static_slack_before_observation', gate.key);
   try {
-    options.store.updateGateObservation(gate.key, fingerprint, at, localObservation);
+    options.store.updateGateObservation(
+      gate.key,
+      fingerprint,
+      options.now().toISOString(),
+      localObservation,
+    );
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);
     throw e;
@@ -232,6 +247,8 @@ export async function publishGateCard(
       options.slack,
       gate.key,
       options.now,
+      undefined,
+      options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
     );
     if (projection.card !== null && projection.fingerprint !== null) {
       return {

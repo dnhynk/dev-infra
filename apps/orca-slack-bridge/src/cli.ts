@@ -608,6 +608,8 @@ export type DaemonDependencies = {
   readonly socketTimeouts?: Partial<SocketTimeouts>;
   /** Production defaults to fifteen seconds and kills the real Orca subprocess at expiry. */
   readonly orcaTimeoutMs?: number;
+  /** Bounds every post-ACK D2 Slack card update; production defaults to fifteen seconds. */
+  readonly slackTimeoutMs?: number;
   /** Production defaults to five seconds; tests may shorten the durable retry cadence. */
   readonly reconcileIntervalMs?: number;
   readonly waitForStop?: () => Promise<void>;
@@ -659,7 +661,14 @@ export async function runDaemonCommand(
     );
     const orca = boundedOrcaRunner(rawOrca, orcaTimeoutMs);
     const slack = dependencies.slack ?? new SlackWebApiPoster({ token: botToken(process.env) });
-    const engine = new GateResolutionEngine({ store, orca, slack });
+    const engine = new GateResolutionEngine({
+      store,
+      orca,
+      slack,
+      ...(dependencies.slackTimeoutMs === undefined
+        ? {}
+        : { slackTimeoutMs: dependencies.slackTimeoutMs }),
+    });
     const handler = new GateActionHandler({
       config: config.slack,
       store,

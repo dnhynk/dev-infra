@@ -1,7 +1,12 @@
 import { renderFingerprint, type RenderedCard } from '../digest/render.js';
 import { randomUUID } from 'node:crypto';
 import type { GateKey } from '../identity/keys.js';
-import type { SlackPoster } from '../slack/post.js';
+import {
+  boundedSlackUpdate,
+  DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  SlackUpdateTimeoutError,
+  type SlackPoster,
+} from '../slack/post.js';
 import type { GateStore } from '../store/schema.js';
 import { renderGateResolutionCard } from './resolution-render.js';
 import type { GateResolutionLifecycle } from './resolution-types.js';
@@ -31,6 +36,7 @@ export async function projectGateResolutionCard(
   gateKey: GateKey,
   now: () => Date,
   fault?: (point: GateProjectionFault, gateKey: GateKey) => void | Promise<void>,
+  timeoutMs = DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
 ): Promise<GateProjectionResult> {
   const projectionOwner = `p${process.pid}.${randomUUID()}`;
   let ownsProjection = false;
@@ -91,16 +97,22 @@ export async function projectGateResolutionCard(
       ownsProjection = true;
       let updated: Awaited<ReturnType<SlackPoster['update']>>;
       try {
-        updated = await slack.update({
+        updated = await boundedSlackUpdate(slack, {
           channel: message.channelId,
           ts: message.messageTs,
           text: card.text,
           blocks: card.blocks,
-        });
-      } catch {
+        }, timeoutMs);
+      } catch (error) {
         store.releaseGateOutboxProjection(gateKey, projectionOwner, now().toISOString());
         ownsProjection = false;
-        store.recordGateAttempt(gateKey, 'card_projection', 'failed', null, now().toISOString());
+        store.recordGateAttempt(
+          gateKey,
+          'card_projection',
+          error instanceof SlackUpdateTimeoutError ? 'timed_out' : 'failed',
+          null,
+          now().toISOString(),
+        );
         return { kind: 'pending', card, fingerprint };
       }
       try {
