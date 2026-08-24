@@ -5,7 +5,9 @@ import { classifyBinding, runIdentity } from '../src/run/liveness.js';
 import type { OrcaRun, OrcaRunner, OrcaTask, OrcaWorker, Read } from '../src/orca/client.js';
 import { askThreadsFrom, listWorkers, readInbox } from '../src/orca/client.js';
 import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
-import type { RunCollection } from '../src/run/types.js';
+import { renderRunCard, renderRunCollectionCard } from '../src/run/render.js';
+import { renderFingerprint } from '../src/digest/render.js';
+import type { RunCollection, RunFacts } from '../src/run/types.js';
 
 /**
  * D1-A Run 사실 집계.
@@ -469,6 +471,27 @@ function collect(over: Record<string, unknown> = {}, config = CONFIG): Promise<R
   return collectRunFacts(orca, config, { now: () => new Date('2026-08-24T00:00:00Z') });
 }
 
+/** 이 Run들을 전부 미등록으로 만드는 조회 대역. 정렬 test가 미등록 목록만 보기 위해 쓴다. */
+const UNREGISTERED_ONLY = {
+  'task-list': {
+    tasks: [taskRow({ created_by_process_incarnation: `${OTHER_REPO_ID}::D:/other@@h:i` })],
+    count: 1,
+  },
+  'worker-list': {
+    workers: [workerRow({ resource: { worktreeId: `${OTHER_REPO_ID}::D:/other` } })],
+  },
+};
+
+/** 컬렉션 카드의 렌더 지문. 목록의 순서가 아니라 카드에 실제로 그려지는 축을 본다. */
+function collectionFingerprint(c: RunCollection): string {
+  return renderFingerprint(
+    renderRunCollectionCard({
+      cards: c.runs.length,
+      collection: { degraded: c.degraded, unregistered: c.unregistered },
+    }),
+  );
+}
+
 describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
   it('등록된 repository의 Run만 표시 대상이다', async () => {
     const c = await collect();
@@ -503,6 +526,106 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
     // 관측은 성공했고 등록에 없었다. 조회 실패와 구분되는 모습이다.
     expect(c.unregistered.runs[0]?.degraded.map((d) => d.kind)).toContain('unregistered_repository');
     expect(c.unregistered.runs[0]?.degraded.map((d) => d.kind)).not.toContain('query_failed');
+  });
+
+  /*
+   * 회귀 방지 — Orca `run-list`의 출력 순서에 기대면 렌더 지문이 흔들린다.
+   *
+   * 미등록 목록은 상위 ENTRY_CAP건만 카드에 싣는다. 순서를 Orca에 맡기면 Orca 정렬이 바뀔 때
+   * 상위 건과 그 나열 순서가 관찰마다 뒤바뀌고, 사실이 그대로여도 지문이 달라져 컬렉션 카드와
+   * 모든 Run 카드의 `skip`이 발화하지 않는다. D1-B가 관측 시각으로 같은 결과를 낸 원인을 두 번에
+   * 걸쳐 닫았다. 이것은 같은 결과를 내는 다른 원인이다.
+   *
+   * 렌더 지문으로 단언한다. 목록의 순서만 보면 카드에 실제로 그려지는 축을 보지 않는 것이다.
+   *
+   * 정렬 키는 `(created_at DESC, id ASC)`다. 지문 안정만 재면 `id`만으로도 통과하므로 **상위
+   * ENTRY_CAP건이 최신 5건인지**도 함께 단언한다. 그 둘이 이 정렬 키가 지는 계약의 전부다.
+   */
+  it('run-list 출력 순서를 뒤집어도 미등록 목록의 렌더 지문이 같고, 상위 건이 최신순이다', async () => {
+    // ENTRY_CAP(5)보다 많아야 "상위 몇 건"이 순서에 따라 갈린다.
+    // id 오름차순과 created_at 내림차순이 정반대가 되게 둔다 — 두 키를 구분하지 못하면 실패한다.
+    const rows = [
+      { ...RUN_ROW, id: 'run_1', created_at: '2026-08-23T01:00:00Z' },
+      { ...RUN_ROW, id: 'run_2', created_at: '2026-08-23T02:00:00Z' },
+      { ...RUN_ROW, id: 'run_3', created_at: '2026-08-23T03:00:00Z' },
+      { ...RUN_ROW, id: 'run_4', created_at: '2026-08-23T04:00:00Z' },
+      { ...RUN_ROW, id: 'run_5', created_at: '2026-08-23T05:00:00Z' },
+      { ...RUN_ROW, id: 'run_6', created_at: '2026-08-23T06:00:00Z' },
+      { ...RUN_ROW, id: 'run_7', created_at: '2026-08-23T07:00:00Z' },
+    ];
+    const newestFirst = ['run_7', 'run_6', 'run_5', 'run_4', 'run_3', 'run_2', 'run_1'];
+
+    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
+    const reversed = await collect({
+      'run-list': { runs: [...rows].reverse() },
+      ...UNREGISTERED_ONLY,
+    });
+
+    expect(forward.unregistered.count).toBe(7);
+    expect(collectionFingerprint(reversed)).toBe(collectionFingerprint(forward));
+    // 무엇으로 고정했는지도 함께 남긴다. 지문만 보면 "둘 다 비어서 같다"와 구분되지 않는다.
+    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(newestFirst);
+    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(newestFirst);
+  });
+
+  /*
+   * 회귀 방지 — 1차 키만으로는 total order가 아니다.
+   *
+   * 같은 `created_at`을 가진 Run이 tie로 남으면 그 자리가 다시 `run-list` 출력 순서에 걸리고,
+   * 이 describe가 막으려는 지문 흔들림이 그 자리에 그대로 남는다.
+   */
+  it('created_at이 같은 Run은 runId가 tie를 깬다', async () => {
+    const same = '2026-08-23T00:00:00Z';
+    const rows = ['run_3', 'run_1', 'run_2'].map((id) => ({ ...RUN_ROW, id, created_at: same }));
+
+    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
+    const reversed = await collect({
+      'run-list': { runs: [...rows].reverse() },
+      ...UNREGISTERED_ONLY,
+    });
+
+    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(['run_1', 'run_2', 'run_3']);
+    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(['run_1', 'run_2', 'run_3']);
+  });
+
+  /*
+   * `created_at`을 읽지 못한 행의 자리를 고정한다.
+   *
+   * `parseOrcaTimestamp`의 타임존 없는 갈래는 형식만 맞으면 범위를 보지 않고 Invalid Date를
+   * 돌려준다. 그 행이 정렬에 들어오는데 NaN을 그대로 비교하면 정렬 결과가 엔진 재량이 되고,
+   * 사실이 그대로여도 지문이 흔들린다. **맨 뒤**에 두고 버리지 않는다 — 읽지 못한 시각은
+   * 최신성을 주장할 근거가 아니지만, 그 Run이 미등록이라는 사실은 사라지면 안 된다.
+   */
+  it('created_at이 범위 밖인 Run은 버려지지 않고 맨 뒤로 간다', async () => {
+    const rows = [
+      { ...RUN_ROW, id: 'run_bad', created_at: '2026-13-45 99:99:99' },
+      { ...RUN_ROW, id: 'run_old', created_at: '2026-08-21T00:00:00Z' },
+      { ...RUN_ROW, id: 'run_new', created_at: '2026-08-23T00:00:00Z' },
+    ];
+
+    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
+    const reversed = await collect({
+      'run-list': { runs: [...rows].reverse() },
+      ...UNREGISTERED_ONLY,
+    });
+
+    expect(forward.unregistered.count).toBe(3);
+    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(['run_new', 'run_old', 'run_bad']);
+    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(['run_new', 'run_old', 'run_bad']);
+    expect(collectionFingerprint(reversed)).toBe(collectionFingerprint(forward));
+  });
+
+  /*
+   * `created_at`이 아예 없거나 형식이 어긋난 행은 여기까지 오지 않는다.
+   *
+   * `listRuns`의 `parseOrcaTimestamp`가 던져 **관찰이 통째로 실패한다.** 이 계약을 고정해 두지
+   * 않으면 나중에 그 실패를 삼키는 변경이 들어왔을 때 그 Run이 정렬에서 조용히 사라진다.
+   */
+  it('created_at이 없는 Run은 조용히 사라지지 않고 관찰을 실패시킨다', async () => {
+    const rows = [{ ...RUN_ROW, id: 'run_1', created_at: undefined }];
+    await expect(collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY })).rejects.toThrow(
+      RangeError,
+    );
   });
 
   it('repository id를 exact 비교한다. 경로가 아니라 id다', async () => {
@@ -689,7 +812,8 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
     });
     const c = await collectRunFacts(orca, CONFIG, { now: () => new Date('2026-08-24T00:00:00Z') });
     // 두 Run 모두 관측됐다. 깨진 행 하나가 나머지를 없애지 않는다.
-    expect(c.runs.map((r) => r.identity.runId)).toEqual(['run_bad', 'run_1']);
+    // 순서는 `collectRunFacts`가 `runId`로 고정한다. Orca가 준 순서가 아니다.
+    expect(c.runs.map((r) => r.identity.runId)).toEqual(['run_1', 'run_bad']);
     // 읽지 못한 Run은 stale이 아니라 unknown이다.
     expect(c.runs.find((r) => r.identity.runId === 'run_bad')?.identity.liveness).toBe('unknown');
     expect(c.degraded.find((x) => x.kind === 'unreadable_field')?.detail).toContain(
@@ -796,6 +920,158 @@ function walk(node: unknown, path: string, visit: (path: string, value: unknown)
     for (const [k, v] of Object.entries(node)) walk(v, `${path}.${k}`, visit);
   }
 }
+
+/*
+ * 카드에 그리는 목록의 순서(`store/schema.ts`의 지문 규칙).
+ *
+ * Orca 조회 출력 순서에 기대는 목록이 카드에 남아 있으면, Orca 정렬이 바뀔 때 사실이 하나도
+ * 바뀌지 않아도 렌더 지문이 흔들려 `publish.ts`의 `skip`이 발화하지 않는다. 매 관찰이
+ * `chat.update`를 만든다. D1-B가 관측 시각으로 같은 결과를 낸 원인을 닫았고, 이것들은 같은
+ * 결과를 내는 다른 원인이다.
+ *
+ * **정렬 키는 total이어야 한다.** 어떤 tie도 입력 순서에 남기면 그 자리에 같은 결함이 남는다.
+ * 그래서 목록 자체가 아니라 **렌더 지문**으로 단언한다 — 카드에 실제로 그려지는 축이 그것이다.
+ */
+describe('카드에 그리는 목록의 정렬', () => {
+  /** blocker 축만 다른 Run 카드 하나. 나머지 축은 두 호출에서 동일하다. */
+  function cardWith(over: Partial<RunFacts>): string {
+    const base: RunFacts = {
+      identity: runIdentity(run(), [task()]),
+      project: 'dev-infra',
+      repositories: ['dnhynk/dev-infra'],
+      observedRepositoryIds: [REPO_ID],
+      tasks: { total: 0, byStatus: [] },
+      dispatches: { total: 0, byStatus: [], retriedTasks: 0 },
+      blockers: { badges: [], notObservable: [] },
+      degraded: [],
+      ...over,
+    };
+    return renderFingerprint(
+      renderRunCard({
+        run: base,
+        pullRequests: [],
+        collection: { degraded: [], unregistered: { count: 0, runs: [] } },
+      }),
+    );
+  }
+
+  // 회귀 방지: `render.ts`가 badge당 상위 ENTRY_CAP(5)건만 싣는다. 순서를 Orca에 맡기면
+  // **상위 5건이 무엇인지까지** 관찰마다 갈린다.
+  it('blocker entry 순서를 뒤집어도 렌더 지문이 같다', () => {
+    const blocked = ['task_b7', 'task_b1', 'task_b5', 'task_b3', 'task_b6', 'task_b2', 'task_b4'];
+    const rows = blocked.map((id) => task({ id, status: 'blocked' }));
+    const blockersOf = (tasks: OrcaTask[]) =>
+      aggregateBlockers({ tasks, gates: [], workers: [], asks: [], escalations: [], agentWaits: [] });
+
+    const forward = blockersOf(rows);
+    const reversed = blockersOf([...rows].reverse());
+
+    expect(cardWith({ blockers: reversed })).toBe(cardWith({ blockers: forward }));
+    // 무엇으로 고정했는지도 남긴다. 지문만 보면 "둘 다 비어서 같다"와 구분되지 않는다.
+    expect(forward.badges[0]?.entries.map((e) => e.taskId)).toEqual([...blocked].sort());
+    expect(reversed.badges[0]?.entries.map((e) => e.taskId)).toEqual([...blocked].sort());
+  });
+
+  // 회귀 방지: generation만으로 정렬하면 같은 generation의 binding들 사이 tie가 task-list
+  // 순서로 갈린다. `render.ts`가 그 목록을 identity 절에 그대로 그린다.
+  it('같은 generation의 binding 순서를 뒤집어도 렌더 지문이 같다', () => {
+    const handles = ['term_d', 'term_a', 'term_c', 'term_b'];
+    const rows = handles.map((h, i) =>
+      task({ id: `task_${i}`, createdBy: ok({ handle: h, paneKey: `pane:${h}`, generation: 2 }) }),
+    );
+    const forward = runIdentity(run(), rows);
+    const reversed = runIdentity(run(), [...rows].reverse());
+
+    expect(cardWith({ identity: reversed })).toBe(cardWith({ identity: forward }));
+    expect(forward.observed.map((o) => o.binding.handle)).toEqual([...handles].sort());
+    expect(reversed.observed.map((o) => o.binding.handle)).toEqual([...handles].sort());
+  });
+});
+
+/*
+ * degraded 절도 같은 부류다. 읽지 못한 칸 한 건은 Orca 행 하나에서 오고, 그 행들의 순서가
+ * 조회 출력 순서면 degraded 줄의 순서가 관찰마다 갈린다. `collect.ts`가 원천 행을 id로 고정하고
+ * inbox의 읽지 못한 칸을 total key로 정렬해 닫는다.
+ */
+describe('degraded 줄의 정렬', () => {
+  function orcaWithReversible(reverse: boolean): FakeOrca {
+    // 읽지 못한 칸을 여럿 만든다. deps가 깨진 Task와 options가 깨진 Gate가 각각 degraded 한 줄이다.
+    const tasks = ['task_c', 'task_a', 'task_d', 'task_b'].map((id) =>
+      taskRow({ id, deps: '{깨진 JSON' }),
+    );
+    const gates = ['gate_c', 'gate_a', 'gate_b'].map((id) => ({
+      id,
+      run_id: 'run_1',
+      task_id: 'task_a',
+      question: 'q',
+      options: '{깨진 JSON',
+      status: 'resolved',
+      resolution: null,
+      created_at: '2026-08-23 00:00:00',
+      resolved_at: null,
+    }));
+    const workers = ['ctx_c', 'ctx_a', 'ctx_b'].map((dispatchId) =>
+      workerRow({ dispatchId, dispatchStatus: 'failed' }),
+    );
+    // inbox의 읽지 못한 칸은 컬렉션 수준 degraded가 되고 Run 카드의 '관찰 전체' 절에 실린다.
+    const messages = ['msg_c', 'msg_a', 'msg_b'].map((id) => ({
+      id,
+      type: 'question',
+      run_id: 'run_1',
+      thread_id: null,
+      subject: 'q',
+      payload: '{깨진 JSON',
+      created_at: '2026-08-23 00:00:00',
+    }));
+    const order = <T>(rows: T[]): T[] => (reverse ? [...rows].reverse() : rows);
+    return new FakeOrca({
+      'run-list': { runs: [RUN_ROW] },
+      'task-list': { tasks: order(tasks), count: tasks.length },
+      'gate-list': { gates: order(gates) },
+      'worker-list': { workers: order(workers) },
+      inbox: { messages: order(messages) },
+    });
+  }
+
+  it('Orca 행 순서를 뒤집어도 degraded 줄의 렌더 지문이 같다', async () => {
+    const run = async (reverse: boolean): Promise<string> => {
+      const c = await collectRunFacts(orcaWithReversible(reverse), CONFIG, {
+        now: () => new Date('2026-08-24T00:00:00Z'),
+      });
+      const facts = c.runs[0];
+      if (facts === undefined) throw new Error('등록된 Run이 없다');
+      return renderFingerprint(
+        renderRunCard({
+          run: facts,
+          pullRequests: [],
+          collection: { degraded: c.degraded, unregistered: c.unregistered },
+        }),
+      );
+    };
+    const forward = await run(false);
+    expect(await run(true)).toBe(forward);
+  });
+
+  // 지문만 보면 "degraded가 비어서 같다"와 구분되지 않는다. 실제로 여러 줄이 났는지 함께 본다.
+  it('위 대조가 degraded가 비어서 성립한 것이 아니다', async () => {
+    const c = await collectRunFacts(orcaWithReversible(false), CONFIG, {
+      now: () => new Date('2026-08-24T00:00:00Z'),
+    });
+    const unreadable = (c.runs[0]?.degraded ?? []).filter((d) => d.kind === 'unreadable_field');
+    expect(unreadable.length).toBeGreaterThan(1);
+    // 컬렉션 수준도 함께 본다. inbox의 읽지 못한 칸이 여기로 온다.
+    expect(
+      c.degraded
+        .filter((d) => d.kind === 'unreadable_field')
+        .map((d) => d.detail.split(' ').slice(0, 2).join(' ')),
+    ).toEqual(['question msg_a의', 'question msg_b의', 'question msg_c의']);
+    // task 넷과 gate 셋이 각각 id 오름차순으로 나온다.
+    expect(unreadable.map((d) => d.detail.split(' ').slice(0, 2).join(' '))).toEqual([
+      'task task_a의', 'task task_b의', 'task task_c의', 'task task_d의',
+      'gate gate_a의', 'gate gate_b의', 'gate gate_c의',
+    ]);
+  });
+});
 
 describe('금지된 파생값 (OD-067, OD-069)', () => {
   it('비율·완료율 값이 어디에도 없다', async () => {

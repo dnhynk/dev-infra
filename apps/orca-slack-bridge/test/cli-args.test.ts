@@ -21,8 +21,14 @@ describe('명령 분기', () => {
     if (p.kind === 'run') expect(p.command).toBe('digest');
   });
 
+  it('runs를 인식한다', () => {
+    const p = parseArgs(['runs']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') expect(p.command).toBe('runs');
+  });
+
   it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack', 'digest']) {
+    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs']) {
       expect(parseArgs([c]).kind).toBe('run');
     }
   });
@@ -95,7 +101,7 @@ describe('digest 옵션', () => {
     expect(parseArgs(['digest', '--pr', '-1']).kind).toBe('error');
   });
 
-  // digest만 외부 write를 한다. --dry-run 오타를 무시하면 확인 없이 실제 채널에 게시된다.
+  // digest와 runs가 외부 write를 한다. --dry-run 오타를 무시하면 확인 없이 실제 채널에 게시된다.
   it('digest는 모르는 플래그를 무시하지 않고 오류로 만든다', () => {
     const p = parseArgs(['digest', '--dry-runn']);
     expect(p.kind).toBe('error');
@@ -104,6 +110,101 @@ describe('digest 옵션', () => {
 
   it('write하지 않는 명령의 기존 동작은 바꾸지 않는다', () => {
     expect(parseArgs(['snapshot', '--dry-runn']).kind).toBe('run');
+  });
+});
+
+describe('runs 옵션', () => {
+  it('기본값은 실제 게시다', () => {
+    const p = parseArgs(['runs']);
+    if (p.kind === 'run') {
+      expect(p.dryRun).toBe(false);
+      expect(p.statePath).toBeNull();
+    }
+  });
+
+  it('--dry-run과 --state를 읽는다', () => {
+    const p = parseArgs(['runs', '--dry-run', '--state', 'D:/state.db']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.dryRun).toBe(true);
+      expect(p.statePath).toBe('D:/state.db');
+    }
+  });
+
+  /*
+   * runs도 되돌릴 수 없는 외부 write를 한다. digest와 같은 검사를 건다.
+   *
+   * 회귀 방지: 이 검사가 runs에 걸리지 않으면 `runs --dry-runn`이 dryRun=false로 내려가
+   * 확인 없이 #agent-runs에 실제 게시된다.
+   */
+  it('runs는 모르는 플래그를 무시하지 않고 오류로 만든다', () => {
+    const p = parseArgs(['runs', '--dry-runn']);
+    expect(p.kind).toBe('error');
+    if (p.kind === 'error') {
+      expect(p.message).toContain('runs');
+      expect(p.message).toContain('--dry-runn');
+    }
+  });
+
+  // 회귀 방지: --dry-runn을 --state의 값으로 삼으면 dryRun=false로 실제 게시하면서
+  // '--dry-runn'이라는 이름의 DB를 열어 기존 매핑을 못 찾고 루트를 하나 더 만든다.
+  it('runs의 값 자리에 플래그가 오면 오류다', () => {
+    const p = parseArgs(['runs', '--state', '--dry-runn']);
+    expect(p.kind).toBe('error');
+    if (p.kind === 'error') {
+      expect(p.message).toContain('--state');
+      expect(p.message).toContain('--dry-runn');
+    }
+  });
+});
+
+/*
+ * 하이픈이 모자란 오타(OD-072의 write 규율).
+ *
+ * 회귀 방지: 검사가 `--`로 시작하는 토큰만 보면 `-dry-run`과 `dry-run`이 통과해 dryRun=false로
+ * 내려간다. 그러면 확인 없이 실제 채널에 게시된다 — `unknownWriteFlag`가 막으려던 결과 그대로다.
+ * `--dry-runn` 형태만 고정하면 이 구멍이 그대로 남는다.
+ */
+describe('write 명령의 하이픈 오타와 떠도는 위치 인자', () => {
+  for (const command of ['digest', 'runs'] as const) {
+    it(`${command}는 하이픈이 모자란 --dry-run 오타를 거부한다`, () => {
+      for (const typo of ['-dry-run', 'dry-run']) {
+        const p = parseArgs([command, typo]);
+        expect(p.kind).toBe('error');
+        if (p.kind === 'error') {
+          expect(p.message).toContain(command);
+          expect(p.message).toContain(typo);
+        }
+      }
+    });
+
+    it(`${command}는 값이 아닌 떠도는 위치 인자를 거부한다`, () => {
+      const p = parseArgs([command, '--dry-run', 'state.db']);
+      expect(p.kind).toBe('error');
+      if (p.kind === 'error') expect(p.message).toContain('state.db');
+    });
+  }
+
+  /*
+   * 대조군. 값 자리의 정상 토큰은 위치 인자가 아니다 — 거부하면 정상 호출이 통째로 막힌다.
+   * 값이 플래그 이름처럼 생겼어도 값 자리에 있으면 값이다.
+   */
+  it('값 자리의 정상 토큰은 거부하지 않는다', () => {
+    expect(parseArgs(['runs', '--state', 'state.db', '--dry-run']).kind).toBe('run');
+    expect(parseArgs(['digest', '--pr', '5', '--state', 'dry-run', '--dry-run']).kind).toBe('run');
+    const p = parseArgs(['digest', '--config', 'c.json', '--orca', 'orca', '--pr-limit', '10']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.configPath).toBe('c.json');
+      expect(p.orcaBin).toBe('orca');
+      expect(p.prLimit).toBe(10);
+    }
+  });
+
+  // write하지 않는 명령의 기존 동작은 바꾸지 않는다. 무시가 무해한 쪽에서 뺏을 것이 없다.
+  it('write하지 않는 명령의 위치 인자는 그대로 흐른다', () => {
+    expect(parseArgs(['snapshot', 'dry-run']).kind).toBe('run');
+    expect(parseArgs(['snapshot', '-dry-run']).kind).toBe('run');
   });
 });
 

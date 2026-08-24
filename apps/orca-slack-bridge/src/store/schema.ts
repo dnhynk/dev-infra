@@ -63,7 +63,7 @@ import type { PrTerminal, ReviewerResult } from '../digest/types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -241,6 +241,49 @@ const RUN_MESSAGE_INDEX = `
 CREATE UNIQUE INDEX run_message_slack_identity ON run_message (channel_id, message_ts)`;
 
 /**
+ * `run_collection_message` 테이블 DDL. `PR_TASK_TABLE`과 같은 이유로 상수 하나로 묶는다.
+ *
+ * **컬렉션 루트는 Run이 아니다.** `run_message`에 끼워 넣지 않는 이유가 그것이다. 그 표의
+ * PRIMARY KEY 컬럼 이름은 `run_key`이고 그 옆 주석이 "형식은 run:<Orca run id>다"라고 못박는다.
+ * Run이 아닌 값을 그 칸에 넣으면 컬럼 이름이 거짓이 되는데, 컬럼 rename은 파괴적 변경이라 이
+ * 파일이 금지한다. 되돌릴 수 없는 잘못된 이름을 남기는 대신 표를 나눈다(OD-080).
+ *
+ * ## 이 루트가 존재하는 이유
+ *
+ * 미등록 Run 수와 컬렉션 수준 degraded는 Run 카드에도 실리지만(`run/render.ts`), 등록된 Run이
+ * 하나도 없으면 카드가 하나도 없어 그 수가 Slack 어디에도 나타나지 않는다. **그 구간이 정확히
+ * OD-078이 감수한 위험 — 등록 열쇠가 통째로 어긋나 Run이 조용히 사라지는 구간 — 이다.** 완화
+ * 장치가 바로 그때 보이지 않으면 완화 장치가 아니다. 그래서 이 루트는 **등록 Run 수와 무관하게
+ * 항상 게시된다.** 조건부로 만들면 장치가 조건부가 된다.
+ *
+ * ## 왜 한 행인가
+ *
+ * 설정의 `slack.channels.agentRuns`가 하나이므로 컬렉션 루트도 하나다. `CHECK (id = 1)`이
+ * `schema_version`과 같은 방식으로 그것을 스키마 수준에서 강제한다. 채널 설정이 바뀌면 새 루트를
+ * 만들지 않고 `channel_id` 불일치를 드러낸다 — `run_message`와 같은 판정이다.
+ *
+ * 보장하지 않는 것은 `run_message`와 같다. crash와 delivery unknown 두 창은 그대로 있고 D1에서
+ * 닫지 않는다. 근거는 `RUN_MESSAGE_TABLE`에 있고 여기서 다시 적지 않는다.
+ *
+ * 한 Slack 메시지가 이 루트와 Run 루트에 동시에 매핑되지 않는다는 것도 스키마가 강제하지
+ * 않는다. 두 표의 제약은 각자의 표 안에서만 유효하다.
+ */
+const RUN_COLLECTION_MESSAGE_TABLE = `
+CREATE TABLE run_collection_message (
+  -- 한 행만 존재한다. 설정의 slack.channels.agentRuns가 하나이므로 컬렉션 루트도 하나다.
+  -- 여러 행이 공존하면 어느 것이 현재 루트인지 알 수 없다(schema_version과 같은 판정).
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  -- chat.update는 channel과 ts를 함께 요구한다. 또한 대상 채널 설정이 바뀌었을 때
+  -- 예전 채널의 ts로 update를 시도하는 대신 불일치를 판정할 수 있다.
+  channel_id         TEXT NOT NULL,
+  message_ts         TEXT NOT NULL,
+  -- 마지막으로 게시한 카드의 지문. 같으면 chat.update를 호출하지 않는다.
+  render_fingerprint TEXT NOT NULL,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+)`;
+
+/**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
  *
  * **비어 있는 파일에만 쓴다.** 이미 버전이 기록된 파일은 `MIGRATIONS`가 올린다. 그래서 이
@@ -289,6 +332,7 @@ ${PR_STATE_TABLE};
 ${PR_THREAD_EVENT_TABLE};
 ${RUN_MESSAGE_TABLE};
 ${RUN_MESSAGE_INDEX};
+${RUN_COLLECTION_MESSAGE_TABLE};
 `;
 
 /**
@@ -328,6 +372,10 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // 비어 있는 채로 시작하고 그것이 맞다. 행이 없다는 것은 "이 Run의 루트를 아직 만들지
   // 않았다"는 뜻이고, 첫 관찰이 루트를 만들며 채운다. 과거에 게시한 Run 카드는 없다.
   [RUN_MESSAGE_TABLE, RUN_MESSAGE_INDEX],
+  // v5 → v6: 컬렉션 루트 매핑 표를 붙인다(OD-080). 기존 행은 건드리지 않는다. 비어 있는 채로
+  // 시작하고 그것이 맞다 — 행이 없다는 것은 "컬렉션 루트를 아직 만들지 않았다"는 뜻이고 첫
+  // 관찰이 만들며 채운다. 과거에 게시한 컬렉션 카드는 없다.
+  [RUN_COLLECTION_MESSAGE_TABLE],
 ];
 
 /**
@@ -576,6 +624,29 @@ export type NewRunMessage = {
 };
 
 /**
+ * 컬렉션 루트 메시지의 Slack message identity와 마지막 관찰이 남긴 값(OD-080).
+ *
+ * `RunMessageRecord`와 달리 key가 없다. 행이 하나뿐이기 때문이고, 그 근거는
+ * `RUN_COLLECTION_MESSAGE_TABLE`에 있다.
+ */
+export type RunCollectionMessageRecord = {
+  readonly channelId: string;
+  readonly messageTs: string;
+  readonly renderFingerprint: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+/** 컬렉션 루트 메시지를 처음 기록할 때 넘기는 값. */
+export type NewRunCollectionMessage = {
+  readonly channelId: string;
+  readonly messageTs: string;
+  readonly renderFingerprint: string;
+  /** ISO8601. `created_at`과 `updated_at`에 같은 값을 쓴다. */
+  readonly at: string;
+};
+
+/**
  * 이 Run에 연결된 PR 하나와 **직전 관측이 저장한** 그 PR의 상태.
  *
  * 재료는 둘 다 이미 store에 있다. 연결은 `pr_task.run_key`(OD-076)이고 상태는
@@ -611,9 +682,8 @@ export type RunPullRequestRecord = {
 /**
  * Run 카드가 쓰는 durable store.
  *
- * `DigestStore`와 **따로 둔다.** 두 카드는 다른 slice가 다른 시점에 게시하고, 한쪽만 필요한
- * 호출자(D1-C의 dry-run, digest의 `ReadOnlyDigestStore`)가 다른 쪽 계약까지 구현해야 하는
- * 이유가 없다. `SqliteDigestStore`는 두 인터페이스를 함께 구현한다 — 파일이 하나이기 때문이지
+ * `DigestStore`와 **따로 둔다.** 두 카드는 다른 명령이 게시하고, 한쪽만 필요한 호출자(`runs`의
+ * dry-run, `digest`의 `ReadOnlyDigestStore`)가 다른 쪽 계약까지 구현해야 하는 이유가 없다. `SqliteDigestStore`는 두 인터페이스를 함께 구현한다 — 파일이 하나이기 때문이지
  * 계약이 하나여서가 아니다.
  *
  * 사용 순서와 crash 경계는 `pr_message`와 같다.
@@ -627,6 +697,9 @@ export type RunPullRequestRecord = {
  * `chat.postMessage` 성공과 `insertRunMessage` 사이에서 죽으면 다음 실행이 루트를 하나 더
  * 만든다. 게시 결과를 모른 채 끝난 호출도 결과가 같다. 두 창의 설명은 `RUN_MESSAGE_TABLE`에
  * 있고 D1은 두 창을 없앴다고 주장하지 않는다.
+ *
+ * 컬렉션 루트(`findRunCollectionMessage` 세 벌)는 같은 순서를 쓰되 key가 없다. Run이 아니므로
+ * 표를 나눴고 그 근거는 `RUN_COLLECTION_MESSAGE_TABLE`에 있다(OD-080).
  */
 export interface RunStore {
   /** 기록된 Run 루트 메시지를 찾는다. 없으면 null이며 이는 정상 출력이다. */
@@ -648,4 +721,18 @@ export interface RunStore {
    * 파일이 실행마다 다른 순서를 내고 그때마다 렌더 지문이 달라져 `chat.update`가 발생한다.
    */
   listRunPullRequests(runKey: RunKey): readonly RunPullRequestRecord[];
+  /**
+   * 기록된 컬렉션 루트 메시지를 찾는다. 없으면 null이며 이는 정상 출력이다(OD-080).
+   *
+   * null은 "컬렉션 루트를 아직 만들지 않았다"는 뜻이다. 첫 관찰이 만든다.
+   */
+  findRunCollectionMessage(): RunCollectionMessageRecord | null;
+  /** 처음 기록한다. 이미 있으면 던진다. 중복 루트 생성을 조용히 덮어쓰지 않는다. */
+  insertRunCollectionMessage(input: NewRunCollectionMessage): void;
+  /**
+   * 렌더 지문과 `updated_at`만 갱신한다. row가 없으면 던진다. `at`은 ISO8601이다.
+   *
+   * message identity는 건드리지 않는다. `updateRunObservation`과 같은 이유다.
+   */
+  updateRunCollectionObservation(renderFingerprint: string, at: string): void;
 }

@@ -151,6 +151,9 @@ Bridge의 C/D 구현 전에 다음 sample을 확보한다.
 D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견·Git remote 기반 자동 등록·자동 발견된
 다중 repository routing은 O1 범위다(OD-068). Run과 등록된 repository를 잇는 열쇠는 설정의
 `orcaRepositoryIds`이고, 등록에 맞지 않는 Run은 버리지 않고 수를 노출한다(OD-078).
+그 수는 Run 카드와 별개로 **등록된 Run 수와 무관하게 항상 게시되는 컬렉션 루트**에도 실린다.
+등록이 통째로 어긋나 Run 카드가 하나도 없는 구간이 곧 OD-078이 감수한 실패 모드이고, 그때도
+사실이 `#agent-runs`에 도달해야 하기 때문이다(OD-080).
 Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·
 `consumer_generation`을 권위로 읽고 live/stale은 generation으로 구분한다. coordinator 환경변수는 보조
 단서로만 쓴다(OD-020).
@@ -160,6 +163,7 @@ Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator
 - Slack 표시가 확정된 Orca 집계 규칙과 일치함
 - `consumer_generation`으로 live/stale Run을 구분함(OD-020)
 - 재시작 뒤 같은 Run root를 재사용함
+- 등록된 Run이 0이어도 미등록 Run 수가 `#agent-runs`에 도달함(OD-080)
 
 ## 8. Bridge Slice D2 · Gate UI와 Orca Resolution
 

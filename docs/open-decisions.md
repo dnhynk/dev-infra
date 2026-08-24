@@ -88,6 +88,7 @@
 | OD-049 | GitHub 공식 Slack App 설치와 repo별 review/workflow 구독 범위 | 운영 환경 준비 전 | OPEN |
 | OD-071 | modal submission validation error를 modal에 유지·표시하는 UX | D2 전 | DECIDED |
 | OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED |
+| OD-080 | 등록 Run이 0인 구간에서도 미등록 사실이 도달할 게시 표면 | D1 전 | DECIDED |
 
 ## Gate와 Channel
 
@@ -1487,5 +1488,43 @@ ID: OD-079
 검증 방법: 칸마다 "깨진 row 1건 + 정상 row N건" fixture에서 정상 row는 그대로 관측되고 깨진 칸만 degraded로
            나오는지 확인한다. 엄격 parser가 같은 값에 여전히 던지는지도 함께 고정한다. 실제 CLI 재실행이
            exit 0으로 바뀌고 보고와 `--json`에 runId·row id·칸 이름·이유가 나오는지 확인한다.
+결정일: 2026-08-24
+```
+
+```text
+ID: OD-080
+상태: DECIDED
+결정: `#agent-runs`에 컬렉션 루트 메시지 하나를 둔다. Run 카드와 별개이며 **등록된 Run 수와
+      무관하게 항상 게시한다.** 싣는 것은 이번 관찰의 Run 카드 수, 미등록 Run 수와 목록,
+      컬렉션 수준 degraded다. 매핑은 새 표 `run_collection_message`(schema v6)에 한 행으로 두고
+      `CHECK (id = 1)`로 한 행을 강제한다. 관측 시각은 카드에 싣지 않는다.
+근거:
+  - OD-078은 "등록 열쇠가 통째로 어긋나 Run이 조용히 사라진다"는 위험을 감수했고, 그 유일한
+    근거가 "미등록 Run을 세어 노출하므로 조용한 실패가 관측 가능해진다"였다.
+  - 그런데 D1-B의 미등록 수 표시 자리는 Run 카드 안이다(`run/render.ts`). 등록된 Run이 하나도
+    없으면 Run 카드도 하나도 없어 그 수가 Slack 어디에도 나타나지 않는다. **그 구간이 정확히
+    OD-078이 감수한 실패 모드다.** 완화 장치가 하필 그때 보이지 않으면 완화 장치가 아니다.
+  - 카드에 관측 시각을 실으면 사실이 그대로여도 관찰마다 렌더 지문이 달라져 `publish.ts`의
+    `skip`이 실운영에서 발화하지 않는다(`store/schema.ts`의 지문 규칙, D1-B 확정).
+  - 미등록 목록에는 D1-B가 확정한 구분("조회에 실패해 판정할 수 없다" ↔ "조회했더니 등록에
+    없다")을 그대로 싣는다. 두 사건을 함께 세면 이 카드가 거짓을 말한다.
+대안과 기각 이유:
+  - `run_message` 표 재사용(예약 key): 그 표의 PRIMARY KEY 컬럼 이름이 `run_key`이고 주석이
+    "형식은 run:<Orca run id>다"로 못박는다. Run이 아닌 값을 넣으면 컬럼 이름이 거짓이 되는데,
+    컬럼 rename은 `store/schema.ts`가 금지한 파괴적 변경이라 **영구히 틀린 이름이 남는다.**
+    표 하나의 비용은 일회성이고 틀린 이름의 비용은 읽는 사람마다 반복된다. 기각.
+  - 등록 Run이 0일 때만 컬렉션 카드 게시: 완화 장치가 조건부가 되고, 그것이 이 결정이 닫으려는
+    구멍과 같은 종류의 구멍이다. durable 매핑도 여전히 필요해 표 결정을 피하지도 못한다. 기각.
+  - 컬렉션 사실을 Run 카드에만 두기(현행 유지): 위 근거의 구간에서 사실이 사라진다. 기각.
+영향 문서/파일: apps/orca-slack-bridge/src/store/schema.ts, src/store/sqlite.ts,
+                apps/orca-slack-bridge/src/run/render.ts, src/run/publish.ts, src/cli.ts,
+                docs/ux/slack-surfaces.md §3.2, docs/specs/orca-slack-bridge.md §6,
+                docs/roadmap.md §7, docs/decision-log.md
+검증 방법: 등록 Run이 0인 컬렉션에서 post가 한 번 나가고 그 blocks에 미등록 수·목록과
+           `unregistered_repository`/`query_failed` 구분이 실리는지 확인한다. 재관찰이 새 루트를
+           만들지 않고 `chat.update`로 가는지, 사실이 그대로면 Slack을 아예 부르지 않는지,
+           재시작 뒤에도 같은 루트를 쓰는지 임시 파일의 실제 sqlite로 확인한다. v5 파일을 올려
+           새로 만든 v6 파일과 스키마(컬럼 순서·notnull·PK·인덱스)와 CHECK 동작을 대조하고,
+           기존 여섯 표의 행이 보존되며 실패 시 v5로 되돌아가는지 확인한다.
 결정일: 2026-08-24
 ```

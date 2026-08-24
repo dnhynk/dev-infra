@@ -15,6 +15,7 @@ import {
   type DigestStore,
   type NewPrMessage,
   type NewPrTask,
+  type NewRunCollectionMessage,
   type NewRunMessage,
   type NewThreadEvent,
   type ObservationRecord,
@@ -23,6 +24,7 @@ import {
   type PrStateSnapshot,
   type PrTaskRecord,
   type PrThreadEventRecord,
+  type RunCollectionMessageRecord,
   type RunMessageRecord,
   type RunPullRequestRecord,
   type RunStore,
@@ -250,6 +252,24 @@ const UPDATE_RUN_OBSERVATION = `
 UPDATE run_message SET render_fingerprint = ?, updated_at = ? WHERE run_key = ?`;
 
 /**
+ * 컬렉션 루트 세 문장(OD-080). 행이 하나뿐이라 key 파라미터가 없다.
+ *
+ * `id = 1`을 SQL에 리터럴로 적는다. 호출자가 넘길 값이 아니고, 넘길 수 있게 하면 두 번째 행을
+ * 만들려는 호출이 컴파일된다. `CHECK (id = 1)`이 그것을 막지만 막는 자리가 둘일 이유가 없다.
+ */
+const SELECT_RUN_COLLECTION_ROW = `
+SELECT channel_id, message_ts, render_fingerprint, created_at, updated_at
+  FROM run_collection_message WHERE id = 1`;
+
+const INSERT_RUN_COLLECTION_ROW = `
+INSERT INTO run_collection_message
+  (id, channel_id, message_ts, render_fingerprint, created_at, updated_at)
+VALUES (1, ?, ?, ?, ?, ?)`;
+
+const UPDATE_RUN_COLLECTION_OBSERVATION = `
+UPDATE run_collection_message SET render_fingerprint = ?, updated_at = ? WHERE id = 1`;
+
+/**
  * 이 Run에 연결된 PR과 저장된 상태를 함께 읽는다.
  *
  * `pr_task`는 (PR, Task) 쌍마다 한 행이므로(OD-076) 한 PR을 여러 Task가 이어서 갱신하면 같은
@@ -296,6 +316,25 @@ type RunPullRequestRow = {
   readonly review_verdict: string | null;
   readonly observed_at: string | null;
 };
+
+/** sqlite가 돌려주는 run_collection_message 한 행. `id`는 항상 1이므로 읽지 않는다. */
+type RunCollectionMessageRow = {
+  readonly channel_id: string;
+  readonly message_ts: string;
+  readonly render_fingerprint: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
+
+function toRunCollectionMessageRecord(row: RunCollectionMessageRow): RunCollectionMessageRecord {
+  return {
+    channelId: row.channel_id,
+    messageTs: row.message_ts,
+    renderFingerprint: row.render_fingerprint,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 function toRunMessageRecord(row: RunMessageRow): RunMessageRecord {
   return {
@@ -617,6 +656,39 @@ export class SqliteDigestStore implements DigestStore, RunStore {
       .sort(byPullRequestNumber);
   }
 
+  findRunCollectionMessage(): RunCollectionMessageRecord | null {
+    const row = this.db.prepare(SELECT_RUN_COLLECTION_ROW).get() as
+      | RunCollectionMessageRow
+      | undefined;
+    return row === undefined ? null : toRunCollectionMessageRecord(row);
+  }
+
+  insertRunCollectionMessage(input: NewRunCollectionMessage): void {
+    try {
+      this.db
+        .prepare(INSERT_RUN_COLLECTION_ROW)
+        .run(input.channelId, input.messageTs, input.renderFingerprint, input.at, input.at);
+    } catch (e) {
+      // `insertRunMessage`와 같은 이유로 조용히 덮어쓰지 않는다. 덮어쓰면 앞서 게시한 Slack
+      // 루트를 잃어버린다.
+      const detail = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `컬렉션 루트 메시지를 기록할 수 없다 (channel ${input.channelId}, ts ${input.messageTs}): ${detail}`,
+        { cause: e },
+      );
+    }
+  }
+
+  updateRunCollectionObservation(renderFingerprint: string, at: string): void {
+    const result = this.db
+      .prepare(UPDATE_RUN_COLLECTION_OBSERVATION)
+      .run(renderFingerprint, at);
+    if (Number(result.changes) === 0) {
+      // 갱신할 행이 없다는 것은 호출 순서가 깨졌다는 뜻이다. 새 행을 만들어 덮지 않는다.
+      throw new Error('컬렉션 루트의 매핑 행이 없어 관찰 결과를 갱신할 수 없다');
+    }
+  }
+
   close(): void {
     // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -737,6 +809,23 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore {
     return (db.prepare(SELECT_RUN_PULL_REQUESTS).all(runKey) as RunPullRequestRow[])
       .map(toRunPullRequestRecord)
       .sort(byPullRequestNumber);
+  }
+
+  findRunCollectionMessage(): RunCollectionMessageRecord | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_RUN_COLLECTION_ROW).get() as
+      | RunCollectionMessageRow
+      | undefined;
+    return row === undefined ? null : toRunCollectionMessageRecord(row);
+  }
+
+  insertRunCollectionMessage(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. 컬렉션 루트 매핑을 기록하려 했다: ${this.path}`);
+  }
+
+  updateRunCollectionObservation(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. 컬렉션 관찰 결과를 갱신하려 했다: ${this.path}`);
   }
 
   close(): void {

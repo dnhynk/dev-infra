@@ -49,10 +49,11 @@ import type {
  * - **미등록 Run 수는 항상 표시한다**(OD-078). 0이어도 그린다. 이 수가 OD-078의 유일한 실패
  *   모드(id 형식·발급이 바뀌어 등록이 통째로 어긋남)를 관측 가능하게 만드는 장치다.
  *
- *   **경계**: 이 수는 컬렉션 수준 사실인데 표시 자리는 Run 카드 안이다. 그래서 등록된 Run이
- *   하나도 없으면 카드도 하나도 없고 이 수가 어디에도 나타나지 않는다. 그 구간이 정확히
- *   "등록이 전부 어긋난" 구간이다. D1-B에는 컬렉션 수준 메시지 표면이 없어 여기서 닫지 않는다.
- *   닫는 자리는 게시 경계를 만드는 D1-C다.
+ *   **경계**: 이 수는 컬렉션 수준 사실인데 이 절의 표시 자리는 Run 카드 안이다. 그래서 등록된
+ *   Run이 하나도 없으면 Run 카드도 하나도 없고 이 수가 여기서는 나타나지 않는다. 그 구간이
+ *   정확히 "등록이 전부 어긋난" 구간이라 그대로 두면 완화 장치가 하필 그때 사라진다. 그 구간을
+ *   `renderRunCollectionCard`가 닫는다 — 등록 Run 수와 무관하게 항상 게시되는 컬렉션 카드가
+ *   같은 절을 싣는다(OD-080). **두 자리의 중복은 의도다.**
  * - **live·stale·unknown을 서로 다르게 그린다.** `unknown`은 판정 불가이고 `stale`은 "더 높은
  *   generation에 인수됐다"는 판정이다. 같은 모양으로 그리면 판정하지 못한 것을 판정한 것처럼
  *   말하게 된다.
@@ -352,6 +353,37 @@ function unregisteredDegradedLine(d: RunDegraded): string {
 }
 
 /**
+ * 미등록 Run 절의 줄(OD-078). **Run 카드와 컬렉션 카드가 같은 함수를 쓴다.**
+ *
+ * 두 곳에 같은 모양을 따로 적으면 한쪽만 고쳐진다. 이 절이 무엇을 드러내야 하는지가
+ * 카드 종류에 따라 달라지지 않으므로 함수 하나로 둔다.
+ *
+ * 첫 줄은 수 하나다. **0이어도 그린다.**
+ */
+function unregisteredLines(unregistered: UnregisteredRuns): string[] {
+  const lines = [`${unregistered.count}`];
+  if (unregistered.count === 0) return lines;
+  for (const u of unregistered.runs.slice(0, ENTRY_CAP)) {
+    lines.push(
+      `• ${esc(u.runId)} — 관측된 Orca repository id: ` +
+        `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
+    );
+    // degraded를 빼면 이 두 줄이 바이트 동일해진다. 그러면 이 절이 두 사건을 함께 센다.
+    lines.push(...u.degraded.map(unregisteredDegradedLine));
+  }
+  if (unregistered.runs.length > ENTRY_CAP) {
+    lines.push(`• 외 ${unregistered.runs.length - ENTRY_CAP}건은 카드에 싣지 않았다`);
+  }
+  // 모두에게 "등록하라"고 말하지 않는다. 조회가 실패한 Run은 등록 여부가 아직 미판정이다.
+  lines.push(
+    '각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의' +
+      ' projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해' +
+      ' 등록 여부를 아직 판정하지 못한 것이다',
+  );
+  return lines;
+}
+
+/**
  * Run 카드를 그린다.
  *
  * 절 순서를 코드가 고정한다. 순서가 흔들리면 렌더 지문이 흔들려 사실이 그대로여도
@@ -494,35 +526,85 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    * 이 수가 오르는 것이 "등록 열쇠가 어긋나 Run이 조용히 사라진다"를 관측 가능하게 만드는
    * 유일한 장치다. 절을 조건부로 만들면 그 장치가 조건부가 된다.
    */
-  const unregisteredLines = [`${collection.unregistered.count}`];
-  if (collection.unregistered.count > 0) {
-    for (const u of collection.unregistered.runs.slice(0, ENTRY_CAP)) {
-      unregisteredLines.push(
-        `• ${esc(u.runId)} — 관측된 Orca repository id: ` +
-          `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
-      );
-      // degraded를 빼면 이 두 줄이 바이트 동일해진다. 그러면 이 절이 두 사건을 함께 센다.
-      unregisteredLines.push(...u.degraded.map(unregisteredDegradedLine));
-    }
-    if (collection.unregistered.runs.length > ENTRY_CAP) {
-      unregisteredLines.push(
-        `• 외 ${collection.unregistered.runs.length - ENTRY_CAP}건은 카드에 싣지 않았다`,
-      );
-    }
-    // 모두에게 "등록하라"고 말하지 않는다. 조회가 실패한 Run은 등록 여부가 아직 미판정이다.
-    unregisteredLines.push(
-      '각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의' +
-        ' projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해' +
-        ' 등록 여부를 아직 판정하지 못한 것이다',
-    );
-  }
-  blocks.push(labelled('등록되지 않은 Run', unregisteredLines));
+  blocks.push(labelled('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
 
   // blocks를 그리지 못하는 자리에서도 identity·Run ID·판정이 남아야 한다. 그 자리도 mrkdwn으로
   // 해석되므로 blocks와 같은 이스케이프를 거친 값을 쓴다.
   const text =
     `${live.emoji} ${escapedIdentity} · ${esc(id.runId)} · ${escapedObjective}` +
     ` — 소유자 binding ${live.label}`;
+
+  return { text, blocks };
+}
+
+/**
+ * 컬렉션 카드 한 장의 입력(OD-080). 여기 없는 값은 카드에 나타나지 않는다.
+ *
+ * **관측 시각이 없다.** Run 카드와 같은 이유다 — 카드에 두면 사실이 그대로여도 관찰마다 렌더
+ * 지문이 달라져 `publish.ts`의 `skip`이 실운영에서 영원히 발화하지 않는다.
+ */
+export type RunCollectionCardInput = {
+  /** 이번 관찰이 만든 Run 카드 수. `RunCollection.runs`의 길이다. */
+  readonly cards: number;
+  readonly collection: RunCollectionContext;
+};
+
+/**
+ * 컬렉션 카드를 그린다(OD-080).
+ *
+ * ## 이 카드가 존재하는 이유
+ *
+ * 미등록 Run 수와 컬렉션 수준 degraded는 Run 카드에도 실린다. 그런데 **등록된 Run이 하나도
+ * 없으면 Run 카드도 하나도 없어 그 사실이 Slack 어디에도 나타나지 않는다.** 그 구간이 정확히
+ * OD-078이 감수한 위험 — `<uuid>::<path>` 형식이나 id 발급이 바뀌어 등록이 통째로 어긋나는
+ * 구간 — 이다. 완화 장치가 하필 그때 보이지 않으면 완화 장치가 아니다.
+ *
+ * 그래서 이 카드는 **등록 Run 수와 무관하게 항상 게시된다.** 등록 Run이 있을 때만 만들거나
+ * 없을 때만 만들면 장치가 조건부가 되고, 그것이 이 카드가 닫으려는 구멍과 같은 종류의 구멍이다.
+ *
+ * ## 중복은 의도다
+ *
+ * 같은 사실이 Run 카드에도 이 카드에도 있다. Run 카드 쪽은 그 Run을 보는 사람이 컬렉션 사실을
+ * 함께 보게 하고, 이 카드 쪽은 Run 카드가 하나도 없어도 그 사실이 남게 한다. 둘 중 하나를
+ * 지우면 그 자리의 목적이 사라진다.
+ *
+ * Run 카드와 달리 이 카드에는 Run identity·진행·blocker가 없다. 컬렉션에 귀속되지 않는
+ * 사실이기 때문이다.
+ */
+export function renderRunCollectionCard(input: RunCollectionCardInput): RenderedCard {
+  const { cards, collection } = input;
+  const headline = `📋 *관찰 요약* · Run 카드 ${cards}장 · 등록되지 않은 Run ${collection.unregistered.count}건`;
+
+  const blocks: SlackBlock[] = [];
+  blocks.push(
+    section(
+      [
+        headline,
+        '이 메시지는 관찰마다 갱신되는 컬렉션 루트다. 등록된 Run이 하나도 없어도 남는다 —' +
+          ' 등록 열쇠가 통째로 어긋난 구간에서도 미등록 수가 보여야 하기 때문이다',
+      ].join('\n'),
+    ),
+  );
+
+  // Run 카드와 같은 함수를 쓴다. 0이어도 그린다.
+  blocks.push(labelled('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
+
+  /*
+   * degraded 절(OD-072). **비어 있어도 그린다.**
+   *
+   * 여기 싣는 것은 관찰 전체의 degraded뿐이다. Run 하나에 귀속되는 degraded는 그 Run의 카드에
+   * 있고, 여기로 옮기면 어느 것이 어느 Run의 사실인지 잃는다.
+   */
+  const degraded = ['관찰 전체'];
+  degraded.push(
+    ...(collection.degraded.length === 0 ? ['• 없음'] : collection.degraded.map(degradedLine)),
+  );
+  degraded.push('Run 하나에 귀속되는 degraded는 그 Run의 카드에 있다');
+  blocks.push(labelled('degraded', degraded));
+
+  // blocks를 그리지 못하는 자리에서도 두 수가 남아야 한다. 그 자리도 mrkdwn으로 해석되므로
+  // blocks와 같은 이스케이프를 거친 값을 쓴다 — 여기 값은 전부 수이므로 이스케이프할 것이 없다.
+  const text = `관찰 요약 · Run 카드 ${cards}장 · 등록되지 않은 Run ${collection.unregistered.count}건`;
 
   return { text, blocks };
 }

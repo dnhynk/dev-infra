@@ -38,7 +38,7 @@
 | Task/PR/blocker 현재 상태와 사람 개입 필요 여부 표시 | current Task 상태/분모와 Dispatch attempts 분리, 원천별 blocker badge 확정 (OD-067, OD-069) | [Run Observer](specs/orca-slack-bridge.md#61-기본-단위), [Run progress 계약](contracts/observation-and-correlation.md#7-run-progress) |
 | Worker ask와 사람 결정용 Orca Gate를 구분 | 확정 운영 방향 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약), [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
 | Worker `ask`/coordinator `reply`, coordinator만 사람용 Gate 생성 | 확정 | [질문과 Gate](specs/orchestration-bootstrap-and-continuity.md#41-worker-질문과-사람용-gate), [Gate 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
-| Gate question/options/recommendation/reason/impact 표시 | 사람용 요약은 Gate, 기계 판정 metadata는 Gate ID 연결 sidecar (OD-050) | [Gate 표시](specs/orca-slack-bridge.md#62-gate-표시), [Gate UX](ux/slack-surfaces.md#32-gate-결정-카드) |
+| Gate question/options/recommendation/reason/impact 표시 | 사람용 요약은 Gate, 기계 판정 metadata는 Gate ID 연결 sidecar (OD-050) | [Gate 표시](specs/orca-slack-bridge.md#62-gate-표시), [Gate UX](ux/slack-surfaces.md#33-gate-결정-카드) |
 | ask/reply와 사람용 Gate correlation | sidecar의 message/thread/dispatch/task/gate mapping이 권위 (OD-019) | [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
 | 버튼 클릭 시 owner/open/duplicate 검증 후 `gate-resolve` | Gate별 직렬화·retry replay·전후 재조회·durable outbox 확정 (OD-051) | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
 | Slack 결정을 Claude prompt로 바로 보내지 않고 Orca Gate에 먼저 기록 | 확정 | [처리 순서](specs/orca-slack-bridge.md#72-처리-순서) |
@@ -54,7 +54,7 @@
 | Channel opt-in·중복·재조회 | dead-window-safe probe, Orca-state no-op, receipted→consumed 경계 확정 (OD-057, OD-058, OD-066) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter) |
 | custom Channel 배포 | development flag만 가능하고 매 기동 확인 필요; 별도 D3 Run (OD-056) | [D3 로드맵](roadmap.md#9-bridge-slice-d3--channel-adapter와-재개-관찰) |
 | Gate가 있어도 독립 Task 계속 실행 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
-| Gate 선택지 button과 직접 입력 modal | 로컬 validation은 3초 내 errors, 원격 Orca 작업은 post-ACK (OD-071) | [Gate UX](ux/slack-surfaces.md#32-gate-결정-카드), [Modal UX](ux/slack-surfaces.md#33-자유형-결정-modal) |
+| Gate 선택지 button과 직접 입력 modal | 로컬 validation은 3초 내 errors, 원격 Orca 작업은 post-ACK (OD-071) | [Gate UX](ux/slack-surfaces.md#33-gate-결정-카드), [Modal UX](ux/slack-surfaces.md#34-자유형-결정-modal) |
 | 일반 thread text는 coordinator로 전달하지 않음 | 확정 | [초기 허용 입력](specs/orca-slack-bridge.md#71-초기-허용-입력) |
 | `Slack USER_ID == OWNER_SLACK_USER_ID` 성격의 sender allowlist | 확정 | [Control Plane](specs/orca-slack-bridge.md#72-처리-순서), [공식 검증](platform-capabilities.md#block-kit과-interaction) |
 | merge·production DB·secret·force push·rollback 등 위험 action 제한 | 확정 초기 제외 | [보안 경계](specs/orca-slack-bridge.md#10-보안-경계) |

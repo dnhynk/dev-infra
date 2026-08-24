@@ -184,10 +184,17 @@ function readSchemaShape(path: string) {
   }
 }
 
-describe('v4 → v5 migration', () => {
+/**
+ * v4 파일을 여는 경로.
+ *
+ * **`SCHEMA_VERSION`을 리터럴로 고정하지 않는다.** 파일을 열면 v4부터 현재 버전까지 모든 단계가
+ * 적용되므로, 이 describe가 보는 것은 "v5 한 단계"가 아니라 "v4 파일이 열리고 기존 행이 남는다"다.
+ * 단계 하나를 보는 곳은 그 단계를 추가한 테스트다 — v5 → v6은 `store-run-collection.test.ts`다.
+ */
+describe('v4 파일 열기', () => {
   // 이 파일의 알려진 함정이다. SCHEMA_DDL에만 있고 MIGRATIONS에는 없는 테이블(또는 그 반대)이
   // 생기면 새 파일과 기존 파일이 다른 스키마로 갈라진다.
-  it('올린 v4 파일과 새로 만든 v5 파일의 스키마가 같다', () => {
+  it('올린 v4 파일과 새로 만든 파일의 스키마가 같다', () => {
     writeV4(dbPath);
     new SqliteDigestStore(dbPath).close();
 
@@ -209,7 +216,6 @@ describe('v4 → v5 migration', () => {
     const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
     raw.close();
     expect(version).toEqual({ version: SCHEMA_VERSION });
-    expect(SCHEMA_VERSION).toBe(5);
   });
 
   it('기존 pr_message·pr_task·pr_state·pr_thread_event 행을 그대로 둔다', () => {

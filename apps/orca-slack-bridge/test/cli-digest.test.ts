@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { openDigestStore, formatDigestError, digestPosters } from '../src/cli.js';
+import { openDigestStore, formatChannelError, digestPosters } from '../src/cli.js';
 import { SlackWebApiPoster } from '../src/slack/post.js';
 import { BOT_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore, SchemaVersionError } from '../src/store/sqlite.js';
@@ -227,7 +227,7 @@ describe('digest 오류 출력', () => {
     }
     expect((thrown as Error).message).toContain(CHANNEL);
 
-    const out = formatDigestError(thrown, CHANNEL);
+    const out = formatChannelError(thrown, CHANNEL);
     expect(out).not.toContain(CHANNEL);
     // 통상 길이의 채널 ID는 maskToken이 통째로 가린다. 앞자리도 남지 않는다.
     expect(out).toContain('(channel ***,');
@@ -250,12 +250,12 @@ describe('digest 오류 출력', () => {
       store.close();
     }
     expect((thrown as Error).message).toContain(CHANNEL);
-    expect(formatDigestError(thrown, CHANNEL)).not.toContain(CHANNEL);
+    expect(formatChannelError(thrown, CHANNEL)).not.toContain(CHANNEL);
   });
 
   it('채널 ID가 없는 오류는 그대로 둔다', () => {
-    expect(formatDigestError(new Error('gh 호출 실패'), CHANNEL)).toBe('gh 호출 실패');
-    expect(formatDigestError('문자열 오류', CHANNEL)).toBe('문자열 오류');
+    expect(formatChannelError(new Error('gh 호출 실패'), CHANNEL)).toBe('gh 호출 실패');
+    expect(formatChannelError('문자열 오류', CHANNEL)).toBe('문자열 오류');
   });
 });
 
