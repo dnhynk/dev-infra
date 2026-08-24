@@ -22,6 +22,44 @@ describe('명령 분기', () => {
     if (socket.kind === 'run') expect(socket.socket).toBe(true);
   });
 
+  it('verify-slack은 지원하는 플래그만 받고 --socket 오타를 URL-only 검증으로 흘리지 않는다', () => {
+    const supported = parseArgs([
+      'verify-slack',
+      '--config', 'bridge.json',
+      '--orca', 'orca-test',
+      '--pr-limit', '5',
+      '--json',
+      '--socket',
+    ]);
+    expect(supported.kind).toBe('run');
+    if (supported.kind === 'run') {
+      expect(supported).toMatchObject({
+        command: 'verify-slack',
+        configPath: 'bridge.json',
+        orcaBin: 'orca-test',
+        prLimit: 5,
+        json: true,
+        socket: true,
+      });
+    }
+
+    for (const argv of [
+      ['verify-slack', '--sokcet'],
+      ['verify-slack', '-socket'],
+      ['verify-slack', 'socket'],
+      ['verify-slack', '--dry-run'],
+      ['verify-slack', '--state', 'state.db'],
+      ['verify-slack', '--pr', '5'],
+    ]) {
+      const parsed = parseArgs(argv);
+      expect(parsed.kind).toBe('error');
+      if (parsed.kind === 'error') {
+        expect(parsed.message).toContain('verify-slack');
+        expect(parsed.message).toContain(String(argv[1]));
+      }
+    }
+  });
+
   it('--socket은 verify-slack 외 모든 명령에서 command-scoped unknown이다', () => {
     for (const argv of [
       ['snapshot', '--socket'],

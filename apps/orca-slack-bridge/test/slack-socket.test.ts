@@ -233,6 +233,101 @@ describe('Socket lifecycle', () => {
     },
   );
 
+  it.each(['warning', 'refresh_requested'] as const)(
+    'candidate가 promotion 전에 받은 %s를 보존해 successor를 한 번만 연다',
+    async (reason) => {
+      const current = new FakeConnection(() => hello());
+      let refreshingCandidate!: FakeConnection;
+      refreshingCandidate = new FakeConnection(() => {
+        // 같은 turn의 중복 lifecycle frame도 successor storm으로 번지지 않아야 한다.
+        refreshingCandidate.refresh(reason);
+        refreshingCandidate.refresh(reason);
+        return hello();
+      });
+      const successor = new FakeConnection(() => hello());
+      const unexpected = new FakeConnection(() => hello());
+      const create = vi.fn(factory([current, refreshingCandidate, successor, unexpected]));
+      const transport = new SlackSocketTransport({ connectionFactory: create });
+
+      await transport.start();
+      current.refresh('refresh_requested');
+      await vi.waitFor(() => expect(successor.startCalls).toBe(1));
+      await vi.waitFor(() => expect(refreshingCandidate.closeCalls).toBe(1));
+      await flushMicrotasks();
+
+      expect(create).toHaveBeenCalledTimes(3);
+      expect(current.closeCalls).toBe(1);
+      expect(refreshingCandidate.closeCalls).toBe(1);
+      expect(successor.closeCalls).toBe(0);
+      expect(unexpected.startCalls).toBe(0);
+
+      await transport.shutdown();
+      expect(current.closeCalls).toBe(1);
+      expect(refreshingCandidate.closeCalls).toBe(1);
+      expect(successor.closeCalls).toBe(1);
+    },
+  );
+
+  it('refresh 뒤 끊긴 candidate는 보존한 refresh를 버리고 backoff recovery만 수행한다', async () => {
+    const delays: number[] = [];
+    const current = new FakeConnection(() => hello());
+    let disconnectedCandidate!: FakeConnection;
+    disconnectedCandidate = new FakeConnection(() => {
+      disconnectedCandidate.refresh('warning');
+      disconnectedCandidate.disconnected();
+      return hello();
+    });
+    const recovered = new FakeConnection(() => hello());
+    const unexpected = new FakeConnection(() => hello());
+    const create = vi.fn(factory([current, disconnectedCandidate, recovered, unexpected]));
+    const transport = new SlackSocketTransport({
+      connectionFactory: create,
+      backoff: { initialMs: 10, maxMs: 40 },
+      sleep: async (delay) => { delays.push(delay); },
+    });
+
+    await transport.start();
+    current.refresh('refresh_requested');
+    await vi.waitFor(() => expect(recovered.startCalls).toBe(1));
+    await flushMicrotasks();
+
+    expect(delays).toEqual([20]);
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(disconnectedCandidate.closeCalls).toBe(1);
+    expect(current.closeCalls).toBe(1);
+    expect(unexpected.startCalls).toBe(0);
+
+    await transport.shutdown();
+    expect(disconnectedCandidate.closeCalls).toBe(1);
+    expect(recovered.closeCalls).toBe(1);
+  });
+
+  it('shutdown은 candidate의 보존된 refresh를 폐기하고 각 connection을 한 번만 닫는다', async () => {
+    const candidateHello = deferred<SocketHello>();
+    const current = new FakeConnection(() => hello());
+    const candidate = new FakeConnection(() => candidateHello.promise);
+    const unexpected = new FakeConnection(() => hello());
+    const create = vi.fn(factory([current, candidate, unexpected]));
+    const transport = new SlackSocketTransport({ connectionFactory: create });
+
+    await transport.start();
+    current.refresh('refresh_requested');
+    await vi.waitFor(() => expect(candidate.startCalls).toBe(1));
+    candidate.refresh('warning');
+
+    const stopping = transport.shutdown();
+    candidateHello.resolve({ appId: 'A01BRIDGE' });
+    await stopping;
+    candidate.refresh('refresh_requested');
+    candidate.disconnected();
+    await flushMicrotasks();
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(current.closeCalls).toBe(1);
+    expect(candidate.closeCalls).toBe(1);
+    expect(unexpected.startCalls).toBe(0);
+  });
+
   it.each([
     ['missing', null],
     ['mismatch', 'A01OTHER'],
@@ -242,7 +337,11 @@ describe('Socket lifecycle', () => {
   ) => {
     const delays: number[] = [];
     const current = new FakeConnection(() => hello());
-    const invalid = new FakeConnection(() => Promise.resolve({ appId }));
+    let invalid!: FakeConnection;
+    invalid = new FakeConnection(() => {
+      invalid.refresh('warning');
+      return Promise.resolve({ appId });
+    });
     const unexpected = new FakeConnection(() => hello());
     const create = vi.fn(factory([current, invalid, unexpected]));
     const transport = new SlackSocketTransport({
@@ -284,6 +383,7 @@ describe('Socket lifecycle', () => {
 
     await transport.start();
     current.refresh('refresh_requested');
+    invalid.refresh('refresh_requested');
     current.disconnected();
     candidateHello.resolve({ appId: 'A01OTHER' });
     await vi.waitFor(() => expect(delays).toEqual([20]));

@@ -31,6 +31,7 @@ type HelloServer = {
   readonly url: string;
   readonly upgrades: () => number;
   readonly send: (index: number, payload: object) => void;
+  readonly sendBatch: (index: number, payloads: readonly object[]) => void;
   readonly disconnect: (index: number) => void;
   readonly close: () => Promise<void>;
 };
@@ -96,6 +97,11 @@ async function startHelloServer(options: {
       const socket = sockets[index];
       if (socket === undefined || socket.destroyed) throw new Error('test WebSocket is not open');
       socket.write(textFrame(payload));
+    },
+    sendBatch: (index, payloads) => {
+      const socket = sockets[index];
+      if (socket === undefined || socket.destroyed) throw new Error('test WebSocket is not open');
+      socket.write(Buffer.concat(payloads.map((payload) => textFrame(payload))));
     },
     disconnect: (index) => {
       const socket = sockets[index];
@@ -205,6 +211,44 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       await transport.shutdown();
     } finally {
       retryRelease.resolve();
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('candidate hello+refresh_requested coalesced batch를 promotion 뒤 successor로 이어간다', async () => {
+    const server = await startHelloServer({ autoHello: false, replyToClose: true });
+    const fetchMock = vi.fn(async () => connectionsOpenResponse(server.url));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      expectedApiAppId: 'A01BRIDGE',
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      backoff: { initialMs: 10, maxMs: 40 },
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      const starting = transport.start();
+      await vi.waitFor(() => expect(server.upgrades()).toBe(1));
+      server.send(0, { type: 'hello', connection_info: { app_id: 'A01BRIDGE' } });
+      await starting;
+
+      server.send(0, { type: 'disconnect', reason: 'refresh_requested' });
+      await vi.waitFor(() => expect(server.upgrades()).toBe(2));
+      server.sendBatch(1, [
+        { type: 'hello', connection_info: { app_id: 'A01BRIDGE' } },
+        { type: 'disconnect', reason: 'refresh_requested' },
+      ]);
+
+      await vi.waitFor(() => expect(server.upgrades()).toBe(3));
+      server.send(2, { type: 'hello', connection_info: { app_id: 'A01BRIDGE' } });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect({ fetches: fetchMock.mock.calls.length, upgrades: server.upgrades() }).toEqual({
+        fetches: 3,
+        upgrades: 3,
+      });
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+    } finally {
       await transport.shutdown().catch(() => undefined);
       await server.close();
     }
@@ -495,6 +539,46 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     }
   });
 
+  it('끝나지 않는 raw reader cancel과 무관하게 lock을 놓고 late rejection을 소비한다', async () => {
+    const cancelGate = deferred<void>();
+    let cancelCalls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull() {},
+      cancel() {
+        cancelCalls += 1;
+        return cancelGate.promise;
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })));
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 20, closeMs: 10 },
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_timeout' });
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect({ cancelCalls, locked: body.locked }).toEqual({ cancelCalls: 1, locked: false });
+
+      cancelGate.reject(new Error('late raw cancellation failure'));
+      await flushMicrotasks();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      expect({ cancelCalls, locked: body.locked }).toEqual({ cancelCalls: 1, locked: false });
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      cancelGate.resolve();
+      await transport.shutdown().catch(() => undefined);
+    }
+  });
+
   it('정상 body EOF 뒤 owner abort는 raw reader를 cancel하지 않는다', async () => {
     const server = await startHelloServer({ replyToClose: true });
     let cancelCalls = 0;
@@ -743,11 +827,15 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     }
   });
 
-  it('consumer cancel 뒤 owner abort는 raw reader를 중복 cancel하지 않는다', async () => {
+  it('consumer cancel은 끝나지 않는 raw cancel을 기다리지 않고 owner abort와 중복되지 않는다', async () => {
     const server = await startHelloServer({ replyToClose: true });
+    const cancelGate = deferred<void>();
     let cancelCalls = 0;
     const body = new ReadableStream<Uint8Array>({
-      cancel() { cancelCalls += 1; },
+      cancel() {
+        cancelCalls += 1;
+        return cancelGate.promise;
+      },
     });
     vi.stubGlobal('fetch', vi.fn(async () => ({
       body,
@@ -775,6 +863,7 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       await flushMicrotasks();
       expect({ cancelCalls, locked: body.locked }).toEqual({ cancelCalls: 1, locked: false });
     } finally {
+      cancelGate.resolve();
       await transport.shutdown().catch(() => undefined);
       await server.close();
     }

@@ -150,6 +150,7 @@ export class SlackSocketTransport {
   private shutdownTask: Promise<void> | null = null;
   private readonly closeTasks = new WeakMap<SocketConnection, Promise<CloseOutcome>>();
   private candidateDisconnected = false;
+  private candidateRefreshReason: SocketRefreshReason | null = null;
   private closeTimeoutObserved = false;
   private readonly timeouts: SocketTimeouts;
 
@@ -228,6 +229,7 @@ export class SlackSocketTransport {
     this.current = null;
     this.candidate = null;
     this.candidateDisconnected = false;
+    this.candidateRefreshReason = null;
     this.previous = null;
     try {
       await Promise.all(connections.map((connection) => this.closeConnection(connection)));
@@ -253,6 +255,7 @@ export class SlackSocketTransport {
     }
     this.candidate = connection;
     this.candidateDisconnected = false;
+    this.candidateRefreshReason = null;
     try {
       let starting: Promise<SocketHello>;
       try {
@@ -288,8 +291,15 @@ export class SlackSocketTransport {
     }
   }
 
-  private handleRefresh(connection: SocketConnection, _reason: SocketRefreshReason): void {
-    if (this.stopped || connection !== this.current) return;
+  private handleRefresh(connection: SocketConnection, reason: SocketRefreshReason): void {
+    if (this.stopped) return;
+    if (connection === this.candidate) {
+      // hello와 같은 transport batch에서 먼저 관측된 refresh를 promotion까지 보존한다.
+      // 여러 lifecycle frame은 한 successor 요청으로 coalesce한다.
+      if (!this.candidateDisconnected) this.candidateRefreshReason ??= reason;
+      return;
+    }
+    if (connection !== this.current) return;
     if (this.reconnectTask !== null) {
       this.pendingReconnect = { connection, immediate: true };
       return;
@@ -301,6 +311,7 @@ export class SlackSocketTransport {
     if (this.stopped) return;
     if (connection === this.candidate) {
       this.candidateDisconnected = true;
+      this.candidateRefreshReason = null;
       return;
     }
     // previous와 이미 retire된 stale connection은 새 current의 lifecycle을 바꾸지 않는다.
@@ -405,9 +416,13 @@ export class SlackSocketTransport {
       this.candidate !== connection
       || this.candidateDisconnected
     ) return false;
+    const refreshReason = this.candidateRefreshReason;
     this.previous = previous;
     this.current = connection;
     this.clearCandidate(connection);
+    // current role을 먼저 확정한 뒤 같은 lifecycle path로 재평가한다. 진행 중인
+    // reconnect에서는 pendingReconnect로 coalesce되어 old close와 successor를 직렬화한다.
+    if (refreshReason !== null) this.handleRefresh(connection, refreshReason);
     return true;
   }
 
@@ -415,6 +430,7 @@ export class SlackSocketTransport {
     if (this.candidate !== connection) return;
     this.candidate = null;
     this.candidateDisconnected = false;
+    this.candidateRefreshReason = null;
   }
 
   private closeConnection(connection: SocketConnection): Promise<CloseOutcome> {
@@ -515,17 +531,11 @@ function releaseSocketBodyReader(reader: unknown): void {
   }
 }
 
-async function cancelSocketBodyReader(reader: SocketBodyReader, reason?: unknown): Promise<void> {
-  try {
-    await reader.cancel(reason);
-  } catch {
-    // raw body cancellation failures never cross the adapter boundary.
-  }
-  try {
-    reader.releaseLock();
-  } catch {
-    // cancellation is still best-effort if a malformed reader keeps its lock.
-  }
+function cancelSocketBodyReader(reader: SocketBodyReader, reason?: unknown): void {
+  // cancel은 즉시 호출하고 late rejection까지 관측하되, 그 promise의 settlement가
+  // wrapper cancel이나 owner shutdown의 lock release를 붙잡게 하지 않는다.
+  observeOperation(() => Promise.resolve(reader.cancel(reason)));
+  releaseSocketBodyReader(reader);
 }
 
 function socketBodyReader(body: unknown): SocketBodyReader {
@@ -561,20 +571,14 @@ function socketBodyReader(body: unknown): SocketBodyReader {
     || typeof releaseLock !== 'function'
   ) {
     if (typeof cancel === 'function') {
-      observeOperation(async () => {
+      observeOperation(() => Promise.resolve(Reflect.apply(cancel, reader, [])));
+      if (typeof releaseLock === 'function') {
         try {
-          await Promise.resolve(Reflect.apply(cancel, reader, []));
+          Reflect.apply(releaseLock, reader, []);
         } catch {
-          // malformed reader cancellation is best-effort.
+          // malformed reader lock release is best-effort.
         }
-        if (typeof releaseLock === 'function') {
-          try {
-            Reflect.apply(releaseLock, reader, []);
-          } catch {
-            // malformed reader lock release is best-effort.
-          }
-        }
-      });
+      }
     } else {
       releaseSocketBodyReader(reader);
       observeSocketBodyCancel(body);
@@ -682,7 +686,7 @@ function fencedSocketResponse(
     } catch {
       // cancellation remains mandatory even if the wrapper controller already transitioned.
     }
-    observeOperation(() => cancelSocketBodyReader(reader));
+    cancelSocketBodyReader(reader);
   };
   try {
     if (signal.aborted) throw new SocketTransportError('connect_failed');
@@ -746,9 +750,9 @@ function fencedSocketResponse(
           abortBody();
         }
       },
-      async cancel(reason) {
+      cancel(reason) {
         if (!finish()) return;
-        await cancelSocketBodyReader(reader, reason);
+        cancelSocketBodyReader(reader, reason);
       },
     });
     return new Response(fencedBody, responseInit);
