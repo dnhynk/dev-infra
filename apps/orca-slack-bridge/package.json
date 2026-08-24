@@ -9,5 +9,9 @@
   },
   "bin": {
     "orca-slack-bridge": "./dist/cli.js"
+  },
+  "dependencies": {
+    "@slack/socket-mode": "3.0.0",
+    "undici": "^7.29.0"
   }
 }

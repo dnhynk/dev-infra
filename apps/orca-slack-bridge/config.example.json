@@ -1,6 +1,7 @@
 {
   "slack": {
     "teamId": "T01234567",
+    "apiAppId": "A01234567",
     "ownerUserIds": [
       "U01234567"
     ],

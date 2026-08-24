@@ -16,6 +16,12 @@ import type { SlackConfig } from '../project/config.js';
 export const BOT_TOKEN_VAR = 'ORCA_SLACK_BRIDGE_BOT_TOKEN';
 export const APP_TOKEN_VAR = 'ORCA_SLACK_BRIDGE_APP_TOKEN';
 
+/** Socket adapter도 같은 전용 환경변수만 읽게 하는 단일 getter. */
+export function appToken(env: NodeJS.ProcessEnv): string | undefined {
+  const token = env[APP_TOKEN_VAR]?.trim();
+  return token === '' ? undefined : token;
+}
+
 export type VerifyResult = {
   readonly checks: readonly Check[];
   readonly ok: boolean;
@@ -66,7 +72,7 @@ export async function verifySlack(
   add('config.slack', true, `team=${config.teamId} owners=${config.ownerUserIds.length} channels=2`);
 
   const botToken = env[BOT_TOKEN_VAR]?.trim();
-  const appToken = env[APP_TOKEN_VAR]?.trim();
+  const configuredAppToken = appToken(env);
 
   // 관례 이름이 설정돼 있으면 진단을 돕는다. 값은 읽지 않는다.
   for (const [generic, specific] of [
@@ -103,13 +109,13 @@ export async function verifySlack(
     }
   }
 
-  if (!appToken) {
+  if (!configuredAppToken) {
     if (!env['SLACK_APP_TOKEN']) add(APP_TOKEN_VAR, false, '환경변수가 비어 있다');
-  } else if (!appToken.startsWith('xapp-')) {
-    add(APP_TOKEN_VAR, false, `xapp-로 시작하지 않는다: ${maskToken(appToken)}`);
+  } else if (!configuredAppToken.startsWith('xapp-')) {
+    add(APP_TOKEN_VAR, false, `xapp-로 시작하지 않는다: ${maskToken(configuredAppToken)}`);
   } else {
-    add(APP_TOKEN_VAR, true, maskToken(appToken));
-    const conn = await slackPost('apps.connections.open', appToken);
+    add(APP_TOKEN_VAR, true, maskToken(configuredAppToken));
+    const conn = await slackPost('apps.connections.open', configuredAppToken);
     if (!conn.ok) {
       const e = String(conn.error);
       add(

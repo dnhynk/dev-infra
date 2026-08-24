@@ -15,6 +15,13 @@ describe('명령 분기', () => {
     if (p.kind === 'run') expect(p.command).toBe('verify-slack');
   });
 
+  it('verify-slack은 명시적 --socket에서만 Socket 연결을 요청한다', () => {
+    const normal = parseArgs(['verify-slack']);
+    const socket = parseArgs(['verify-slack', '--socket']);
+    if (normal.kind === 'run') expect(normal.socket).toBe(false);
+    if (socket.kind === 'run') expect(socket.socket).toBe(true);
+  });
+
   it('digest를 인식한다', () => {
     const p = parseArgs(['digest']);
     expect(p.kind).toBe('run');

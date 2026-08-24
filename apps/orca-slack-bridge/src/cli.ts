@@ -10,6 +10,7 @@ import {
   type RunObserveOptions,
 } from './run/publish.js';
 import { verifySlack, formatVerify, maskToken } from './slack/verify.js';
+import { verifySocketPreflight } from './slack/socket.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import {
   SlackWebApiPoster,
@@ -45,6 +46,8 @@ export type ParsedArgs =
       readonly pr: number | null;
       /** 참이면 Slack과 store에 쓰지 않는다. */
       readonly dryRun: boolean;
+      /** `verify-slack`에서만 실제 Socket hello를 확인한다. */
+      readonly socket: boolean;
     };
 
 type RunArgs = Extract<ParsedArgs, { readonly kind: 'run' }>;
@@ -179,13 +182,14 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     statePath: arg(argv, '--state') ?? null,
     pr,
     dryRun: argv.includes('--dry-run'),
+    socket: command === 'verify-slack' && argv.includes('--socket'),
   };
 }
 
 const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
-verify-slack  Slack 토큰과 설정을 확인한다 (메시지를 게시하지 않는다)
+verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
 runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
 
@@ -193,6 +197,10 @@ runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
   --pr-limit <n>    repository당 조회할 PR 수 (기본 50)
   --json            요약 대신 결과 전체를 JSON으로 출력
+
+verify-slack 전용:
+
+  --socket          Socket에 연결해 hello/App ID를 확인한 뒤 바로 닫는다
 
 digest·runs 전용:
 
@@ -434,7 +442,14 @@ async function main(): Promise<number> {
   const config = await loadConfig(parsed.configPath ?? defaultConfigPath());
 
   if (parsed.command === 'verify-slack') {
-    const result = await verifySlack(config.slack, process.env);
+    let result = await verifySlack(config.slack, process.env);
+    if (parsed.socket && result.ok) {
+      const socketCheck = await verifySocketPreflight(config.slack, process.env);
+      result = {
+        checks: [...result.checks, socketCheck],
+        ok: socketCheck.ok,
+      };
+    }
     process.stdout.write(formatVerify(result) + '\n');
     return result.ok ? 0 : 1;
   }
