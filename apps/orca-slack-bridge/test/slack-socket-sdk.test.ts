@@ -222,8 +222,19 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
 
   it('malformed fetch response는 WebSocket 전에 fail closed한다', async () => {
     const server = await startHelloServer();
+    let cancelCalls = 0;
+    let resourceActive = true;
     const malformed = {
-      body: {},
+      body: {
+        getReader() {
+          return {
+            cancel() {
+              cancelCalls += 1;
+              resourceActive = false;
+            },
+          };
+        },
+      },
       headers: new Headers({ 'content-type': 'application/json' }),
       status: 200,
       statusText: 'OK',
@@ -237,10 +248,235 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
 
     try {
       await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      await flushMicrotasks();
       expect(fetchMock).toHaveBeenCalledOnce();
-      expect(server.upgrades()).toBe(0);
+      expect({ cancelCalls, resourceActive, upgrades: server.upgrades() }).toEqual({
+        cancelCalls: 1,
+        resourceActive: false,
+        upgrades: 0,
+      });
       await expect(transport.shutdown()).resolves.toBeUndefined();
     } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('malformed metadata와 Response reconstruction failure도 body를 cancel한다', async () => {
+    const server = await startHelloServer();
+    const cases: ReadonlyArray<readonly [
+      string,
+      (body: ReadableStream<Uint8Array>) => Record<string, unknown>,
+    ]> = [
+      ['status', (body) => ({
+        body,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        status: 199,
+        statusText: 'OK',
+      })],
+      ['headers', (body) => ({
+        body,
+        headers: {
+          get: () => null,
+          entries: () => [[1, 'not-a-header']],
+        },
+        status: 200,
+        statusText: 'OK',
+      })],
+      ['reconstruction', (body) => ({
+        body,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        status: 204,
+        statusText: 'No Content',
+      })],
+    ];
+
+    try {
+      for (const [failure, makeResponse] of cases) {
+        let cancelCalls = 0;
+        let resourceActive = true;
+        const body = new ReadableStream<Uint8Array>({
+          cancel() {
+            cancelCalls += 1;
+            resourceActive = false;
+          },
+        });
+        const fetchMock = vi.fn(async () => makeResponse(body));
+        vi.stubGlobal('fetch', fetchMock);
+        const transport = new SlackSocketTransport({
+          connectionFactory: slackSdkConnectionFactory('xapp-test'),
+          timeouts: { startMs: 500, closeMs: 100 },
+        });
+
+        try {
+          await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+          await flushMicrotasks();
+          expect(fetchMock, failure).toHaveBeenCalledOnce();
+          expect({ cancelCalls, resourceActive, upgrades: server.upgrades() }, failure).toEqual({
+            cancelCalls: 1,
+            resourceActive: false,
+            upgrades: 0,
+          });
+          await expect(transport.shutdown(), failure).resolves.toBeUndefined();
+        } finally {
+          await transport.shutdown().catch(() => undefined);
+        }
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('malformed body chunk를 fail closed하고 raw reader를 cancel한다', async () => {
+    const server = await startHelloServer();
+    let cancelCalls = 0;
+    let resourceActive = true;
+    const body = new ReadableStream<unknown>({
+      start(controller) {
+        controller.enqueue('not-a-byte-chunk');
+      },
+      cancel() {
+        cancelCalls += 1;
+        resourceActive = false;
+      },
+    });
+    const fetchMock = vi.fn(async () => ({
+      body,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      status: 200,
+      statusText: 'OK',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).rejects.toMatchObject({ code: 'connect_failed' });
+      await flushMicrotasks();
+      expect({ cancelCalls, resourceActive, upgrades: server.upgrades() }).toEqual({
+        cancelCalls: 1,
+        resourceActive: false,
+        upgrades: 0,
+      });
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('정상 body EOF 뒤 owner abort는 raw reader를 cancel하지 않는다', async () => {
+    const server = await startHelloServer({ replyToClose: true });
+    let cancelCalls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true, url: server.url })));
+        controller.close();
+      },
+      cancel() { cancelCalls += 1; },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      body,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      status: 200,
+      statusText: 'OK',
+    })));
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).resolves.toBeUndefined();
+      expect(server.upgrades()).toBe(1);
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+      await flushMicrotasks();
+      expect(cancelCalls).toBe(0);
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('consumer cancel 뒤 owner abort는 raw reader를 중복 cancel하지 않는다', async () => {
+    const server = await startHelloServer({ replyToClose: true });
+    let cancelCalls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() { cancelCalls += 1; },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      body,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      status: 200,
+      statusText: 'OK',
+    })));
+    vi.spyOn(Response.prototype, 'text').mockImplementation(async function text(this: Response) {
+      await this.body?.cancel('consumer stopped');
+      return JSON.stringify({ ok: true, url: server.url });
+    });
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      await expect(transport.start()).resolves.toBeUndefined();
+      expect({ cancelCalls, upgrades: server.upgrades() }).toEqual({
+        cancelCalls: 1,
+        upgrades: 1,
+      });
+      await expect(transport.shutdown()).resolves.toBeUndefined();
+      await flushMicrotasks();
+      expect(cancelCalls).toBe(1);
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('fetch fulfillment과 response fence 사이 shutdown도 body resource를 cancel한다', async () => {
+    const server = await startHelloServer();
+    const request = deferred<Response>();
+    let cancelCalls = 0;
+    let resourceActive = true;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelCalls += 1;
+        resourceActive = false;
+      },
+    });
+    const response = new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    const fetchMock = vi.fn(() => request.promise);
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+    });
+
+    try {
+      const starting = transport.start();
+      const rejected = expect(starting).rejects.toMatchObject({ code: 'connect_failed' });
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+      // settleOperation의 fetch reaction 뒤, fencedSocketResponse continuation 앞에서 abort한다.
+      const shutdownAfterFulfillment = request.promise.then(() => transport.shutdown());
+      request.resolve(response);
+
+      await rejected;
+      await expect(shutdownAfterFulfillment).resolves.toBeUndefined();
+      await flushMicrotasks();
+      expect({ cancelCalls, resourceActive, upgrades: server.upgrades() }).toEqual({
+        cancelCalls: 1,
+        resourceActive: false,
+        upgrades: 0,
+      });
+    } finally {
+      request.resolve(response);
       await transport.shutdown().catch(() => undefined);
       await server.close();
     }
@@ -297,15 +533,15 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     vi.useFakeTimers();
     const bodyRelease = deferred<void>();
     const requestSignals: Array<AbortSignal | undefined> = [];
-    let bodyCancelled = false;
+    let bodyCancelCalls = 0;
     const body = new ReadableStream<Uint8Array>({
       async pull(controller) {
         await bodyRelease.promise;
-        if (bodyCancelled) return;
+        if (bodyCancelCalls > 0) return;
         controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true, url: server.url })));
         controller.close();
       },
-      cancel() { bodyCancelled = true; },
+      cancel() { bodyCancelCalls += 1; },
     });
     vi.stubGlobal('fetch', vi.fn((_url: string | URL, init?: RequestInit) => {
       requestSignals.push(init?.signal ?? undefined);
@@ -343,7 +579,7 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       vi.useRealTimers();
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(server.upgrades()).toBe(0);
-      expect(bodyCancelled).toBe(true);
+      expect(bodyCancelCalls).toBe(1);
       expect(clients[0]?.websocket).toBeUndefined();
       expect(clients[0]?.listenerCount('disconnected')).toBe(0);
     } finally {

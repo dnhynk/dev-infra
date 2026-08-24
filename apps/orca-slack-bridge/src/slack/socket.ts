@@ -486,23 +486,110 @@ const SILENT_LOGGER: Logger = {
 type SocketHttpFetch = NonNullable<NonNullable<SocketModeOptions['clientOptions']>['fetch']>;
 type SocketHttpResponse = Awaited<ReturnType<SocketHttpFetch>>;
 type SocketBodyReader = {
-  readonly read: () => Promise<unknown>;
+  readonly read: () => unknown;
   readonly cancel: (reason?: unknown) => unknown;
+  readonly releaseLock: () => unknown;
 };
 
+function observeSocketBodyCancel(target: unknown, reason?: unknown): boolean {
+  if (!isRecord(target)) return false;
+  let cancel: unknown;
+  try {
+    cancel = target['cancel'];
+  } catch {
+    return false;
+  }
+  if (typeof cancel !== 'function') return false;
+  const args = reason === undefined ? [] : [reason];
+  observeOperation(() => Promise.resolve(Reflect.apply(cancel, target, args)));
+  return true;
+}
+
+function releaseSocketBodyReader(reader: unknown): void {
+  if (!isRecord(reader)) return;
+  try {
+    const releaseLock = reader['releaseLock'];
+    if (typeof releaseLock === 'function') Reflect.apply(releaseLock, reader, []);
+  } catch {
+    // malformed readers still fall through to raw body cancellation.
+  }
+}
+
+async function cancelSocketBodyReader(reader: SocketBodyReader, reason?: unknown): Promise<void> {
+  try {
+    await reader.cancel(reason);
+  } catch {
+    // raw body cancellation failures never cross the adapter boundary.
+  }
+  try {
+    reader.releaseLock();
+  } catch {
+    // cancellation is still best-effort if a malformed reader keeps its lock.
+  }
+}
+
 function socketBodyReader(body: unknown): SocketBodyReader {
-  if (!isRecord(body) || typeof body['getReader'] !== 'function') {
+  if (!isRecord(body)) {
     throw new SocketTransportError('connect_failed');
   }
-  const reader: unknown = body['getReader']();
+  let reader: unknown;
+  try {
+    const getReader = body['getReader'];
+    if (typeof getReader !== 'function') throw new SocketTransportError('connect_failed');
+    reader = Reflect.apply(getReader, body, []);
+  } catch {
+    observeSocketBodyCancel(body);
+    throw new SocketTransportError('connect_failed');
+  }
+  let read: unknown;
+  let cancel: unknown;
+  let releaseLock: unknown;
+  try {
+    if (isRecord(reader)) {
+      // cancel을 먼저 잡아 read accessor 자체가 malformed여도 획득한 reader를 놓는다.
+      cancel = reader['cancel'];
+      releaseLock = reader['releaseLock'];
+      read = reader['read'];
+    }
+  } catch {
+    // 아래의 public cancellation fallback이 처리한다.
+  }
   if (
     !isRecord(reader)
-    || typeof reader['read'] !== 'function'
-    || typeof reader['cancel'] !== 'function'
+    || typeof read !== 'function'
+    || typeof cancel !== 'function'
+    || typeof releaseLock !== 'function'
   ) {
+    if (typeof cancel === 'function') {
+      observeOperation(async () => {
+        try {
+          await Promise.resolve(Reflect.apply(cancel, reader, []));
+        } catch {
+          // malformed reader cancellation is best-effort.
+        }
+        if (typeof releaseLock === 'function') {
+          try {
+            Reflect.apply(releaseLock, reader, []);
+          } catch {
+            // malformed reader lock release is best-effort.
+          }
+        }
+      });
+    } else {
+      releaseSocketBodyReader(reader);
+      observeSocketBodyCancel(body);
+    }
     throw new SocketTransportError('connect_failed');
   }
-  return reader as SocketBodyReader;
+  return {
+    read: () => Reflect.apply(read, reader, []),
+    cancel: (reason?: unknown) => Reflect.apply(
+      cancel,
+      reader,
+      reason === undefined ? [] : [reason],
+    ),
+    releaseLock: () => Reflect.apply(releaseLock, reader, []),
+  };
 }
 
 function isUint8ArrayChunk(value: unknown): value is Uint8Array {
@@ -535,31 +622,45 @@ function socketHeaders(value: unknown): Headers {
   }
 }
 
-/** Response body reader도 owner abort에 묶어 SDK가 late URL을 파싱하지 못하게 한다. */
-function fencedSocketResponse(
-  response: SocketHttpResponse,
-  signal: AbortSignal,
-): SocketHttpResponse {
-  if (!isRecord(response) || signal.aborted) {
-    throw new SocketTransportError('connect_failed');
-  }
-  const { body: rawBody, status, statusText } = response;
+function socketResponseInit(response: Record<string, unknown>): ResponseInit {
+  const status = response['status'];
+  const statusText = response['statusText'];
   if (
-    !Number.isInteger(status)
+    typeof status !== 'number'
+    || !Number.isInteger(status)
     || status < 200
     || status > 599
     || typeof statusText !== 'string'
   ) {
     throw new SocketTransportError('connect_failed');
   }
-  const headers = socketHeaders(response.headers);
-  const responseInit = { status, statusText, headers };
+  return { status, statusText, headers: socketHeaders(response['headers']) };
+}
+
+/** Response body reader도 owner abort에 묶어 SDK가 late URL을 파싱하지 못하게 한다. */
+function fencedSocketResponse(
+  response: SocketHttpResponse,
+  signal: AbortSignal,
+): SocketHttpResponse {
+  if (!isRecord(response)) throw new SocketTransportError('connect_failed');
+  let rawBody: unknown;
+  try {
+    // fulfillment 직후부터 adapter가 body를 소유하므로 metadata보다 먼저 reader를 잡는다.
+    rawBody = response['body'];
+  } catch {
+    throw new SocketTransportError('connect_failed');
+  }
   if (rawBody === null) {
-    return new Response(null, responseInit);
+    try {
+      if (signal.aborted) throw new SocketTransportError('connect_failed');
+      return new Response(null, socketResponseInit(response));
+    } catch {
+      throw new SocketTransportError('connect_failed');
+    }
   }
   const reader = socketBodyReader(rawBody);
   let finished = false;
-  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
   const finish = (): boolean => {
     if (finished) return false;
     finished = true;
@@ -568,60 +669,68 @@ function fencedSocketResponse(
   };
   const abortBody = (): void => {
     if (!finish()) return;
-    streamController.error(new SocketTransportError('connect_failed'));
-    observeOperation(() => Promise.resolve(reader.cancel()));
+    try {
+      streamController?.error(new SocketTransportError('connect_failed'));
+    } catch {
+      // cancellation remains mandatory even if the wrapper controller already transitioned.
+    }
+    observeOperation(() => cancelSocketBodyReader(reader));
   };
-  const fencedBody = new ReadableStream<Uint8Array>({
-    start(controller) {
-      streamController = controller;
-      if (signal.aborted) abortBody();
-      else signal.addEventListener('abort', abortBody, { once: true });
-    },
-    async pull(controller) {
-      if (finished) return;
-      let reading: Promise<unknown>;
-      try {
-        reading = Promise.resolve(reader.read());
-      } catch {
-        abortBody();
-        return;
-      }
-      const outcome = await settleOperation(reading, { signal });
-      if (finished) return;
-      if (outcome.status !== 'fulfilled') {
-        abortBody();
-        return;
-      }
-      try {
-        if (!isRecord(outcome.value) || typeof outcome.value['done'] !== 'boolean') {
+  try {
+    if (signal.aborted) throw new SocketTransportError('connect_failed');
+    const responseInit = socketResponseInit(response);
+    const fencedBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        if (signal.aborted) abortBody();
+        else signal.addEventListener('abort', abortBody, { once: true });
+      },
+      async pull(controller) {
+        if (finished) return;
+        let reading: Promise<unknown>;
+        try {
+          reading = Promise.resolve(reader.read());
+        } catch {
           abortBody();
           return;
         }
-        if (outcome.value['done']) {
-          finish();
-          controller.close();
-          return;
-        }
-        const chunk = outcome.value['value'];
-        if (!isUint8ArrayChunk(chunk)) {
+        const outcome = await settleOperation(reading, { signal });
+        if (finished) return;
+        if (outcome.status !== 'fulfilled') {
           abortBody();
           return;
         }
-        controller.enqueue(chunk);
-      } catch {
-        abortBody();
-      }
-    },
-    async cancel(reason) {
-      if (!finish()) return;
-      try {
-        await reader.cancel(reason);
-      } catch {
-        // raw body cancellation failures never cross the adapter boundary.
-      }
-    },
-  });
-  return new Response(fencedBody, responseInit);
+        try {
+          if (!isRecord(outcome.value) || typeof outcome.value['done'] !== 'boolean') {
+            abortBody();
+            return;
+          }
+          if (outcome.value['done']) {
+            if (!finish()) return;
+            releaseSocketBodyReader(reader);
+            controller.close();
+            return;
+          }
+          const chunk = outcome.value['value'];
+          if (!isUint8ArrayChunk(chunk)) {
+            abortBody();
+            return;
+          }
+          controller.enqueue(chunk);
+        } catch {
+          abortBody();
+        }
+      },
+      async cancel(reason) {
+        if (!finish()) return;
+        await cancelSocketBodyReader(reader, reason);
+      },
+    });
+    return new Response(fencedBody, responseInit);
+  } catch {
+    abortBody();
+    throw new SocketTransportError('connect_failed');
+  }
 }
 
 /**
