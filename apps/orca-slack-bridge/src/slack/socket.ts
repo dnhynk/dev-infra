@@ -1,4 +1,9 @@
-import { LogLevel, SocketModeClient, type Logger } from '@slack/socket-mode';
+import {
+  LogLevel,
+  SocketModeClient,
+  type Logger,
+  type SocketModeOptions,
+} from '@slack/socket-mode';
 import type { SlackConfig } from '../project/config.js';
 import { APP_TOKEN_VAR, appToken, type Check } from './verify.js';
 
@@ -80,17 +85,29 @@ function settleOperation<T>(
 
     if (signal?.aborted) {
       finish({ status: 'aborted' });
-      return;
-    }
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (options.timeoutMs !== undefined) {
-      timer = setTimeout(() => finish({ status: 'timed_out' }), options.timeoutMs);
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (options.timeoutMs !== undefined) {
+        timer = setTimeout(() => finish({ status: 'timed_out' }), options.timeoutMs);
+      }
     }
     operation.then(
       (value) => finish({ status: 'fulfilled', value }),
       () => finish({ status: 'rejected' }),
     );
   });
+}
+
+/** 이미 caller 경계를 벗어난 cleanup의 late reject까지 소비한다. */
+function observeOperation(operation: () => Promise<unknown>): void {
+  try {
+    void Promise.resolve(operation()).then(
+      () => undefined,
+      () => undefined,
+    );
+  } catch {
+    // 동기 SDK 오류도 adapter 경계 밖으로 내보내지 않는다.
+  }
 }
 
 function defaultSleep(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -338,6 +355,9 @@ export class SlackSocketTransport {
     const task = settleOperation(closing, { timeoutMs: this.timeouts.closeMs }).then((outcome) => {
       if (outcome.status === 'timed_out') {
         this.closeTimeoutObserved = true;
+        // SDK v3 disconnect는 첫 호출이 close handshake를 기다릴 수 있다. public close를
+        // 한 번 더 호출해 SDK가 가진 listener/timer cleanup을 진행하되 caller는 더 기다리지 않는다.
+        observeOperation(() => connection.close());
         return 'timed_out' as const;
       }
       return outcome.status === 'fulfilled' ? 'closed' as const : 'failed' as const;
@@ -389,6 +409,31 @@ const SILENT_LOGGER: Logger = {
   getLevel: () => LogLevel.ERROR,
 };
 
+type SocketHttpFetch = NonNullable<NonNullable<SocketModeOptions['clientOptions']>['fetch']>;
+type SocketHttpResponse = Awaited<ReturnType<SocketHttpFetch>>;
+
+/**
+ * SDK의 documented clientOptions.fetch seam에 owner abort를 결합한다. 실제 fetch가 signal을
+ * 무시하고 늦게 settle해도 SDK start에는 더 이상 URL을 넘기지 않고 late reject도 소비한다.
+ */
+function fencedSocketFetch(ownerSignal: AbortSignal): SocketHttpFetch {
+  return async (url, init) => {
+    const signal = init?.signal === undefined
+      ? ownerSignal
+      : AbortSignal.any([ownerSignal, init.signal]);
+    if (signal.aborted) throw new SocketTransportError('connect_failed');
+    let fetching: Promise<SocketHttpResponse>;
+    try {
+      fetching = globalThis.fetch(url, { ...init, signal });
+    } catch {
+      throw new SocketTransportError('connect_failed');
+    }
+    const outcome = await settleOperation(fetching, { signal });
+    if (outcome.status !== 'fulfilled') throw new SocketTransportError('connect_failed');
+    return outcome.value;
+  };
+}
+
 class IdentitySocketModeClient extends SocketModeClient {
   private observedAppId: string | null | undefined;
   private lifecycleHooks: SocketConnectionHooks | null;
@@ -398,12 +443,19 @@ class IdentitySocketModeClient extends SocketModeClient {
     hooks?.disconnected();
   };
 
-  constructor(appTokenValue: string, hooks: SocketConnectionHooks) {
+  constructor(
+    appTokenValue: string,
+    hooks: SocketConnectionHooks,
+    requestSignal: AbortSignal,
+  ) {
     super({
       appToken: appTokenValue,
       autoReconnectEnabled: false,
       logger: SILENT_LOGGER,
-      clientOptions: { retryConfig: { retries: 0 } },
+      clientOptions: {
+        retryConfig: { retries: 0 },
+        fetch: fencedSocketFetch(requestSignal),
+      },
     });
     this.lifecycleHooks = hooks;
     this.on('disconnected', this.disconnectedListener);
@@ -435,33 +487,36 @@ class IdentitySocketModeClient extends SocketModeClient {
 /** SDK start가 URL을 발급한 직후 연결하며, adapter 밖에는 hello App ID만 반환한다. */
 export function slackSdkConnectionFactory(appTokenValue: string): SocketConnectionFactory {
   return (hooks) => {
-    const client = new IdentitySocketModeClient(appTokenValue, hooks);
+    const requestAbort = new AbortController();
+    const client = new IdentitySocketModeClient(appTokenValue, hooks, requestAbort.signal);
     let closed = false;
-    let closing: Promise<void> | null = null;
+    const close = async (): Promise<void> => {
+      closed = true;
+      requestAbort.abort();
+      client.disposeLifecycle();
+      try {
+        // 반복 호출은 의도적이다. SDK v3는 두 번째 public disconnect에서 stalled
+        // close handshake의 listener/timer cleanup을 계속 진행한다.
+        await client.disconnect();
+      } catch {
+        throw new SocketTransportError('connect_failed');
+      }
+    };
     return {
       start: async () => {
         if (closed) throw new SocketTransportError('connect_failed');
         try {
           await client.start();
-          if (closed) throw new SocketTransportError('connect_failed');
+          if (closed) {
+            observeOperation(close);
+            throw new SocketTransportError('connect_failed');
+          }
           return client.hello();
         } catch {
           throw new SocketTransportError('connect_failed');
         }
       },
-      close: () => {
-        if (closing !== null) return closing;
-        closed = true;
-        client.disposeLifecycle();
-        closing = (async () => {
-          try {
-            await client.disconnect();
-          } catch {
-            throw new SocketTransportError('connect_failed');
-          }
-        })();
-        return closing;
-      },
+      close,
     };
   };
 }

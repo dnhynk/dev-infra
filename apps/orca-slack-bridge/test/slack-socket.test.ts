@@ -16,8 +16,9 @@ import { APP_TOKEN_VAR } from '../src/slack/verify.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => { resolve = res; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -318,7 +319,7 @@ describe('Socket lifecycle', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('shutdown의 끝나지 않는 close는 bounded fixed error이고 반복 호출해도 한 번만 닫는다', async () => {
+  it('shutdown의 끝나지 않는 close는 bounded error 뒤 cleanup을 한 번 재구동한다', async () => {
     vi.useFakeTimers();
     const neverClose = deferred<void>();
     const connection = new FakeConnection(() => hello(), () => neverClose.promise);
@@ -341,7 +342,7 @@ describe('Socket lifecycle', () => {
     await firstStop;
     expect(failure).toMatchObject({ code: 'close_timeout' });
     await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_timeout' });
-    expect(connection.closeCalls).toBe(1);
+    expect(connection.closeCalls).toBe(2);
     expect(create).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
 
@@ -349,7 +350,39 @@ describe('Socket lifecycle', () => {
     connection.disconnected();
     await flushMicrotasks();
     expect(create).toHaveBeenCalledOnce();
+    expect(connection.closeCalls).toBe(2);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('timeout 뒤 close rejection도 drain하고 반복 shutdown은 cleanup을 중복하지 않는다', async () => {
+    vi.useFakeTimers();
+    const lateClose = deferred<void>();
+    const connection = new FakeConnection(() => hello(), () => lateClose.promise);
+    const transport = new SlackSocketTransport({
+      connectionFactory: factory([connection]),
+      timeouts: { startMs: 25, closeMs: 20 },
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      await transport.start();
+      const stopping = transport.shutdown();
+      const rejected = expect(stopping).rejects.toMatchObject({ code: 'close_timeout' });
+      await vi.advanceTimersByTimeAsync(20);
+      await rejected;
+      expect(connection.closeCalls).toBe(2);
+
+      lateClose.reject(new Error('wss://late-secret.invalid payload=RAW'));
+      await flushMicrotasks();
+      expect(unhandled).toEqual([]);
+      await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_timeout' });
+      expect(connection.closeCalls).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('shutdown은 clean close하고 reconnect하지 않는다', async () => {
