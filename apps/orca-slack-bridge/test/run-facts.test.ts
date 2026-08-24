@@ -943,6 +943,7 @@ describe('카드에 그리는 목록의 정렬', () => {
       tasks: { total: 0, byStatus: [] },
       dispatches: { total: 0, byStatus: [], retriedTasks: 0 },
       blockers: { badges: [], notObservable: [] },
+      gates: [],
       degraded: [],
       ...over,
     };

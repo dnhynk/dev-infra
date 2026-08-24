@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 import { loadConfig, defaultConfigPath, type BridgeConfig } from './project/config.js';
+import {
+  readGateRegistrationDocument,
+  registerGateMetadata,
+  type GateRegistrationResult,
+} from './gate/register.js';
 import { GhCli } from './github/runner.js';
 import { OrcaCli, type OrcaRunner } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
@@ -18,7 +23,7 @@ import {
   type ThreadPoster,
 } from './slack/post.js';
 import { ReadOnlyDigestStore, SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
-import type { DigestStore, RunStore } from './store/schema.js';
+import type { DigestStore, GateStore, RunStore } from './store/schema.js';
 import {
   MemorySummaryCache,
   OpenAiSummaryProvider,
@@ -27,7 +32,7 @@ import {
   type SummaryProvider,
 } from './summarize/index.js';
 
-export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs';
+export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register';
 
 export type ParsedArgs =
   | { readonly kind: 'help' }
@@ -41,6 +46,8 @@ export type ParsedArgs =
       readonly json: boolean;
       /** durable store 경로. null이면 `ORCA_SLACK_BRIDGE_STATE` 또는 기본 경로다. */
       readonly statePath: string | null;
+      /** Required JSON file transport for `gate-register`; null for other commands. */
+      readonly inputPath: string | null;
       /** `digest`가 처리할 PR 번호. null이면 전부. */
       readonly pr: number | null;
       /** 참이면 Slack과 store에 쓰지 않는다. */
@@ -61,14 +68,21 @@ function arg(argv: readonly string[], name: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs'];
+const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs', 'gate-register'];
 
 function isCommand(v: string | undefined): v is Command {
   return v !== undefined && (COMMANDS as readonly string[]).includes(v);
 }
 
 /** 값을 받는 플래그와 받지 않는 플래그. 값 검사와 `digest`의 오타 검사에 쓴다. */
-const VALUE_FLAGS: readonly string[] = ['--config', '--orca', '--pr-limit', '--pr', '--state'];
+const VALUE_FLAGS: readonly string[] = [
+  '--config',
+  '--orca',
+  '--pr-limit',
+  '--pr',
+  '--state',
+  '--input',
+];
 const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
 
 /**
@@ -76,7 +90,25 @@ const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run'];
  *
  * 이 목록의 명령만 모르는 인자를 거부한다. 근거는 `unknownWriteFlag`에 있다.
  */
-const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs'];
+const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs', 'gate-register'];
+
+/** `gate-register` has a deliberately narrow production transport; other known flags are still invalid. */
+function unknownGateRegisterArg(argv: readonly string[]): string | null {
+  const valueFlags = new Set(['--input', '--state', '--orca']);
+  const boolFlags = new Set(['--json']);
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (valueFlags.has(token)) {
+      const value = argv[i + 1];
+      if (value !== undefined && !value.startsWith('--')) i += 1;
+      continue;
+    }
+    if (boolFlags.has(token)) continue;
+    return token;
+  }
+  return null;
+}
 
 /**
  * 값 플래그가 값을 실제로 받았는지 본다. 위반이 없으면 null.
@@ -159,6 +191,26 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       return { kind: 'error', message: `${command}가 모르는 인자다: ${unknown}` };
     }
   }
+  if (command === 'gate-register') {
+    const unknown = unknownGateRegisterArg(argv);
+    if (unknown !== null) {
+      return { kind: 'error', message: `gate-register가 모르는 인자다: ${unknown}` };
+    }
+    const inputCount = argv.filter((token) => token === '--input').length;
+    if (inputCount !== 1) {
+      return {
+        kind: 'error',
+        message:
+          inputCount === 0
+            ? 'gate-register는 --input <JSON 파일 경로>가 필수다'
+            : 'gate-register는 --input을 정확히 한 번만 받는다',
+      };
+    }
+    const inputPath = arg(argv, '--input');
+    if (inputPath === undefined || inputPath.trim() === '') {
+      return { kind: 'error', message: 'gate-register --input 경로가 비어 있다' };
+    }
+  }
   const prLimitRaw = arg(argv, '--pr-limit');
   const prLimit = prLimitRaw === undefined ? 50 : Number.parseInt(prLimitRaw, 10);
   if (!Number.isSafeInteger(prLimit) || prLimit <= 0) {
@@ -177,17 +229,19 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     prLimit,
     json: argv.includes('--json'),
     statePath: arg(argv, '--state') ?? null,
+    inputPath: arg(argv, '--input') ?? null,
     pr,
     dryRun: argv.includes('--dry-run'),
   };
 }
 
-const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs>
+const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (메시지를 게시하지 않는다)
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
 runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
+gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite에 등록한다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
@@ -203,9 +257,15 @@ digest 전용:
 
   --pr <number>     이 번호의 PR만 처리한다
 
+gate-register 전용:
+
+  --input <path>    strict Gate metadata JSON 파일 (필수; stdin/자유 텍스트 입력 없음)
+  --state <path>    등록할 durable store 경로
+
 snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
 runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
-하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080).`;
+하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080). gate-register는 Orca Gate를
+read-only로 재조회한 뒤 local SQLite에만 쓰고 Slack/Orca mutation을 하지 않는다.`;
 
 /**
  * summarizer provider를 만든다.
@@ -296,7 +356,10 @@ export function digestPosters(
  * 반환 타입만 다르다. `runs`는 `DigestStore`가 아니라 `RunStore`를 쓴다. 두 인터페이스를 나눈
  * 이유는 `store/schema.ts`에 있고, 여기서 다시 합치면 그 경계가 CLI에서 무너진다.
  */
-export function openRunStore(statePath: string, dryRun: boolean): RunStore & { close(): void } {
+export function openRunStore(
+  statePath: string,
+  dryRun: boolean,
+): RunStore & GateStore & { close(): void } {
   return dryRun ? new ReadOnlyDigestStore(statePath) : new SqliteDigestStore(statePath);
 }
 
@@ -308,11 +371,10 @@ export function openRunStore(statePath: string, dryRun: boolean): RunStore & { c
  * 이 배선을 다시 `null`로 되돌리면 실패하는 테스트가 필요한데, `runRunsCommand`는 실제 `orca`
  * 프로세스를 만들어 그 자리에서 볼 수 없기 때문이다.
  *
- * **`digestPosters`와 달리 thread 경계를 돌려주지 않는다.** D1 Run 카드에는 thread 표면이 없다.
- * OD-072가 정한 owner 개입 알림은 D2 범위이고, 지금 여기서 `ThreadPoster`를 넘기면 아무도 쓰지
- * 않는 write 경계가 생긴다.
+ * D2-A부터 같은 concrete poster를 root와 Gate thread 경계에 함께 건다. Gate renderer에는
+ * action block이 없고 이 thread 경계는 정적 reply create/update만 소비한다.
  */
-export function runsPoster(dryRun: boolean, env: NodeJS.ProcessEnv): SlackPoster | null {
+export function runsPoster(dryRun: boolean, env: NodeJS.ProcessEnv): SlackWebApiPoster | null {
   if (dryRun) return null;
   return new SlackWebApiPoster({ token: botToken(env) });
 }
@@ -329,17 +391,19 @@ export function runsPoster(dryRun: boolean, env: NodeJS.ProcessEnv): SlackPoster
 export function runsObserveOptions(
   parsed: RunArgs,
   config: BridgeConfig,
-  store: RunStore,
+  store: RunStore & GateStore,
   env: NodeJS.ProcessEnv,
 ): RunObserveOptions {
   if (config.slack === null) {
     throw new Error('runs는 설정의 slack 섹션이 필요하다. 게시 채널은 설정에서만 읽는다');
   }
+  const poster = runsPoster(parsed.dryRun, env);
   return {
     config,
     channel: config.slack.channels.agentRuns,
     store,
-    slack: runsPoster(parsed.dryRun, env),
+    slack: poster,
+    thread: poster,
     now: () => new Date(),
   };
 }
@@ -380,6 +444,42 @@ export async function runRunsCommand(
   } catch (e) {
     // main의 최상위 handler로 올리지 않는다. 그쪽은 채널 ID를 지울 근거를 갖고 있지 않다.
     process.stderr.write(formatChannelError(e, channel) + '\n');
+    return 1;
+  } finally {
+    store.close();
+  }
+}
+
+function formatGateRegistration(result: GateRegistrationResult): string {
+  return [
+    `Gate metadata ${result.action}`,
+    `gate ${result.metadata.gateKey}`,
+    `run ${result.metadata.runKey}`,
+    `task ${result.metadata.taskKey}`,
+    `ask ${result.metadata.askMessageId}`,
+  ].join('\n');
+}
+
+/** `gate-register --input` production ingress: one read-only Orca query and one local store write. */
+export async function runGateRegisterCommand(
+  parsed: RunArgs,
+  orca?: OrcaRunner,
+): Promise<number> {
+  if (parsed.command !== 'gate-register' || parsed.inputPath === null) {
+    process.stderr.write('gate-register는 --input <JSON 파일 경로>가 필수다\n');
+    return 2;
+  }
+  const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
+  const store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
+  try {
+    const document = await readGateRegistrationDocument(parsed.inputPath);
+    const result = await registerGateMetadata(orca ?? new OrcaCli(orcaBin), store, document);
+    process.stdout.write(
+      (parsed.json ? JSON.stringify(result, null, 2) : formatGateRegistration(result)) + '\n',
+    );
+    return 0;
+  } catch (e) {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return 1;
   } finally {
     store.close();
@@ -429,6 +529,10 @@ async function main(): Promise<number> {
   if (parsed.kind === 'error') {
     process.stderr.write(parsed.message + '\n\n' + USAGE + '\n');
     return 2;
+  }
+
+  if (parsed.command === 'gate-register') {
+    return await runGateRegisterCommand(parsed);
   }
 
   const config = await loadConfig(parsed.configPath ?? defaultConfigPath());

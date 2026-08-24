@@ -175,6 +175,7 @@ function facts(over: Partial<RunFacts> = {}): RunFacts {
       badges: badges(),
       notObservable: [{ source: 'ciFailure', reason: 'Orca schema에 CI 전용 상태가 없다' }],
     },
+    gates: [],
     degraded: [
       { kind: 'liveness_unknown', detail: 'Task가 없어 Run row와 대조할 binding이 없다' },
     ],

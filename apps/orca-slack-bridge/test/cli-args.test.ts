@@ -27,10 +27,18 @@ describe('명령 분기', () => {
     if (p.kind === 'run') expect(p.command).toBe('runs');
   });
 
-  it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs']) {
-      expect(parseArgs([c]).kind).toBe('run');
+  it('gate-register를 인식한다', () => {
+    const p = parseArgs(['gate-register', '--input', 'C:/gate.json']);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.command).toBe('gate-register');
+      expect(p.inputPath).toBe('C:/gate.json');
     }
+  });
+
+  it('모든 문서화된 명령이 인식된다', () => {
+    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs']) expect(parseArgs([c]).kind).toBe('run');
+    expect(parseArgs(['gate-register', '--input', 'gate.json']).kind).toBe('run');
   });
 
   it('인자 없이는 도움말', () => {
@@ -154,6 +162,53 @@ describe('runs 옵션', () => {
     if (p.kind === 'error') {
       expect(p.message).toContain('--state');
       expect(p.message).toContain('--dry-runn');
+    }
+  });
+});
+
+describe('gate-register transport', () => {
+  it('--input <JSON 파일 경로>를 정확히 한 번 요구한다', () => {
+    for (const argv of [
+      ['gate-register'],
+      ['gate-register', '--input'],
+      ['gate-register', '--input', 'a.json', '--input', 'b.json'],
+    ]) {
+      const p = parseArgs(argv);
+      expect(p.kind).toBe('error');
+      if (p.kind === 'error') expect(p.message).toContain('--input');
+    }
+  });
+
+  it('파일 transport와 local/read-only 경계 플래그만 받는다', () => {
+    const p = parseArgs([
+      'gate-register',
+      '--input',
+      'gate.json',
+      '--state',
+      'state.db',
+      '--orca',
+      'orca-test',
+      '--json',
+    ]);
+    expect(p.kind).toBe('run');
+    if (p.kind === 'run') {
+      expect(p.inputPath).toBe('gate.json');
+      expect(p.statePath).toBe('state.db');
+      expect(p.orcaBin).toBe('orca-test');
+      expect(p.json).toBe(true);
+    }
+  });
+
+  it('stdin/free-text/shell JSON과 다른 명령용 플래그를 production 입력으로 받지 않는다', () => {
+    for (const extra of [
+      ['{"gateId":"gate_x"}'],
+      ['--payload', '{"gateId":"gate_x"}'],
+      ['--dry-run'],
+      ['--pr', '1'],
+      ['--config', 'config.json'],
+    ]) {
+      const p = parseArgs(['gate-register', '--input', 'gate.json', ...extra]);
+      expect(p.kind).toBe('error');
     }
   });
 });
