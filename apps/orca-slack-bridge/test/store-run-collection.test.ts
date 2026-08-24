@@ -223,7 +223,7 @@ function rejectsSecondRow(path: string): boolean {
   }
 }
 
-describe('v5 → v6 migration', () => {
+describe('v5 → current migration (v6 collection step 포함)', () => {
   // 이 파일의 알려진 함정이다. SCHEMA_DDL에만 있고 MIGRATIONS에는 없는 테이블(또는 그 반대)이
   // 생기면 새 파일과 기존 파일이 다른 스키마로 갈라진다.
   it('올린 v5 파일과 새로 만든 v6 파일의 스키마가 같다', () => {
@@ -247,7 +247,7 @@ describe('v5 → v6 migration', () => {
     expect(rejectsSecondRow(freshPath)).toBe(true);
   });
 
-  it('run_collection_message 표를 붙이고 버전을 올린다', () => {
+  it('run_collection_message 표를 붙이고 current 버전까지 올린다', () => {
     writeV5(dbPath);
 
     const store = new SqliteDigestStore(dbPath);
@@ -260,7 +260,7 @@ describe('v5 → v6 migration', () => {
     const version = raw.prepare('SELECT version FROM schema_version WHERE id = 1').get();
     raw.close();
     expect(version).toEqual({ version: SCHEMA_VERSION });
-    expect(SCHEMA_VERSION).toBe(6);
+    expect(SCHEMA_VERSION).toBe(7);
   });
 
   it('기존 여섯 표의 행을 그대로 둔다', () => {

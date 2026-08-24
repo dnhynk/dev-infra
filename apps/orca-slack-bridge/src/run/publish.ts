@@ -1,8 +1,9 @@
 import { renderFingerprint, type RenderedCard } from '../digest/render.js';
+import { publishGateCard, type GatePublishResult } from '../gate/publish.js';
 import type { OrcaRunner } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
-import type { SlackPoster } from '../slack/post.js';
-import type { RunStore } from '../store/schema.js';
+import type { SlackPoster, ThreadPoster } from '../slack/post.js';
+import type { GateStore, RunStore } from '../store/schema.js';
 import { collectRunFacts } from './collect.js';
 import {
   renderRunCard,
@@ -83,10 +84,12 @@ export type RunCollectionPublishResult = {
   /** 컬렉션 루트. **등록 Run 수와 무관하게 항상 있다.** */
   readonly collection: RunPublishOutcome;
   readonly runs: readonly RunPublishResult[];
+  /** Static replies keyed by Gate; never contains action blocks in D2-A. */
+  readonly gates: readonly GatePublishResult[];
 };
 
 export type RunPublishOptions = {
-  readonly store: RunStore;
+  readonly store: RunStore & GateStore;
   /**
    * Slack write 경계. **null이면 dry-run이다** — Slack도 store도 건드리지 않고 결정만 돌려준다.
    *
@@ -94,6 +97,8 @@ export type RunPublishOptions = {
    * 쓰면 한쪽만 고쳐진다.
    */
   readonly slack: SlackPoster | null;
+  /** Gate thread reply boundary. Null together with `slack` means dry-run. */
+  readonly thread: ThreadPoster | null;
   /** 대상 채널 ID. 설정의 `slack.channels.agentRuns`에서 온다. */
   readonly channel: string;
   readonly now: () => Date;
@@ -270,16 +275,33 @@ export async function publishRunCollection(
     unregistered: collection.unregistered,
   };
   const results: RunPublishResult[] = [];
+  const gateResults: GatePublishResult[] = [];
   for (const run of collection.runs) {
-    results.push(
-      await publishRunCard(options, {
-        run,
-        pullRequests: options.store.listRunPullRequests(run.identity.key),
-        collection: context,
-      }),
-    );
+    const root = await publishRunCard(options, {
+      run,
+      pullRequests: options.store.listRunPullRequests(run.identity.key),
+      collection: context,
+    });
+    results.push(root);
+    const rootMessageTs = root.action === 'channel_mismatch' ? null : root.messageTs;
+    for (const gate of run.gates) {
+      gateResults.push(
+        await publishGateCard(
+          {
+            store: options.store,
+            slack: options.slack,
+            thread: options.thread,
+            channel: options.channel,
+            now: options.now,
+          },
+          run.identity.key,
+          rootMessageTs,
+          gate,
+        ),
+      );
+    }
   }
-  return { collection: collectionResult, runs: results };
+  return { collection: collectionResult, runs: results, gates: gateResults };
 }
 
 /**
@@ -293,9 +315,11 @@ export type RunObserveOptions = {
   readonly config: BridgeConfig;
   /** 게시 대상 채널 ID. 설정의 `slack.channels.agentRuns`에서만 온다. 여기서 만들지 않는다. */
   readonly channel: string;
-  readonly store: RunStore;
+  readonly store: RunStore & GateStore;
   /** Slack write 경계. **null이면 dry-run이다.** */
   readonly slack: SlackPoster | null;
+  /** Static Gate thread reply boundary. Null together with `slack` means dry-run. */
+  readonly thread: ThreadPoster | null;
   readonly now: () => Date;
 };
 
@@ -330,7 +354,10 @@ export async function runRunObserver(
   orca: OrcaRunner,
   options: RunObserveOptions,
 ): Promise<RunObserveReport> {
-  const facts = await collectRunFacts(orca, options.config, { now: options.now });
+  const facts = await collectRunFacts(orca, options.config, {
+    now: options.now,
+    gateStore: options.store,
+  });
   const published = await publishRunCollection(options, facts);
   return {
     observedAt: facts.observedAt,
@@ -341,7 +368,16 @@ export async function runRunObserver(
 }
 
 /** 카드 한 장의 결정을 사람이 읽는 줄로 만든다. */
-function outcomeLines(label: string, outcome: RunPublishOutcome, dryRun: boolean): string[] {
+function outcomeLines(
+  label: string,
+  outcome: {
+    readonly action: string;
+    readonly messageTs: string | null;
+    readonly fingerprint: string;
+    readonly card: RenderedCard;
+  },
+  dryRun: boolean,
+): string[] {
   const lines = [
     `${label}  ${outcome.action}`,
     `  fingerprint ${outcome.fingerprint}`,
@@ -375,8 +411,13 @@ export function formatRunObserveReport(report: RunObserveReport): string {
     lines.push(...outcomeLines(r.run.identity.runId, r, report.dryRun));
     lines.push('');
   }
+  for (const gate of report.published.gates) {
+    lines.push(...outcomeLines(`Gate ${gate.gate.gateId}`, gate, report.dryRun));
+    lines.push('');
+  }
   lines.push(
     `Run 카드 ${report.published.runs.length}건 / 컬렉션 카드 1건 / ` +
+      `Gate thread 카드 ${report.published.gates.length}건 / ` +
       `등록되지 않은 Run ${report.facts.unregistered.count}건`,
   );
   return lines.join('\n');

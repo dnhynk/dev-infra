@@ -8,7 +8,7 @@ import { BOT_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
 import type { OrcaRunner } from '../src/orca/client.js';
-import type { RunStore } from '../src/store/schema.js';
+import type { GateStore, RunStore } from '../src/store/schema.js';
 
 /**
  * runs 명령의 CLI 경계 검증(OD-080, OD-078).
@@ -158,7 +158,7 @@ describe('runs write 경계 배선', () => {
 });
 
 describe('runs 관찰 옵션', () => {
-  function withStore<T>(fn: (store: RunStore & { close(): void }) => T): T {
+  function withStore<T>(fn: (store: RunStore & GateStore & { close(): void }) => T): T {
     const store = openRunStore(statePath, false);
     try {
       return fn(store);
@@ -181,6 +181,7 @@ describe('runs 관찰 옵션', () => {
     withStore((store) => {
       const options = runsObserveOptions(args(['runs', '--dry-run']), CONFIG, store, {});
       expect(options.slack).toBeNull();
+      expect(options.thread).toBeNull();
     });
   });
 
@@ -190,6 +191,7 @@ describe('runs 관찰 옵션', () => {
         [BOT_TOKEN_VAR]: TOKEN,
       });
       expect(options.slack).toBeInstanceOf(SlackWebApiPoster);
+      expect(options.thread).toBe(options.slack);
     });
   });
 

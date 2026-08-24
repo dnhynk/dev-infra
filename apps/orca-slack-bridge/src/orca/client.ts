@@ -4,6 +4,7 @@ import { unwrap } from './envelope.js';
 import {
   parseJsonField,
   parseOrcaTimestamp,
+  parseStringArrayField,
   repositoryIdFromWorktreeId,
   worktreePathFromIncarnation,
 } from './coerce.js';
@@ -351,7 +352,9 @@ export async function listTaskPage(
       runId: str(o['run_id']),
       title: str(o['task_title']) || str(o['display_name']),
       status: str(o['status']),
-      deps: read(() => parseJsonField<readonly string[]>(o['deps'], [])),
+      deps: read(() =>
+        parseStringArrayField(o['deps'], [], `task ${str(o['id'])}의 deps`),
+      ),
       result: read(() => parseJsonField<unknown>(o['result'], null)),
       worktreePath: inc === '' ? null : worktreePathFromIncarnation(inc),
       repositoryId: inc === '' ? null : repositoryIdFromWorktreeId(inc),
@@ -390,7 +393,9 @@ export async function listGates(runner: OrcaRunner, runId: string): Promise<Orca
       runId: str(o['run_id']),
       taskId: str(o['task_id']),
       question: str(o['question']),
-      options: read(() => parseJsonField<readonly string[]>(o['options'], [])),
+      options: read(() =>
+        parseStringArrayField(o['options'], [], `gate ${str(o['id'])}의 options`),
+      ),
       status: str(o['status']),
       resolution: strOrNull(o['resolution']),
       createdAt: parseOrcaTimestamp(str(o['created_at'])),

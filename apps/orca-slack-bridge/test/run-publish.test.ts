@@ -84,6 +84,7 @@ function facts(over: Partial<RunFacts> = {}, runId = RUN_ID): RunFacts {
     tasks: { total: 10, byStatus: [{ status: 'completed', count: 10 }] },
     dispatches: { total: 12, byStatus: [{ status: 'completed', count: 12 }], retriedTasks: 1 },
     blockers: { badges: [], notObservable: [] },
+    gates: [],
     degraded: [],
     ...over,
   };
@@ -98,7 +99,7 @@ function input(run: RunFacts = facts()): RunCardInput {
 }
 
 function options(store: SqliteDigestStore, slack: SlackPoster | null): RunPublishOptions {
-  return { store, slack, channel: CHANNEL, now: () => new Date(AT) };
+  return { store, slack, thread: null, channel: CHANNEL, now: () => new Date(AT) };
 }
 
 describe('Run 루트 재사용', () => {
@@ -194,7 +195,13 @@ describe('Run 루트 재사용', () => {
     const slack = new FakeSlack();
     await publishRunCard(options(store, slack), input());
 
-    const moved: RunPublishOptions = { store, slack, channel: 'C0OTHER', now: () => new Date(AT) };
+    const moved: RunPublishOptions = {
+      store,
+      slack,
+      thread: null,
+      channel: 'C0OTHER',
+      now: () => new Date(AT),
+    };
     const result = await publishRunCard(moved, input(facts({ tasks: { total: 99, byStatus: [] } })));
     store.close();
 
@@ -409,7 +416,13 @@ describe('컬렉션 게시', () => {
 
     const LATER = '2026-08-24T06:30:00.000Z';
     observe(LATER);
-    const later: RunPublishOptions = { store, slack, channel: CHANNEL, now: () => new Date(LATER) };
+    const later: RunPublishOptions = {
+      store,
+      slack,
+      thread: null,
+      channel: CHANNEL,
+      now: () => new Date(LATER),
+    };
     const second = await publishRunCollection(later, collection({ observedAt: LATER, runs: [facts()] }));
     store.close();
 
@@ -579,7 +592,13 @@ describe('컬렉션 카드 (OD-080)', () => {
     const slack = new FakeSlack();
     await publishRunCollection(options(store, slack), empty());
 
-    const moved: RunPublishOptions = { store, slack, channel: 'C0OTHER', now: () => new Date(AT) };
+    const moved: RunPublishOptions = {
+      store,
+      slack,
+      thread: null,
+      channel: 'C0OTHER',
+      now: () => new Date(AT),
+    };
     const result = await publishRunCollection(
       moved,
       empty({

@@ -3,8 +3,10 @@ import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 import type { CheckFact } from '../github/pull-request.js';
+import { parseGateOptionMetadataArray } from '../gate/register.js';
+import type { GateMetadata } from '../gate/types.js';
 import { pullRequestNumber } from '../identity/keys.js';
-import type { PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
+import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
   ENABLE_WAL,
@@ -13,8 +15,11 @@ import {
   SCHEMA_VERSION,
   STATE_PATH_VAR,
   type DigestStore,
+  type GateMessageRecord,
+  type GateStore,
   type NewPrMessage,
   type NewPrTask,
+  type NewGateMessage,
   type NewRunCollectionMessage,
   type NewRunMessage,
   type NewThreadEvent,
@@ -269,6 +274,36 @@ VALUES (1, ?, ?, ?, ?, ?)`;
 const UPDATE_RUN_COLLECTION_OBSERVATION = `
 UPDATE run_collection_message SET render_fingerprint = ?, updated_at = ? WHERE id = 1`;
 
+const SELECT_GATE_METADATA = `
+SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
+       options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+  FROM gate_metadata WHERE gate_key = ?`;
+
+const SELECT_RUN_GATE_METADATA = `
+SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
+       options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+  FROM gate_metadata WHERE run_key = ?
+ ORDER BY gate_key`;
+
+const INSERT_GATE_METADATA = `
+INSERT INTO gate_metadata
+  (gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
+   options_json, recommendation_option_id, recommendation_reason, impact, registered_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+const SELECT_GATE_MESSAGE = `
+SELECT gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint,
+       created_at, updated_at
+  FROM gate_message WHERE gate_key = ?`;
+
+const INSERT_GATE_MESSAGE = `
+INSERT INTO gate_message
+  (gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+
+const UPDATE_GATE_OBSERVATION = `
+UPDATE gate_message SET render_fingerprint = ?, updated_at = ? WHERE gate_key = ?`;
+
 /**
  * 이 Run에 연결된 PR과 저장된 상태를 함께 읽는다.
  *
@@ -325,6 +360,77 @@ type RunCollectionMessageRow = {
   readonly created_at: string;
   readonly updated_at: string;
 };
+
+type GateMetadataRow = {
+  readonly gate_key: string;
+  readonly run_key: string;
+  readonly task_key: string;
+  readonly dispatch_key: string;
+  readonly ask_message_id: string;
+  readonly question_thread_id: string;
+  readonly options_json: string;
+  readonly recommendation_option_id: string;
+  readonly recommendation_reason: string;
+  readonly impact: string;
+  readonly registered_at: string;
+};
+
+type GateMessageRow = {
+  readonly gate_key: string;
+  readonly run_key: string;
+  readonly channel_id: string;
+  readonly thread_ts: string;
+  readonly message_ts: string;
+  readonly render_fingerprint: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
+
+function toGateMetadata(row: GateMetadataRow): GateMetadata {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.options_json);
+  } catch (e) {
+    throw new TypeError(
+      `${row.gate_key}의 gate_metadata.options_json이 JSON이 아니다: ${e instanceof Error ? e.message : String(e)}`,
+      { cause: e },
+    );
+  }
+  const options = parseGateOptionMetadataArray(parsed, `${row.gate_key}.options_json`);
+  if (!options.some((option) => option.id === row.recommendation_option_id)) {
+    throw new TypeError(
+      `${row.gate_key}의 recommendation_option_id가 options_json에 없다: ${row.recommendation_option_id}`,
+    );
+  }
+  return {
+    gateKey: row.gate_key as GateKey,
+    runKey: row.run_key as RunKey,
+    taskKey: row.task_key as TaskKey,
+    dispatchKey: row.dispatch_key as GateMetadata['dispatchKey'],
+    askMessageId: row.ask_message_id,
+    questionThreadId: row.question_thread_id,
+    options,
+    recommendation: {
+      optionId: row.recommendation_option_id,
+      reason: row.recommendation_reason,
+    },
+    impact: row.impact,
+    registeredAt: row.registered_at,
+  };
+}
+
+function toGateMessage(row: GateMessageRow): GateMessageRecord {
+  return {
+    gateKey: row.gate_key as GateKey,
+    runKey: row.run_key as RunKey,
+    channelId: row.channel_id,
+    threadTs: row.thread_ts,
+    messageTs: row.message_ts,
+    renderFingerprint: row.render_fingerprint,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 function toRunCollectionMessageRecord(row: RunCollectionMessageRow): RunCollectionMessageRecord {
   return {
@@ -498,7 +604,7 @@ function toRecord(row: PrMessageRow): PrMessageRecord {
   };
 }
 
-export class SqliteDigestStore implements DigestStore, RunStore {
+export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
   private readonly db: DatabaseSync;
 
   /** 파일을 열고 스키마를 준비한다. 부모 디렉터리가 없으면 만든다. */
@@ -689,6 +795,78 @@ export class SqliteDigestStore implements DigestStore, RunStore {
     }
   }
 
+  findGateMetadata(gateKey: GateKey): GateMetadata | null {
+    const row = this.db.prepare(SELECT_GATE_METADATA).get(gateKey) as GateMetadataRow | undefined;
+    return row === undefined ? null : toGateMetadata(row);
+  }
+
+  listGateMetadata(runKey: RunKey): readonly GateMetadata[] {
+    return (this.db.prepare(SELECT_RUN_GATE_METADATA).all(runKey) as GateMetadataRow[]).map(
+      toGateMetadata,
+    );
+  }
+
+  insertGateMetadata(metadata: GateMetadata): void {
+    try {
+      this.db
+        .prepare(INSERT_GATE_METADATA)
+        .run(
+          metadata.gateKey,
+          metadata.runKey,
+          metadata.taskKey,
+          metadata.dispatchKey,
+          metadata.askMessageId,
+          metadata.questionThreadId,
+          JSON.stringify(metadata.options),
+          metadata.recommendation.optionId,
+          metadata.recommendation.reason,
+          metadata.impact,
+          metadata.registeredAt,
+        );
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      throw new Error(`${metadata.gateKey}의 sidecar metadata를 기록할 수 없다: ${detail}`, {
+        cause: e,
+      });
+    }
+  }
+
+  findGateMessage(gateKey: GateKey): GateMessageRecord | null {
+    const row = this.db.prepare(SELECT_GATE_MESSAGE).get(gateKey) as GateMessageRow | undefined;
+    return row === undefined ? null : toGateMessage(row);
+  }
+
+  insertGateMessage(message: NewGateMessage): void {
+    try {
+      this.db
+        .prepare(INSERT_GATE_MESSAGE)
+        .run(
+          message.gateKey,
+          message.runKey,
+          message.channelId,
+          message.threadTs,
+          message.messageTs,
+          message.renderFingerprint,
+          message.at,
+          message.at,
+        );
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `${message.gateKey}의 thread 메시지를 기록할 수 없다 ` +
+          `(channel ${message.channelId}, ts ${message.messageTs}): ${detail}`,
+        { cause: e },
+      );
+    }
+  }
+
+  updateGateObservation(gateKey: GateKey, renderFingerprint: string, at: string): void {
+    const result = this.db.prepare(UPDATE_GATE_OBSERVATION).run(renderFingerprint, at, gateKey);
+    if (Number(result.changes) === 0) {
+      throw new Error(`${gateKey}의 thread 매핑 행이 없어 관찰 결과를 갱신할 수 없다`);
+    }
+  }
+
   close(): void {
     // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -733,7 +911,7 @@ type OpenedCopy = {
  * 복사본에는 쓴다. 원본이 옛 버전이면 `openCopy`가 복사본에만 migration을 건다. 원본은
  * 그대로이므로 "아무것도 쓰지 않는다"는 유지되고, dry-run은 실제 실행과 같은 컬럼을 읽는다.
  */
-export class ReadOnlyDigestStore implements DigestStore, RunStore {
+export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
   private readonly opened: OpenedCopy;
 
   constructor(private readonly path: string) {
@@ -826,6 +1004,40 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore {
 
   updateRunCollectionObservation(): void {
     throw new Error(`dry-run은 store에 쓰지 않는다. 컬렉션 관찰 결과를 갱신하려 했다: ${this.path}`);
+  }
+
+  findGateMetadata(gateKey: GateKey): GateMetadata | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_METADATA).get(gateKey) as GateMetadataRow | undefined;
+    return row === undefined ? null : toGateMetadata(row);
+  }
+
+  listGateMetadata(runKey: RunKey): readonly GateMetadata[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_RUN_GATE_METADATA).all(runKey) as GateMetadataRow[]).map(
+      toGateMetadata,
+    );
+  }
+
+  insertGateMetadata(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate metadata를 기록하려 했다: ${this.path}`);
+  }
+
+  findGateMessage(gateKey: GateKey): GateMessageRecord | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_MESSAGE).get(gateKey) as GateMessageRow | undefined;
+    return row === undefined ? null : toGateMessage(row);
+  }
+
+  insertGateMessage(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate thread 매핑을 기록하려 했다: ${this.path}`);
+  }
+
+  updateGateObservation(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate 관찰 결과를 갱신하려 했다: ${this.path}`);
   }
 
   close(): void {

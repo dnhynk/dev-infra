@@ -1,5 +1,6 @@
 import type { RunKey } from '../identity/keys.js';
 import type { RunBindingFacts } from '../orca/client.js';
+import type { GateDecisionFacts } from '../gate/types.js';
 
 /**
  * D1 Run 카드의 입력 계약.
@@ -273,6 +274,8 @@ export type RunFacts = {
   readonly tasks: TaskAggregate;
   readonly dispatches: DispatchAttempts;
   readonly blockers: BlockerFacts;
+  /** Raw Gate/Task facts joined with exact sidecar metadata; rendered as Run-thread replies. */
+  readonly gates: readonly GateDecisionFacts[];
   readonly degraded: readonly RunDegraded[];
 };
 
