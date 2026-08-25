@@ -5,7 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
-import { detectGateResumeEvidence, normalizeGateResumeSnapshot } from '../src/channel/resume.js';
+import {
+  detectGateResumeEvidence,
+  GateResumeEngine,
+  normalizeGateResumeSnapshot,
+} from '../src/channel/resume.js';
 import {
   GateChannelDeliveryEngine,
   type GateChannelDeliveryTransport,
@@ -142,6 +146,39 @@ class MutableResumeOrca implements OrcaRunner {
       }));
     }
     return Promise.reject(new Error(`unexpected ${args.join(' ')}`));
+  }
+}
+
+class HeldTaskResumeOrca extends MutableResumeOrca {
+  readonly taskReadStarted: Promise<void>;
+  readonly #taskReadReleased: Promise<void>;
+  #markTaskReadStarted!: () => void;
+  #releaseTaskRead!: () => void;
+  #held = false;
+
+  constructor() {
+    super();
+    this.taskReadStarted = new Promise<void>((resolve) => {
+      this.#markTaskReadStarted = resolve;
+    });
+    this.#taskReadReleased = new Promise<void>((resolve) => {
+      this.#releaseTaskRead = resolve;
+    });
+  }
+
+  releaseTaskRead(): void {
+    this.#releaseTaskRead();
+  }
+
+  override run(args: readonly string[]): Promise<string> {
+    if (!this.#held && args[1] === 'task-list') {
+      this.#held = true;
+      this.#markTaskReadStarted();
+      // Intentionally ignores AbortSignal. The cancelled owner must release its durable lease
+      // before this external read settles, then remain fenced when the stale result arrives.
+      return this.#taskReadReleased.then(() => super.run(args));
+    }
+    return super.run(args);
   }
 }
 
@@ -494,6 +531,118 @@ describe('v12 durable resume evidence and existing-card projection', () => {
     expect(slack.updates[0]?.text).toContain('task_followup');
     expect(slack.updates[0]?.text).toContain('ctx_followup');
     store.close();
+  });
+
+  it('releases an aborted resume lease immediately and fences its late owner behind a successor', async () => {
+    const observedAt = '2026-08-24T10:00:05.000Z';
+    const nowMs = Date.parse(observedAt);
+    const now = () => new Date(nowMs);
+    const store = new SqliteDigestStore(path, { monotonicNow: () => nowMs });
+    const staleOrca = new HeldTaskResumeOrca();
+    const successorOrca = new HeldTaskResumeOrca();
+    successorOrca.followup = 'dispatched';
+    const running: Promise<void>[] = [];
+    try {
+      prepareLegacyDelivery(store, 'consumed');
+      expect(store.listDueGateResumeObservations(observedAt)).toHaveLength(1);
+
+      const staleController = new AbortController();
+      const staleRun = new GateResumeEngine({ store, orca: staleOrca, now }).reconcile(
+        staleController.signal,
+      );
+      running.push(staleRun);
+      await staleOrca.taskReadStarted;
+      const staleLease = store.findGateResumeObservation(GATE);
+      expect(staleLease).toMatchObject({
+        evidence: null,
+        leaseOwner: expect.stringMatching(/^p\d+\./),
+      });
+      if (staleLease?.leaseOwner === null || staleLease?.leaseOwner === undefined) {
+        throw new Error('stale resume lease owner missing');
+      }
+      const staleOwner = staleLease.leaseOwner;
+      const staleRevision = staleLease.revision;
+
+      staleController.abort();
+      const released = store.findGateResumeObservation(GATE);
+      expect(released).toMatchObject({
+        revision: staleRevision + 1,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        evidence: null,
+        nextObservationAt: RECEIPT_AT,
+      });
+      expect(now().toISOString()).toBe(observedAt);
+      if (released === null) throw new Error('resume lease release missing');
+
+      const successorRun = new GateResumeEngine({ store, orca: successorOrca, now }).reconcile();
+      running.push(successorRun);
+      await successorOrca.taskReadStarted;
+      const successorLease = store.findGateResumeObservation(GATE);
+      expect(successorLease).toMatchObject({
+        revision: released.revision + 1,
+        leaseOwner: expect.stringMatching(/^p\d+\./),
+        evidence: null,
+      });
+      expect(successorLease?.leaseOwner).not.toBe(staleOwner);
+      expect(now().toISOString()).toBe(observedAt);
+
+      expect(store.recordGateResumeObservation(
+        GATE,
+        staleRevision,
+        staleOwner,
+        baseline,
+        null,
+        observedAt,
+        '2026-08-24T10:00:35.000Z',
+        null,
+      )).toBeNull();
+      expect(store.releaseGateResumeLease(GATE, staleOwner, observedAt)).toBe(false);
+      expect(store.findGateResumeObservation(GATE)).toEqual(successorLease);
+
+      successorOrca.releaseTaskRead();
+      await successorRun;
+      const positive = store.findGateResumeObservation(GATE);
+      expect(positive).toMatchObject({
+        evidence: {
+          kind: 'new_dispatch',
+          taskId: 'task_followup',
+          dispatchId: 'ctx_followup',
+          fromStatus: 'pending',
+          toStatus: 'dispatched',
+        },
+        nextObservationAt: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      expect(successorOrca.calls).toContain('dispatch-show');
+      expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: true });
+
+      const slack = new RecordingSlack();
+      expect(await projectGateResolutionCard(store, slack, GATE, now)).toMatchObject({
+        kind: 'projected',
+      });
+      expect(slack.updates).toHaveLength(1);
+      expect(slack.updates[0]).toMatchObject({ channel: CHANNEL, ts: MESSAGE_TS });
+      expect(slack.updates[0]?.text).toContain('▶️ 작업 재개');
+      expect(slack.updates[0]?.text).toContain('task_followup');
+      expect(slack.updates[0]?.text).toContain('ctx_followup');
+
+      const observationAfterSuccessor = store.findGateResumeObservation(GATE);
+      const deliveryAfterSuccessor = store.findGateChannelDelivery(GATE);
+      const outboxAfterSuccessor = store.findGateResolutionOutbox(GATE);
+      staleOrca.releaseTaskRead();
+      await staleRun;
+      expect(store.findGateResumeObservation(GATE)).toEqual(observationAfterSuccessor);
+      expect(store.findGateChannelDelivery(GATE)).toEqual(deliveryAfterSuccessor);
+      expect(store.findGateResolutionOutbox(GATE)).toEqual(outboxAfterSuccessor);
+      expect(slack.updates).toHaveLength(1);
+    } finally {
+      staleOrca.releaseTaskRead();
+      successorOrca.releaseTaskRead();
+      await Promise.allSettled(running);
+      store.close();
+    }
   });
 
   it('persists one new completed Dispatch when Task dispatch_id remains omitted', async () => {

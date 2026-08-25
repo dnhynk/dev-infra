@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   boundedSlackUpdate,
   SlackApiError,
@@ -68,6 +68,43 @@ describe('SlackWebApiPoster', () => {
       SlackUpdateTimeoutError,
     );
     expect(Date.now() - began).toBeLessThan(1_000);
+  });
+
+  it('external abort promptly fences a cancellation-ignoring update and clears its deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const hanging: SlackPoster = {
+        post: () => Promise.reject(new Error('unused')),
+        update: () => new Promise(() => undefined),
+      };
+      const controller = new AbortController();
+      const updating = boundedSlackUpdate(
+        hanging,
+        { ...updateInput, signal: controller.signal },
+      );
+      await Promise.resolve();
+      controller.abort();
+
+      await expect(updating).rejects.toThrowError('Slack update aborted');
+      expect(vi.getTimerCount()).toBe(0);
+
+      let calls = 0;
+      const alreadyAborted = new AbortController();
+      alreadyAborted.abort();
+      await expect(boundedSlackUpdate({
+        post: () => Promise.reject(new Error('unused')),
+        update: () => {
+          calls += 1;
+          return new Promise(() => undefined);
+        },
+      }, { ...updateInput, signal: alreadyAborted.signal })).rejects.toThrowError(
+        'Slack update aborted',
+      );
+      expect(calls).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('aborts the production fetch at the card deadline without retrying', async () => {

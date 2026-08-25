@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, runDaemonCommand } from '../src/cli.js';
-import type { ChannelProductionDeliveryHandlers } from '../src/channel/pipe-server.js';
+import type {
+  ChannelPipeErrorCode,
+  ChannelProductionDeliveryHandlers,
+} from '../src/channel/pipe-server.js';
 import {
   gateActionId,
   gateBlockId,
@@ -269,10 +272,13 @@ class FakeChannelServer {
   readonly events: string[];
   readonly failStart: boolean;
   productionHandlers: ChannelProductionDeliveryHandlers | null = null;
+  readonly failure: Promise<ChannelPipeErrorCode>;
+  private fail!: (code: ChannelPipeErrorCode) => void;
 
   constructor(events: string[] = [], failStart = false) {
     this.events = events;
     this.failStart = failStart;
+    this.failure = new Promise((resolve) => { this.fail = resolve; });
   }
 
   async start(): Promise<void> {
@@ -282,6 +288,18 @@ class FakeChannelServer {
 
   async stop(): Promise<void> {
     this.events.push('channel:stop');
+  }
+
+  quiesce(): void {
+    this.events.push('channel:quiesce');
+  }
+
+  waitForFailure(): Promise<ChannelPipeErrorCode> {
+    return this.failure;
+  }
+
+  triggerRuntimeFailure(): void {
+    this.fail('pipe_runtime_error');
   }
 
   async deliverGate(): Promise<{ readonly kind: 'pending'; readonly code: 'no_candidate' }> {
@@ -294,7 +312,7 @@ class FakeChannelServer {
 }
 
 describe('daemon production wiring', () => {
-  it('owns the Channel server before Socket ingress and releases it before Socket shutdown', async () => {
+  it('owns the Channel server before Socket ingress and retains it through Socket shutdown', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
     const events: string[] = [];
@@ -309,7 +327,13 @@ describe('daemon production wiring', () => {
       waitForStop: () => Promise.resolve(),
     });
     expect(code).toBe(0);
-    expect(events).toEqual(['channel:start', 'socket:start', 'channel:stop', 'socket:stop']);
+    expect(events).toEqual([
+      'channel:start',
+      'socket:start',
+      'channel:quiesce',
+      'socket:stop',
+      'channel:stop',
+    ]);
   });
 
   it('installs durable delivery callbacks and reconciles the live Channel runtime at startup', async () => {
@@ -405,7 +429,42 @@ describe('daemon production wiring', () => {
       waitForStop: () => Promise.resolve(),
     });
     expect(code).toBe(1);
-    expect(events).toEqual(['channel:start', 'channel:stop']);
+    expect(events).toEqual(['channel:start', 'channel:quiesce', 'channel:stop']);
+  });
+
+  it('treats post-listen pipe ownership failure as fatal and drains Socket before release', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const channel = new FakeChannelServer(events);
+    const running = runDaemonCommand(parsed, CONFIG, {
+      channelServer: channel,
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      connectionFactory: () => ({
+        start: () => {
+          events.push('socket:start');
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => {
+          events.push('socket:stop');
+          return Promise.resolve();
+        },
+      }),
+      waitForStop: () => new Promise<void>(() => undefined),
+    });
+
+    await waitFor(() => events.includes('socket:start'));
+    channel.triggerRuntimeFailure();
+
+    expect(await running).toBe(1);
+    expect(events).toEqual([
+      'channel:start',
+      'socket:start',
+      'channel:quiesce',
+      'socket:stop',
+      'channel:stop',
+    ]);
   });
 
   it('direct button → modal errors → valid ACK → fake Orca → durable projection을 잇는다', async () => {

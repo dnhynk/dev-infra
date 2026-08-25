@@ -40,6 +40,7 @@ export type SlackSocketTransportOptions = {
 export type SocketTransportErrorCode =
   | 'connect_failed'
   | 'connect_timeout'
+  | 'close_failed'
   | 'close_timeout'
   | 'hello_app_id_missing'
   | 'hello_app_id_mismatch';
@@ -47,6 +48,7 @@ export type SocketTransportErrorCode =
 const SOCKET_ERROR_MESSAGES: Readonly<Record<SocketTransportErrorCode, string>> = {
   connect_failed: 'Socket Mode 연결에 실패했다',
   connect_timeout: 'Socket Mode hello 제한 시간을 넘었다',
+  close_failed: 'Socket Mode 연결 종료에 실패했다',
   close_timeout: 'Socket Mode 연결 종료 제한 시간을 넘었다',
   hello_app_id_missing: 'Socket hello에 App ID가 없다',
   hello_app_id_mismatch: 'Socket hello App ID가 설정과 일치하지 않는다',
@@ -159,6 +161,7 @@ export class SlackSocketTransport {
   private readonly closeTasks = new WeakMap<SocketConnection, Promise<CloseOutcome>>();
   private candidateDisconnected = false;
   private candidateRefreshReason: SocketRefreshReason | null = null;
+  private closeFailureObserved = false;
   private closeTimeoutObserved = false;
   private readonly timeouts: SocketTimeouts;
 
@@ -183,6 +186,7 @@ export class SlackSocketTransport {
     const abort = new AbortController();
     this.abort = abort;
     this.shutdownTask = null;
+    this.closeFailureObserved = false;
     this.closeTimeoutObserved = false;
     this.pendingReconnect = null;
     this.stopped = false;
@@ -218,7 +222,9 @@ export class SlackSocketTransport {
     ) {
       this.shutdownTask = this.closeTimeoutObserved
         ? Promise.reject(new SocketTransportError('close_timeout'))
-        : Promise.resolve();
+        : this.closeFailureObserved
+          ? Promise.reject(new SocketTransportError('close_failed'))
+          : Promise.resolve();
       return this.shutdownTask;
     }
     this.shutdownTask = this.performShutdown();
@@ -246,6 +252,7 @@ export class SlackSocketTransport {
       this.stopping = false;
     }
     if (this.closeTimeoutObserved) throw new SocketTransportError('close_timeout');
+    if (this.closeFailureObserved) throw new SocketTransportError('close_failed');
   }
 
   private async openConnection(signal: AbortSignal): Promise<SocketConnection> {
@@ -256,7 +263,21 @@ export class SlackSocketTransport {
       connection = this.options.connectionFactory({
         refresh: (reason) => ref !== null && this.handleRefresh(ref, reason),
         disconnected: () => ref !== null && this.handleDisconnected(ref),
-        ...(this.options.event === undefined ? {} : { event: this.options.event }),
+        ...(this.options.event === undefined ? {} : {
+          event: (event: SocketSlackEvent) => {
+            // A freshly opened Socket is only a candidate until its hello/App ID has been
+            // verified and it has been atomically promoted. During overlap, only the current
+            // connection may deliver envelopes; candidate/previous/retired callbacks stay
+            // unACKed so Slack can redeliver them through the authoritative connection.
+            if (
+              ref === null
+              || ref !== this.current
+              || this.stopped
+              || this.stopping
+            ) return Promise.resolve();
+            return this.options.event!(event);
+          },
+        }),
       });
       ref = connection;
     } catch {
@@ -459,7 +480,12 @@ export class SlackSocketTransport {
         observeOperation(() => connection.close());
         return 'timed_out' as const;
       }
-      return outcome.status === 'fulfilled' ? 'closed' as const : 'failed' as const;
+      if (outcome.status === 'fulfilled') return 'closed' as const;
+      this.closeFailureObserved = true;
+      // A synchronous or immediate SDK close failure may occur before its own listener cleanup.
+      // Re-enter the public close boundary once without extending the daemon's bounded wait.
+      observeOperation(() => connection.close());
+      return 'failed' as const;
     });
     this.closeTasks.set(connection, task);
     return task;

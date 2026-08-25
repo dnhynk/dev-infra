@@ -15,6 +15,7 @@ export const DEFAULT_DELIVERY_ATTEMPT_DELAYS_MS = [5_000, 10_000, 20_000, 30_000
 export const DEFAULT_DELIVERY_RECEIPT_BACKOFF_MS = 30_000;
 export const DEFAULT_DELIVERY_RECONCILE_DEADLINE_MS = 20_000;
 export const DEFAULT_DELIVERY_CONCURRENCY = 8;
+const DELIVERY_OWNER_ABORT_REASON = 'delivery_owner_aborted';
 
 export type GateChannelDeliveryTransport = {
   deliverGate(
@@ -134,8 +135,20 @@ export class GateChannelDeliveryEngine {
   }
 
   /** Lazy seed plus one bounded, concurrent, deadline-limited due batch. */
-  async reconcile(): Promise<void> {
+  async reconcile(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
     const controller = new AbortController();
+    let ownerCancelled = false;
+    let resolveOwnerCancel!: () => void;
+    const ownerCancel = new Promise<void>((resolve) => { resolveOwnerCancel = resolve; });
+    const abortFromOwner = (): void => {
+      if (ownerCancelled) return;
+      ownerCancelled = true;
+      controller.abort(DELIVERY_OWNER_ABORT_REASON);
+      resolveOwnerCancel();
+    };
+    signal?.addEventListener('abort', abortFromOwner, { once: true });
+    if (signal?.aborted) abortFromOwner();
     let expired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const startedAt = this.#monotonicNow();
@@ -147,7 +160,7 @@ export class GateChannelDeliveryEngine {
       if (expired) return;
       expired = true;
       this.#onError('delivery_reconcile_deadline');
-      controller.abort();
+      controller.abort('delivery_deadline');
       resolveDeadline();
     };
     const commitFence = (): boolean => {
@@ -164,7 +177,7 @@ export class GateChannelDeliveryEngine {
         if (this.#singleSlotPrefersSeed) {
           const seed = this.#store.seedPendingGateChannelDeliveries(at, 1, commitFence);
           if (seed.kind === 'fenced') {
-            expire();
+            if (!controller.signal.aborted) expire();
             return;
           }
           if (seed.deliveries.length === 0 && commitFence()) {
@@ -175,7 +188,7 @@ export class GateChannelDeliveryEngine {
           if (due.length === 0 && commitFence()) {
             const seed = this.#store.seedPendingGateChannelDeliveries(at, 1, commitFence);
             if (seed.kind === 'fenced') {
-              expire();
+              if (!controller.signal.aborted) expire();
               return;
             }
           }
@@ -185,11 +198,11 @@ export class GateChannelDeliveryEngine {
         const seedQuota = Math.max(1, Math.floor(this.#batchLimit / 2));
         const seed = this.#store.seedPendingGateChannelDeliveries(at, seedQuota, commitFence);
         if (seed.kind === 'fenced') {
-          expire();
+          if (!controller.signal.aborted) expire();
           return;
         }
         if (!commitFence()) {
-          expire();
+          if (!controller.signal.aborted) expire();
           return;
         }
         const sendLimit = this.#batchLimit - seed.deliveries.length;
@@ -198,20 +211,21 @@ export class GateChannelDeliveryEngine {
         }
       }
       if (!commitFence()) {
-        expire();
+        if (!controller.signal.aborted) expire();
         return;
       }
       if (due.length > 0) await this.#runBatch(due, controller.signal);
       if (commitFence()) await this.#resume.reconcile(controller.signal);
     })();
     try {
-      await Promise.race([work, deadline]);
+      await Promise.race([work, deadline, ownerCancel]);
     } catch (error) {
       controller.abort();
       throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      if (expired) void work.catch(() => undefined);
+      signal?.removeEventListener('abort', abortFromOwner);
+      if (expired || ownerCancelled) void work.catch(() => undefined);
     }
   }
 
@@ -306,18 +320,26 @@ export class GateChannelDeliveryEngine {
         const latest = this.#store.findGateChannelDelivery(current.gateKey);
         if (latest?.leaseOwner === owner) {
           current = latest;
-          const deferred = this.#defer(
-            latest,
-            owner,
-            this.#retryDelay(latest),
-            'delivery_reconcile_deadline',
-          );
-          if (!deferred) {
+          if (signal.reason === DELIVERY_OWNER_ABORT_REASON) {
             this.#store.releaseGateChannelDeliveryLease(
               latest.gateKey,
               owner,
               this.#now().toISOString(),
             );
+          } else {
+            const deferred = this.#defer(
+              latest,
+              owner,
+              this.#retryDelay(latest),
+              'delivery_reconcile_deadline',
+            );
+            if (!deferred) {
+              this.#store.releaseGateChannelDeliveryLease(
+                latest.gateKey,
+                owner,
+                this.#now().toISOString(),
+              );
+            }
           }
         }
       } catch {

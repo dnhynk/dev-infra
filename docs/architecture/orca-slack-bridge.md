@@ -1,6 +1,6 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · C1 구현·검증 반영, 후속 slice 경계 미정**
+상태: **Draft · C1~D3 offline 구현·검증 반영, D3 live acceptance 미검증**
 
 이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 
@@ -139,9 +139,9 @@ Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설
 | daemon | PC에서 상시 실행 | Slack, Orca/GitHub 관찰, DB, Slack projection |
 | Channel Adapter | coordinator 세션별 subprocess | pending Gate ID push, reply tool application receipt 반환 |
 
-D3 구현은 development flag의 매 기동 확인과 research preview 변동성 때문에 이번 Run에서 분리해 별도 Run으로
-산정한다. allowlist plugin 등재는 이번 결정에 포함하지 않는다(OD-056). 별도 Run에서도 다음 장애가 서로 다른
-failure domain임을 보존한다.
+D3 구현은 별도 Run에서 완료됐고, daemon과 session Adapter는 실제 process/pipe 경계로 분리된다.
+development flag의 매 기동 확인은 사람이 수행하며 allowlist plugin 등재는 포함하지 않는다(OD-056).
+offline acceptance는 다음 장애가 서로 다른 failure domain임을 보존한다.
 
 - daemon이 살아 있고 coordinator가 닫힘
 - coordinator가 살아 있고 Slack 연결이 끊김

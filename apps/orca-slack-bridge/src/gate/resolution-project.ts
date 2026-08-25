@@ -42,6 +42,7 @@ export async function projectGateResolutionCard(
   now: () => Date,
   fault?: (point: GateProjectionFault, gateKey: GateKey) => void | Promise<void>,
   timeoutMs = DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<GateProjectionResult> {
   const projectionOwner = `p${process.pid}.${randomUUID()}`;
   let ownsProjection = false;
@@ -49,6 +50,7 @@ export async function projectGateResolutionCard(
   let abandonProjection = false;
   try {
     for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (signal?.aborted) return { kind: 'pending', card: null, fingerprint: null };
     const intent = store.findGateResolution(gateKey);
     const outbox = store.findGateResolutionOutbox(gateKey);
     const message = store.findGateMessage(gateKey);
@@ -139,6 +141,7 @@ export async function projectGateResolutionCard(
             ts: message.messageTs,
             text: card.text,
             blocks: card.blocks,
+            ...(signal === undefined ? {} : { signal }),
           }, timeoutMs);
         } catch (error) {
           const released = store.releaseGateOutboxProjection(
@@ -149,6 +152,7 @@ export async function projectGateResolutionCard(
           );
           ownsProjection = !released;
           if (released) ownedChannelClaim = undefined;
+          if (signal?.aborted) return { kind: 'pending', card, fingerprint };
           store.recordGateAttempt(
             gateKey,
             'card_projection',
@@ -158,6 +162,7 @@ export async function projectGateResolutionCard(
           );
           return { kind: 'pending', card, fingerprint };
         }
+        if (signal?.aborted) return { kind: 'pending', card, fingerprint };
         try {
           await fault?.('after_slack_success_before_local_completion', gateKey);
         } catch (e) {
@@ -166,6 +171,7 @@ export async function projectGateResolutionCard(
           abandonProjection = true;
           throw e;
         }
+        if (signal?.aborted) return { kind: 'pending', card, fingerprint };
         if (updated.channel !== message.channelId || updated.ts !== message.messageTs) {
           const released = store.releaseGateOutboxProjection(
             gateKey,
@@ -186,6 +192,7 @@ export async function projectGateResolutionCard(
         }
       }
     }
+    if (signal?.aborted) return { kind: 'pending', card, fingerprint };
     if (store.markGateOutboxProjected(
       gateKey,
       outbox.revision,

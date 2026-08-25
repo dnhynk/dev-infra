@@ -1,6 +1,6 @@
 # `orca-slack-bridge` Umbrella 스펙
 
-상태: **Draft · C1 구현됨, 후속 slice 미구현**
+상태: **Draft · C1~D3 offline 구현됨, D3 live acceptance 미검증**
 해결 대상: **C + D**  
 예정 위치: `dev-infra/apps/orca-slack-bridge`
 
@@ -326,8 +326,11 @@ Adapter reply tool 왕복이며 유일한 로컬 반환 경로라고 규정하�
 - delivery는 `receipted`→`consumed` 두 단계다. receipt는 retry backoff를 늦출 뿐 재조회를 막지 않고,
   Orca 효과를 확인한 `consumed`에서만 재조회를 억제한다(OD-057, OD-066).
 
-이 D3 계약의 구현은 이번 Run 범위가 아니며 development flag의 매 기동 확인과 research preview 변동성 때문에
-별도 Run에서 다시 산정한다. allowlist plugin 등재는 이번 결정에 포함하지 않는다(OD-056).
+이 D3 계약은 schema v12 sidecar와 daemon-owned pipe, session Adapter, exact Run/generation routing,
+delivery/receipt/consume, post-baseline Task/Dispatch evidence, existing-card projection으로 구현됐다.
+구현은 새 Task/Dispatch를 만들지 않고 실제 Orca 상태를 관찰한다. development flag의 매 기동 확인과
+research-preview 변동성은 자동화하지 않으며 allowlist plugin 등재도 범위가 아니다(OD-056).
+actual Claude Code 2.1.243 opt-in과 실제 Task resume는 `LIVE_CHANNEL_UNVERIFIED`로 남는다.
 
 ## 9. Durability와 멱등성
 

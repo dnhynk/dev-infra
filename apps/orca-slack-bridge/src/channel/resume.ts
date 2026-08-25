@@ -435,7 +435,27 @@ export class GateResumeEngine {
     );
     if (lease.kind !== 'acquired') return;
     let released = false;
+    const releaseOnAbort = (): void => {
+      if (released) return;
+      // Abort dispatch is synchronous. Relinquish this exact owner before the outer delivery
+      // scheduler detaches non-cooperative Orca work and permits SQLite shutdown/restart.
+      try {
+        this.#store.releaseGateResumeLease(
+          candidate.gateKey,
+          owner,
+          this.#now().toISOString(),
+        );
+      } catch {
+        // The owner is fenced by its random identity and every late completion observes abort.
+        // A store that is already unavailable cannot safely accept another cleanup write.
+      } finally {
+        released = true;
+      }
+    };
+    signal?.addEventListener('abort', releaseOnAbort, { once: true });
+    if (isAborted(signal)) releaseOnAbort();
     try {
+      if (released || isAborted(signal)) return;
       const delivery = this.#store.findGateChannelDelivery(candidate.gateKey);
       if (delivery === null || delivery.resumeBaselineState !== 'recorded') return;
       let latest: GateResumeSnapshot;
@@ -490,7 +510,8 @@ export class GateResumeEngine {
         null,
       ) !== null;
     } finally {
-      if (!released && !isAborted(signal)) {
+      signal?.removeEventListener('abort', releaseOnAbort);
+      if (!released) {
         this.#store.releaseGateResumeLease(candidate.gateKey, owner, this.#now().toISOString());
       }
     }

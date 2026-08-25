@@ -185,7 +185,9 @@ Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator
 
 ## 9. Bridge Slice D3 · Channel Adapter와 재개 관찰
 
-**이번 Run 범위 밖이다.** D3 구현은 별도 Run에서 다시 size를 산정하고 착수한다(OD-056, DL-049).
+**D3-1~D3-3 구현 완료, D3-4 offline acceptance 완료, live acceptance 대기.** D3는 원래 계획대로
+별도 Run에서 transport, durable delivery, actual Task-resume evidence, lifecycle acceptance로 나눴다
+(OD-056, DL-049). 현재 잔여 상태는 `LIVE_CHANNEL_UNVERIFIED`다.
 
 분리 근거:
 
@@ -214,7 +216,10 @@ Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator
 - 실제 Orca 변화가 관찰된 뒤에만 Slack에 재개를 표시함
 - Fresh/Resume coordinator session의 opt-in이 end-to-end probe로 확인되고 pending Gate를 재조회함
 
-별도 D3 Run은 구현 직전 대상 Claude Code 버전의 배포 경로와 로컬 smoke test를 다시 통과해야 한다.
+D3-4의 hermetic 하니스는 위 출구 조건의 crash/restart·routing·projection 경계를 검증하지만 실제
+Claude Code opt-in을 대신하지 않는다. exact reviewed build로 interactive Claude Code 2.1.243
+development-channel smoke와 실제 post-baseline Task/Dispatch resume를 coordinator가 관찰한 뒤에만
+`LIVE_CHANNEL_UNVERIFIED`를 해제한다.
 
 ## 10. Bridge Slice O1 · 운영 자동화
 

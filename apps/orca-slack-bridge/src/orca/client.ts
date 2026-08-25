@@ -689,6 +689,7 @@ export async function resolveExactGate(
   identity: ExactGateIdentity,
   resolution: string,
   retryRequestId: string,
+  options?: OrcaRunOptions,
 ): Promise<GateResolveResult> {
   let result: unknown;
   try {
@@ -698,7 +699,7 @@ export async function resolveExactGate(
       '--resolution', resolution,
       '--retry-request', retryRequestId,
       '--json',
-    ]);
+    ], options);
   } catch {
     // Orca/runner diagnostics may echo argv or response data. The resolver treats every mutation
     // failure as response-unknown, so a fixed error preserves the safety semantics without leaking

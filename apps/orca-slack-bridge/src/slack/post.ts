@@ -125,6 +125,7 @@ export async function boundedSlackUpdate(
       `Slack update timeout must be a finite number between 10 and ${DEFAULT_SLACK_UPDATE_TIMEOUT_MS}`,
     );
   }
+  if (input.signal?.aborted) throw new Error('Slack update aborted');
   const deadline = Math.trunc(timeoutMs);
   const abort = new AbortController();
   const signal = input.signal === undefined
@@ -132,6 +133,16 @@ export async function boundedSlackUpdate(
     : AbortSignal.any([input.signal, abort.signal]);
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectExternalAbort!: (error: Error) => void;
+  const externalAbort = new Promise<never>((_resolve, reject) => {
+    rejectExternalAbort = reject;
+  });
+  const onExternalAbort = (): void => {
+    abort.abort();
+    rejectExternalAbort(new Error('Slack update aborted'));
+  };
+  input.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  if (input.signal?.aborted) onExternalAbort();
   const operation = Promise.resolve().then(() => slack.update({ ...input, signal }));
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
@@ -141,12 +152,13 @@ export async function boundedSlackUpdate(
     }, deadline);
   });
   try {
-    return await Promise.race([operation, timeout]);
+    return await Promise.race([operation, timeout, externalAbort]);
   } catch (error) {
     if (timedOut) throw new SlackUpdateTimeoutError();
     throw error;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    input.signal?.removeEventListener('abort', onExternalAbort);
     // An injected client may ignore AbortSignal. Drain its eventual rejection without awaiting it.
     void operation.catch(() => undefined);
   }
