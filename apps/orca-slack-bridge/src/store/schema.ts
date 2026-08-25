@@ -68,12 +68,13 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  * D2-C는 v7 sidecar/thread mapping 위에 local Gate observation, immutable winner intent,
  * bounded evidence와 card/notification outbox를 additive v8로 덧붙인다. v9는 그 v8 행을
  * 재작성하지 않고 ordinary Slack completion을 fence하는 monotonic generation 표만 덧붙인다.
- * D3는 v10 outbox를 재작성하지 않고 additive v11 delivery sidecar를 덧붙인다. v10의
- * `notification_state`는 계속 `pending` 하나만 허용하며 D3 lifecycle은 별도 표가 소유한다.
+ * D3는 v10 outbox를 재작성하지 않고 additive v11 delivery sidecar를 덧붙인다. v12는 그
+ * delivery에 legacy baseline 격리 표지를 붙이고 normalized resume evidence sidecar를 더한다.
+ * v10의 `notification_state`는 계속 `pending` 하나만 허용하며 D3 lifecycle은 별도 표가 소유한다.
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -502,6 +503,8 @@ CREATE INDEX gate_resolution_audit_gate ON gate_resolution_audit (gate_key, id)`
  * the D2 source intent while this sidecar owns delivery retries and exact effect consumption.
  * Session/connection claims are never durable trust inputs, so no binding or epoch column exists.
  */
+const GATE_RESUME_BASELINE_COLUMN = ` resume_baseline_state TEXT NOT NULL DEFAULT 'unavailable' CHECK (resume_baseline_state IN ('unavailable','required','recorded')),`;
+
 const GATE_CHANNEL_DELIVERY_TABLE = `
 CREATE TABLE gate_channel_delivery (
   gate_key            TEXT PRIMARY KEY REFERENCES gate_resolution_outbox(gate_key),
@@ -521,7 +524,7 @@ CREATE TABLE gate_channel_delivery (
   lease_expires_at    TEXT,
   last_error_code     TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
   created_at          TEXT NOT NULL,
-  updated_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,${GATE_RESUME_BASELINE_COLUMN}
   CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL)
       OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
   CHECK (lease_expires_at IS NULL OR lease_expires_at > updated_at),
@@ -553,6 +556,53 @@ const GATE_CHANNEL_DELIVERY_RUN_INDEX = `
 CREATE INDEX gate_channel_delivery_run
   ON gate_channel_delivery (run_key, state, gate_key)`;
 
+/**
+ * Additive v12 normalized Task/Dispatch baseline and observation. JSON contains only sorted Task
+ * IDs, statuses, and Dispatch IDs/statuses; raw task results, worker resources, and payloads have
+ * no column and are rejected by the strict decoder.
+ */
+const GATE_RESUME_OBSERVATION_TABLE = `
+CREATE TABLE gate_resume_observation (
+  gate_key              TEXT PRIMARY KEY REFERENCES gate_channel_delivery(gate_key),
+  revision              INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
+  baseline_json         TEXT NOT NULL CHECK (length(baseline_json) BETWEEN 2 AND 200000),
+  latest_json           TEXT CHECK (latest_json IS NULL OR length(latest_json) BETWEEN 2 AND 200000),
+  evidence_kind         TEXT CHECK (evidence_kind IS NULL OR evidence_kind IN ('new_dispatch','status_transition')),
+  evidence_task_id      TEXT CHECK (evidence_task_id IS NULL OR length(evidence_task_id) BETWEEN 1 AND 500),
+  evidence_dispatch_id  TEXT CHECK (evidence_dispatch_id IS NULL OR length(evidence_dispatch_id) BETWEEN 1 AND 500),
+  evidence_from_status  TEXT CHECK (evidence_from_status IS NULL OR length(evidence_from_status) BETWEEN 1 AND 80),
+  evidence_to_status    TEXT CHECK (evidence_to_status IS NULL OR evidence_to_status IN ('dispatched','completed')),
+  next_observation_at   TEXT,
+  observed_at           TEXT,
+  lease_owner           TEXT CHECK (lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 80),
+  lease_expires_at      TEXT,
+  last_error_code       TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL,
+  CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL)
+      OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
+  CHECK (lease_expires_at IS NULL OR lease_expires_at > updated_at),
+  CHECK (updated_at >= created_at),
+  CHECK (observed_at IS NULL OR updated_at >= observed_at),
+  CHECK (
+    (evidence_kind IS NULL AND evidence_task_id IS NULL AND evidence_dispatch_id IS NULL
+      AND evidence_from_status IS NULL AND evidence_to_status IS NULL)
+    OR (evidence_kind IS NOT NULL AND evidence_task_id IS NOT NULL
+      AND evidence_dispatch_id IS NOT NULL AND evidence_to_status IS NOT NULL
+      AND next_observation_at IS NULL)
+  )
+)`;
+
+/** Exact deployed v11 table used by the v10→v11 step before v12 appends its quarantine column. */
+const GATE_CHANNEL_DELIVERY_V11_TABLE = GATE_CHANNEL_DELIVERY_TABLE.replace(
+  GATE_RESUME_BASELINE_COLUMN,
+  '',
+);
+
+const GATE_RESUME_OBSERVATION_DUE_INDEX = `
+CREATE INDEX gate_resume_observation_due
+  ON gate_resume_observation (next_observation_at, gate_key)`;
+
 /** Exact code-owned v8 objects. Startup compares normalized sqlite_master SQL fail-closed. */
 export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_metadata: GATE_METADATA_TABLE,
@@ -583,9 +633,17 @@ export const GATE_V10_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
 
 /** v11 adds only the D3 delivery sidecar and its deterministic scheduling/routing indexes. */
 export const GATE_V11_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
-  gate_channel_delivery: GATE_CHANNEL_DELIVERY_TABLE,
+  gate_channel_delivery: GATE_CHANNEL_DELIVERY_V11_TABLE,
   gate_channel_delivery_due: GATE_CHANNEL_DELIVERY_DUE_INDEX,
   gate_channel_delivery_run: GATE_CHANNEL_DELIVERY_RUN_INDEX,
+};
+
+/** v12 adds only normalized resume evidence; the existing D2 and D3 lifecycle meanings remain. */
+export const GATE_V12_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  // Override the deployed v11 table in the merged current-object map after ALTER ADD COLUMN.
+  gate_channel_delivery: GATE_CHANNEL_DELIVERY_TABLE,
+  gate_resume_observation: GATE_RESUME_OBSERVATION_TABLE,
+  gate_resume_observation_due: GATE_RESUME_OBSERVATION_DUE_INDEX,
 };
 
 /**
@@ -657,6 +715,8 @@ ${GATE_RESOLUTION_AUDIT_INDEX};
 ${GATE_CHANNEL_DELIVERY_TABLE};
 ${GATE_CHANNEL_DELIVERY_DUE_INDEX};
 ${GATE_CHANNEL_DELIVERY_RUN_INDEX};
+${GATE_RESUME_OBSERVATION_TABLE};
+${GATE_RESUME_OBSERVATION_DUE_INDEX};
 `;
 
 /**
@@ -725,9 +785,16 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // v10 → v11: additive D3 delivery state only. Existing v10 rows are deliberately not
   // backfilled here; the production daemon lazily and idempotently seeds exact resolved D2 rows.
   [
-    GATE_CHANNEL_DELIVERY_TABLE,
+    GATE_CHANNEL_DELIVERY_V11_TABLE,
     GATE_CHANNEL_DELIVERY_DUE_INDEX,
     GATE_CHANNEL_DELIVERY_RUN_INDEX,
+  ],
+  // v11 → v12: existing deliveries are explicitly baseline-unavailable because they may already
+  // have crossed the pipe. New inserts opt into `required`; only a strict pre-send read records it.
+  [
+    "ALTER TABLE gate_channel_delivery ADD COLUMN resume_baseline_state TEXT NOT NULL DEFAULT 'unavailable' CHECK (resume_baseline_state IN ('unavailable','required','recorded'))",
+    GATE_RESUME_OBSERVATION_TABLE,
+    GATE_RESUME_OBSERVATION_DUE_INDEX,
   ],
 ];
 

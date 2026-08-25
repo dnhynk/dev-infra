@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { projectGateResolutionCard } from '../src/gate/resolution-project.js';
-import type { GateSnapshot } from '../src/gate/resolution-types.js';
+import type { GateChannelDelivery, GateSnapshot } from '../src/gate/resolution-types.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type {
   PostedMessage,
@@ -268,8 +268,53 @@ function seedDelivery(store: SqliteDigestStore) {
   return seeded[0]!;
 }
 
-describe('additive v11 Channel delivery schema', () => {
-  it('makes fresh v11 exactly equal to populated v10→v11 without rewriting the v10 outbox', () => {
+function baselineFor(delivery: GateChannelDelivery) {
+  return {
+    schemaVersion: 1 as const,
+    sourceTaskId: delivery.taskKey.slice('task:'.length),
+    sourceDispatchId: delivery.sourceDispatchId,
+    candidates: [{
+      taskId: delivery.taskKey.slice('task:'.length),
+      status: 'completed',
+      currentDispatchId: delivery.sourceDispatchId,
+      dispatches: [{ dispatchId: delivery.sourceDispatchId, status: 'completed' }],
+    }],
+  };
+}
+
+function recordBaseline(
+  store: SqliteDigestStore,
+  seeded: GateChannelDelivery,
+  at = SEEDED_AT,
+): GateChannelDelivery {
+  const owner = 't.store-baseline';
+  const lease = store.acquireGateChannelDeliveryLease(
+    seeded.gateKey,
+    owner,
+    at,
+    new Date(new Date(at).valueOf() + 60_000).toISOString(),
+  );
+  if (lease.kind !== 'acquired') throw new Error(`baseline lease failed: ${lease.kind}`);
+  const recorded = store.recordGateResumeBaseline(
+    seeded.gateKey,
+    lease.delivery.revision,
+    owner,
+    baselineFor(seeded),
+    at,
+  );
+  if (recorded === null) throw new Error('baseline record failed');
+  if (!store.releaseGateChannelDeliveryLease(seeded.gateKey, owner, at)) {
+    throw new Error('baseline release failed');
+  }
+  return store.findGateChannelDelivery(seeded.gateKey)!;
+}
+
+function seedAndBaseline(store: SqliteDigestStore, at = SEEDED_AT): GateChannelDelivery {
+  return recordBaseline(store, seedDelivery(store), at);
+}
+
+describe('additive v12 Channel resume schema', () => {
+  it('makes fresh v12 exactly equal to populated v10→v12 without rewriting the v10 outbox', () => {
     const migratedPath = join(dir, 'migrated.db');
     const v11 = new SqliteDigestStore(migratedPath);
     resolveD2(v11);
@@ -280,6 +325,7 @@ describe('additive v11 Channel delivery schema', () => {
     const outboxDdlBefore = v10.prepare(
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_resolution_outbox'",
     ).get();
+    v10.exec('DROP TABLE gate_resume_observation');
     v10.exec('DROP TABLE gate_channel_delivery');
     v10.prepare('UPDATE schema_version SET version = 10 WHERE id = 1').run();
     v10.close();
@@ -290,7 +336,7 @@ describe('additive v11 Channel delivery schema', () => {
 
     const postMigration = new DatabaseSync(migratedPath, { readOnly: true });
     expect(postMigration.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({
-      version: 11,
+      version: 12,
     });
     expect(postMigration.prepare('SELECT * FROM gate_resolution_outbox').get()).toEqual(outboxBefore);
     expect(postMigration.prepare(
@@ -300,7 +346,7 @@ describe('additive v11 Channel delivery schema', () => {
 
     const freshPath = join(dir, 'fresh.db');
     new SqliteDigestStore(freshPath).close();
-    expect(SCHEMA_VERSION).toBe(11);
+    expect(SCHEMA_VERSION).toBe(12);
     expect(deliverySchemaShape(migratedPath)).toEqual(deliverySchemaShape(freshPath));
 
     const lazy = new SqliteDigestStore(migratedPath);
@@ -323,6 +369,7 @@ describe('additive v11 Channel delivery schema', () => {
     prepared.close();
 
     const v10 = new DatabaseSync(legacyPath);
+    v10.exec('DROP TABLE gate_resume_observation');
     v10.exec('DROP TABLE gate_channel_delivery');
     v10.prepare('UPDATE schema_version SET version = 10 WHERE id = 1').run();
     v10.prepare(
@@ -359,7 +406,7 @@ describe('additive v11 Channel delivery schema', () => {
   it('fails closed on future schema instead of rewriting or downgrading it', () => {
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path);
-    raw.prepare('UPDATE schema_version SET version = 12 WHERE id = 1').run();
+    raw.prepare('UPDATE schema_version SET version = 13 WHERE id = 1').run();
     raw.close();
     expect(() => new SqliteDigestStore(path)).toThrow(SchemaVersionError);
   });
@@ -452,7 +499,7 @@ describe('monotonic crash-safe Channel lifecycle', () => {
   it('rolls back delivery state and its card re-arm when the commit deadline fence closes', () => {
     const store = new SqliteDigestStore(path);
     resolveD2(store);
-    seedDelivery(store);
+    seedAndBaseline(store);
     const pendingDelivery = store.findGateChannelDelivery(GATE);
     const pendingOutbox = store.findGateResolutionOutbox(GATE);
 
@@ -488,7 +535,7 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     // itself, while the FINAL4 regression below advances monotonic time explicitly.
     let store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
-    seedDelivery(store);
+    seedAndBaseline(store);
     expect(store.markGateChannelAttempted(
       GATE,
       ATTEMPTED_AT,
@@ -538,7 +585,7 @@ describe('monotonic crash-safe Channel lifecycle', () => {
   it('recovers an expired lease without allowing a stale owner to release the replacement', () => {
     const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
-    seedDelivery(store);
+    seedAndBaseline(store);
     expect(store.acquireGateChannelDeliveryLease(
       GATE,
       't.expired-owner',
@@ -575,7 +622,7 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     store.close();
   });
 
-  it('keeps attempted/receipt/consumed distinct and defers every D3 card generation to D3-3', async () => {
+  it('keeps lifecycle distinct while each D3 generation deterministically updates the existing card', async () => {
     const store = new SqliteDigestStore(path);
     const slack = new RecordingSlack();
     resolveD2(store);
@@ -595,16 +642,24 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     expect(store.acquireGateOutboxProjection(
       GATE, seededOutbox.revision, PROJECTION_OWNER, SEEDED_AT,
     )).toBe('deferred');
-    expect(store.listAcknowledgedGateOutboxes()).toEqual([]);
+    expect(store.listAcknowledgedGateOutboxes()).toHaveLength(1);
     expect(await projectGateResolutionCard(
       store, slack, GATE, () => new Date(SEEDED_AT),
-    )).toMatchObject({ kind: 'pending' });
+    )).toMatchObject({ kind: 'projected' });
     expect(slack.updates).toHaveLength(1);
 
     const lease = store.acquireGateChannelDeliveryLease(
       GATE, DELIVERY_OWNER, SEEDED_AT, LEASE_EXPIRY,
     );
     if (lease.kind !== 'acquired') throw new Error(`delivery lease failed: ${lease.kind}`);
+    const baselined = store.recordGateResumeBaseline(
+      GATE,
+      lease.delivery.revision,
+      DELIVERY_OWNER,
+      baselineFor(seeded),
+      SEEDED_AT,
+    );
+    if (baselined === null) throw new Error('delivery baseline failed');
     const attempted = store.markGateChannelAttempted(
       GATE, ATTEMPTED_AT, '2026-08-24T10:00:08.000Z',
     );
@@ -614,11 +669,12 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     );
     expect(await projectGateResolutionCard(
       store, slack, GATE, () => new Date(ATTEMPTED_AT),
-    )).toMatchObject({ kind: 'pending' });
+    )).toMatchObject({ kind: 'projected' });
+    expect(slack.updates).toHaveLength(1);
     expect(store.markGateOutboxProjected(
       GATE, projected.revision, 'stale-card', PROJECTION_OWNER, ATTEMPTED_AT,
     )).toBe(false);
-    expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: true });
+    expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: false });
 
     const receipted = store.markGateChannelReceipted(GATE, RECEIPTED_AT);
     expect(receipted).toMatchObject({ state: 'receipted', consumedAt: null });
@@ -627,7 +683,11 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     );
     expect(await projectGateResolutionCard(
       store, slack, GATE, () => new Date(RECEIPTED_AT),
-    )).toMatchObject({ kind: 'pending' });
+    )).toMatchObject({ kind: 'projected' });
+    expect(slack.updates).toHaveLength(2);
+    expect(slack.updates.at(-1)?.text).toContain(
+      'Coordinator 확인됨 · 후속 Task 재개 미관찰',
+    );
     expect(store.markGateChannelAttempted(
       GATE, RECEIPTED_AT, '2026-08-24T10:00:09.000Z',
     )).toMatchObject({ state: 'receipted', attemptCount: 1 });
@@ -647,16 +707,16 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     const consumedOutbox = store.findGateResolutionOutbox(GATE)!;
     expect(consumedDelivery.deferredOutboxRevision).toBe(consumedOutbox.revision);
     expect(consumedOutbox).toMatchObject({ cardPending: true, projectedAt: null });
-    expect(store.listAcknowledgedGateOutboxes()).toEqual([]);
+    expect(store.listAcknowledgedGateOutboxes()).toHaveLength(1);
     expect(await projectGateResolutionCard(
       store, slack, GATE, () => new Date(CONSUMED_AT),
-    )).toMatchObject({ kind: 'pending' });
-    expect(slack.updates).toHaveLength(1);
+    )).toMatchObject({ kind: 'projected' });
+    expect(slack.updates).toHaveLength(2);
     expect(store.listDueGateChannelDeliveries('2026-08-24T11:00:00.000Z')).toEqual([]);
     expect(store.consumeGateChannelDelivery(
       GATE, effectLease.delivery.revision, DELIVERY_OWNER, resolved, CONSUMED_AT,
     )).toMatchObject({ kind: 'duplicate', delivery: { state: 'consumed' } });
-    expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: true });
+    expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: false });
     store.close();
 
     const reopened = new SqliteDigestStore(path);
@@ -665,53 +725,19 @@ describe('monotonic crash-safe Channel lifecycle', () => {
     });
     const deferred = reopened.findGateChannelDelivery(GATE)!;
     const pendingOutbox = reopened.findGateResolutionOutbox(GATE)!;
-    expect(pendingOutbox).toMatchObject({
-      revision: deferred.deferredOutboxRevision,
-      cardPending: true,
-      projectedAt: null,
-    });
+    expect(pendingOutbox).toMatchObject({ cardPending: false });
+    expect(pendingOutbox.revision).toBeGreaterThan(deferred.deferredOutboxRevision);
     expect(await projectGateResolutionCard(
       reopened, slack, GATE, () => new Date(CONSUMED_AT),
-    )).toMatchObject({ kind: 'pending' });
-    expect(slack.updates).toHaveLength(1);
-    expect(reopened.acquireGateOutboxProjection(
-      GATE,
-      pendingOutbox.revision,
-      PROJECTION_OWNER,
-      CONSUMED_AT,
-      {
-        expectedDeliveryRevision: deferred.revision - 1,
-        expectedOutboxRevision: pendingOutbox.revision,
-      },
-    )).toBe('deferred');
-    expect(reopened.acquireGateOutboxProjection(
-      GATE,
-      pendingOutbox.revision,
-      PROJECTION_OWNER,
-      CONSUMED_AT,
-      {
-        expectedDeliveryRevision: deferred.revision,
-        expectedOutboxRevision: pendingOutbox.revision,
-      },
-    )).toBe('acquired');
-    expect(reopened.markGateOutboxProjected(
-      GATE,
-      pendingOutbox.revision,
-      'd3-3-exact-future-card',
-      PROJECTION_OWNER,
-      CONSUMED_AT,
-      {
-        expectedDeliveryRevision: deferred.revision,
-        expectedOutboxRevision: pendingOutbox.revision,
-      },
-    )).toBe(true);
+    )).toMatchObject({ kind: 'current' });
+    expect(slack.updates).toHaveLength(2);
     reopened.close();
   });
 
   it('recovers receipted rows after restart and refuses mismatched fresh Gate evidence', () => {
     let store = new SqliteDigestStore(path);
     resolveD2(store);
-    seedDelivery(store);
+    seedAndBaseline(store);
     expect(store.markGateChannelAttempted(
       GATE, ATTEMPTED_AT, '2026-08-24T10:00:08.000Z',
     )?.state).toBe('attempted');
@@ -823,12 +849,7 @@ describe('FINAL4 durable projection and rollback clocks', () => {
       't.ordinary-projector',
       CONSUMED_AT,
     )).toBe('deferred');
-    expect(await projectGateResolutionCard(
-      store,
-      slack,
-      GATE,
-      () => new Date(CONSUMED_AT),
-    )).toMatchObject({ kind: 'pending' });
+    expect(store.listAcknowledgedGateOutboxes()).toHaveLength(1);
     expect(slack.updates).toEqual([]);
 
     // A recovered owner must loop on the new exact identity before acting. Its release advances
@@ -872,12 +893,7 @@ describe('FINAL4 durable projection and rollback clocks', () => {
       '2026-08-24T10:00:08.000Z',
       recoveredClaim,
     )).toBe(false);
-    expect(await projectGateResolutionCard(
-      store,
-      slack,
-      GATE,
-      () => new Date('2026-08-24T10:00:08.000Z'),
-    )).toMatchObject({ kind: 'pending' });
+    expect(store.listAcknowledgedGateOutboxes()).toHaveLength(1);
     expect(slack.updates).toEqual([]);
     store.close();
 
@@ -921,7 +937,7 @@ describe('FINAL4 durable projection and rollback clocks', () => {
     const secondDeliveryOwner = 't.equality-delivery-owner';
     let store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
-    seedDelivery(store);
+    seedAndBaseline(store);
 
     const firstLease = store.acquireGateChannelDeliveryLease(
       GATE,
@@ -1041,13 +1057,13 @@ describe('FINAL4 durable projection and rollback clocks', () => {
       '2026-08-24T10:00:06.000Z',
       releaseClaim,
     )).toBe(false);
-    expect(store.listAcknowledgedGateOutboxes()).toEqual([]);
+    expect(store.listAcknowledgedGateOutboxes()).toHaveLength(1);
     store.close();
 
     store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     expect(store.findGateChannelDelivery(GATE)).toEqual(releasedDelivery);
     expect(store.findGateResolutionOutbox(GATE)).toEqual(releasedOutbox);
-    expect(store.listAcknowledgedGateOutboxes()).toEqual([]);
+    expect(store.listAcknowledgedGateOutboxes()).toHaveLength(1);
     store.close();
   });
 
@@ -1058,7 +1074,7 @@ describe('FINAL4 durable projection and rollback clocks', () => {
     let monotonicMs = 0;
     let store = new SqliteDigestStore(path, { monotonicNow: () => monotonicMs });
     resolveD2(store);
-    seedDelivery(store);
+    seedAndBaseline(store);
 
     monotonicMs = 1_000;
     expect(store.listDueGateChannelDeliveries(rollbackAt)).toHaveLength(1);
@@ -1228,10 +1244,12 @@ describe('FINAL4 durable projection and rollback clocks', () => {
     let monotonicMs = 0;
     let store = new SqliteDigestStore(path, { monotonicNow: () => monotonicMs });
     resolveD2(store);
-    expect(seedDelivery(store)).toMatchObject({
+    const frozenSeed = seedDelivery(store);
+    expect(frozenSeed).toMatchObject({
       updatedAt: frozenNow,
       nextAttemptAt: frozenNow,
     });
+    recordBaseline(store, frozenSeed, frozenNow);
     store.close();
 
     // The new process reads T as its causal floor, while every caller continues to report exactly
@@ -1362,7 +1380,9 @@ describe('FINAL4 durable projection and rollback clocks', () => {
     let monotonicMs = 0;
     let store = new SqliteDigestStore(path, { monotonicNow: () => monotonicMs });
     resolveD2(store);
-    expect(seedDelivery(store)).toMatchObject({ updatedAt: floor, nextAttemptAt: floor });
+    const creepingSeed = seedDelivery(store);
+    expect(creepingSeed).toMatchObject({ updatedAt: floor, nextAttemptAt: floor });
+    recordBaseline(store, creepingSeed, floor);
     store.close();
 
     store = new SqliteDigestStore(path, { monotonicNow: () => monotonicMs });

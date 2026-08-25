@@ -460,6 +460,99 @@ export async function listTaskPage(
   };
 }
 
+export type StrictResumeTask = {
+  readonly id: string;
+  readonly runId: string;
+  readonly status: string;
+  readonly deps: readonly string[];
+  readonly currentDispatchId: string | null;
+};
+
+const STRICT_RESUME_TASK_STATUSES = new Set([
+  'pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked',
+]);
+
+const STRICT_RESUME_DISPATCH_STATUSES = new Set([
+  'dispatched', 'completed', 'failed', 'circuit_broken',
+]);
+
+function strictBoundedString(value: unknown, at: string, cap = 500): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > cap) {
+    throw new TypeError(`${at}이(가) 1..${cap}자의 string이 아니다`);
+  }
+  return value;
+}
+
+function strictResumeStatus(
+  value: unknown,
+  allowed: ReadonlySet<string>,
+  at: string,
+): string {
+  const status = strictBoundedString(value, at, 80);
+  if (!allowed.has(status)) throw new TypeError(`${at}이(가) 알려진 Orca status가 아니다`);
+  return status;
+}
+
+/** Fail-closed Task reread used only by the targeted D3 resume observer. */
+export async function readStrictResumeTasks(
+  runner: OrcaRunner,
+  runId: string,
+  options?: OrcaRunOptions,
+): Promise<readonly StrictResumeTask[]> {
+  const result = await call<unknown>(
+    runner,
+    ['orchestration', 'task-list', '--run', runId, '--json'],
+    options,
+  );
+  if (!isRecord(result)) throw new TypeError('resume task-list result가 object가 아니다');
+  exactObjectKeys(result, ['runId', 'tasks', 'count', 'legacyReadOnly'], 'resume task-list result');
+  if (
+    result['runId'] !== runId ||
+    !Array.isArray(result['tasks']) ||
+    result['count'] !== result['tasks'].length ||
+    typeof result['legacyReadOnly'] !== 'boolean'
+  ) {
+    throw new TypeError('resume task-list result correlation/count가 어긋난다');
+  }
+  const seen = new Set<string>();
+  return result['tasks'].map((raw, index) => {
+    if (!isRecord(raw)) throw new TypeError(`resume task-list.tasks[${index}]가 object가 아니다`);
+    const id = strictBoundedString(raw['id'], `resume task-list.tasks[${index}].id`);
+    if (seen.has(id)) throw new TypeError(`resume task-list에 중복 Task ${id}가 있다`);
+    seen.add(id);
+    if (raw['run_id'] !== runId) {
+      throw new TypeError(`resume task ${id}의 Run correlation이 어긋난다`);
+    }
+    if (raw['deps'] === null || raw['deps'] === undefined) {
+      throw new TypeError(`resume task ${id}.deps가 없다`);
+    }
+    const deps = parseStringArrayField(raw['deps'], [], `resume task ${id}.deps`);
+    if (new Set(deps).size !== deps.length || deps.some((dep) => dep.length === 0 || dep.length > 500)) {
+      throw new TypeError(`resume task ${id}.deps identity가 어긋난다`);
+    }
+    const status = strictResumeStatus(
+      raw['status'],
+      STRICT_RESUME_TASK_STATUSES,
+      `resume task ${id}.status`,
+    );
+    const currentDispatch = raw['dispatch_id'] ?? null;
+    if (currentDispatch !== null && typeof currentDispatch !== 'string') {
+      throw new TypeError(`resume task ${id}.dispatch_id가 string/null이 아니다`);
+    }
+    if (status === 'dispatched' && currentDispatch === null) {
+      throw new TypeError(`resume task ${id}.dispatch_id가 dispatched 상태에서 없다`);
+    }
+    return {
+      id,
+      runId,
+      status,
+      deps,
+      currentDispatchId:
+        currentDispatch === null ? null : strictBoundedString(currentDispatch, `resume task ${id}.dispatch_id`),
+    };
+  });
+}
+
 /** gate row를 읽는다. `options` 파싱 실패를 그 gate 하나에 가둔다. 근거는 `listTasks`와 같다. */
 export async function listGates(runner: OrcaRunner, runId: string): Promise<OrcaGate[]> {
   const r = await call<{ gates?: unknown[] }>(runner, [
@@ -674,6 +767,120 @@ export async function listWorkers(runner: OrcaRunner, runId: string): Promise<Or
       repositoryId: worktreeId === '' ? null : repositoryIdFromWorktreeId(worktreeId),
     };
   });
+}
+
+export type StrictResumeWorker = {
+  readonly dispatchId: string;
+  readonly taskId: string;
+  readonly runId: string;
+  readonly dispatchStatus: string;
+};
+
+/** Fail-closed worker history reread used only for normalized D3 correlation evidence. */
+export async function readStrictResumeWorkers(
+  runner: OrcaRunner,
+  runId: string,
+  options?: OrcaRunOptions,
+): Promise<readonly StrictResumeWorker[]> {
+  const result = await call<unknown>(
+    runner,
+    ['orchestration', 'worker-list', '--run', runId, '--json'],
+    options,
+  );
+  if (!isRecord(result)) throw new TypeError('resume worker-list result가 object가 아니다');
+  exactObjectKeys(result, ['workers', 'counts'], 'resume worker-list result');
+  if (!Array.isArray(result['workers']) || !isRecord(result['counts'])) {
+    throw new TypeError('resume worker-list workers/counts shape가 어긋난다');
+  }
+  let countedWorkers = 0;
+  for (const [bucket, value] of Object.entries(result['counts'])) {
+    if (bucket.length === 0 || typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError(`resume worker-list.counts.${bucket}이(가) non-negative safe integer가 아니다`);
+    }
+    countedWorkers += value;
+    if (!Number.isSafeInteger(countedWorkers)) {
+      throw new TypeError('resume worker-list.counts 합계가 safe integer가 아니다');
+    }
+  }
+  if (countedWorkers !== result['workers'].length) {
+    throw new TypeError('resume worker-list workers/counts 합계가 어긋난다');
+  }
+  const seen = new Set<string>();
+  return result['workers'].map((raw, index) => {
+    if (!isRecord(raw)) throw new TypeError(`resume worker-list.workers[${index}]가 object가 아니다`);
+    const dispatchId = strictBoundedString(
+      raw['dispatchId'],
+      `resume worker-list.workers[${index}].dispatchId`,
+    );
+    if (seen.has(dispatchId)) {
+      throw new TypeError(`resume worker-list에 중복 Dispatch ${dispatchId}가 있다`);
+    }
+    seen.add(dispatchId);
+    if (raw['runId'] !== runId) {
+      throw new TypeError(`resume Dispatch ${dispatchId}의 Run correlation이 어긋난다`);
+    }
+    return {
+      dispatchId,
+      taskId: strictBoundedString(raw['taskId'], `resume Dispatch ${dispatchId}.taskId`),
+      runId,
+      dispatchStatus: strictResumeStatus(
+        raw['dispatchStatus'],
+        STRICT_RESUME_DISPATCH_STATUSES,
+        `resume Dispatch ${dispatchId}.dispatchStatus`,
+      ),
+    };
+  });
+}
+
+export type StrictResumeDispatch = {
+  readonly dispatchId: string;
+  readonly taskId: string;
+  readonly runId: string;
+  readonly status: string;
+};
+
+/** Strictly read the current Dispatch selected by Orca for one exact Task. */
+export async function readStrictResumeTaskDispatch(
+  runner: OrcaRunner,
+  identity: { readonly runId: string; readonly taskId: string },
+  options?: OrcaRunOptions,
+): Promise<StrictResumeDispatch> {
+  const result = await call<unknown>(
+    runner,
+    ['orchestration', 'dispatch-show', '--task', identity.taskId, '--json'],
+    options,
+  );
+  if (!isRecord(result)) throw new TypeError('resume dispatch-show result가 object가 아니다');
+  exactObjectKeys(result, ['dispatch'], 'resume dispatch-show result');
+  const row = result['dispatch'];
+  if (!isRecord(row)) throw new TypeError('resume dispatch-show.dispatch가 object가 아니다');
+  const dispatchId = strictBoundedString(row['id'], 'resume dispatch-show.dispatch.id');
+  if (row['task_id'] !== identity.taskId || row['run_id'] !== identity.runId) {
+    throw new TypeError('resume dispatch-show correlation이 어긋난다');
+  }
+  return {
+    dispatchId,
+    taskId: identity.taskId,
+    runId: identity.runId,
+    status: strictResumeStatus(
+      row['status'],
+      STRICT_RESUME_DISPATCH_STATUSES,
+      'resume dispatch-show.dispatch.status',
+    ),
+  };
+}
+
+/** Final targeted Dispatch confirmation for a provisional positive witness. */
+export async function readExactResumeDispatch(
+  runner: OrcaRunner,
+  identity: { readonly runId: string; readonly taskId: string; readonly dispatchId: string },
+  options?: OrcaRunOptions,
+): Promise<StrictResumeDispatch> {
+  const dispatch = await readStrictResumeTaskDispatch(runner, identity, options);
+  if (dispatch.dispatchId !== identity.dispatchId) {
+    throw new TypeError('resume dispatch-show correlation이 어긋난다');
+  }
+  return dispatch;
 }
 
 /**

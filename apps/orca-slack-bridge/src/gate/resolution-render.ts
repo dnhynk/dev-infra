@@ -1,15 +1,26 @@
 import type { RenderedCard } from '../digest/render.js';
-import type { GateResolutionIntent, GateResolutionOutbox } from './resolution-types.js';
+import type {
+  GateChannelDelivery,
+  GateResolutionIntent,
+  GateResolutionOutbox,
+  GateResumeObservation,
+} from './resolution-types.js';
 import { GATE_DIRECT_OPTION_ID } from './direct-input-types.js';
 
 function cut(value: string, cap: number): string {
   return value.length <= cap ? value : `${value.slice(0, Math.max(0, cap - 1))}…`;
 }
 
+function esc(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /** Deterministic D2 card. It deliberately projects only a pending D3 notification. */
 export function renderGateResolutionCard(
   intent: GateResolutionIntent,
   outbox: GateResolutionOutbox,
+  delivery: GateChannelDelivery | null = null,
+  resume: GateResumeObservation | null = null,
 ): RenderedCard {
   const heading =
     outbox.cardState === 'resolving'
@@ -36,8 +47,22 @@ export function renderGateResolutionCard(
       ? 'Orca mutation 응답 없음'
       : `Orca mutation ${intent.resolveResult.mutation.requestId} · replayed ${intent.resolveResult.mutation.replayed ? 'yes' : 'no'}`;
   const selection = intent.optionId === GATE_DIRECT_OPTION_ID ? '직접 입력' : intent.optionId;
+  const resumeState = resume?.evidence !== null && resume?.evidence !== undefined
+    ? {
+        label: '▶️ 작업 재개',
+        detail: `Task ${resume.evidence.taskId} · Dispatch ${resume.evidence.dispatchId}`,
+      }
+    : delivery?.state === 'receipted' || delivery?.state === 'consumed'
+      ? {
+          label: 'Coordinator 확인됨 · 후속 Task 재개 미관찰',
+          detail: `Task ${intent.taskId} · Dispatch ${intent.dispatchId}`,
+        }
+      : {
+          label: 'Coordinator 통지 대기',
+          detail: `Task ${intent.taskId} · Dispatch ${intent.dispatchId}`,
+        };
   return {
-    text: `${outbox.cardState} · ${intent.gateKey.slice('gate:'.length)} · Coordinator 통지 대기`,
+    text: `${outbox.cardState} · ${esc(intent.gateKey.slice('gate:'.length))} · ${resumeState.label} · ${esc(resumeState.detail)}`,
     blocks: [
       {
         type: 'section',
@@ -63,8 +88,15 @@ export function renderGateResolutionCard(
         type: 'section',
         text: {
           type: 'plain_text',
+          text: `${resumeState.label}\n${resumeState.detail}`,
+          emoji: true,
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'plain_text',
           text:
-            'Coordinator 통지 대기\n' +
             `${mutation}\n` +
             `ask ${cut(intent.askMessageId, 500)} · thread ${cut(intent.questionThreadId, 500)}\n` +
             `dispatch ${cut(intent.dispatchId, 500)} · task ${cut(intent.taskId, 500)}`,

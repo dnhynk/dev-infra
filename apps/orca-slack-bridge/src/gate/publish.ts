@@ -154,7 +154,12 @@ export async function publishGateCard(
     if (resolution.ackState !== 'acked') {
       return { ...base, action: 'skip', messageTs: existing?.messageTs ?? null };
     }
-    const resolutionCard = renderGateResolutionCard(resolution, resolutionOutbox);
+    const resolutionCard = renderGateResolutionCard(
+      resolution,
+      resolutionOutbox,
+      options.store.findGateChannelDelivery(gate.key),
+      options.store.findGateResumeObservation(gate.key),
+    );
     const resolutionFingerprint = renderFingerprint(resolutionCard);
     if (isDryRun || options.slack === null) {
       return {
@@ -250,7 +255,12 @@ export async function publishGateCard(
     const racedIntent = options.store.findGateResolution(gate.key);
     const racedOutbox = options.store.findGateResolutionOutbox(gate.key);
     if (racedIntent?.ackState === 'acked' && racedOutbox !== null) {
-      const resolutionCard = renderGateResolutionCard(racedIntent, racedOutbox);
+      const resolutionCard = renderGateResolutionCard(
+        racedIntent,
+        racedOutbox,
+        options.store.findGateChannelDelivery(gate.key),
+        options.store.findGateResumeObservation(gate.key),
+      );
       const resolutionFingerprint = renderFingerprint(resolutionCard);
       const projection = await projectGateResolutionCard(
         options.store,

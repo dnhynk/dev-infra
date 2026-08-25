@@ -10,7 +10,7 @@ import {
 } from '../src/channel/delivery.js';
 import type { ChannelDeliverySendResult } from '../src/channel/pipe-server.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
-import type { GateSnapshot } from '../src/gate/resolution-types.js';
+import type { GateChannelDelivery, GateSnapshot } from '../src/gate/resolution-types.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
@@ -304,6 +304,25 @@ function boundedEngine(
   transport: RecordingTransport,
   batchLimit: number,
 ): GateChannelDeliveryEngine {
+  const ensureBaseline = (
+    delivery: GateChannelDelivery,
+    owner: string,
+  ): Promise<GateChannelDelivery | null> => {
+    if (delivery.resumeBaselineState === 'recorded') return Promise.resolve(delivery);
+    return Promise.resolve(store.recordGateResumeBaseline(
+      delivery.gateKey, delivery.revision, owner, {
+      schemaVersion: 1,
+      sourceTaskId: delivery.taskKey.slice('task:'.length),
+      sourceDispatchId: delivery.sourceDispatchId,
+      candidates: [{
+        taskId: delivery.taskKey.slice('task:'.length),
+        status: 'completed',
+        currentDispatchId: delivery.sourceDispatchId,
+        dispatches: [{ dispatchId: delivery.sourceDispatchId, status: 'completed' }],
+      }],
+      }, RECONCILE_AT,
+    ));
+  };
   return new GateChannelDeliveryEngine({
     store,
     orca: unusedOrca,
@@ -316,6 +335,7 @@ function boundedEngine(
     batchLimit,
     concurrency: 8,
     reconcileDeadlineMs: 2_000,
+    resume: { ensureBaseline, reconcile: () => Promise.resolve() },
   });
 }
 

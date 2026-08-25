@@ -9,7 +9,10 @@ import {
 } from '../slack/post.js';
 import type { GateStore } from '../store/schema.js';
 import { renderGateResolutionCard } from './resolution-render.js';
-import type { GateResolutionLifecycle } from './resolution-types.js';
+import type {
+  GateChannelProjectionClaim,
+  GateResolutionLifecycle,
+} from './resolution-types.js';
 
 export type GateProjectionResult = {
   readonly kind: 'absent' | 'current' | 'projected' | 'pending';
@@ -42,6 +45,7 @@ export async function projectGateResolutionCard(
 ): Promise<GateProjectionResult> {
   const projectionOwner = `p${process.pid}.${randomUUID()}`;
   let ownsProjection = false;
+  let ownedChannelClaim: GateChannelProjectionClaim | undefined;
   let abandonProjection = false;
   try {
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -49,6 +53,8 @@ export async function projectGateResolutionCard(
     const outbox = store.findGateResolutionOutbox(gateKey);
     const message = store.findGateMessage(gateKey);
     const localObservation = store.findGateLocalObservation(gateKey);
+    const delivery = store.findGateChannelDelivery(gateKey);
+    const resume = store.findGateResumeObservation(gateKey);
     if (intent === null || outbox === null || intent.ackState !== 'acked') {
       return { kind: 'absent', card: null, fingerprint: null };
     }
@@ -68,7 +74,16 @@ export async function projectGateResolutionCard(
       );
       return { kind: 'pending', card: null, fingerprint: null };
     }
-    const card = renderGateResolutionCard(intent, outbox);
+    const fencedDelivery = delivery === null ? null : store.findGateChannelDelivery(gateKey);
+    if (delivery !== null && fencedDelivery?.revision !== delivery.revision) continue;
+    const channelClaim = delivery !== null &&
+      delivery.deferredOutboxRevision === outbox.revision
+      ? {
+          expectedDeliveryRevision: delivery.revision,
+          expectedOutboxRevision: outbox.revision,
+        }
+      : undefined;
+    const card = renderGateResolutionCard(intent, outbox, delivery, resume);
     const fingerprint = renderFingerprint(card);
     const forceProjection =
       outbox.cardPending || localObservation?.mappingState === 'write_pending';
@@ -102,6 +117,7 @@ export async function projectGateResolutionCard(
         outbox.revision,
         projectionOwner,
         now().toISOString(),
+        channelClaim,
       );
       if (lease === 'busy') return { kind: 'pending', card, fingerprint };
       // D3-2 re-arms the shared card outbox atomically but deliberately leaves its exact
@@ -110,48 +126,64 @@ export async function projectGateResolutionCard(
       if (lease === 'superseded') continue;
       if (lease === 'recovered') {
         ownsProjection = true;
+        ownedChannelClaim = channelClaim;
         continue;
       }
       ownsProjection = true;
-      let updated: Awaited<ReturnType<SlackPoster['update']>>;
-      try {
-        updated = await boundedSlackUpdate(slack, {
-          channel: message.channelId,
-          ts: message.messageTs,
-          text: card.text,
-          blocks: card.blocks,
-        }, timeoutMs);
-      } catch (error) {
-        store.releaseGateOutboxProjection(gateKey, projectionOwner, now().toISOString());
-        ownsProjection = false;
-        store.recordGateAttempt(
-          gateKey,
-          'card_projection',
-          error instanceof SlackUpdateTimeoutError ? 'timed_out' : 'failed',
-          null,
-          now().toISOString(),
-        );
-        return { kind: 'pending', card, fingerprint };
-      }
-      try {
-        await fault?.('after_slack_success_before_local_completion', gateKey);
-      } catch (e) {
-        // This seam models process death: keep the durable owner. A normal catchable Slack failure
-        // above releases it; a real crash cannot run a local release.
-        abandonProjection = true;
-        throw e;
-      }
-      if (updated.channel !== message.channelId || updated.ts !== message.messageTs) {
-        store.releaseGateOutboxProjection(gateKey, projectionOwner, now().toISOString());
-        ownsProjection = false;
-        store.recordGateAttempt(
-          gateKey,
-          'card_projection',
-          'identity_mismatch',
-          null,
-          now().toISOString(),
-        );
-        return { kind: 'pending', card, fingerprint };
+      ownedChannelClaim = channelClaim;
+      if (message.renderFingerprint !== fingerprint) {
+        let updated: Awaited<ReturnType<SlackPoster['update']>>;
+        try {
+          updated = await boundedSlackUpdate(slack, {
+            channel: message.channelId,
+            ts: message.messageTs,
+            text: card.text,
+            blocks: card.blocks,
+          }, timeoutMs);
+        } catch (error) {
+          const released = store.releaseGateOutboxProjection(
+            gateKey,
+            projectionOwner,
+            now().toISOString(),
+            channelClaim,
+          );
+          ownsProjection = !released;
+          if (released) ownedChannelClaim = undefined;
+          store.recordGateAttempt(
+            gateKey,
+            'card_projection',
+            error instanceof SlackUpdateTimeoutError ? 'timed_out' : 'failed',
+            null,
+            now().toISOString(),
+          );
+          return { kind: 'pending', card, fingerprint };
+        }
+        try {
+          await fault?.('after_slack_success_before_local_completion', gateKey);
+        } catch (e) {
+          // This seam models process death: keep the durable owner. A normal catchable Slack failure
+          // above releases it; a real crash cannot run a local release.
+          abandonProjection = true;
+          throw e;
+        }
+        if (updated.channel !== message.channelId || updated.ts !== message.messageTs) {
+          const released = store.releaseGateOutboxProjection(
+            gateKey,
+            projectionOwner,
+            now().toISOString(),
+            channelClaim,
+          );
+          ownsProjection = !released;
+          if (released) ownedChannelClaim = undefined;
+          store.recordGateAttempt(
+            gateKey,
+            'card_projection',
+            'identity_mismatch',
+            null,
+            now().toISOString(),
+          );
+          return { kind: 'pending', card, fingerprint };
+        }
       }
     }
     if (store.markGateOutboxProjected(
@@ -160,8 +192,10 @@ export async function projectGateResolutionCard(
       fingerprint,
       projectionOwner,
       now().toISOString(),
+      channelClaim,
     )) {
       ownsProjection = false;
+      ownedChannelClaim = undefined;
       store.recordGateAttempt(gateKey, 'card_projection', 'succeeded', null, now().toISOString());
       return { kind: 'projected', card, fingerprint };
     }
@@ -170,7 +204,12 @@ export async function projectGateResolutionCard(
     return { kind: 'pending', card: null, fingerprint: null };
   } finally {
     if (ownsProjection && !abandonProjection) {
-      store.releaseGateOutboxProjection(gateKey, projectionOwner, now().toISOString());
+      store.releaseGateOutboxProjection(
+        gateKey,
+        projectionOwner,
+        now().toISOString(),
+        ownedChannelClaim,
+      );
     }
   }
 }
