@@ -8,6 +8,7 @@ import {
   ChannelProtocolError,
   decodeAdapterMessage,
   encodeChannelFrame,
+  isGateId,
   type AdapterHello,
   type AdapterToDaemonMessage,
   type ChannelProtocolErrorCode,
@@ -32,6 +33,8 @@ export type ChannelPipeErrorCode =
   | 'stale_epoch'
   | 'wrong_attempt'
   | 'wrong_receipt'
+  | 'delivery_event_failed'
+  | 'production_delivery_limit'
   | 'run_read_failed'
   | 'shutdown_timeout';
 
@@ -59,15 +62,28 @@ export type ChannelConnectionSnapshot = {
 };
 
 export type ChannelRouteDecision =
-  | { readonly kind: 'pending'; readonly code: 'run_missing' | 'run_unreadable' | 'no_candidate' | 'unverified' | 'stale_generation' | 'run_read_failed' }
+  | { readonly kind: 'pending'; readonly code: 'run_missing' | 'run_unreadable' | 'no_candidate' | 'unverified' | 'stale_generation' | 'run_read_failed' | 'backpressure' | 'connection_capacity' | 'write_failed' }
   | { readonly kind: 'ambiguous'; readonly code: 'duplicate_run' | 'same_binding' }
   | {
-      readonly kind: 'eligible_but_disabled';
+      readonly kind: 'eligible';
       readonly epoch: string;
       readonly generation: number;
-      /** D3-1 has no production Gate writer or durable delivery state. */
-      readonly productionDeliveryEnabled: false;
     };
+
+export type ChannelDeliverySendResult =
+  | Exclude<ChannelRouteDecision, { readonly kind: 'eligible' }>
+  | { readonly kind: 'sent'; readonly epoch: string; readonly generation: number };
+
+export type ChannelProductionDeliveryEvent = {
+  readonly gateId: string;
+  readonly connectionEpoch: string;
+};
+
+export type ChannelProductionDeliveryHandlers = {
+  /** Synchronous so a receipt ACK can never cross the pipe before its durable commit. */
+  readonly attempted: (event: ChannelProductionDeliveryEvent) => void;
+  readonly receipted: (event: ChannelProductionDeliveryEvent) => void;
+};
 
 type ConnectionState = {
   readonly socket: Socket;
@@ -81,11 +97,22 @@ type ConnectionState = {
   verified: boolean;
   probeDelayIndex: number;
   writeBlocked: boolean;
-  pendingReceiptAck: string | null;
+  readonly pendingReceiptAcks: Set<string>;
+  readonly productionGateIds: Set<string>;
   timer: ReturnType<typeof setTimeout> | null;
 };
 
 type BindingGenerationIndex = ReadonlyMap<string, ReadonlyMap<string, number>>;
+
+type ChannelRouteSelection =
+  | {
+      readonly decision: Extract<ChannelRouteDecision, { readonly kind: 'eligible' }>;
+      readonly connection: ConnectionState;
+    }
+  | {
+      readonly decision: Exclude<ChannelRouteDecision, { readonly kind: 'eligible' }>;
+      readonly connection: null;
+    };
 
 export type ChannelPipeServerOptions = {
   readonly orca: OrcaRunner;
@@ -96,6 +123,7 @@ export type ChannelPipeServerOptions = {
   readonly shutdownTimeoutMs?: number;
   readonly maxConnections?: number;
   readonly maxConnectionsPerBinding?: number;
+  readonly maxProductionGateIdsPerConnection?: number;
   /** Test seam for deterministic backpressure; production always calls `socket.write(frame)`. */
   readonly writeFrame?: (socket: Socket, frame: Buffer) => boolean;
   /** Receives bounded codes only. Raw frames, claims, paths, and socket errors are never passed. */
@@ -164,8 +192,9 @@ async function abortableListRuns(
 /**
  * Daemon-owned local Channel endpoint.
  *
- * D3-1 intentionally has no method that writes a production Gate. It exercises the real pipe,
- * Adapter, MCP notification, and receipt probe while routing evaluation remains read-only.
+ * The dead-window-safe probe remains the only verification signal. D3 production Gate writes use
+ * the same exact-generation route only after verification and report Adapter events through a
+ * synchronous durable handler installed before startup.
  */
 export class ChannelPipeServer {
   readonly #orca: OrcaRunner;
@@ -176,14 +205,17 @@ export class ChannelPipeServer {
   readonly #shutdownTimeoutMs: number;
   readonly #maxConnections: number;
   readonly #maxConnectionsPerBinding: number;
+  readonly #maxProductionGateIdsPerConnection: number;
   readonly #writeFrame: (socket: Socket, frame: Buffer) => boolean;
   readonly #onError: (code: ChannelPipeErrorCode) => void;
   readonly #connections = new Set<ConnectionState>();
   #server: Server | null = null;
   #bindingAbort: AbortController | null = null;
   #bindingRead: Promise<BindingGenerationIndex | null> | null = null;
+  #productionHandlers: ChannelProductionDeliveryHandlers | null = null;
   #stopping = false;
   #productionRouteEvaluations = 0;
+  #productionGateWrites = 0;
 
   constructor(options: ChannelPipeServerOptions) {
     this.#orca = options.orca;
@@ -208,8 +240,22 @@ export class ChannelPipeServer {
       throw new TypeError('max_connections_per_binding_invalid');
     }
     this.#maxConnectionsPerBinding = maxConnectionsPerBinding;
+    const maxProductionGateIds = options.maxProductionGateIdsPerConnection ?? 256;
+    if (
+      !Number.isSafeInteger(maxProductionGateIds) ||
+      maxProductionGateIds < 1 ||
+      maxProductionGateIds > 4_096
+    ) {
+      throw new TypeError('max_production_gate_ids_invalid');
+    }
+    this.#maxProductionGateIdsPerConnection = maxProductionGateIds;
     this.#writeFrame = options.writeFrame ?? ((socket, frame) => socket.write(frame));
     this.#onError = options.onError ?? (() => undefined);
+  }
+
+  setProductionDeliveryHandlers(handlers: ChannelProductionDeliveryHandlers): void {
+    if (this.#server !== null) throw new ChannelPipeError('pipe_in_use');
+    this.#productionHandlers = handlers;
   }
 
   async start(): Promise<void> {
@@ -290,18 +336,19 @@ export class ChannelPipeServer {
     readonly bindingReads: 0 | 1;
     readonly queuedReceiptAcks: number;
     readonly productionRouteEvaluations: number;
-    readonly productionGateWrites: 0;
+    readonly productionGateWrites: number;
   } {
     return {
       listening: this.#server?.listening ?? false,
       sockets: this.#connections.size,
       timers: [...this.#connections].filter((connection) => connection.timer !== null).length,
       bindingReads: this.#bindingRead === null ? 0 : 1,
-      queuedReceiptAcks: [...this.#connections].filter(
-        (connection) => connection.pendingReceiptAck !== null,
-      ).length,
+      queuedReceiptAcks: [...this.#connections].reduce(
+        (count, connection) => count + connection.pendingReceiptAcks.size,
+        0,
+      ),
       productionRouteEvaluations: this.#productionRouteEvaluations,
-      productionGateWrites: 0,
+      productionGateWrites: this.#productionGateWrites,
     };
   }
 
@@ -328,8 +375,48 @@ export class ChannelPipeServer {
     return snapshots;
   }
 
-  /** Read-only D3-1 router shell. It never broadcasts and cannot flush a production Gate. */
+  /** Read-only route inspection; delivery uses the same selector and then performs one exact write. */
   async evaluateProductionRoute(runId: string): Promise<ChannelRouteDecision> {
+    return (await this.#selectProductionRoute(runId)).decision;
+  }
+
+  /** Write only after the current Run/generation has exactly one verified Adapter candidate. */
+  async deliverGate(runId: string, gateId: string): Promise<ChannelDeliverySendResult> {
+    if (!isGateId(gateId)) throw new ChannelPipeError('invalid_gate_id');
+    if (this.#productionHandlers === null) throw new ChannelPipeError('delivery_event_failed');
+    const selected = await this.#selectProductionRoute(runId);
+    if (selected.connection === null) return selected.decision;
+    const connection = selected.connection;
+    if (connection.writeBlocked) return { kind: 'pending', code: 'backpressure' };
+    if (
+      !connection.productionGateIds.has(gateId) &&
+      connection.productionGateIds.size >= this.#maxProductionGateIdsPerConnection
+    ) {
+      this.#onError('production_delivery_limit');
+      connection.socket.destroy();
+      return { kind: 'pending', code: 'connection_capacity' };
+    }
+    connection.productionGateIds.add(gateId);
+    const wrote = this.#write(connection, {
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'notify',
+      connection_epoch: selected.decision.epoch,
+      gate_id: gateId,
+    });
+    if (!wrote && !connection.writeBlocked) {
+      connection.productionGateIds.delete(gateId);
+      return { kind: 'pending', code: 'write_failed' };
+    }
+    // `socket.write() === false` still means the frame was accepted into Node's bounded queue.
+    this.#productionGateWrites += 1;
+    return {
+      kind: 'sent',
+      epoch: selected.decision.epoch,
+      generation: selected.decision.generation,
+    };
+  }
+
+  async #selectProductionRoute(runId: string): Promise<ChannelRouteSelection> {
     this.#productionRouteEvaluations += 1;
     const connectionSnapshot = [...this.#connections];
     const bindings = new Map<ConnectionState, BindingGenerationIndex | null>();
@@ -343,17 +430,21 @@ export class ChannelPipeServer {
       runs = (await listRuns(this.#orca)).filter((run) => run.id === runId);
     } catch {
       this.#onError('run_read_failed');
-      return { kind: 'pending', code: 'run_read_failed' };
+      return { decision: { kind: 'pending', code: 'run_read_failed' }, connection: null };
     }
-    if (runs.length === 0) return { kind: 'pending', code: 'run_missing' };
-    if (runs.length > 1) return { kind: 'ambiguous', code: 'duplicate_run' };
+    if (runs.length === 0) {
+      return { decision: { kind: 'pending', code: 'run_missing' }, connection: null };
+    }
+    if (runs.length > 1) {
+      return { decision: { kind: 'ambiguous', code: 'duplicate_run' }, connection: null };
+    }
     const run = runs[0]!;
     if (
       run.coordinatorHandle === null ||
       run.coordinatorPaneKey === null ||
       run.consumerGeneration.kind !== 'value'
     ) {
-      return { kind: 'pending', code: 'run_unreadable' };
+      return { decision: { kind: 'pending', code: 'run_unreadable' }, connection: null };
     }
 
     const candidates = connectionSnapshot.filter((connection) =>
@@ -364,7 +455,9 @@ export class ChannelPipeServer {
       connection.hello.terminal_handle === run.coordinatorHandle &&
       connection.hello.pane_key === run.coordinatorPaneKey,
     );
-    if (candidates.length === 0) return { kind: 'pending', code: 'no_candidate' };
+    if (candidates.length === 0) {
+      return { decision: { kind: 'pending', code: 'no_candidate' }, connection: null };
+    }
 
     const currentGeneration = run.consumerGeneration.value;
     const key = bindingKey(run.coordinatorHandle, run.coordinatorPaneKey);
@@ -389,19 +482,29 @@ export class ChannelPipeServer {
       currentCandidates.push(candidate);
     }
     if (currentCandidates.length === 0) {
-      if (retiredFailedRead) return { kind: 'pending', code: 'run_read_failed' };
-      if (retiredStaleGeneration) return { kind: 'pending', code: 'stale_generation' };
-      return { kind: 'pending', code: 'no_candidate' };
+      if (retiredFailedRead) {
+        return { decision: { kind: 'pending', code: 'run_read_failed' }, connection: null };
+      }
+      if (retiredStaleGeneration) {
+        return { decision: { kind: 'pending', code: 'stale_generation' }, connection: null };
+      }
+      return { decision: { kind: 'pending', code: 'no_candidate' }, connection: null };
     }
-    if (currentCandidates.length > 1) return { kind: 'ambiguous', code: 'same_binding' };
+    if (currentCandidates.length > 1) {
+      return { decision: { kind: 'ambiguous', code: 'same_binding' }, connection: null };
+    }
     const candidate = currentCandidates[0]!;
-    if (!candidate.verified) return { kind: 'pending', code: 'unverified' };
+    if (!candidate.verified) {
+      return { decision: { kind: 'pending', code: 'unverified' }, connection: null };
+    }
 
     return {
-      kind: 'eligible_but_disabled',
-      epoch: candidate.epoch!,
-      generation: currentGeneration,
-      productionDeliveryEnabled: false,
+      decision: {
+        kind: 'eligible',
+        epoch: candidate.epoch!,
+        generation: currentGeneration,
+      },
+      connection: candidate,
     };
   }
 
@@ -427,7 +530,8 @@ export class ChannelPipeServer {
       verified: false,
       probeDelayIndex: 0,
       writeBlocked: false,
-      pendingReceiptAck: null,
+      pendingReceiptAcks: new Set(),
+      productionGateIds: new Set(),
       timer: null,
     };
     this.#connections.add(connection);
@@ -501,34 +605,64 @@ export class ChannelPipeServer {
       return;
     }
     if (message.type === 'attempted') {
-      if (message.gate_id !== connection.probeGateId) {
+      if (
+        message.gate_id !== connection.probeGateId &&
+        !connection.productionGateIds.has(message.gate_id)
+      ) {
         this.#rejectConnection(connection, 'wrong_attempt');
         return;
       }
       connection.attemptedWrites += 1;
+      if (message.gate_id !== connection.probeGateId) {
+        try {
+          this.#productionHandlers?.attempted({
+            gateId: message.gate_id,
+            connectionEpoch: connection.epoch,
+          });
+        } catch {
+          this.#onError('delivery_event_failed');
+        }
+      }
       return;
     }
     if (message.type === 'receipt') {
-      if (message.gate_id !== connection.probeGateId) {
+      const probeReceipt = message.gate_id === connection.probeGateId;
+      if (!probeReceipt && !connection.productionGateIds.has(message.gate_id)) {
         this.#rejectConnection(connection, 'wrong_receipt');
         return;
       }
-      if (!connection.verified) {
+      if (probeReceipt && !connection.verified) {
         connection.verified = true;
         if (!connection.writeBlocked) this.#clearTimer(connection);
       }
-      if (connection.writeBlocked) {
-        connection.pendingReceiptAck = message.gate_id;
-        return;
+      if (!probeReceipt) {
+        try {
+          this.#productionHandlers?.receipted({
+            gateId: message.gate_id,
+            connectionEpoch: connection.epoch,
+          });
+        } catch {
+          // No ACK: the Adapter's receipt tool remains retryable and cannot outrun durable state.
+          this.#onError('delivery_event_failed');
+          return;
+        }
       }
-      // Duplicate receipt calls are idempotent: acknowledge the already-verified same epoch/ID.
-      this.#write(connection, {
-        version: CHANNEL_PROTOCOL_VERSION,
-        type: 'receipt_ack',
-        connection_epoch: connection.epoch,
-        gate_id: message.gate_id,
-      });
+      this.#ackReceipt(connection, message.gate_id);
     }
+  }
+
+  #ackReceipt(connection: ConnectionState, gateId: string): void {
+    if (connection.writeBlocked) {
+      connection.pendingReceiptAcks.add(gateId);
+      return;
+    }
+    // Duplicate receipt calls are idempotent for every Gate sent in this exact epoch.
+    this.#write(connection, {
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt_ack',
+      connection_epoch: connection.epoch!,
+      gate_id: gateId,
+    });
   }
 
   #writeProbe(connection: ConnectionState): void {
@@ -591,15 +725,17 @@ export class ChannelPipeServer {
     if (!this.#connections.has(connection) || !connection.writeBlocked) return;
     this.#clearTimer(connection);
     connection.writeBlocked = false;
-    const pendingReceiptAck = connection.pendingReceiptAck;
-    connection.pendingReceiptAck = null;
-    if (pendingReceiptAck !== null && connection.epoch !== null) {
-      this.#write(connection, {
-        version: CHANNEL_PROTOCOL_VERSION,
-        type: 'receipt_ack',
-        connection_epoch: connection.epoch,
-        gate_id: pendingReceiptAck,
-      });
+    if (connection.pendingReceiptAcks.size > 0 && connection.epoch !== null) {
+      for (const gateId of [...connection.pendingReceiptAcks]) {
+        connection.pendingReceiptAcks.delete(gateId);
+        this.#write(connection, {
+          version: CHANNEL_PROTOCOL_VERSION,
+          type: 'receipt_ack',
+          connection_epoch: connection.epoch,
+          gate_id: gateId,
+        });
+        if (connection.writeBlocked || connection.socket.destroyed) break;
+      }
       return;
     }
     if (connection.verified || connection.socket.destroyed) return;

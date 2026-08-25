@@ -28,6 +28,7 @@ export type ChannelAdapterErrorCode =
   | 'stale_epoch'
   | 'unexpected_message'
   | 'mcp_write_failed'
+  | 'notification_limit'
   | 'invalid_gate_id'
   | 'receipt_not_current'
   | 'receipt_timeout'
@@ -85,13 +86,15 @@ type ActiveConnection = {
   readonly connectionId: string;
   readonly decoder: ChannelNdjsonDecoder<DaemonToAdapterMessage>;
   readonly acknowledgedGateIds: Set<string>;
+  readonly notifiedGateIds: Set<string>;
   readonly pendingReceipts: Map<string, PendingReceipt>;
   readonly notificationWrites: Set<string>;
+  readonly notificationQueue: string[];
   epoch: string | null;
   probeGateId: string | null;
   writeBlocked: boolean;
   writeTimer: ReturnType<typeof setTimeout> | null;
-  queuedReceiptGateId: string | null;
+  readonly queuedReceiptGateIds: Set<string>;
 };
 
 export type ChannelNotificationWriter = {
@@ -107,6 +110,7 @@ export type ChannelAdapterClientOptions = {
   readonly receiptAckTimeoutMs?: number;
   readonly writeTimeoutMs?: number;
   readonly shutdownTimeoutMs?: number;
+  readonly maxGateIdsPerConnection?: number;
   /** Test seam for deterministic backpressure; production always calls `socket.write(frame)`. */
   readonly writeFrame?: (socket: Socket, frame: Buffer) => boolean;
   /** Bounded codes only; never receives frames, claims, paths, argv, environment, or socket errors. */
@@ -140,6 +144,7 @@ export class ChannelAdapterClient {
   readonly #receiptAckTimeoutMs: number;
   readonly #writeTimeoutMs: number;
   readonly #shutdownTimeoutMs: number;
+  readonly #maxGateIdsPerConnection: number;
   readonly #writeFrame: (socket: Socket, frame: Buffer) => boolean;
   readonly #onError: (code: ChannelAdapterErrorCode) => void;
   readonly #pendingNotifications = new Set<Promise<void>>();
@@ -177,6 +182,11 @@ export class ChannelAdapterClient {
       options.shutdownTimeoutMs ?? 2_000,
       'shutdown_timeout_invalid',
     );
+    const maxGateIds = options.maxGateIdsPerConnection ?? 256;
+    if (!Number.isSafeInteger(maxGateIds) || maxGateIds < 1 || maxGateIds > 4_096) {
+      throw new TypeError('max_gate_ids_invalid');
+    }
+    this.#maxGateIdsPerConnection = maxGateIds;
     this.#writeFrame = options.writeFrame ?? ((socket, frame) => socket.write(frame));
     this.#onError = options.onError ?? (() => undefined);
   }
@@ -225,7 +235,7 @@ export class ChannelAdapterClient {
     if (
       active === null ||
       active.epoch === null ||
-      active.probeGateId !== gateId ||
+      !active.notifiedGateIds.has(gateId) ||
       active.socket.destroyed
     ) {
       return Promise.reject(new ChannelAdapterError('receipt_not_current'));
@@ -239,12 +249,10 @@ export class ChannelAdapterClient {
     void pending.promise.finally(() => {
       clearTimeout(pending.timer);
       if (active.pendingReceipts.get(gateId) === pending) active.pendingReceipts.delete(gateId);
-      if (active.queuedReceiptGateId === gateId && !active.pendingReceipts.has(gateId)) {
-        active.queuedReceiptGateId = null;
-      }
+      if (!active.pendingReceipts.has(gateId)) active.queuedReceiptGateIds.delete(gateId);
     }).catch(() => undefined);
     if (active.writeBlocked) {
-      active.queuedReceiptGateId = gateId;
+      active.queuedReceiptGateIds.add(gateId);
       return pending.promise;
     }
     this.#write(active, {
@@ -261,7 +269,7 @@ export class ChannelAdapterClient {
     readonly reconnectTimer: 0 | 1;
     readonly receiptTimers: number;
     readonly writeTimer: 0 | 1;
-    readonly queuedReceipts: 0 | 1;
+    readonly queuedReceipts: number;
     readonly notificationWrites: number;
     readonly epoch: string | null;
   } {
@@ -270,7 +278,7 @@ export class ChannelAdapterClient {
       reconnectTimer: this.#reconnectTimer === null ? 0 : 1,
       receiptTimers: this.#active?.pendingReceipts.size ?? 0,
       writeTimer: this.#active?.writeTimer === null || this.#active === null ? 0 : 1,
-      queuedReceipts: this.#active?.queuedReceiptGateId === null || this.#active === null ? 0 : 1,
+      queuedReceipts: this.#active?.queuedReceiptGateIds.size ?? 0,
       notificationWrites: this.#pendingNotifications.size,
       epoch: this.#active?.epoch ?? null,
     };
@@ -284,13 +292,15 @@ export class ChannelAdapterClient {
       connectionId: `connection_${randomUUID()}`,
       decoder: new ChannelNdjsonDecoder(decodeDaemonMessage),
       acknowledgedGateIds: new Set(),
+      notifiedGateIds: new Set(),
       pendingReceipts: new Map(),
       notificationWrites: new Set(),
+      notificationQueue: [],
       epoch: null,
       probeGateId: null,
       writeBlocked: false,
       writeTimer: null,
-      queuedReceiptGateId: null,
+      queuedReceiptGateIds: new Set(),
     };
     this.#active = active;
 
@@ -387,30 +397,51 @@ export class ChannelAdapterClient {
     }
 
     if (active.probeGateId === null) active.probeGateId = message.gate_id;
-    else if (active.probeGateId !== message.gate_id) {
-      this.#onError('unexpected_message');
+    if (
+      !active.notifiedGateIds.has(message.gate_id) &&
+      active.notifiedGateIds.size >= this.#maxGateIdsPerConnection
+    ) {
+      this.#onError('notification_limit');
       active.socket.destroy();
       return;
     }
-    if (active.notificationWrites.has(message.gate_id)) return;
-    // Stdio is one process-wide transport. A write that ignores disconnect must not let every new
-    // pipe epoch retain another ActiveConnection closure; one unresolved MCP write is the hard cap.
-    if (this.#pendingNotifications.size > 0) return;
-    active.notificationWrites.add(message.gate_id);
+    if (
+      active.notificationWrites.has(message.gate_id) ||
+      active.notificationQueue.includes(message.gate_id)
+    ) return;
+    // Receipt may race the transport-write completion callback, so membership is recorded before
+    // invoking MCP. It is scoped to this exact connection and discarded on reconnect.
+    active.notifiedGateIds.add(message.gate_id);
+    active.notificationQueue.push(message.gate_id);
+    this.#drainNotificationQueue(active);
+  }
+
+  #drainNotificationQueue(active: ActiveConnection): void {
+    if (
+      this.#active !== active ||
+      active.socket.destroyed ||
+      active.epoch === null ||
+      this.#pendingNotifications.size > 0
+    ) return;
+    const gateId = active.notificationQueue.shift();
+    if (gateId === undefined) return;
+    active.notificationWrites.add(gateId);
     const epoch = active.epoch;
-    const task = this.#notificationWriter.notifyGate(message.gate_id).then(() => {
+    const task = this.#notificationWriter.notifyGate(gateId).then(() => {
       if (this.#active !== active || active.epoch !== epoch || active.socket.destroyed) return;
       this.#write(active, {
         version: CHANNEL_PROTOCOL_VERSION,
         type: 'attempted',
         connection_epoch: epoch,
-        gate_id: message.gate_id,
+        gate_id: gateId,
       });
     }).catch(() => {
       this.#onError('mcp_write_failed');
     }).finally(() => {
-      active.notificationWrites.delete(message.gate_id);
+      active.notificationWrites.delete(gateId);
       this.#pendingNotifications.delete(task);
+      const current = this.#active;
+      if (current !== null) this.#drainNotificationQueue(current);
     });
     this.#pendingNotifications.add(task);
   }
@@ -442,22 +473,26 @@ export class ChannelAdapterClient {
     if (active.writeTimer !== null) clearTimeout(active.writeTimer);
     active.writeTimer = null;
     active.writeBlocked = false;
-    const gateId = active.queuedReceiptGateId;
-    active.queuedReceiptGateId = null;
-    if (gateId === null || active.epoch === null || !active.pendingReceipts.has(gateId)) return;
-    this.#write(active, {
-      version: CHANNEL_PROTOCOL_VERSION,
-      type: 'receipt',
-      connection_epoch: active.epoch,
-      gate_id: gateId,
-    });
+    if (active.epoch === null) return;
+    for (const gateId of [...active.queuedReceiptGateIds]) {
+      active.queuedReceiptGateIds.delete(gateId);
+      if (!active.pendingReceipts.has(gateId)) continue;
+      this.#write(active, {
+        version: CHANNEL_PROTOCOL_VERSION,
+        type: 'receipt',
+        connection_epoch: active.epoch,
+        gate_id: gateId,
+      });
+      if (active.writeBlocked || active.socket.destroyed) break;
+    }
   }
 
   #clearWriteState(active: ActiveConnection): void {
     if (active.writeTimer !== null) clearTimeout(active.writeTimer);
     active.writeTimer = null;
     active.writeBlocked = false;
-    active.queuedReceiptGateId = null;
+    active.queuedReceiptGateIds.clear();
+    active.notificationQueue.length = 0;
   }
 
   #rejectReceipts(active: ActiveConnection, code: ChannelAdapterErrorCode): void {
@@ -466,5 +501,6 @@ export class ChannelAdapterClient {
       receipt.reject(new ChannelAdapterError(code));
     }
     active.pendingReceipts.clear();
+    active.queuedReceiptGateIds.clear();
   }
 }

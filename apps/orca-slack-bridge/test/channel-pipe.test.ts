@@ -193,12 +193,146 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     expect(new Set(gates)).toEqual(new Set([connection.probeGateId]));
     expect(connection.attemptedWrites).toBeGreaterThanOrEqual(0);
     expect(await daemon.evaluateProductionRoute(RUN_ID)).toMatchObject({
-      kind: 'eligible_but_disabled',
+      kind: 'eligible',
       epoch: connection.epoch,
       generation: 1,
-      productionDeliveryEnabled: false,
     });
     expect(daemon.getResourceSnapshot().productionGateWrites).toBe(0);
+  });
+
+  it('delivers production Gates only through a verified exact route and durably observes each callback', async () => {
+    const path = pipePath('production-delivery');
+    const daemon = server(path);
+    const attempted: string[] = [];
+    const receipted: string[] = [];
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ gateId }) => attempted.push(gateId),
+      receipted: ({ gateId }) => receipted.push(gateId),
+    });
+    await daemon.start();
+
+    const writes: string[] = [];
+    let client!: ChannelAdapterClient;
+    client = adapter(path, {
+      notifyGate: async (gateId) => {
+        writes.push(gateId);
+        const probeGateId = daemon.listConnections()[0]?.probeGateId;
+        if (gateId === probeGateId) await client.reportReceipt(gateId);
+      },
+    });
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    const firstGateId = 'gate_aaaaaaaaaaaa';
+    const secondGateId = 'gate_bbbbbbbbbbbb';
+    expect(await daemon.deliverGate(RUN_ID, firstGateId)).toMatchObject({ kind: 'sent' });
+    expect(await daemon.deliverGate(RUN_ID, secondGateId)).toMatchObject({ kind: 'sent' });
+    await waitFor(() => attempted.length === 2);
+    expect(writes.slice(-2)).toEqual([firstGateId, secondGateId]);
+    expect(attempted).toEqual([firstGateId, secondGateId]);
+    expect(receipted).toEqual([]);
+
+    expect(await client.reportReceipt(secondGateId)).toBe('accepted');
+    expect(await client.reportReceipt(firstGateId)).toBe('accepted');
+    await waitFor(() => receipted.length === 2);
+    expect(receipted).toEqual([secondGateId, firstGateId]);
+    expect(await client.reportReceipt(firstGateId)).toBe('duplicate');
+    await expect(client.reportReceipt('gate_cccccccccccc')).rejects.toThrowError(
+      'receipt_not_current',
+    );
+    expect(daemon.getResourceSnapshot().productionGateWrites).toBe(2);
+  });
+
+  it('replays an unreceipted production Gate through a newly verified reconnect epoch', async () => {
+    const path = pipePath('production-replay');
+    const attemptedEpochs: string[] = [];
+    const productionGateId = 'gate_dddddddddddd';
+    let daemon = server(path);
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ connectionEpoch }) => attemptedEpochs.push(connectionEpoch),
+      receipted: () => undefined,
+    });
+    await daemon.start();
+
+    const writes: string[] = [];
+    let client!: ChannelAdapterClient;
+    client = adapter(path, {
+      notifyGate: async (gateId) => {
+        writes.push(gateId);
+        if (gateId === daemon.listConnections()[0]?.probeGateId) {
+          await client.reportReceipt(gateId);
+        }
+      },
+    });
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+    const firstEpoch = daemon.listConnections()[0]!.epoch;
+    expect(await daemon.deliverGate(RUN_ID, productionGateId)).toMatchObject({ kind: 'sent' });
+    await waitFor(() => writes.filter((gateId) => gateId === productionGateId).length === 1);
+    await waitFor(() => attemptedEpochs.includes(firstEpoch));
+
+    await daemon.stop();
+    daemon = server(path);
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ connectionEpoch }) => attemptedEpochs.push(connectionEpoch),
+      receipted: () => undefined,
+    });
+    await daemon.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+    const secondEpoch = daemon.listConnections()[0]!.epoch;
+    expect(secondEpoch).not.toBe(firstEpoch);
+    expect(await daemon.deliverGate(RUN_ID, productionGateId)).toMatchObject({ kind: 'sent' });
+    await waitFor(() => writes.filter((gateId) => gateId === productionGateId).length === 2);
+    await waitFor(() => attemptedEpochs.includes(secondEpoch));
+    expect(await client.reportReceipt(productionGateId)).toBe('accepted');
+  });
+
+  it('withholds a production receipt ACK until the synchronous durable callback succeeds', async () => {
+    const path = pipePath('production-receipt-fence');
+    const errors: string[] = [];
+    const daemon = server(path, new FakeOrca(), errors);
+    let receiptCalls = 0;
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: () => {
+        receiptCalls += 1;
+        if (receiptCalls === 1) throw new Error('raw durable failure');
+      },
+    });
+    await daemon.start();
+    const raw = await rawAdapter(path);
+    const probe = raw.messages.find((message) => message.type === 'notify')!;
+    raw.socket.write(encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: probe.connection_epoch,
+      gate_id: probe.gate_id,
+    }));
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    const productionGateId = 'gate_eeeeeeeeeeee';
+    expect(await daemon.deliverGate(RUN_ID, productionGateId)).toMatchObject({ kind: 'sent' });
+    await waitFor(() => raw.messages.some(
+      (message) => message.type === 'notify' && message.gate_id === productionGateId,
+    ));
+    const receipt = encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: probe.connection_epoch,
+      gate_id: productionGateId,
+    });
+    raw.socket.write(receipt);
+    await waitFor(() => errors.includes('delivery_event_failed'));
+    expect(raw.messages.filter(
+      (message) => message.type === 'receipt_ack' && message.gate_id === productionGateId,
+    )).toHaveLength(0);
+
+    raw.socket.write(receipt);
+    await waitFor(() => raw.messages.some(
+      (message) => message.type === 'receipt_ack' && message.gate_id === productionGateId,
+    ));
+    expect(receiptCalls).toBe(2);
+    raw.socket.destroy();
   });
 
   it('keeps an Adapter-first client alive through ENOENT and connects when the daemon appears', async () => {
@@ -431,10 +565,9 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       (connection) => connection.epoch !== staleNotify.connection_epoch,
     )!;
     const expected = {
-      kind: 'eligible_but_disabled',
+      kind: 'eligible',
       epoch: currentConnection.epoch,
       generation: 2,
-      productionDeliveryEnabled: false,
     } as const;
 
     expect(await daemon.evaluateProductionRoute(RUN_ID)).toEqual(expected);
@@ -478,7 +611,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     client = adapter(path, { notifyGate: async (gateId) => { await client.reportReceipt(gateId); } });
     client.start();
     await waitFor(() => daemon.listConnections()[0]?.verified === true);
-    expect((await daemon.evaluateProductionRoute(RUN_ID)).kind).toBe('eligible_but_disabled');
+    expect((await daemon.evaluateProductionRoute(RUN_ID)).kind).toBe('eligible');
 
     orca.generation = 2;
     expect(await daemon.evaluateProductionRoute(RUN_ID)).toEqual({
@@ -522,7 +655,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     await waitFor(() => errors.includes('run_read_failed'));
     orca.fail = false;
     await waitFor(() => daemon.listConnections()[0]?.verified === true);
-    expect((await daemon.evaluateProductionRoute(RUN_ID)).kind).toBe('eligible_but_disabled');
+    expect((await daemon.evaluateProductionRoute(RUN_ID)).kind).toBe('eligible');
     expect(daemon.getResourceSnapshot().bindingReads).toBe(0);
   });
 
@@ -553,7 +686,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       daemon.listConnections()[0]?.verified === true &&
       daemon.listConnections()[0]?.epoch !== firstEpoch
     ));
-    expect((await daemon.evaluateProductionRoute(RUN_ID)).kind).toBe('eligible_but_disabled');
+    expect((await daemon.evaluateProductionRoute(RUN_ID)).kind).toBe('eligible');
   });
 
   it('fails the second daemon on fixed ownership, then releases every socket/timer for rebind', async () => {

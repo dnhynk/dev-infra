@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, runDaemonCommand } from '../src/cli.js';
+import type { ChannelProductionDeliveryHandlers } from '../src/channel/pipe-server.js';
 import {
   gateActionId,
   gateBlockId,
@@ -220,6 +221,7 @@ class NeverSettlingSlack implements SlackPoster {
 class FakeChannelServer {
   readonly events: string[];
   readonly failStart: boolean;
+  productionHandlers: ChannelProductionDeliveryHandlers | null = null;
 
   constructor(events: string[] = [], failStart = false) {
     this.events = events;
@@ -233,6 +235,14 @@ class FakeChannelServer {
 
   async stop(): Promise<void> {
     this.events.push('channel:stop');
+  }
+
+  async deliverGate(): Promise<{ readonly kind: 'pending'; readonly code: 'no_candidate' }> {
+    return { kind: 'pending', code: 'no_candidate' };
+  }
+
+  setProductionDeliveryHandlers(handlers: ChannelProductionDeliveryHandlers): void {
+    this.productionHandlers = handlers;
   }
 }
 
@@ -253,6 +263,47 @@ describe('daemon production wiring', () => {
     });
     expect(code).toBe(0);
     expect(events).toEqual(['channel:start', 'socket:start', 'channel:stop', 'socket:stop']);
+  });
+
+  it('installs durable delivery callbacks and reconciles the live Channel runtime at startup', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const channel = new FakeChannelServer();
+    const deliveryEvents: string[] = [];
+    let reconciles = 0;
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: channel,
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      createChannelDelivery: (_store, _orca, transport) => {
+        expect(transport).toBe(channel);
+        return {
+          reconcile: () => { reconciles += 1; return Promise.resolve(); },
+          recordAttempted: (gateId) => deliveryEvents.push(`attempted:${gateId}`),
+          recordReceipted: (gateId) => deliveryEvents.push(`receipted:${gateId}`),
+        };
+      },
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: async () => {
+        await waitFor(() => reconciles === 1 && channel.productionHandlers !== null);
+        channel.productionHandlers!.attempted({
+          gateId: 'gate_aaaaaaaaaaaa', connectionEpoch: 'epoch_test',
+        });
+        channel.productionHandlers!.receipted({
+          gateId: 'gate_aaaaaaaaaaaa', connectionEpoch: 'epoch_test',
+        });
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(reconciles).toBe(1);
+    expect(deliveryEvents).toEqual([
+      'attempted:gate_aaaaaaaaaaaa',
+      'receipted:gate_aaaaaaaaaaaa',
+    ]);
   });
 
   it('fails closed before Socket ingress when Channel ownership cannot be acquired', async () => {

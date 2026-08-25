@@ -56,7 +56,13 @@ import {
   type ChannelNotificationWriter,
 } from './channel/adapter.js';
 import { ChannelMcpServer, type ChannelReceiptHandler } from './channel/mcp-server.js';
-import { ChannelPipeServer } from './channel/pipe-server.js';
+import { GateChannelDeliveryEngine } from './channel/delivery.js';
+import {
+  ChannelPipeServer,
+  type ChannelDeliverySendResult,
+  type ChannelProductionDeliveryEvent,
+  type ChannelProductionDeliveryHandlers,
+} from './channel/pipe-server.js';
 import type { Readable, Writable } from 'node:stream';
 
 export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register' | 'daemon' | 'channel-adapter';
@@ -718,6 +724,14 @@ export async function runChannelAdapterCommand(
 export type ChannelDaemonServer = {
   start(): Promise<void>;
   stop(): Promise<void>;
+  deliverGate(runId: string, gateId: string): Promise<ChannelDeliverySendResult>;
+  setProductionDeliveryHandlers?(handlers: ChannelProductionDeliveryHandlers): void;
+};
+
+export type ChannelDeliveryRuntime = {
+  reconcile(): Promise<void>;
+  recordAttempted(gateId: string): unknown;
+  recordReceipted(gateId: string): unknown;
 };
 
 export type DaemonDependencies = {
@@ -734,6 +748,11 @@ export type DaemonDependencies = {
   readonly reconcileIntervalMs?: number;
   readonly waitForStop?: () => Promise<void>;
   readonly channelServer?: ChannelDaemonServer;
+  readonly createChannelDelivery?: (
+    store: GateStore,
+    orca: OrcaRunner,
+    transport: ChannelDaemonServer,
+  ) => ChannelDeliveryRuntime;
 };
 
 function processStop(): Promise<void> {
@@ -748,7 +767,7 @@ function processStop(): Promise<void> {
   });
 }
 
-/** Production D2 path: strict v10 startup → reconcile → exactly-one interactive consumer. */
+/** Production D2+D3-2 path: strict v11 startup → durable reconcile → one consumer. */
 export async function runDaemonCommand(
   parsed: RunArgs,
   config: BridgeConfig,
@@ -766,6 +785,7 @@ export async function runDaemonCommand(
   let store: SqliteDigestStore | null = null;
   let transport: SlackSocketTransport | null = null;
   let channelServer: ChannelDaemonServer | null = null;
+  let channelDelivery: ChannelDeliveryRuntime | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let reconciliation: Promise<void> | null = null;
   const pending = new Set<Promise<void>>();
@@ -824,17 +844,31 @@ export async function runDaemonCommand(
     // Acquire the single fixed pipe before recovery or Slack ingress. A second daemon fails closed
     // here and cannot become either the Channel owner or an interactive consumer.
     channelServer = dependencies.channelServer ?? new ChannelPipeServer({ orca });
+    channelDelivery = dependencies.createChannelDelivery?.(store, orca, channelServer) ??
+      new GateChannelDeliveryEngine({ store, orca, transport: channelServer });
+    channelServer.setProductionDeliveryHandlers?.({
+      attempted: (event: ChannelProductionDeliveryEvent) => {
+        channelDelivery?.recordAttempted(event.gateId);
+      },
+      receipted: (event: ChannelProductionDeliveryEvent) => {
+        channelDelivery?.recordReceipted(event.gateId);
+      },
+    });
     await channelServer.start();
 
     // No Slack Socket event can race schema validation or startup recovery.
     await engine.reconcile();
+    await channelDelivery.reconcile();
     const configuredInterval = dependencies.reconcileIntervalMs ?? 5_000;
     if (!Number.isFinite(configuredInterval) || configuredInterval < 10) {
       throw new TypeError('reconcileIntervalMs must be a finite number >= 10');
     }
     const scheduleReconciliation = (): void => {
       if (reconciliation !== null) return;
-      const work = engine.reconcile().catch(() => undefined);
+      const work = engine.reconcile()
+        .then(() => channelDelivery?.reconcile())
+        .then(() => undefined)
+        .catch(() => undefined);
       reconciliation = work;
       pending.add(work);
       void work.finally(() => {

@@ -27,6 +27,10 @@ import {
 import {
   GATE_AUDIT_LIMIT,
   GATE_FACT_CAP,
+  type GateChannelConsumeResult,
+  type GateChannelDelivery,
+  type GateChannelDeliveryLeaseResult,
+  type GateChannelDeliveryState,
   type GateCardState,
   type GateClaimInput,
   type GateClaimResult,
@@ -49,6 +53,7 @@ import {
   GATE_V8_SCHEMA_OBJECTS,
   GATE_V9_SCHEMA_OBJECTS,
   GATE_V10_SCHEMA_OBJECTS,
+  GATE_V11_SCHEMA_OBJECTS,
   MIGRATIONS,
   SCHEMA_DDL,
   SCHEMA_VERSION,
@@ -541,6 +546,45 @@ SELECT gate_key, revision, card_state, card_pending, notification_state, project
        projection_owner, projection_expires_at, last_error_code, created_at, updated_at
   FROM gate_resolution_outbox WHERE gate_key = ?`;
 
+const SELECT_GATE_CHANNEL_DELIVERY = `
+SELECT gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+       last_attempt_at, next_attempt_at, receipted_at, consumed_at,
+       lease_owner, lease_expires_at, last_error_code, created_at, updated_at
+  FROM gate_channel_delivery WHERE gate_key = ?`;
+
+const SELECT_ALL_GATE_CHANNEL_DELIVERIES = `
+SELECT gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+       last_attempt_at, next_attempt_at, receipted_at, consumed_at,
+       lease_owner, lease_expires_at, last_error_code, created_at, updated_at
+  FROM gate_channel_delivery ORDER BY gate_key`;
+
+const SELECT_DUE_GATE_CHANNEL_DELIVERIES = `
+SELECT gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+       last_attempt_at, next_attempt_at, receipted_at, consumed_at,
+       lease_owner, lease_expires_at, last_error_code, created_at, updated_at
+  FROM gate_channel_delivery
+ WHERE state <> 'consumed' AND next_attempt_at <= ?
+ ORDER BY next_attempt_at, gate_key
+ LIMIT ?`;
+
+const SELECT_GATE_CHANNEL_SEED_KEYS = `
+SELECT o.gate_key
+  FROM gate_resolution_outbox o
+  JOIN gate_resolution r ON r.gate_key = o.gate_key
+  LEFT JOIN gate_channel_delivery d ON d.gate_key = o.gate_key
+ WHERE o.notification_state = 'pending'
+   AND r.ack_state = 'acked'
+   AND r.lifecycle = 'resolved'
+   AND d.gate_key IS NULL
+ ORDER BY o.gate_key`;
+
+const INSERT_GATE_CHANNEL_DELIVERY = `
+INSERT INTO gate_channel_delivery
+  (gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+   last_attempt_at, next_attempt_at, receipted_at, consumed_at,
+   lease_owner, lease_expires_at, last_error_code, created_at, updated_at)
+VALUES (?, ?, ?, ?, 0, 'pending', 0, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`;
+
 const MARK_GATE_OUTBOX_PROJECTED = `
 UPDATE gate_resolution_outbox
    SET revision = revision + 1, card_pending = 0, projected_at = ?, projection_owner = NULL,
@@ -734,6 +778,25 @@ type GateOutboxRow = {
   readonly projected_at: string | null;
   readonly projection_owner: string | null;
   readonly projection_expires_at: string | null;
+  readonly last_error_code: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
+
+type GateChannelDeliveryRow = {
+  readonly gate_key: string;
+  readonly run_key: string;
+  readonly task_key: string;
+  readonly source_dispatch_id: string;
+  readonly revision: number;
+  readonly state: string;
+  readonly attempt_count: number;
+  readonly last_attempt_at: string | null;
+  readonly next_attempt_at: string | null;
+  readonly receipted_at: string | null;
+  readonly consumed_at: string | null;
+  readonly lease_owner: string | null;
+  readonly lease_expires_at: string | null;
   readonly last_error_code: string | null;
   readonly created_at: string;
   readonly updated_at: string;
@@ -1226,6 +1289,92 @@ function toGateOutbox(row: GateOutboxRow): GateResolutionOutbox {
   };
 }
 
+const GATE_CHANNEL_DELIVERY_STATES = new Set<GateChannelDeliveryState>([
+  'pending', 'attempted', 'receipted', 'consumed',
+]);
+
+function toGateChannelDelivery(row: GateChannelDeliveryRow): GateChannelDelivery {
+  if (!GATE_CHANNEL_DELIVERY_STATES.has(row.state as GateChannelDeliveryState)) {
+    throw new TypeError(`${row.gate_key}의 Channel delivery state가 잘못됐다`);
+  }
+  if (
+    !Number.isSafeInteger(row.attempt_count) ||
+    row.attempt_count < 0 ||
+    row.attempt_count > 1_000_000
+  ) {
+    throw new TypeError(`${row.gate_key}의 Channel delivery attempt_count가 잘못됐다`);
+  }
+  if ((row.lease_owner === null) !== (row.lease_expires_at === null)) {
+    throw new TypeError(`${row.gate_key}의 Channel delivery lease shape가 잘못됐다`);
+  }
+  const state = row.state as GateChannelDeliveryState;
+  const createdAt = storedIso(row.created_at, `${row.gate_key}.delivery created_at`);
+  const updatedAt = storedIso(row.updated_at, `${row.gate_key}.delivery updated_at`);
+  const lastAttemptAt = row.last_attempt_at === null
+    ? null
+    : storedIso(row.last_attempt_at, `${row.gate_key}.delivery last_attempt_at`);
+  const nextAttemptAt = row.next_attempt_at === null
+    ? null
+    : storedIso(row.next_attempt_at, `${row.gate_key}.delivery next_attempt_at`);
+  const receiptedAt = row.receipted_at === null
+    ? null
+    : storedIso(row.receipted_at, `${row.gate_key}.delivery receipted_at`);
+  const consumedAt = row.consumed_at === null
+    ? null
+    : storedIso(row.consumed_at, `${row.gate_key}.delivery consumed_at`);
+  const leaseOwner = row.lease_owner === null
+    ? null
+    : storedLeaseOwner(row.lease_owner, `${row.gate_key}.delivery lease_owner`);
+  const leaseExpiresAt = row.lease_expires_at === null
+    ? null
+    : storedIso(row.lease_expires_at, `${row.gate_key}.delivery lease_expires_at`);
+  const lastErrorCode = row.last_error_code === null
+    ? null
+    : gateCode(row.last_error_code, 80);
+  const validLifecycle =
+    (state === 'pending' && row.attempt_count === 0 && lastAttemptAt === null &&
+      nextAttemptAt !== null && receiptedAt === null && consumedAt === null) ||
+    (state === 'attempted' && row.attempt_count >= 1 && lastAttemptAt !== null &&
+      nextAttemptAt !== null && receiptedAt === null && consumedAt === null) ||
+    (state === 'receipted' && row.attempt_count >= 1 && lastAttemptAt !== null &&
+      nextAttemptAt !== null && receiptedAt !== null && consumedAt === null) ||
+    (state === 'consumed' && row.attempt_count >= 1 && lastAttemptAt !== null &&
+      nextAttemptAt === null && receiptedAt !== null && consumedAt !== null &&
+      leaseOwner === null && leaseExpiresAt === null && lastErrorCode === null);
+  if (
+    !validLifecycle ||
+    updatedAt < createdAt ||
+    (leaseExpiresAt !== null && leaseExpiresAt <= updatedAt) ||
+    (lastAttemptAt !== null && lastAttemptAt < createdAt) ||
+    (receiptedAt !== null && (lastAttemptAt === null || receiptedAt < lastAttemptAt)) ||
+    (consumedAt !== null && (receiptedAt === null || consumedAt < receiptedAt))
+  ) {
+    throw new TypeError(`${row.gate_key}의 Channel delivery lifecycle evidence가 불완전하다`);
+  }
+  return {
+    gateKey: storedKey(row.gate_key, 'gate:', 'gate_channel_delivery.gate_key') as GateKey,
+    runKey: storedKey(row.run_key, 'run:', `${row.gate_key}.delivery run_key`) as RunKey,
+    taskKey: storedKey(row.task_key, 'task:', `${row.gate_key}.delivery task_key`) as TaskKey,
+    sourceDispatchId: storedText(
+      row.source_dispatch_id,
+      `${row.gate_key}.delivery source_dispatch_id`,
+      500,
+    ),
+    revision: storedRevision(row.revision, `${row.gate_key}.delivery revision`),
+    state,
+    attemptCount: row.attempt_count,
+    lastAttemptAt,
+    nextAttemptAt,
+    receiptedAt,
+    consumedAt,
+    leaseOwner,
+    leaseExpiresAt,
+    lastErrorCode,
+    createdAt,
+    updatedAt,
+  };
+}
+
 function toGateMetadata(row: GateMetadataRow): GateMetadata {
   storedText(row.options_json, `${row.gate_key}.options_json`, 200_000);
   let parsed: unknown;
@@ -1479,6 +1628,23 @@ function cardStateForLifecycle(lifecycle: GateResolutionLifecycle): GateCardStat
   if (lifecycle === 'conflict') return 'conflict';
   if (lifecycle === 'degraded' || lifecycle === 'uncertain') return 'degraded';
   return 'resolving';
+}
+
+/** Supersede any in-flight Slack completion in the same transaction as a D3 state transition. */
+function rearmGateOutboxForChannelTransition(
+  db: DatabaseSync,
+  gateKey: GateKey,
+  at: string,
+): void {
+  const result = db.prepare(
+    `UPDATE gate_resolution_outbox
+        SET revision = revision + 1, card_pending = 1, projected_at = NULL,
+            projection_owner = NULL, projection_expires_at = NULL, updated_at = ?
+      WHERE gate_key = ? AND notification_state = 'pending'`,
+  ).run(at, gateKey);
+  if (Number(result.changes) !== 1) {
+    throw new Error(`${gateKey}의 D2 outbox를 Channel transition과 함께 re-arm하지 못했다`);
+  }
 }
 
 export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
@@ -3100,6 +3266,355 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     return row === undefined ? null : toGateOutbox(row);
   }
 
+  seedPendingGateChannelDeliveries(at: string): readonly GateChannelDelivery[] {
+    const seededAt = storedIso(at, 'Gate Channel delivery seed.at');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const keys = this.db.prepare(SELECT_GATE_CHANNEL_SEED_KEYS).all() as {
+        readonly gate_key: string;
+      }[];
+      const seeded: GateChannelDelivery[] = [];
+      for (const row of keys) {
+        const gateKey = storedKey(
+          row.gate_key,
+          'gate:',
+          'gate_channel_delivery seed.gate_key',
+        ) as GateKey;
+        const intentRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as
+          | GateResolutionRow
+          | undefined;
+        const metadataRow = this.db.prepare(SELECT_GATE_METADATA).get(gateKey) as
+          | GateMetadataRow
+          | undefined;
+        const outboxRow = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as
+          | GateOutboxRow
+          | undefined;
+        if (intentRow === undefined || metadataRow === undefined || outboxRow === undefined) {
+          throw new Error(`${gateKey}의 D2 Channel seed correlation row가 불완전하다`);
+        }
+        const intent = toGateResolution(intentRow);
+        const metadata = toGateMetadata(metadataRow);
+        const outbox = toGateOutbox(outboxRow);
+        if (
+          intent.ackState !== 'acked' ||
+          intent.lifecycle !== 'resolved' ||
+          intent.preRead?.status !== 'pending' ||
+          intent.postRead?.status !== 'resolved' ||
+          intent.postRead.resolution !== intent.optionResolution ||
+          intent.resolveResult?.gate.resolvedAt !== intent.postRead.resolvedAt ||
+          outbox.notificationState !== 'pending' ||
+          metadata.runKey !== `run:${intent.postRead.runId}` ||
+          metadata.taskKey !== `task:${intent.postRead.taskId}` ||
+          metadata.dispatchKey !== `dispatch:${intent.dispatchId}`
+        ) {
+          throw new Error(`${gateKey}의 D2 pending→resolved evidence가 Channel seed와 어긋난다`);
+        }
+        this.db.prepare(INSERT_GATE_CHANNEL_DELIVERY).run(
+          gateKey,
+          metadata.runKey,
+          metadata.taskKey,
+          intent.dispatchId,
+          seededAt,
+          seededAt,
+          seededAt,
+        );
+        rearmGateOutboxForChannelTransition(this.db, gateKey, seededAt);
+        const inserted = this.db.prepare(SELECT_GATE_CHANNEL_DELIVERY).get(gateKey) as
+          | GateChannelDeliveryRow
+          | undefined;
+        if (inserted === undefined) throw new Error(`${gateKey}의 Channel seed를 다시 읽지 못했다`);
+        seeded.push(toGateChannelDelivery(inserted));
+      }
+      this.db.exec('COMMIT');
+      return seeded;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  findGateChannelDelivery(gateKey: GateKey): GateChannelDelivery | null {
+    const row = this.db.prepare(SELECT_GATE_CHANNEL_DELIVERY).get(gateKey) as
+      | GateChannelDeliveryRow
+      | undefined;
+    return row === undefined ? null : toGateChannelDelivery(row);
+  }
+
+  listDueGateChannelDeliveries(at: string, limit = 64): readonly GateChannelDelivery[] {
+    const dueAt = storedIso(at, 'Gate Channel delivery due.at');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new TypeError('Gate Channel delivery due limit이 1..1000이 아니다');
+    }
+    return (this.db.prepare(SELECT_DUE_GATE_CHANNEL_DELIVERIES).all(
+      dueAt,
+      limit,
+    ) as GateChannelDeliveryRow[]).map(toGateChannelDelivery);
+  }
+
+  acquireGateChannelDeliveryLease(
+    gateKey: GateKey,
+    owner: string,
+    at: string,
+    expiresAt: string,
+  ): GateChannelDeliveryLeaseResult {
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.Channel delivery lease owner`);
+    const acquiredAt = storedIso(at, `${gateKey}.Channel delivery lease at`);
+    const expiry = storedIso(expiresAt, `${gateKey}.Channel delivery lease expiresAt`);
+    if (expiry <= acquiredAt) throw new TypeError(`${gateKey}의 Channel lease expiry가 미래가 아니다`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateChannelDelivery(gateKey);
+      if (
+        current === null ||
+        current.state === 'consumed' ||
+        current.nextAttemptAt === null ||
+        current.nextAttemptAt > acquiredAt
+      ) {
+        this.db.exec('COMMIT');
+        return { kind: 'unavailable' };
+      }
+      if (acquiredAt < current.updatedAt) {
+        throw new TypeError(`${gateKey}의 Channel lease clock이 역행했다`);
+      }
+      if (
+        current.leaseOwner !== null &&
+        current.leaseExpiresAt !== null &&
+        current.leaseExpiresAt > acquiredAt
+      ) {
+        this.db.exec('COMMIT');
+        return { kind: 'busy', expiresAt: current.leaseExpiresAt };
+      }
+      const result = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND state <> 'consumed'`,
+      ).run(safeOwner, expiry, acquiredAt, gateKey, current.revision);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return { kind: 'unavailable' };
+      }
+      const leased = this.findGateChannelDelivery(gateKey);
+      if (leased === null) throw new Error(`${gateKey}의 acquired Channel lease를 다시 읽지 못했다`);
+      this.db.exec('COMMIT');
+      return { kind: 'acquired', delivery: leased };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  releaseGateChannelDeliveryLease(gateKey: GateKey, owner: string, at: string): boolean {
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.Channel delivery release owner`);
+    const releasedAt = storedIso(at, `${gateKey}.Channel delivery release at`);
+    const result = this.db.prepare(
+      `UPDATE gate_channel_delivery
+          SET revision = revision + 1, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE gate_key = ? AND lease_owner = ? AND updated_at <= ? AND state <> 'consumed'`,
+    ).run(releasedAt, gateKey, safeOwner, releasedAt);
+    return Number(result.changes) === 1;
+  }
+
+  deferGateChannelDelivery(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    at: string,
+    nextAttemptAt: string,
+    errorCode: string | null,
+  ): GateChannelDelivery | null {
+    storedRevision(expectedRevision, `${gateKey}.Channel defer expected revision`);
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.Channel defer owner`);
+    const deferredAt = storedIso(at, `${gateKey}.Channel defer at`);
+    const next = storedIso(nextAttemptAt, `${gateKey}.Channel defer nextAttemptAt`);
+    if (next < deferredAt) throw new TypeError(`${gateKey}의 Channel defer 시각이 역행했다`);
+    const safeError = errorCode === null ? null : gateCode(errorCode, 80);
+    const result = this.db.prepare(
+      `UPDATE gate_channel_delivery
+          SET revision = revision + 1, next_attempt_at = ?, lease_owner = NULL,
+              lease_expires_at = NULL, last_error_code = ?, updated_at = ?
+        WHERE gate_key = ? AND revision = ? AND lease_owner = ?
+          AND lease_expires_at > ? AND state <> 'consumed'`,
+    ).run(next, safeError, deferredAt, gateKey, expectedRevision, safeOwner, deferredAt);
+    return Number(result.changes) === 1 ? this.findGateChannelDelivery(gateKey) : null;
+  }
+
+  markGateChannelAttempted(
+    gateKey: GateKey,
+    at: string,
+    nextAttemptAt: string,
+  ): GateChannelDelivery | null {
+    const attemptedAt = storedIso(at, `${gateKey}.Channel attempted at`);
+    const next = storedIso(nextAttemptAt, `${gateKey}.Channel attempted nextAttemptAt`);
+    if (next < attemptedAt) throw new TypeError(`${gateKey}의 Channel attempted retry가 역행했다`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateChannelDelivery(gateKey);
+      if (current === null) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      if (current.state === 'receipted' || current.state === 'consumed') {
+        this.db.exec('COMMIT');
+        return current;
+      }
+      if (attemptedAt < current.updatedAt || current.attemptCount >= 1_000_000) {
+        throw new TypeError(`${gateKey}의 Channel attempted evidence가 현재 row와 어긋난다`);
+      }
+      const firstTransition = current.state === 'pending';
+      const result = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, state = 'attempted', attempt_count = attempt_count + 1,
+                last_attempt_at = ?, next_attempt_at = ?, lease_owner = NULL,
+                lease_expires_at = NULL, last_error_code = NULL, updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND state IN ('pending','attempted')`,
+      ).run(attemptedAt, next, attemptedAt, gateKey, current.revision);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return this.findGateChannelDelivery(gateKey);
+      }
+      if (firstTransition) rearmGateOutboxForChannelTransition(this.db, gateKey, attemptedAt);
+      const updated = this.findGateChannelDelivery(gateKey);
+      this.db.exec('COMMIT');
+      return updated;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  markGateChannelReceipted(gateKey: GateKey, at: string): GateChannelDelivery | null {
+    const receiptedAt = storedIso(at, `${gateKey}.Channel receipted at`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateChannelDelivery(gateKey);
+      if (current === null) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      if (current.state === 'receipted' || current.state === 'consumed') {
+        this.db.exec('COMMIT');
+        return current;
+      }
+      if (receiptedAt < current.updatedAt) {
+        throw new TypeError(`${gateKey}의 Channel receipt clock이 역행했다`);
+      }
+      const result = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, state = 'receipted',
+                attempt_count = CASE WHEN attempt_count = 0 THEN 1 ELSE attempt_count END,
+                last_attempt_at = COALESCE(last_attempt_at, ?), next_attempt_at = ?,
+                receipted_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                last_error_code = NULL, updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND state IN ('pending','attempted')`,
+      ).run(receiptedAt, receiptedAt, receiptedAt, receiptedAt, gateKey, current.revision);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return this.findGateChannelDelivery(gateKey);
+      }
+      rearmGateOutboxForChannelTransition(this.db, gateKey, receiptedAt);
+      const updated = this.findGateChannelDelivery(gateKey);
+      this.db.exec('COMMIT');
+      return updated;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  consumeGateChannelDelivery(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    freshGate: GateSnapshot,
+    at: string,
+  ): GateChannelConsumeResult {
+    storedRevision(expectedRevision, `${gateKey}.Channel consume expected revision`);
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.Channel consume owner`);
+    const consumedAt = storedIso(at, `${gateKey}.Channel consume at`);
+    const fresh = toGateSnapshot(freshGate, `${gateKey}.fresh Gate effect`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateChannelDelivery(gateKey);
+      if (current === null) {
+        this.db.exec('COMMIT');
+        return { kind: 'superseded' };
+      }
+      if (current.state === 'consumed') {
+        this.db.exec('COMMIT');
+        return { kind: 'duplicate', delivery: current };
+      }
+      if (
+        current.state !== 'receipted' ||
+        current.revision !== expectedRevision ||
+        current.leaseOwner !== safeOwner ||
+        current.leaseExpiresAt === null ||
+        current.leaseExpiresAt <= consumedAt ||
+        current.receiptedAt === null ||
+        consumedAt < current.updatedAt
+      ) {
+        this.db.exec('COMMIT');
+        return { kind: 'superseded' };
+      }
+      const intentRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as
+        | GateResolutionRow
+        | undefined;
+      const metadataRow = this.db.prepare(SELECT_GATE_METADATA).get(gateKey) as
+        | GateMetadataRow
+        | undefined;
+      if (intentRow === undefined || metadataRow === undefined) {
+        throw new Error(`${gateKey}의 consumed D2 correlation row가 없다`);
+      }
+      const intent = toGateResolution(intentRow);
+      const metadata = toGateMetadata(metadataRow);
+      const pre = intent.preRead;
+      const post = intent.postRead;
+      const matches =
+        intent.ackState === 'acked' &&
+        intent.lifecycle === 'resolved' &&
+        pre?.status === 'pending' &&
+        pre.resolution === null &&
+        pre.resolvedAt === null &&
+        post?.status === 'resolved' &&
+        post.resolution === intent.optionResolution &&
+        intent.resolveResult?.gate.resolvedAt === post.resolvedAt &&
+        current.runKey === metadata.runKey &&
+        current.taskKey === metadata.taskKey &&
+        current.sourceDispatchId === intent.dispatchId &&
+        fresh.gateId === post.gateId &&
+        fresh.runId === post.runId &&
+        fresh.taskId === post.taskId &&
+        fresh.options.length === post.options.length &&
+        fresh.options.every((option, index) => option === post.options[index]) &&
+        fresh.status === 'resolved' &&
+        fresh.resolution === post.resolution &&
+        fresh.resolvedAt === post.resolvedAt;
+      if (!matches) {
+        this.db.exec('COMMIT');
+        return { kind: 'mismatch' };
+      }
+      const result = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, state = 'consumed', next_attempt_at = NULL,
+                consumed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                last_error_code = NULL, updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND state = 'receipted'
+            AND lease_owner = ? AND lease_expires_at > ?`,
+      ).run(consumedAt, consumedAt, gateKey, expectedRevision, safeOwner, consumedAt);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return { kind: 'superseded' };
+      }
+      rearmGateOutboxForChannelTransition(this.db, gateKey, consumedAt);
+      const consumed = this.findGateChannelDelivery(gateKey);
+      if (consumed === null) throw new Error(`${gateKey}의 consumed Channel row를 다시 읽지 못했다`);
+      this.db.exec('COMMIT');
+      return { kind: 'consumed', delivery: consumed };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
   beginGateObservationWrite(
     gateKey: GateKey,
     at: string,
@@ -3766,6 +4281,56 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
     );
   }
 
+  seedPendingGateChannelDeliveries(): readonly GateChannelDelivery[] {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel delivery를 seed하려 했다: ${this.path}`);
+  }
+
+  findGateChannelDelivery(gateKey: GateKey): GateChannelDelivery | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_CHANNEL_DELIVERY).get(gateKey) as
+      | GateChannelDeliveryRow
+      | undefined;
+    return row === undefined ? null : toGateChannelDelivery(row);
+  }
+
+  listDueGateChannelDeliveries(at: string, limit = 64): readonly GateChannelDelivery[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    const dueAt = storedIso(at, 'dry-run Gate Channel delivery due.at');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new TypeError('Gate Channel delivery due limit이 1..1000이 아니다');
+    }
+    return (db.prepare(SELECT_DUE_GATE_CHANNEL_DELIVERIES).all(
+      dueAt,
+      limit,
+    ) as GateChannelDeliveryRow[]).map(toGateChannelDelivery);
+  }
+
+  acquireGateChannelDeliveryLease(): GateChannelDeliveryLeaseResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel delivery lease를 획득하려 했다: ${this.path}`);
+  }
+
+  releaseGateChannelDeliveryLease(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel delivery lease를 해제하려 했다: ${this.path}`);
+  }
+
+  deferGateChannelDelivery(): GateChannelDelivery | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel delivery를 defer하려 했다: ${this.path}`);
+  }
+
+  markGateChannelAttempted(): GateChannelDelivery | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel attempted를 기록하려 했다: ${this.path}`);
+  }
+
+  markGateChannelReceipted(): GateChannelDelivery | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel receipt를 기록하려 했다: ${this.path}`);
+  }
+
+  consumeGateChannelDelivery(): GateChannelConsumeResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Channel delivery를 consume하려 했다: ${this.path}`);
+  }
+
   beginGateObservationWrite(
     _gateKey: GateKey,
     _at: string,
@@ -3928,6 +4493,11 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   ],
   gate_resolution_attempt: ['id', 'gate_key', 'phase', 'outcome', 'detail', 'created_at'],
   gate_resolution_audit: ['id', 'gate_key', 'event', 'reason', 'created_at'],
+  gate_channel_delivery: [
+    'gate_key', 'run_key', 'task_key', 'source_dispatch_id', 'revision', 'state',
+    'attempt_count', 'last_attempt_at', 'next_attempt_at', 'receipted_at', 'consumed_at',
+    'lease_owner', 'lease_expires_at', 'last_error_code', 'created_at', 'updated_at',
+  ],
 };
 
 /** Current Gate schema is a fail-closed boundary: exact shape, SQLite integrity, and every row. */
@@ -3957,6 +4527,7 @@ function validateCurrentGateStore(
     ...GATE_V8_SCHEMA_OBJECTS,
     ...GATE_V9_SCHEMA_OBJECTS,
     ...GATE_V10_SCHEMA_OBJECTS,
+    ...GATE_V11_SCHEMA_OBJECTS,
   };
   for (const [name, expected] of Object.entries(gateSchemaObjects)) {
     const row = db.prepare(
@@ -3971,15 +4542,15 @@ function validateCurrentGateStore(
     `SELECT type, name, tbl_name FROM sqlite_master
       WHERE (type = 'trigger' AND tbl_name IN
               ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_direct_modal','gate_resolution',
-               'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit'))
+               'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit','gate_channel_delivery'))
          OR (type = 'table' AND
               (name LIKE 'gate_metadata%' OR name LIKE 'gate_message%' OR
                name LIKE 'gate_local_observation%' OR name LIKE 'gate_observation_generation%' OR
                name LIKE 'gate_direct_modal%' OR
-               name LIKE 'gate_resolution%'))
+               name LIKE 'gate_resolution%' OR name LIKE 'gate_channel_delivery%'))
          OR (type = 'index' AND tbl_name IN
               ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_direct_modal','gate_resolution',
-               'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit'))`,
+               'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit','gate_channel_delivery'))`,
   ).all() as {
     readonly type: string;
     readonly name: string;
@@ -4028,11 +4599,15 @@ function validateCurrentGateStore(
             projection_owner, projection_expires_at, last_error_code, created_at, updated_at
        FROM gate_resolution_outbox ORDER BY gate_key`,
   ).all() as GateOutboxRow[]).map(toGateOutbox);
+  const deliveries = (db.prepare(
+    SELECT_ALL_GATE_CHANNEL_DELIVERIES,
+  ).all() as GateChannelDeliveryRow[]).map(toGateChannelDelivery);
   const observationByGate = new Map(observations.map((row) => [row.gateKey, row]));
   const metadataByGate = new Map(metadatas.map((row) => [row.gateKey, row]));
   const messageByGate = new Map(messages.map((row) => [row.gateKey, row]));
   const intentByGate = new Map(intents.map((row) => [row.gateKey, row]));
   const outboxByGate = new Map(outboxes.map((row) => [row.gateKey, row]));
+  const deliveryByGate = new Map(deliveries.map((row) => [row.gateKey, row]));
   const modalBySession = new Map(modalSessions.map((row) => [row.sessionId, row]));
 
   for (const observation of observations) {
@@ -4093,6 +4668,9 @@ function validateCurrentGateStore(
 
   if (outboxes.some((row) => !intentByGate.has(row.gateKey))) {
     throw new Error(`store 파일에 Gate resolution 없는 orphan outbox가 있다: ${path}`);
+  }
+  if (deliveries.some((row) => !outboxByGate.has(row.gateKey))) {
+    throw new Error(`store 파일에 D2 outbox 없는 orphan Channel delivery가 있다: ${path}`);
   }
   if (
     observations.some(
@@ -4174,6 +4752,30 @@ function validateCurrentGateStore(
     }
     // `toGateResolution` already applies the same lifecycle/evidence matrix used before every
     // progress write. The remaining checks in this loop are cross-table correlations only.
+  }
+
+  for (const delivery of deliveries) {
+    const intent = intentByGate.get(delivery.gateKey);
+    const metadata = metadataByGate.get(delivery.gateKey);
+    const outbox = outboxByGate.get(delivery.gateKey);
+    const pre = intent?.preRead;
+    const post = intent?.postRead;
+    if (
+      intent === undefined || metadata === undefined || outbox === undefined ||
+      intent.ackState !== 'acked' || intent.lifecycle !== 'resolved' ||
+      pre?.status !== 'pending' || pre.resolution !== null || pre.resolvedAt !== null ||
+      post?.status !== 'resolved' || post.resolution !== intent.optionResolution ||
+      intent.resolveResult?.gate.resolvedAt !== post.resolvedAt ||
+      delivery.runKey !== metadata.runKey || delivery.taskKey !== metadata.taskKey ||
+      delivery.sourceDispatchId !== intent.dispatchId ||
+      outbox.notificationState !== 'pending' ||
+      delivery.createdAt < intent.createdAt
+    ) {
+      throw new Error(`store 파일의 ${delivery.gateKey} Channel/D2 correlation이 어긋난다: ${path}`);
+    }
+  }
+  if (deliveryByGate.size !== deliveries.length) {
+    throw new Error(`store 파일에 중복 Channel delivery identity가 있다: ${path}`);
   }
 
   const attempts = db.prepare(
