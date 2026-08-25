@@ -263,9 +263,10 @@ function engine(
   orca: OrcaRunner,
   slack: FakeSlack,
   fault?: (point: GateResolutionFault) => void | Promise<void>,
+  leaseDurationMs = 30_000,
 ): GateResolutionEngine {
   return new GateResolutionEngine({
-    store, orca, slack, now: () => new Date(AT), leaseDurationMs: 100,
+    store, orca, slack, now: () => new Date(AT), leaseDurationMs,
     leaseOwner: `t.engine-${++engineSequence}`,
     ...(fault ? { fault } : {}),
   });
@@ -1466,7 +1467,7 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     const secondStore = new SqliteDigestStore(path);
     const orca = new FakeOrca();
     orca.blockResolveResponse = true;
-    const first = engine(firstStore, orca, new FakeSlack());
+    const first = engine(firstStore, orca, new FakeSlack(), undefined, 100);
     const secondSlack = new FakeSlack();
     const second = engine(secondStore, orca, secondSlack);
     const firstRun = first.resolveAndProject(GATE);
