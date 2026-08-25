@@ -17,11 +17,16 @@ application receipt, Gate effect, and Task resume as separate facts.
   `gate_resolution_outbox` DDL and its `notification_state='pending'` contract are unchanged.
 - The daemon lazily and idempotently materializes only acknowledged, terminal D2 rows with exact
   stored pending-to-resolved evidence. Migration itself performs no inferred backfill.
+- An exact-base v10 recovery row whose pending baseline was already overwritten by a resolved
+  snapshot is quarantined by omission: it cannot poison startup and cannot manufacture D3 evidence,
+  while independently provable companion rows still seed normally.
 - Delivery state is monotonic `pending -> attempted -> receipted -> consumed`, with a revision CAS,
   acquisition-specific expiring lease ownership, bounded retry/error fields, and strict timestamp,
   lifecycle, D2-correlation, foreign-key, column, DDL, and allowed-object validation.
 - A regressed process clock is clamped to the latest persisted D2 evidence before seed and outbox
-  re-arm. Reopen rejects an artificially backdated cross-table seed.
+  re-arm. Defer similarly derives its effective update/retry clock from persisted causal timestamps
+  inside the revision/owner transaction, and schema plus runtime validation require every lifecycle
+  event timestamp to be at or before `updated_at`.
 - Every state transition and the existing Gate card-outbox re-arm share one `BEGIN IMMEDIATE`
   transaction. A stale card projection revision cannot clear the newer generation.
 - `attempted` means only that the Adapter's MCP notification write resolved. `receipted` is only the
@@ -41,6 +46,9 @@ application receipt, Gate effect, and Task resume as separate facts.
   cannot suppress replay to the new current generation.
 - Receipt ACK is emitted only after the synchronous durable callback succeeds. A callback failure
   deliberately leaves the Adapter receipt retryable.
+- Fresh Run reads for a bounded callback burst run concurrently, then their durable callbacks and
+  ACKs commit on one arrival-ordered chain. Each event has a 4.5-second daemon deadline below the
+  Adapter's production 5-second receipt timeout; expired or blocked events cannot produce a late ACK.
 - Connection-local sent/notified sets are bounded and discarded on reconnect. Multi-Gate MCP
   notifications are serialized, receipt/ACK backpressure queues are bounded sets, and the daemon
   rejects an over-cap asynchronous inbound queue.
@@ -64,11 +72,16 @@ The focused suites cover:
 - post-resolve/pre-post-read fault, close/reopen, failed recovery read, D2 completion, D3 seed,
   another reopen, and production daemon startup;
 - rollback seed clock, idempotent reseed, due pacing, and strict reopen;
+- populated-v10 quarantine of a legacy overwritten baseline without blocking a valid companion;
+- rollback defer after an attempted event and newer lease, delay preservation, stale-CAS
+  idempotency, and exact reopen/due pacing;
 - send-before-attempt crash, receipt-before-effect crash/restart, exact mismatch/read failure,
   pending-effect redelivery, bounded redacted errors, and no Task mutation;
 - overlapping reconcile fencing and multi-row hung-Orca deadline/late-completion safety;
 - verified-only production send, ordered multi-Gate callbacks, durable receipt ACK fencing,
   wrong Gate receipt, reconnect replay, and generation-takeover stale receipt rejection;
+- three production Gates with six independent 1.7-second fresh route reads, concurrent validation,
+  wire-ordered durable callbacks, and all receipt ACKs inside the default Adapter window;
 - production daemon startup wiring of the new store/runtime callbacks and reconciliation caller.
 
 ## Verification checkpoint
@@ -78,8 +91,8 @@ product write was performed.
 
 | Command | Result |
 |---|---|
-| focused D3-2/D2 recovery suite | pass — 9 files, 157 tests |
-| `pnpm test` | pass — 49 files, 1080 tests |
+| focused D3-2/D2 recovery suite | pass — 9 files, 160 tests |
+| `pnpm test` | pass — 49 files, 1083 tests |
 | `pnpm typecheck` | pass |
 | app `typecheck` | pass |
 | app `build` | pass |
@@ -91,8 +104,15 @@ product write was performed.
 Two independent read-only Codex/GPT auditors reviewed implementation commit `7869c1c`. Their schema/
 crash and delivery/routing reviews found one P1 and three P2 issues: loss of the D2 pending baseline
 after a post-mutation crash, regressed seed-clock persistence, stale receipt acceptance after Run
-takeover, and an unbounded serial 64-row reconciliation pass. All four findings were corrected with
-the regressions listed above. The corrected head is held for independent re-audit before completion.
+takeover, and an unbounded serial 64-row reconciliation pass. All four were corrected in `b0b849d`.
+
+Two fresh independent auditors then reviewed `b0b849d` and found three remaining cases: a populated
+v10 legacy baseline could block lazy seed, rollback during lease defer could backdate `updated_at`,
+and serial callback validation could exceed the aggregate Adapter ACK window. The implementation now
+quarantines only the unprovable legacy row, clamps defer inside its CAS transaction with matching DDL/
+runtime invariants, and parallelizes bounded fresh reads while preserving ordered durable callbacks.
+This new head is held for another independent schema/crash and delivery/routing audit before
+completion.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 

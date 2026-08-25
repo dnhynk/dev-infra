@@ -35,6 +35,7 @@ export type ChannelPipeErrorCode =
   | 'wrong_receipt'
   | 'stale_delivery'
   | 'delivery_event_failed'
+  | 'delivery_event_expired'
   | 'production_delivery_limit'
   | 'inbound_message_limit'
   | 'run_read_failed'
@@ -89,6 +90,16 @@ export type ChannelProductionDeliveryHandlers = {
   readonly receipted: (event: ChannelProductionDeliveryEvent) => void;
 };
 
+type ProductionAdapterMessage = Extract<
+  AdapterToDaemonMessage,
+  { readonly type: 'attempted' | 'receipt' }
+>;
+
+type QueuedProductionEvent = {
+  readonly message: ProductionAdapterMessage;
+  readonly deadlineAt: number;
+};
+
 type ConnectionState = {
   readonly socket: Socket;
   readonly decoder: ChannelNdjsonDecoder<AdapterToDaemonMessage>;
@@ -103,6 +114,9 @@ type ConnectionState = {
   writeBlocked: boolean;
   readonly pendingReceiptAcks: Set<string>;
   readonly productionDeliveries: Map<string, ChannelProductionDeliveryEvent>;
+  readonly productionEventQueue: QueuedProductionEvent[];
+  productionEventsActive: number;
+  productionCommit: Promise<void>;
   inbound: Promise<void>;
   pendingInboundMessages: number;
   timer: ReturnType<typeof setTimeout> | null;
@@ -131,6 +145,10 @@ export type ChannelPipeServerOptions = {
   readonly maxConnectionsPerBinding?: number;
   readonly maxProductionGateIdsPerConnection?: number;
   readonly eventValidationTimeoutMs?: number;
+  /** Bounds fresh route reads without serially consuming the Adapter's 5 second ACK window. */
+  readonly maxConcurrentProductionEvents?: number;
+  /** Absolute daemon-side callback/ACK budget; production defaults below the Adapter timeout. */
+  readonly productionEventDeadlineMs?: number;
   /** Test seam for deterministic backpressure; production always calls `socket.write(frame)`. */
   readonly writeFrame?: (socket: Socket, frame: Buffer) => boolean;
   /** Receives bounded codes only. Raw frames, claims, paths, and socket errors are never passed. */
@@ -234,6 +252,8 @@ export class ChannelPipeServer {
   readonly #maxConnectionsPerBinding: number;
   readonly #maxProductionGateIdsPerConnection: number;
   readonly #eventValidationTimeoutMs: number;
+  readonly #maxConcurrentProductionEvents: number;
+  readonly #productionEventDeadlineMs: number;
   readonly #writeFrame: (socket: Socket, frame: Buffer) => boolean;
   readonly #onError: (code: ChannelPipeErrorCode) => void;
   readonly #connections = new Set<ConnectionState>();
@@ -281,6 +301,22 @@ export class ChannelPipeServer {
       options.eventValidationTimeoutMs ?? 2_000,
       'event_validation_timeout',
     );
+    const maxConcurrentProductionEvents = options.maxConcurrentProductionEvents ?? 8;
+    if (
+      !Number.isSafeInteger(maxConcurrentProductionEvents) ||
+      maxConcurrentProductionEvents < 1 ||
+      maxConcurrentProductionEvents > 64
+    ) {
+      throw new TypeError('max_concurrent_production_events_invalid');
+    }
+    this.#maxConcurrentProductionEvents = maxConcurrentProductionEvents;
+    this.#productionEventDeadlineMs = finiteMs(
+      options.productionEventDeadlineMs ?? 4_500,
+      'production_event_deadline',
+    );
+    if (this.#productionEventDeadlineMs >= 5_000) {
+      throw new TypeError('production_event_deadline_exceeds_adapter_timeout');
+    }
     this.#writeFrame = options.writeFrame ?? ((socket, frame) => socket.write(frame));
     this.#onError = options.onError ?? (() => undefined);
   }
@@ -594,6 +630,9 @@ export class ChannelPipeServer {
       writeBlocked: false,
       pendingReceiptAcks: new Set(),
       productionDeliveries: new Map(),
+      productionEventQueue: [],
+      productionEventsActive: 0,
+      productionCommit: Promise.resolve(),
       inbound: Promise.resolve(),
       pendingInboundMessages: 0,
       timer: null,
@@ -614,9 +653,10 @@ export class ChannelPipeServer {
             break;
           }
           connection.pendingInboundMessages += 1;
+          const receivedAt = Date.now();
           const handled = connection.inbound.then(async () => {
             if (socket.destroyed) return;
-            await this.#handleMessage(connection, message);
+            await this.#handleMessage(connection, message, receivedAt);
           });
           connection.inbound = handled
             .catch(() => {
@@ -639,6 +679,7 @@ export class ChannelPipeServer {
         this.#onError(error instanceof ChannelProtocolError ? error.code : 'unexpected_message');
       }
       this.#clearTimer(connection);
+      connection.productionEventQueue.length = 0;
       this.#connections.delete(connection);
     });
   }
@@ -646,6 +687,7 @@ export class ChannelPipeServer {
   async #handleMessage(
     connection: ConnectionState,
     message: AdapterToDaemonMessage,
+    receivedAt: number,
   ): Promise<void> {
     if (message.type === 'hello') {
       if (connection.hello !== null) {
@@ -694,13 +736,7 @@ export class ChannelPipeServer {
       }
       connection.attemptedWrites += 1;
       if (message.gate_id !== connection.probeGateId) {
-        const token = await this.#validateProductionEvent(connection, message.gate_id);
-        if (token === null) return;
-        try {
-          this.#productionHandlers?.attempted(token);
-        } catch {
-          this.#onError('delivery_event_failed');
-        }
+        this.#enqueueProductionEvent(connection, message, receivedAt);
       }
       return;
     }
@@ -715,23 +751,111 @@ export class ChannelPipeServer {
         if (!connection.writeBlocked) this.#clearTimer(connection);
       }
       if (!probeReceipt) {
-        const token = await this.#validateProductionEvent(connection, message.gate_id);
-        if (token === null) return;
-        try {
-          this.#productionHandlers?.receipted(token);
-        } catch {
-          // No ACK: the Adapter's receipt tool remains retryable and cannot outrun durable state.
-          this.#onError('delivery_event_failed');
-          return;
-        }
+        this.#enqueueProductionEvent(connection, message, receivedAt);
+        return;
       }
       this.#ackReceipt(connection, message.gate_id);
     }
   }
 
+  #enqueueProductionEvent(
+    connection: ConnectionState,
+    message: ProductionAdapterMessage,
+    receivedAt: number,
+  ): void {
+    if (
+      connection.productionEventsActive + connection.productionEventQueue.length >= 256
+    ) {
+      this.#rejectConnection(connection, 'inbound_message_limit');
+      return;
+    }
+    connection.productionEventQueue.push({
+      message,
+      deadlineAt: receivedAt + this.#productionEventDeadlineMs,
+    });
+    this.#drainProductionEvents(connection);
+  }
+
+  #drainProductionEvents(connection: ConnectionState): void {
+    while (
+      connection.productionEventsActive < this.#maxConcurrentProductionEvents &&
+      connection.productionEventQueue.length > 0 &&
+      this.#connections.has(connection) &&
+      !connection.socket.destroyed &&
+      !this.#stopping
+    ) {
+      const event = connection.productionEventQueue.shift()!;
+      if (Date.now() >= event.deadlineAt) {
+        this.#expireProductionEvent(connection);
+        return;
+      }
+      connection.productionEventsActive += 1;
+      void this.#processProductionEvent(connection, event)
+        .catch(() => {
+          this.#onError('delivery_event_failed');
+        })
+        .finally(() => {
+          connection.productionEventsActive -= 1;
+          this.#drainProductionEvents(connection);
+        });
+    }
+  }
+
+  async #processProductionEvent(
+    connection: ConnectionState,
+    event: QueuedProductionEvent,
+  ): Promise<void> {
+    const remainingMs = event.deadlineAt - Date.now();
+    if (remainingMs < 1) {
+      this.#expireProductionEvent(connection);
+      return;
+    }
+    // Start the expensive fresh Run read in parallel, but append its durable callback and ACK to
+    // one arrival-ordered commit chain. This keeps callback serialization without summing route
+    // latency across a burst and consuming the Adapter's aggregate receipt timeout.
+    const validation = this.#validateProductionEvent(
+      connection,
+      event.message.gate_id,
+      Math.min(this.#eventValidationTimeoutMs, remainingMs),
+    );
+    const committed = connection.productionCommit.then(async () => {
+      const token = await validation;
+      if (token === null || connection.socket.destroyed || this.#stopping) return;
+      if (Date.now() >= event.deadlineAt) {
+        this.#expireProductionEvent(connection);
+        return;
+      }
+      try {
+        if (event.message.type === 'attempted') this.#productionHandlers?.attempted(token);
+        else this.#productionHandlers?.receipted(token);
+      } catch {
+        // No receipt ACK: the Adapter's receipt tool remains retryable and cannot outrun durable state.
+        this.#onError('delivery_event_failed');
+        return;
+      }
+      if (event.message.type === 'receipt') {
+        if (Date.now() >= event.deadlineAt || connection.writeBlocked) {
+          this.#expireProductionEvent(connection);
+          return;
+        }
+        this.#ackReceipt(connection, event.message.gate_id);
+      }
+    });
+    connection.productionCommit = committed.catch(() => undefined);
+    await committed;
+  }
+
+  #expireProductionEvent(connection: ConnectionState): void {
+    if (connection.socket.destroyed) return;
+    connection.productionEventQueue.length = 0;
+    this.#onError('delivery_event_expired');
+    connection.socket.destroy();
+  }
+
   async #validateProductionEvent(
     connection: ConnectionState,
     gateId: string,
+    timeoutMs: number,
   ): Promise<ChannelProductionDeliveryEvent | null> {
     const token = connection.productionDeliveries.get(gateId);
     if (
@@ -741,7 +865,7 @@ export class ChannelPipeServer {
       connection.socket.destroyed
     ) return null;
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), this.#eventValidationTimeoutMs);
+    const timer = setTimeout(() => deadline.abort(), timeoutMs);
     timer.unref?.();
     let selected: ChannelRouteSelection;
     try {

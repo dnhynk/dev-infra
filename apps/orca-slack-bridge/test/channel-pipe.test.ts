@@ -33,8 +33,11 @@ class FakeOrca implements OrcaRunner {
   duplicateRun = false;
   missingRun = false;
   fail = false;
+  delayMs = 0;
+  calls = 0;
 
-  run(args: readonly string[]): Promise<string> {
+  run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
+    this.calls += 1;
     if (this.fail) return Promise.reject(new Error('raw private Orca failure'));
     if (args.join(' ') !== 'orchestration run-list --json') {
       return Promise.reject(new Error('unexpected fake command'));
@@ -49,13 +52,27 @@ class FakeOrca implements OrcaRunner {
       created_at: '2026-08-25T00:00:00.000Z',
       updated_at: '2026-08-25T00:00:00.000Z',
     };
-    return Promise.resolve(JSON.stringify({
+    const response = JSON.stringify({
       id: 'fake',
       ok: true,
       result: {
         runs: this.missingRun ? [] : this.duplicateRun ? [row, { ...row }] : [row],
       },
-    }));
+    });
+    if (this.delayMs === 0) return Promise.resolve(response);
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        options.signal?.removeEventListener('abort', abort);
+        resolve(response);
+      }, this.delayMs);
+      const abort = (): void => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener('abort', abort);
+        reject(new Error('fake aborted'));
+      };
+      if (options.signal?.aborted === true) abort();
+      else options.signal?.addEventListener('abort', abort, { once: true });
+    });
   }
 }
 
@@ -241,6 +258,83 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       'receipt_not_current',
     );
     expect(daemon.getResourceSnapshot().productionGateWrites).toBe(2);
+  });
+
+  it('validates a three-Gate slow-route burst concurrently while committing callbacks in wire order', async () => {
+    const path = pipePath('production-slow-route-burst');
+    const orca = new FakeOrca();
+    const daemonErrors: string[] = [];
+    const adapterErrors: string[] = [];
+    const daemon = server(path, orca, daemonErrors);
+    const callbacks: string[] = [];
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ gateId }) => callbacks.push(`attempted:${gateId}`),
+      receipted: ({ gateId }) => callbacks.push(`receipted:${gateId}`),
+    });
+    await daemon.start();
+
+    const gates = [
+      'gate_111111111111',
+      'gate_222222222222',
+      'gate_333333333333',
+    ];
+    const productionWrites: string[] = [];
+    let releaseFirstProductionWrite!: () => void;
+    const heldFirstProductionWrite = new Promise<void>((resolve) => {
+      releaseFirstProductionWrite = resolve;
+    });
+    let client!: ChannelAdapterClient;
+    client = new ChannelAdapterClient({
+      identity: identity(),
+      notificationWriter: {
+        notifyGate: async (gateId) => {
+          if (gateId === daemon.listConnections()[0]?.probeGateId) {
+            await client.reportReceipt(gateId);
+            return;
+          }
+          productionWrites.push(gateId);
+          if (productionWrites.length === 1) await heldFirstProductionWrite;
+        },
+      },
+      pipePath: path,
+      reconnectDelaysMs: [10, 20, 40],
+      shutdownTimeoutMs: 500,
+      onError: (code) => adapterErrors.push(code),
+      // Intentionally omit receiptAckTimeoutMs: this exercises the production 5 second default.
+    });
+    adapters.push(client);
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+    const attemptedBefore = daemon.listConnections()[0]!.attemptedWrites;
+
+    for (const gateId of gates) {
+      expect(await daemon.deliverGate(RUN_ID, gateId)).toMatchObject({ kind: 'sent' });
+    }
+    const callbackReadStart = orca.calls;
+    orca.delayMs = 1_700;
+    releaseFirstProductionWrite();
+    await waitFor(() => productionWrites.length === gates.length);
+    await waitFor(() => (
+      (daemon.listConnections()[0]?.attemptedWrites ?? 0) >= attemptedBefore + gates.length
+    ));
+
+    const receiptBeganAt = Date.now();
+    await expect(Promise.all(gates.map((gateId) => client.reportReceipt(gateId)))).resolves.toEqual([
+      'accepted',
+      'accepted',
+      'accepted',
+    ]);
+    expect(Date.now() - receiptBeganAt).toBeLessThan(4_500);
+    await waitFor(() => callbacks.length === gates.length * 2);
+    expect(callbacks).toEqual([
+      ...gates.map((gateId) => `attempted:${gateId}`),
+      ...gates.map((gateId) => `receipted:${gateId}`),
+    ]);
+    expect(orca.calls - callbackReadStart).toBe(gates.length * 2);
+    expect(daemonErrors).not.toContain('delivery_event_expired');
+    expect(daemonErrors).not.toContain('stale_delivery');
+    expect(adapterErrors).not.toContain('wrong_receipt_ack');
+    expect(daemon.listConnections()[0]?.verified).toBe(true);
   });
 
   it('replays an unreceipted production Gate through a newly verified reconnect epoch', async () => {

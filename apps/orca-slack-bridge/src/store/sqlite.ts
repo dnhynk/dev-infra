@@ -575,6 +575,7 @@ SELECT o.gate_key
  WHERE o.notification_state = 'pending'
    AND r.ack_state = 'acked'
    AND r.lifecycle = 'resolved'
+   AND json_extract(r.pre_read_json, '$.status') = 'pending'
    AND d.gate_key IS NULL
  ORDER BY o.gate_key`;
 
@@ -1344,6 +1345,9 @@ function toGateChannelDelivery(row: GateChannelDeliveryRow): GateChannelDelivery
   if (
     !validLifecycle ||
     updatedAt < createdAt ||
+    (lastAttemptAt !== null && updatedAt < lastAttemptAt) ||
+    (receiptedAt !== null && updatedAt < receiptedAt) ||
+    (consumedAt !== null && updatedAt < consumedAt) ||
     (leaseExpiresAt !== null && leaseExpiresAt <= updatedAt) ||
     (lastAttemptAt !== null && lastAttemptAt < createdAt) ||
     (receiptedAt !== null && (lastAttemptAt === null || receiptedAt < lastAttemptAt)) ||
@@ -3296,6 +3300,13 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         const intent = toGateResolution(intentRow);
         const metadata = toGateMetadata(metadataRow);
         const outbox = toGateOutbox(outboxRow);
+        if (intent.preRead?.status === 'resolved') {
+          // Exact-base v10 could overwrite the original pending baseline while recovering a
+          // structured post-mutation result. That terminal row is valid D2 history but cannot
+          // prove pending→resolved causality, so v11 must quarantine it by omission rather than
+          // poisoning every daemon startup or manufacturing consumable D3 evidence.
+          continue;
+        }
         if (
           intent.ackState !== 'acked' ||
           intent.lifecycle !== 'resolved' ||
@@ -3439,14 +3450,60 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     const next = storedIso(nextAttemptAt, `${gateKey}.Channel defer nextAttemptAt`);
     if (next < deferredAt) throw new TypeError(`${gateKey}의 Channel defer 시각이 역행했다`);
     const safeError = errorCode === null ? null : gateCode(errorCode, 80);
-    const result = this.db.prepare(
-      `UPDATE gate_channel_delivery
-          SET revision = revision + 1, next_attempt_at = ?, lease_owner = NULL,
-              lease_expires_at = NULL, last_error_code = ?, updated_at = ?
-        WHERE gate_key = ? AND revision = ? AND lease_owner = ?
-          AND lease_expires_at > ? AND state <> 'consumed'`,
-    ).run(next, safeError, deferredAt, gateKey, expectedRevision, safeOwner, deferredAt);
-    return Number(result.changes) === 1 ? this.findGateChannelDelivery(gateKey) : null;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateChannelDelivery(gateKey);
+      if (
+        current === null ||
+        current.revision !== expectedRevision ||
+        current.leaseOwner !== safeOwner ||
+        current.leaseExpiresAt === null ||
+        current.state === 'consumed'
+      ) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      let effectiveAt = deferredAt;
+      for (const candidate of [
+        current.createdAt,
+        current.updatedAt,
+        current.lastAttemptAt,
+        current.receiptedAt,
+      ]) {
+        if (candidate !== null && candidate > effectiveAt) effectiveAt = candidate;
+      }
+      if (current.leaseExpiresAt <= effectiveAt) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const delayMs = new Date(next).valueOf() - new Date(deferredAt).valueOf();
+      const effectiveNext = new Date(new Date(effectiveAt).valueOf() + delayMs).toISOString();
+      const result = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, next_attempt_at = ?, lease_owner = NULL,
+                lease_expires_at = NULL, last_error_code = ?, updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND lease_owner = ?
+            AND lease_expires_at > ? AND state <> 'consumed'`,
+      ).run(
+        effectiveNext,
+        safeError,
+        effectiveAt,
+        gateKey,
+        expectedRevision,
+        safeOwner,
+        effectiveAt,
+      );
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const deferred = this.findGateChannelDelivery(gateKey);
+      this.db.exec('COMMIT');
+      return deferred;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   markGateChannelAttempted(

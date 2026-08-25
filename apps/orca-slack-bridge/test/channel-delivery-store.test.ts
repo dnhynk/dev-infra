@@ -27,6 +27,45 @@ const RESOLUTION_REQUEST = '11111111-1111-4111-8111-111111111111';
 const DELIVERY_OWNER = 't.channel-delivery';
 const PROJECTION_OWNER = 't.channel-projection';
 
+type DeliveryFixture = {
+  readonly gateId: string;
+  readonly runId: string;
+  readonly taskId: string;
+  readonly gate: ReturnType<typeof gateKey>;
+  readonly run: ReturnType<typeof runKey>;
+  readonly task: ReturnType<typeof taskKey>;
+  readonly dispatchId: string;
+  readonly threadTs: string;
+  readonly messageTs: string;
+  readonly resolutionRequest: string;
+};
+
+const FIXTURE: DeliveryFixture = {
+  gateId: 'gate_delivery',
+  runId: 'run_delivery',
+  taskId: 'task_delivery',
+  gate: GATE,
+  run: RUN,
+  task: TASK,
+  dispatchId: DISPATCH_ID,
+  threadTs: THREAD_TS,
+  messageTs: MESSAGE_TS,
+  resolutionRequest: RESOLUTION_REQUEST,
+};
+
+const COMPANION: DeliveryFixture = {
+  gateId: 'gate_delivery_companion',
+  runId: 'run_delivery_companion',
+  taskId: 'task_delivery_companion',
+  gate: gateKey('gate_delivery_companion'),
+  run: runKey('run_delivery_companion'),
+  task: taskKey('task_delivery_companion'),
+  dispatchId: 'ctx_delivery_companion',
+  threadTs: '1787554800.000011',
+  messageTs: '1787554800.000012',
+  resolutionRequest: '22222222-2222-4222-8222-222222222222',
+};
+
 let dir: string;
 let path: string;
 
@@ -54,14 +93,38 @@ const resolved: GateSnapshot = {
   resolvedAt: '2026-08-24T10:00:01.000Z',
 };
 
-function seedD2(store: SqliteDigestStore): void {
+function snapshots(fixture: DeliveryFixture): {
+  readonly pending: GateSnapshot;
+  readonly resolved: GateSnapshot;
+} {
+  const fixturePending: GateSnapshot = {
+    gateId: fixture.gateId,
+    runId: fixture.runId,
+    taskId: fixture.taskId,
+    options: ['현행 유지', '변경'],
+    status: 'pending',
+    resolution: null,
+    resolvedAt: null,
+  };
+  return {
+    pending: fixturePending,
+    resolved: {
+      ...fixturePending,
+      status: 'resolved',
+      resolution: '현행 유지',
+      resolvedAt: '2026-08-24T10:00:01.000Z',
+    },
+  };
+}
+
+function seedD2(store: SqliteDigestStore, fixture: DeliveryFixture = FIXTURE): void {
   store.insertGateMetadata({
-    gateKey: GATE,
-    runKey: RUN,
-    taskKey: TASK,
-    dispatchKey: dispatchKey(DISPATCH_ID),
-    askMessageId: 'msg_delivery',
-    questionThreadId: 'thread_delivery',
+    gateKey: fixture.gate,
+    runKey: fixture.run,
+    taskKey: fixture.task,
+    dispatchKey: dispatchKey(fixture.dispatchId),
+    askMessageId: `msg_${fixture.gateId}`,
+    questionThreadId: `thread_${fixture.gateId}`,
     options: [
       { id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' },
       { id: 'change', label: '변경', description: '변경한다', resolution: '변경' },
@@ -71,18 +134,18 @@ function seedD2(store: SqliteDigestStore): void {
     registeredAt: AT,
   });
   store.insertGateMessage({
-    gateKey: GATE,
-    runKey: RUN,
+    gateKey: fixture.gate,
+    runKey: fixture.run,
     channelId: CHANNEL,
-    threadTs: THREAD_TS,
-    messageTs: MESSAGE_TS,
+    threadTs: fixture.threadTs,
+    messageTs: fixture.messageTs,
     renderFingerprint: 'fp',
     at: AT,
   });
   store.saveGateLocalObservation({
-    gateKey: GATE,
-    runKey: RUN,
-    taskKey: TASK,
+    gateKey: fixture.gate,
+    runKey: fixture.run,
+    taskKey: fixture.task,
     status: 'pending',
     resolution: null,
     resolvedAt: null,
@@ -92,46 +155,72 @@ function seedD2(store: SqliteDigestStore): void {
   });
 }
 
-function resolveD2(store: SqliteDigestStore): void {
-  seedD2(store);
+function resolveD2(store: SqliteDigestStore, fixture: DeliveryFixture = FIXTURE): void {
+  const fixtureSnapshots = snapshots(fixture);
+  seedD2(store, fixture);
   const claim = store.claimGateResolution({
     teamId: 'T0TEAM',
     ownerUserId: 'U0OWNER',
     apiAppId: 'A0APP',
     channelId: CHANNEL,
-    threadTs: THREAD_TS,
-    messageTs: MESSAGE_TS,
-    blockId: gateBlockId(GATE),
-    actionId: gateActionId(GATE, 'keep'),
+    threadTs: fixture.threadTs,
+    messageTs: fixture.messageTs,
+    blockId: gateBlockId(fixture.gate),
+    actionId: gateActionId(fixture.gate, 'keep'),
     actionValue: 'keep',
-    retryRequestId: RESOLUTION_REQUEST,
+    retryRequestId: fixture.resolutionRequest,
     at: AT,
   });
   if (claim.kind !== 'claimed') throw new Error(`claim failed: ${claim.kind}`);
-  const acked = store.markGateResolutionAck(GATE, claim.intent.revision, 'acked', AT);
+  const acked = store.markGateResolutionAck(fixture.gate, claim.intent.revision, 'acked', AT);
   if (acked === null) throw new Error('ACK failed');
-  const lease = store.acquireGateResolutionLease(GATE, 't.d2-resolver', AT, LEASE_EXPIRY);
+  const lease = store.acquireGateResolutionLease(
+    fixture.gate,
+    't.d2-resolver',
+    AT,
+    LEASE_EXPIRY,
+  );
   if (lease.kind !== 'acquired') throw new Error(`D2 lease failed: ${lease.kind}`);
-  const preRead = store.updateGateResolution(GATE, lease.intent.revision, 't.d2-resolver', {
-    lifecycle: 'pre_read', preRead: pending, at: AT,
-  });
-  if (preRead === null) throw new Error('pre-read failed');
-  const resolving = store.updateGateResolution(GATE, preRead.revision, 't.d2-resolver', {
-    lifecycle: 'resolving', at: AT,
-  });
-  if (resolving === null) throw new Error('resolving failed');
-  const postRead = store.updateGateResolution(GATE, resolving.revision, 't.d2-resolver', {
-    lifecycle: 'post_read',
-    resolveResult: {
-      gate: resolved,
-      mutation: { requestId: RESOLUTION_REQUEST, replayed: false },
+  const preRead = store.updateGateResolution(
+    fixture.gate,
+    lease.intent.revision,
+    't.d2-resolver',
+    {
+      lifecycle: 'pre_read', preRead: fixtureSnapshots.pending, at: AT,
     },
-    at: AT,
-  });
+  );
+  if (preRead === null) throw new Error('pre-read failed');
+  const resolving = store.updateGateResolution(
+    fixture.gate,
+    preRead.revision,
+    't.d2-resolver',
+    {
+      lifecycle: 'resolving', at: AT,
+    },
+  );
+  if (resolving === null) throw new Error('resolving failed');
+  const postRead = store.updateGateResolution(
+    fixture.gate,
+    resolving.revision,
+    't.d2-resolver',
+    {
+      lifecycle: 'post_read',
+      resolveResult: {
+        gate: fixtureSnapshots.resolved,
+        mutation: { requestId: fixture.resolutionRequest, replayed: false },
+      },
+      at: AT,
+    },
+  );
   if (postRead === null) throw new Error('post-read failed');
-  const terminal = store.updateGateResolution(GATE, postRead.revision, 't.d2-resolver', {
-    lifecycle: 'resolved', postRead: resolved, at: AT,
-  });
+  const terminal = store.updateGateResolution(
+    fixture.gate,
+    postRead.revision,
+    't.d2-resolver',
+    {
+      lifecycle: 'resolved', postRead: fixtureSnapshots.resolved, at: AT,
+    },
+  );
   if (terminal?.lifecycle !== 'resolved') throw new Error('terminal resolution failed');
 }
 
@@ -204,6 +293,38 @@ describe('additive v11 Channel delivery schema', () => {
     lazy.close();
   });
 
+  it('quarantines an unprovable exact-base v10 recovery row while seeding its valid companion', () => {
+    const legacyPath = join(dir, 'legacy-populated-v10.db');
+    const prepared = new SqliteDigestStore(legacyPath);
+    resolveD2(prepared);
+    resolveD2(prepared, COMPANION);
+    prepared.close();
+
+    const v10 = new DatabaseSync(legacyPath);
+    v10.exec('DROP TABLE gate_channel_delivery');
+    v10.prepare('UPDATE schema_version SET version = 10 WHERE id = 1').run();
+    v10.prepare(
+      `UPDATE gate_resolution
+          SET pre_read_json = post_read_json
+        WHERE gate_key = ?`,
+    ).run(GATE);
+    v10.close();
+
+    const migrated = new SqliteDigestStore(legacyPath);
+    expect(migrated.seedPendingGateChannelDeliveries(SEEDED_AT)).toMatchObject([{
+      gateKey: COMPANION.gate,
+      runKey: COMPANION.run,
+      taskKey: COMPANION.task,
+      sourceDispatchId: COMPANION.dispatchId,
+      state: 'pending',
+    }]);
+    expect(migrated.findGateChannelDelivery(GATE)).toBeNull();
+    expect(migrated.findGateChannelDelivery(COMPANION.gate)).not.toBeNull();
+    expect(migrated.findGateResolutionOutbox(GATE)?.notificationState).toBe('pending');
+    expect(migrated.seedPendingGateChannelDeliveries(SEEDED_AT)).toEqual([]);
+    migrated.close();
+  });
+
   it('fails closed on future schema instead of rewriting or downgrading it', () => {
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path);
@@ -258,6 +379,13 @@ describe('additive v11 Channel delivery schema', () => {
                     next_attempt_at = '2026-08-24T09:59:59.000Z'`,
       },
       {
+        name: 'event-after-update-clock',
+        sql: `UPDATE gate_channel_delivery
+                SET state = 'attempted', attempt_count = 1,
+                    last_attempt_at = '2026-08-24T10:00:03.000Z',
+                    updated_at = '2026-08-24T10:00:02.000Z'`,
+      },
+      {
         name: 'unknown-trigger',
         sql: `CREATE TRIGGER gate_channel_delivery_unknown AFTER UPDATE ON gate_channel_delivery
               BEGIN SELECT 1; END`,
@@ -279,6 +407,56 @@ describe('additive v11 Channel delivery schema', () => {
 });
 
 describe('monotonic crash-safe Channel lifecycle', () => {
+  it('clamps a rollback defer to persisted lease history and survives reopen idempotently', () => {
+    let store = new SqliteDigestStore(path);
+    resolveD2(store);
+    seedDelivery(store);
+    expect(store.markGateChannelAttempted(
+      GATE,
+      ATTEMPTED_AT,
+      '2026-08-24T10:00:07.000Z',
+    )).toMatchObject({ state: 'attempted', updatedAt: ATTEMPTED_AT });
+    const lease = store.acquireGateChannelDeliveryLease(
+      GATE,
+      DELIVERY_OWNER,
+      '2026-08-24T10:00:08.000Z',
+      '2026-08-24T10:00:20.000Z',
+    );
+    if (lease.kind !== 'acquired') throw new Error(`rollback lease failed: ${lease.kind}`);
+
+    const deferred = store.deferGateChannelDelivery(
+      GATE,
+      lease.delivery.revision,
+      DELIVERY_OWNER,
+      '2026-08-24T10:00:02.500Z',
+      '2026-08-24T10:00:07.500Z',
+      'route_pending',
+    );
+    expect(deferred).toMatchObject({
+      state: 'attempted',
+      updatedAt: '2026-08-24T10:00:08.000Z',
+      nextAttemptAt: '2026-08-24T10:00:13.000Z',
+      lastAttemptAt: ATTEMPTED_AT,
+      leaseOwner: null,
+      lastErrorCode: 'route_pending',
+    });
+    expect(store.deferGateChannelDelivery(
+      GATE,
+      lease.delivery.revision,
+      DELIVERY_OWNER,
+      '2026-08-24T10:00:02.500Z',
+      '2026-08-24T10:00:07.500Z',
+      'route_pending',
+    )).toBeNull();
+    store.close();
+
+    store = new SqliteDigestStore(path);
+    expect(store.findGateChannelDelivery(GATE)).toEqual(deferred);
+    expect(store.listDueGateChannelDeliveries('2026-08-24T10:00:12.999Z')).toEqual([]);
+    expect(store.listDueGateChannelDeliveries('2026-08-24T10:00:13.000Z')).toHaveLength(1);
+    store.close();
+  });
+
   it('recovers an expired lease without allowing a stale owner to release the replacement', () => {
     const store = new SqliteDigestStore(path);
     resolveD2(store);

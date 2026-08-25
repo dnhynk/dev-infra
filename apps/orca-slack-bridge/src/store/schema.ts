@@ -537,7 +537,10 @@ CREATE TABLE gate_channel_delivery (
   CHECK (last_attempt_at IS NULL OR last_attempt_at >= created_at),
   CHECK (receipted_at IS NULL OR receipted_at >= last_attempt_at),
   CHECK (consumed_at IS NULL OR consumed_at >= receipted_at),
-  CHECK (updated_at >= created_at)
+  CHECK (updated_at >= created_at),
+  CHECK (last_attempt_at IS NULL OR updated_at >= last_attempt_at),
+  CHECK (receipted_at IS NULL OR updated_at >= receipted_at),
+  CHECK (consumed_at IS NULL OR updated_at >= consumed_at)
 )`;
 
 const GATE_CHANNEL_DELIVERY_DUE_INDEX = `
