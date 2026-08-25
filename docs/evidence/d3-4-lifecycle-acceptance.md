@@ -8,7 +8,7 @@ Branch: `dnhynk/d3-4-lifecycle-acceptance`
 
 Orca: Run `run_f93a72e6ef6e`, Task `task_6ea165cbe114`, Dispatch `ctx_b289c2cffb59`
 
-PR: pending
+PR: [#37](https://github.com/dnhynk/dev-infra/pull/37)
 
 ## Delivered boundary
 
