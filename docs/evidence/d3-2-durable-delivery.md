@@ -41,8 +41,12 @@ application receipt, Gate effect, and Task resume as separate facts.
   consume the replacement generation, while the ordinary D2 projector still sees no deferred row.
   The same dual CAS preserves a live independent delivery lease and clears it at exact expiry, so
   provenance advancement cannot violate the v11 lease clock or revive its stale delivery owner.
-- `attempted` means only that the Adapter's MCP notification write resolved. `receipted` is only the
-  reply-tool application callback. Neither is delivery consumption or Task resume.
+- `attempted` means only that the Adapter's MCP notification write resolved. It may perform a
+  non-authorizing `listRuns` read of the current Run to validate that the in-memory route is still
+  current, but it never rereads Gate/effect authority, emits a daemon ACK, advances the
+  application/production authority revision, consumes the delivery token, or suppresses retry or
+  replay. `receipted` is only the reply-tool application callback; neither state is delivery
+  consumption or Task resume.
 - `consumed` requires a fresh strict `gate-list` reread whose Gate/run/task/options, resolved status,
   resolution, and `resolvedAt` match the durable D2 pending-to-resolved evidence.
 - A pending, unreadable, or mismatched fresh Gate remains receipted and retryable with a bounded
@@ -58,12 +62,23 @@ application receipt, Gate effect, and Task resume as separate facts.
   cannot suppress replay to the new current generation.
 - Receipt ACK is emitted only after the synchronous durable callback succeeds. A callback failure
   deliberately leaves the Adapter receipt retryable.
-- Fresh Run reads for different Gates start concurrently and durable callbacks stay on one
-  arrival-ordered chain. Every authority read carries the production callback revision captured
-  before that read starts; if a receipt boundary advances while any initial, speculative, or
-  commit-boundary read is pending, the stale result cannot inherit the newer revision. `attempted`
-  records only a historical transport write and emits no daemon ACK; receipt alone advances the
-  authority/ACK boundary, and every later event still honors the latest preceding receipt boundary.
+- Fresh Run route reads for different Gates start concurrently and durable callbacks stay on one
+  arrival-ordered chain per connection. Every receipt-side route validation that can precede an
+  application-authority commit carries the production callback revision captured before that read
+  starts; if a receipt boundary advances while any initial, speculative, or commit-boundary read is
+  pending, the stale result cannot inherit the newer revision. An `attempted` current-Run `listRuns`
+  check uses the route shape only and is non-authorizing: receipt alone advances the authority/ACK
+  boundary, and every later event still honors the latest preceding receipt boundary.
+- Production-event admission is daemon-global rather than per connection. Verified connections
+  enter one bounded, fair admission scheduler, so one busy connection cannot monopolize the shared
+  fresh-read/callback concurrency budget while another connection has eligible work. Per-connection
+  ordered commit chains still preserve each connection's receipt authority boundaries.
+- Every queued production event retains the original monotonic deadline fixed when that event
+  arrived; time waiting for the daemon-global permit is charged to that same budget and cannot
+  re-anchor or extend it. Each admitted event owns exactly one permit, returned exactly once on every
+  terminal path—including validation rejection or failure, expiry, callback success or throw,
+  socket loss/takeover, and daemon stop/cancellation—before the next fair waiter is admitted. An
+  event rejected before admission never acquires a permit.
 - Adapter receipt deadlines and daemon callback deadlines use monotonic clocks. Protocol v2
   calibrates the two process-monotonic domains during each connection hello, then carries both the
   translated absolute Adapter deadline and its remaining budget. The daemon chooses the earliest
@@ -110,8 +125,15 @@ The focused suites cover:
 - overlapping reconcile fencing and multi-row hung-Orca deadline/late-completion safety;
 - verified-only production send, ordered multi-Gate callbacks, durable receipt ACK fencing,
   wrong Gate receipt, reconnect replay, and generation-takeover stale receipt rejection;
-- a receipt-before-attempted boundary requiring an exact fresh third authority read, with attempted
-  producing no ACK or Orca read, preserving its finite retry deadline, and leaving the Gate resendable;
+- four independently verified bindings under a daemon-global cap of two, with a noisy connection
+  backlog unable to monopolize admission, cross-connection round-robin progress, and no starvation;
+- exact permit cleanup after active socket close, validation timeout, synchronous callback throw,
+  asynchronous callback rejection, rejected route read, queued original-deadline expiry, and daemon
+  shutdown/restart, with late settlement producing zero durable callback and zero ACK and never
+  double-returning capacity;
+- a receipt-before-attempted boundary requiring an exact fresh third route read, with attempted
+  producing no ACK or Gate/effect authority reread, preserving its finite retry deadline, and
+  leaving the Gate resendable;
 - three production Gates with overlapping attempted plus receipt events, 1.4-second authority reads,
   exactly nine reads across the required initial/speculative/commit waves, wire-ordered callbacks,
   and all three receipt ACKs inside 4.5 seconds under the production 5-second Adapter window;
@@ -145,8 +167,8 @@ product write was performed.
 
 | Command | Result |
 |---|---|
-| focused D3-2 store/delivery/protocol suite | pass — 5 files, 73 tests |
-| `pnpm test` | pass — 50 files, 1106 tests |
+| focused D3-2 store/delivery/protocol suite | pass — 5 files, 79 tests |
+| `pnpm test` | pass — 50 files, 1112 tests |
 | `pnpm typecheck` | pass |
 | app `typecheck` | pass |
 | app `build` | pass |
@@ -194,6 +216,15 @@ cases. A final adversarial preflight also reproduced exact provenance recovery/r
 independently expired delivery lease; the dual CAS now clears that lease at equality and proves all
 late owner writes are zero-effect across restart. This repair remains held for a fresh exact-head
 independent audit pair.
+
+The FINAL5 schema/crash audit approved that exact head, while the delivery/routing audit found that
+the configured production-event limit was enforced per connection and therefore multiplied across
+verified sockets. It also required the evidence to state the deliberately narrow meaning of
+`attempted`. This repair moves admission to one daemon-global fair scheduler, retains every event's
+arrival-fixed monotonic deadline, and returns its idempotent permit on every terminal path. The
+per-connection commit chain remains ordered, stale late work is fenced to zero effect, and
+`attempted` permits only non-authorizing current-Run route validation—not Gate/effect authority,
+ACK, authority-revision advance, token consumption, or retry/replay suppression.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 

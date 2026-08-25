@@ -103,9 +103,11 @@ export type ChannelProductionCommitFence = () => boolean;
 
 export type ChannelProductionDeliveryHandlers = {
   /**
-   * Historical Adapter transport-write evidence only. It emits no daemon ACK, grants no
-   * application/Orca authority, leaves the Gate replayable, and still revalidates after every
-   * preceding receipt boundary before this synchronous durable callback may run.
+   * Historical Adapter transport-write evidence only. Admission may run a non-authorizing current-
+   * Run `listRuns` route validation, but it performs no Gate/effect reread, emits no daemon ACK,
+   * advances no application/production authority revision, consumes no token, and suppresses no
+   * retry/replay. It still revalidates after every preceding receipt boundary before this
+   * synchronous durable callback may run.
    */
   readonly attempted: (
     event: ChannelProductionDeliveryEvent,
@@ -128,6 +130,13 @@ type QueuedProductionEvent = {
   readonly deadlineNs: bigint;
 };
 
+type ProductionEventPermit = {
+  readonly connection: ConnectionState;
+  readonly deadlineNs: bigint;
+  timer: ReturnType<typeof setTimeout> | null;
+  released: boolean;
+};
+
 type ConnectionState = {
   readonly socket: Socket;
   readonly decoder: ChannelNdjsonDecoder<AdapterToDaemonMessage>;
@@ -143,6 +152,8 @@ type ConnectionState = {
   readonly pendingReceiptAcks: Set<string>;
   readonly productionDeliveries: Map<string, ChannelProductionDeliveryEvent>;
   readonly productionEventQueue: QueuedProductionEvent[];
+  readonly productionEventPermits: Set<ProductionEventPermit>;
+  readonly productionAbort: AbortController;
   productionEventsActive: number;
   productionCommit: Promise<void>;
   productionCommitRevision: number;
@@ -174,7 +185,7 @@ export type ChannelPipeServerOptions = {
   readonly maxConnectionsPerBinding?: number;
   readonly maxProductionGateIdsPerConnection?: number;
   readonly eventValidationTimeoutMs?: number;
-  /** Bounds fresh route reads without serially consuming the Adapter's 5 second ACK window. */
+  /** Daemon-global fair ceiling across production reads/callbacks on every verified connection. */
   readonly maxConcurrentProductionEvents?: number;
   /** Absolute daemon-side callback/ACK budget; production defaults below the Adapter timeout. */
   readonly productionEventDeadlineMs?: number;
@@ -286,6 +297,8 @@ export class ChannelPipeServer {
   readonly #writeFrame: (socket: Socket, frame: Buffer) => boolean;
   readonly #onError: (code: ChannelPipeErrorCode) => void;
   readonly #connections = new Set<ConnectionState>();
+  readonly #productionReadyConnections: ConnectionState[] = [];
+  readonly #productionReadySet = new Set<ConnectionState>();
   #server: Server | null = null;
   #bindingAbort: AbortController | null = null;
   #bindingRead: Promise<BindingGenerationIndex | null> | null = null;
@@ -293,6 +306,7 @@ export class ChannelPipeServer {
   #stopping = false;
   #productionRouteEvaluations = 0;
   #productionGateWrites = 0;
+  #productionEventsActive = 0;
 
   constructor(options: ChannelPipeServerOptions) {
     this.#orca = options.orca;
@@ -396,6 +410,7 @@ export class ChannelPipeServer {
     const bindingRead = this.#bindingRead;
     for (const connection of this.#connections) {
       this.#clearTimer(connection);
+      this.#retireProductionConnection(connection);
       connection.socket.destroy();
     }
 
@@ -424,6 +439,8 @@ export class ChannelPipeServer {
     }
     if (this.#bindingRead === bindingRead) this.#bindingRead = null;
     this.#connections.clear();
+    this.#productionReadyConnections.length = 0;
+    this.#productionReadySet.clear();
   }
 
   getResourceSnapshot(): {
@@ -660,6 +677,8 @@ export class ChannelPipeServer {
       pendingReceiptAcks: new Set(),
       productionDeliveries: new Map(),
       productionEventQueue: [],
+      productionEventPermits: new Set(),
+      productionAbort: new AbortController(),
       productionEventsActive: 0,
       productionCommit: Promise.resolve(),
       productionCommitRevision: 0,
@@ -709,8 +728,8 @@ export class ChannelPipeServer {
         this.#onError(error instanceof ChannelProtocolError ? error.code : 'unexpected_message');
       }
       this.#clearTimer(connection);
-      connection.productionEventQueue.length = 0;
       this.#connections.delete(connection);
+      this.#retireProductionConnection(connection);
     });
   }
 
@@ -812,31 +831,118 @@ export class ChannelPipeServer {
           )
         : receivedNs + msAsNs(this.#productionEventDeadlineMs),
     });
-    this.#drainProductionEvents(connection);
+    this.#markProductionConnectionReady(connection);
+    this.#drainProductionEvents();
   }
 
-  #drainProductionEvents(connection: ConnectionState): void {
+  /**
+   * Admit one event per ready connection turn. The single daemon-wide counter is the configured
+   * validation/callback ceiling across every verified socket, while the ready FIFO prevents a busy
+   * connection from starving peers. Each connection's events are still shifted and appended to its
+   * own productionCommit chain in original frame order.
+   */
+  #drainProductionEvents(): void {
     while (
-      connection.productionEventsActive < this.#maxConcurrentProductionEvents &&
-      connection.productionEventQueue.length > 0 &&
-      this.#connections.has(connection) &&
-      !connection.socket.destroyed &&
+      this.#productionEventsActive < this.#maxConcurrentProductionEvents &&
+      this.#productionReadyConnections.length > 0 &&
       !this.#stopping
     ) {
+      const connection = this.#productionReadyConnections.shift()!;
+      if (!this.#productionReadySet.delete(connection)) continue;
+      if (
+        connection.productionEventQueue.length === 0 ||
+        !this.#connections.has(connection) ||
+        connection.socket.destroyed
+      ) continue;
       const event = connection.productionEventQueue.shift()!;
+      // Rejoin at the tail before admission so another already-ready connection gets the next
+      // permit. The Set prevents an enqueue/release race from duplicating a connection in the FIFO.
+      this.#markProductionConnectionReady(connection);
       if (process.hrtime.bigint() >= event.deadlineNs) {
         this.#expireProductionEvent(connection);
-        return;
+        continue;
       }
+      const permit = this.#acquireProductionEventPermit(connection, event.deadlineNs);
       connection.productionEventsActive += 1;
+      this.#productionEventsActive += 1;
       void this.#processProductionEvent(connection, event)
         .catch(() => {
           this.#onError('delivery_event_failed');
         })
         .finally(() => {
-          connection.productionEventsActive -= 1;
-          this.#drainProductionEvents(connection);
+          this.#releaseProductionEventPermit(permit);
         });
+    }
+  }
+
+  #markProductionConnectionReady(connection: ConnectionState): void {
+    if (
+      this.#stopping ||
+      connection.productionEventQueue.length === 0 ||
+      !this.#connections.has(connection) ||
+      connection.socket.destroyed ||
+      this.#productionReadySet.has(connection)
+    ) return;
+    this.#productionReadySet.add(connection);
+    this.#productionReadyConnections.push(connection);
+  }
+
+  #removeProductionConnectionReady(connection: ConnectionState): void {
+    if (!this.#productionReadySet.delete(connection)) return;
+    const index = this.#productionReadyConnections.indexOf(connection);
+    if (index >= 0) this.#productionReadyConnections.splice(index, 1);
+  }
+
+  #acquireProductionEventPermit(
+    connection: ConnectionState,
+    deadlineNs: bigint,
+  ): ProductionEventPermit {
+    const permit: ProductionEventPermit = {
+      connection,
+      deadlineNs,
+      timer: null,
+      released: false,
+    };
+    connection.productionEventPermits.add(permit);
+    const expireAtOriginalDeadline = (): void => {
+      if (permit.released) return;
+      const remainingMs = remainingDeadlineMs(deadlineNs);
+      if (remainingMs > 0) {
+        permit.timer = setTimeout(expireAtOriginalDeadline, remainingMs);
+        permit.timer.unref?.();
+        return;
+      }
+      // This also returns every other permit owned by the failed connection. Any validation that
+      // ignores cancellation may settle later, but the destroyed socket/token fence makes it
+      // zero-effect and its finally observes this permit as already released.
+      this.#expireProductionEvent(connection);
+    };
+    permit.timer = setTimeout(expireAtOriginalDeadline, remainingDeadlineMs(deadlineNs));
+    permit.timer.unref?.();
+    return permit;
+  }
+
+  #releaseProductionEventPermit(permit: ProductionEventPermit): void {
+    if (permit.released) return;
+    permit.released = true;
+    if (permit.timer !== null) {
+      clearTimeout(permit.timer);
+      permit.timer = null;
+    }
+    const connection = permit.connection;
+    if (!connection.productionEventPermits.delete(permit)) return;
+    connection.productionEventsActive -= 1;
+    this.#productionEventsActive -= 1;
+    this.#markProductionConnectionReady(connection);
+    this.#drainProductionEvents();
+  }
+
+  #retireProductionConnection(connection: ConnectionState): void {
+    connection.productionEventQueue.length = 0;
+    this.#removeProductionConnectionReady(connection);
+    connection.productionAbort.abort();
+    for (const permit of [...connection.productionEventPermits]) {
+      this.#releaseProductionEventPermit(permit);
     }
   }
 
@@ -933,17 +1039,20 @@ export class ChannelPipeServer {
       const advanceCallbackBoundary = (): void => {
         if (callbackBoundaryAdvanced) return;
         callbackBoundaryAdvanced = true;
-        // Attempted is a historical transport-write fact and emits no daemon ACK. It neither
-        // suppresses replay nor asserts current application authority, so it cannot invalidate a
-        // concurrently started receipt authority read. A receipt callback is the authority/ACK
-        // boundary: every later receipt must have a read that began after that boundary.
+        // Attempted is a historical transport-write fact. Its current-Run listRuns validation is
+        // non-authorizing: it emits no daemon ACK, advances no application/production authority
+        // revision, consumes no token, and suppresses no retry/replay. A receipt callback is the
+        // authority/ACK boundary: every later event must have a read that began after it.
         if (event.message.type === 'receipt') connection.productionCommitRevision += 1;
       };
       try {
+        // Production handlers are synchronous durable transactions, but TypeScript/JavaScript can
+        // still supply a thenable to a void callback. Assimilate it so rejection, expiry, and permit
+        // cleanup stay on this ordered boundary and no receipt ACK can outrun callback settlement.
         if (event.message.type === 'attempted') {
-          this.#productionHandlers?.attempted(token, commitFence);
+          await this.#productionHandlers?.attempted(token, commitFence);
         } else {
-          this.#productionHandlers?.receipted(token, commitFence);
+          await this.#productionHandlers?.receipted(token, commitFence);
         }
       } catch {
         advanceCallbackBoundary();
@@ -971,10 +1080,13 @@ export class ChannelPipeServer {
   }
 
   #expireProductionEvent(connection: ConnectionState): void {
-    if (connection.socket.destroyed) return;
-    connection.productionEventQueue.length = 0;
-    this.#onError('delivery_event_expired');
-    connection.socket.destroy();
+    if (!connection.socket.destroyed) {
+      this.#onError('delivery_event_expired');
+      connection.socket.destroy();
+    }
+    // Do not wait for the close event: a route runner may ignore cancellation. Reclaim all of this
+    // connection's global permits now, with idempotent late finally/close cleanup.
+    this.#retireProductionConnection(connection);
   }
 
   #receiptCommitWritable(connection: ConnectionState): boolean {
@@ -1035,7 +1147,10 @@ export class ChannelPipeServer {
     timer.unref?.();
     let selected: ChannelRouteSelection;
     try {
-      selected = await this.#selectProductionRoute(token.runId, deadline.signal);
+      selected = await this.#selectProductionRoute(
+        token.runId,
+        combinedSignal(deadline.signal, connection.productionAbort.signal),
+      );
     } finally {
       clearTimeout(timer);
     }

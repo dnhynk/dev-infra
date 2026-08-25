@@ -141,6 +141,91 @@ class HeldRouteOrca implements OrcaRunner {
   }
 }
 
+type GlobalRouteBinding = {
+  readonly runId: string;
+  readonly gateId: string;
+  readonly identity: ChannelAdapterIdentity;
+};
+
+type GlobalHeldRouteRead = {
+  readonly index: number;
+  release(): void;
+  reject(): void;
+};
+
+/**
+ * Multi-binding authority fixture whose held reads deliberately ignore AbortSignal. This exposes
+ * daemon-global admission directly and lets close/deadline/shutdown retire server work before a
+ * stale injected dependency settles.
+ */
+class GlobalAdmissionOrca implements OrcaRunner {
+  hold = false;
+  calls = 0;
+  active = 0;
+  maxActive = 0;
+  readonly held: GlobalHeldRouteRead[] = [];
+
+  constructor(readonly bindings: readonly GlobalRouteBinding[]) {}
+
+  run(args: readonly string[], _options: OrcaRunOptions = {}): Promise<string> {
+    this.calls += 1;
+    if (args.join(' ') !== 'orchestration run-list --json') {
+      return Promise.reject(new Error('unexpected global-admission command'));
+    }
+    const response = JSON.stringify({
+      id: 'fake',
+      ok: true,
+      result: {
+        runs: this.bindings.map((binding) => ({
+          id: binding.runId,
+          objective: 'global admission test',
+          coordinator_handle: binding.identity.terminalHandle,
+          coordinator_pane_key: binding.identity.paneKey,
+          consumer_generation: 1,
+          legacy: false,
+          created_at: '2026-08-25T00:00:00.000Z',
+          updated_at: '2026-08-25T00:00:00.000Z',
+        })),
+      },
+    });
+    if (!this.hold) return Promise.resolve(response);
+
+    const index = this.held.length;
+    this.active += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const finish = (result: 'release' | 'reject'): void => {
+        if (settled) return;
+        settled = true;
+        this.active -= 1;
+        if (result === 'release') resolve(response);
+        else reject(new Error('controlled global-admission read failure'));
+      };
+      this.held.push({
+        index,
+        release: () => finish('release'),
+        reject: () => finish('reject'),
+      });
+    });
+  }
+}
+
+function globalBindings(count: number, offset = 0): readonly GlobalRouteBinding[] {
+  return Array.from({ length: count }, (_, localIndex) => {
+    const index = offset + localIndex + 1;
+    return {
+      runId: `run_global${index}`,
+      gateId: `gate_${String(index).padStart(12, '0')}`,
+      identity: {
+        sessionId: randomUUID(),
+        terminalHandle: `term_global-${index}`,
+        paneKey: `global-${index}:pane-${index}`,
+      },
+    };
+  });
+}
+
 class AbortAwareNeverSettlingOrca implements OrcaRunner {
   calls = 0;
   active = 0;
@@ -187,7 +272,10 @@ async function waitFor(check: () => boolean, timeoutMs = 3_000): Promise<void> {
   }
 }
 
-async function rawAdapter(path: string): Promise<{
+async function rawAdapter(
+  path: string,
+  adapterIdentity: ChannelAdapterIdentity = identity(),
+): Promise<{
   readonly socket: Socket;
   readonly messages: DaemonToAdapterMessage[];
 }> {
@@ -204,14 +292,59 @@ async function rawAdapter(path: string): Promise<{
   socket.write(encodeChannelFrame({
     version: CHANNEL_PROTOCOL_VERSION,
     type: 'hello',
-    session_id: randomUUID(),
-    terminal_handle: TERMINAL,
-    pane_key: PANE,
+    session_id: adapterIdentity.sessionId,
+    terminal_handle: adapterIdentity.terminalHandle,
+    pane_key: adapterIdentity.paneKey,
     instance_id: `adapter_${randomUUID()}`,
     connection_id: `connection_${randomUUID()}`,
   }));
   await waitFor(() => messages.some((message) => message.type === 'notify'));
   return { socket, messages };
+}
+
+type RawAdapterConnection = Awaited<ReturnType<typeof rawAdapter>>;
+
+function rawProbe(raw: RawAdapterConnection): Extract<DaemonToAdapterMessage, { type: 'notify' }> {
+  const probe = raw.messages.find((message) => message.type === 'notify');
+  if (probe === undefined) throw new Error('raw adapter probe missing');
+  return probe;
+}
+
+function rawAttemptedFrame(raw: RawAdapterConnection, gateId: string): Buffer {
+  return encodeChannelFrame({
+    version: CHANNEL_PROTOCOL_VERSION,
+    type: 'attempted',
+    connection_epoch: rawProbe(raw).connection_epoch,
+    gate_id: gateId,
+  });
+}
+
+function rawReceiptFrame(raw: RawAdapterConnection, gateId: string, budgetMs = 5_000): Buffer {
+  return encodeChannelFrame({
+    version: CHANNEL_PROTOCOL_VERSION,
+    type: 'receipt',
+    connection_epoch: rawProbe(raw).connection_epoch,
+    gate_id: gateId,
+    ack_budget_ms: budgetMs,
+    ack_deadline_ns: (process.hrtime.bigint() + BigInt(budgetMs) * 1_000_000n).toString(),
+  });
+}
+
+function receiptAckCount(raw: RawAdapterConnection, gateId: string): number {
+  return raw.messages.filter(
+    (message) => message.type === 'receipt_ack' && message.gate_id === gateId,
+  ).length;
+}
+
+async function openVerifiedRaw(
+  path: string,
+  binding: GlobalRouteBinding,
+): Promise<RawAdapterConnection> {
+  const raw = await rawAdapter(path, binding.identity);
+  const probe = rawProbe(raw);
+  raw.socket.write(rawReceiptFrame(raw, probe.gate_id));
+  await waitFor(() => receiptAckCount(raw, probe.gate_id) === 1);
+  return raw;
 }
 
 const servers: ChannelPipeServer[] = [];
@@ -410,6 +543,474 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       (message) => message.type === 'receipt_ack' && message.gate_id === secondGateId,
     )).toHaveLength(0);
     raw.socket.destroy();
+  });
+
+  it('admits production events through one fair daemon-global FIFO with a hard concurrency cap', async () => {
+    const path = pipePath('production-global-admission-fifo');
+    const bindings = globalBindings(4);
+    const noisyGateIds = [
+      bindings[0]!.gateId,
+      'gate_a00000000001',
+      'gate_a00000000002',
+      'gate_a00000000003',
+    ];
+    const orca = new GlobalAdmissionOrca(bindings);
+    const callbacks: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      maxConcurrentProductionEvents: 2,
+    });
+    servers.push(daemon);
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ gateId }) => callbacks.push(gateId),
+      receipted: () => undefined,
+    });
+    await daemon.start();
+    const raws: RawAdapterConnection[] = [];
+    for (const binding of bindings) raws.push(await openVerifiedRaw(path, binding));
+    expect(daemon.listConnections().filter((connection) => connection.verified)).toHaveLength(4);
+
+    for (const gateId of noisyGateIds) {
+      expect(await daemon.deliverGate(bindings[0]!.runId, gateId)).toMatchObject({
+        kind: 'sent', generation: 1,
+      });
+      await waitFor(() => raws[0]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === gateId,
+      ));
+    }
+    for (let index = 1; index < bindings.length; index += 1) {
+      const binding = bindings[index]!;
+      expect(await daemon.deliverGate(binding.runId, binding.gateId)).toMatchObject({
+        kind: 'sent', generation: 1,
+      });
+      await waitFor(() => raws[index]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === binding.gateId,
+      ));
+    }
+
+    orca.hold = true;
+    raws[0]!.socket.write(rawAttemptedFrame(raws[0]!, noisyGateIds[0]!));
+    await waitFor(() => orca.held.length === 1);
+    raws[0]!.socket.write(rawAttemptedFrame(raws[0]!, noisyGateIds[1]!));
+    await waitFor(() => orca.held.length === 2);
+
+    // B becomes ready while A owns both permits. Only then add A's noisy backlog, followed by C
+    // and D. A fair per-connection FIFO must admit B before either later A event and continue to
+    // rotate C/D ahead of A's final queued event.
+    raws[1]!.socket.write(rawAttemptedFrame(raws[1]!, bindings[1]!.gateId));
+    const bEpoch = rawProbe(raws[1]!).connection_epoch;
+    await waitFor(() => daemon.listConnections().some(
+      (connection) => connection.epoch === bEpoch && connection.attemptedWrites === 1,
+    ));
+    raws[0]!.socket.write(Buffer.concat([
+      rawAttemptedFrame(raws[0]!, noisyGateIds[2]!),
+      rawAttemptedFrame(raws[0]!, noisyGateIds[3]!),
+    ]));
+    const aEpoch = rawProbe(raws[0]!).connection_epoch;
+    await waitFor(() => daemon.listConnections().some(
+      (connection) => connection.epoch === aEpoch && connection.attemptedWrites === 4,
+    ));
+    for (const index of [2, 3]) {
+      const raw = raws[index]!;
+      raw.socket.write(rawAttemptedFrame(raw, bindings[index]!.gateId));
+      const epoch = rawProbe(raw).connection_epoch;
+      await waitFor(() => daemon.listConnections().some(
+        (connection) => connection.epoch === epoch && connection.attemptedWrites === 1,
+      ));
+    }
+    expect(orca.held).toHaveLength(2);
+    expect(orca.active).toBe(2);
+    expect(orca.maxActive).toBe(2);
+    expect(callbacks).toEqual([]);
+
+    orca.held[0]!.release();
+    await waitFor(() => callbacks.length === 1 && orca.held.length === 3);
+    expect(callbacks).toEqual([noisyGateIds[0]]);
+    expect(orca.active).toBe(2);
+    orca.held[2]!.release();
+    await waitFor(() => callbacks.length === 2 && orca.held.length === 4);
+    expect(callbacks).toEqual([noisyGateIds[0], bindings[1]!.gateId]);
+    expect(orca.active).toBe(2);
+
+    orca.held[1]!.release();
+    await waitFor(() => callbacks.length === 3 && orca.held.length === 5);
+    orca.held[3]!.release();
+    await waitFor(() => callbacks.length === 4 && orca.held.length === 6);
+    orca.held[4]!.release();
+    await waitFor(() => callbacks.length === 5 && orca.held.length === 7);
+    orca.held[5]!.release();
+    await waitFor(() => callbacks.length === 6);
+    orca.held[6]!.release();
+    await waitFor(() => callbacks.length === 7);
+    expect(callbacks).toEqual([
+      noisyGateIds[0],
+      bindings[1]!.gateId,
+      noisyGateIds[1],
+      noisyGateIds[2],
+      bindings[2]!.gateId,
+      bindings[3]!.gateId,
+      noisyGateIds[3],
+    ]);
+    expect(orca.active).toBe(0);
+    expect(orca.maxActive).toBe(2);
+    for (const raw of raws) raw.socket.destroy();
+  });
+
+  it('returns a global permit exactly once when a connection closes around a non-abort-aware read', async () => {
+    const path = pipePath('production-global-admission-close');
+    const bindings = globalBindings(3, 10);
+    const orca = new GlobalAdmissionOrca(bindings);
+    const callbacks: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      eventValidationTimeoutMs: 1_000,
+      productionEventDeadlineMs: 2_000,
+      maxConcurrentProductionEvents: 1,
+    });
+    servers.push(daemon);
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: ({ gateId }) => callbacks.push(gateId),
+    });
+    await daemon.start();
+    const raws: RawAdapterConnection[] = [];
+    for (const binding of bindings) raws.push(await openVerifiedRaw(path, binding));
+    for (let index = 0; index < bindings.length; index += 1) {
+      const binding = bindings[index]!;
+      expect(await daemon.deliverGate(binding.runId, binding.gateId)).toMatchObject({ kind: 'sent' });
+      await waitFor(() => raws[index]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === binding.gateId,
+      ));
+    }
+
+    orca.hold = true;
+    raws[0]!.socket.write(rawReceiptFrame(raws[0]!, bindings[0]!.gateId));
+    await waitFor(() => orca.held.length === 1);
+    raws[1]!.socket.write(rawReceiptFrame(raws[1]!, bindings[1]!.gateId));
+    raws[2]!.socket.write(rawReceiptFrame(raws[2]!, bindings[2]!.gateId));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(orca.held).toHaveLength(1);
+
+    const closedEpoch = rawProbe(raws[0]!).connection_epoch;
+    raws[0]!.socket.destroy();
+    await waitFor(() => !daemon.listConnections().some(
+      (connection) => connection.epoch === closedEpoch,
+    ));
+    await waitFor(() => orca.held.length === 2, 300);
+    expect(callbacks).toEqual([]);
+
+    // The retired injected read may settle later, but it cannot invoke durable state or return the
+    // already-reclaimed permit a second time while connection 2 still owns the only slot.
+    orca.held[0]!.release();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(orca.held).toHaveLength(2);
+    expect(callbacks).toEqual([]);
+    expect(receiptAckCount(raws[0]!, bindings[0]!.gateId)).toBe(0);
+
+    orca.held[1]!.release();
+    await waitFor(() => callbacks.length === 1 && orca.held.length === 3);
+    await waitFor(() => receiptAckCount(raws[1]!, bindings[1]!.gateId) === 1);
+    expect(callbacks).toEqual([bindings[1]!.gateId]);
+    orca.held[2]!.release();
+    await waitFor(() => callbacks.length === 2);
+    await waitFor(() => receiptAckCount(raws[2]!, bindings[2]!.gateId) === 1);
+    expect(callbacks).toEqual([bindings[1]!.gateId, bindings[2]!.gateId]);
+    raws[1]!.socket.destroy();
+    raws[2]!.socket.destroy();
+  });
+
+  it('reclaims a timed-out global permit while a non-abort-aware read settles harmlessly late', async () => {
+    const path = pipePath('production-global-admission-timeout');
+    const bindings = globalBindings(3, 20);
+    const orca = new GlobalAdmissionOrca(bindings);
+    const errors: string[] = [];
+    const callbacks: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      eventValidationTimeoutMs: 100,
+      productionEventDeadlineMs: 500,
+      maxConcurrentProductionEvents: 1,
+      onError: (code) => errors.push(code),
+    });
+    servers.push(daemon);
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: ({ gateId }) => callbacks.push(gateId),
+    });
+    await daemon.start();
+    const raws: RawAdapterConnection[] = [];
+    for (const binding of bindings) raws.push(await openVerifiedRaw(path, binding));
+    for (let index = 0; index < bindings.length; index += 1) {
+      const binding = bindings[index]!;
+      expect(await daemon.deliverGate(binding.runId, binding.gateId)).toMatchObject({ kind: 'sent' });
+      await waitFor(() => raws[index]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === binding.gateId,
+      ));
+    }
+
+    orca.hold = true;
+    raws[0]!.socket.write(rawReceiptFrame(raws[0]!, bindings[0]!.gateId, 500));
+    await waitFor(() => orca.held.length === 1);
+    raws[1]!.socket.write(rawReceiptFrame(raws[1]!, bindings[1]!.gateId, 500));
+    raws[2]!.socket.write(rawReceiptFrame(raws[2]!, bindings[2]!.gateId, 500));
+    await waitFor(() => orca.held.length === 2, 300);
+    expect(errors).toContain('run_read_failed');
+    expect(callbacks).toEqual([]);
+    expect(receiptAckCount(raws[0]!, bindings[0]!.gateId)).toBe(0);
+
+    orca.held[0]!.release();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(orca.held).toHaveLength(2);
+    expect(callbacks).toEqual([]);
+    orca.held[1]!.release();
+    await waitFor(() => callbacks.length === 1 && orca.held.length === 3);
+    await waitFor(() => receiptAckCount(raws[1]!, bindings[1]!.gateId) === 1);
+    expect(callbacks).toEqual([bindings[1]!.gateId]);
+    orca.held[2]!.release();
+    await waitFor(() => callbacks.length === 2);
+    await waitFor(() => receiptAckCount(raws[2]!, bindings[2]!.gateId) === 1);
+    expect(callbacks).toEqual([bindings[1]!.gateId, bindings[2]!.gateId]);
+    for (const raw of raws) raw.socket.destroy();
+  });
+
+  it('expires a queued receipt from its original receive-time deadline before any route read', async () => {
+    const path = pipePath('production-global-queued-original-deadline');
+    const bindings = globalBindings(2, 60);
+    const orca = new GlobalAdmissionOrca(bindings);
+    const errors: string[] = [];
+    const callbacks: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      eventValidationTimeoutMs: 400,
+      productionEventDeadlineMs: 500,
+      maxConcurrentProductionEvents: 1,
+      onError: (code) => errors.push(code),
+    });
+    servers.push(daemon);
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: ({ gateId }) => callbacks.push(gateId),
+    });
+    await daemon.start();
+    const raws = [
+      await openVerifiedRaw(path, bindings[0]!),
+      await openVerifiedRaw(path, bindings[1]!),
+    ];
+    for (let index = 0; index < bindings.length; index += 1) {
+      const binding = bindings[index]!;
+      expect(await daemon.deliverGate(binding.runId, binding.gateId)).toMatchObject({ kind: 'sent' });
+      await waitFor(() => raws[index]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === binding.gateId,
+      ));
+    }
+
+    orca.hold = true;
+    raws[0]!.socket.write(rawReceiptFrame(raws[0]!, bindings[0]!.gateId, 500));
+    await waitFor(() => orca.held.length === 1);
+    const readsWithAHeld = orca.calls;
+
+    // The attempted marker is only an observable inbound fence: once its counter advances, B's
+    // preceding short-budget receipt is definitely in the global queue behind A's sole permit.
+    raws[1]!.socket.write(Buffer.concat([
+      rawReceiptFrame(raws[1]!, bindings[1]!.gateId, 40),
+      rawAttemptedFrame(raws[1]!, bindings[1]!.gateId),
+    ]));
+    const bEpoch = rawProbe(raws[1]!).connection_epoch;
+    await waitFor(() => daemon.listConnections().some(
+      (connection) => connection.epoch === bEpoch && connection.attemptedWrites === 1,
+    ));
+    expect(orca.held).toHaveLength(1);
+    expect(orca.calls).toBe(readsWithAHeld);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(orca.calls).toBe(readsWithAHeld);
+    expect(callbacks).toEqual([]);
+    expect(receiptAckCount(raws[1]!, bindings[1]!.gateId)).toBe(0);
+
+    orca.held[0]!.release();
+    await waitFor(() => callbacks.length === 1);
+    await waitFor(() => receiptAckCount(raws[0]!, bindings[0]!.gateId) === 1);
+    await waitFor(() => !daemon.listConnections().some(
+      (connection) => connection.epoch === bEpoch,
+    ));
+    expect(errors).toContain('delivery_event_expired');
+    expect(callbacks).toEqual([bindings[0]!.gateId]);
+    expect(orca.calls).toBe(readsWithAHeld);
+    expect(receiptAckCount(raws[1]!, bindings[1]!.gateId)).toBe(0);
+    expect(orca.held).toHaveLength(1);
+    for (const raw of raws) raw.socket.destroy();
+  });
+
+  it('returns global permits after callback throw/reject and an Orca read rejection', async () => {
+    const path = pipePath('production-global-admission-failures');
+    const bindings = globalBindings(4, 30);
+    const orca = new GlobalAdmissionOrca(bindings);
+    const errors: string[] = [];
+    const handlerCalls: string[] = [];
+    const durableCallbacks: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      eventValidationTimeoutMs: 1_000,
+      productionEventDeadlineMs: 2_000,
+      maxConcurrentProductionEvents: 1,
+      onError: (code) => errors.push(code),
+    });
+    servers.push(daemon);
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: ({ gateId }) => {
+        handlerCalls.push(gateId);
+        if (gateId === bindings[0]!.gateId) throw new Error('controlled durable failure');
+        if (gateId === bindings[1]!.gateId) {
+          return Promise.reject(new Error('controlled async durable failure'));
+        }
+        durableCallbacks.push(gateId);
+      },
+    });
+    await daemon.start();
+    const raws: RawAdapterConnection[] = [];
+    for (const binding of bindings) raws.push(await openVerifiedRaw(path, binding));
+    for (let index = 0; index < bindings.length; index += 1) {
+      const binding = bindings[index]!;
+      expect(await daemon.deliverGate(binding.runId, binding.gateId)).toMatchObject({ kind: 'sent' });
+      await waitFor(() => raws[index]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === binding.gateId,
+      ));
+    }
+
+    orca.hold = true;
+    raws[0]!.socket.write(rawReceiptFrame(raws[0]!, bindings[0]!.gateId));
+    await waitFor(() => orca.held.length === 1);
+    raws[1]!.socket.write(rawReceiptFrame(raws[1]!, bindings[1]!.gateId));
+    raws[2]!.socket.write(rawReceiptFrame(raws[2]!, bindings[2]!.gateId));
+    raws[3]!.socket.write(rawReceiptFrame(raws[3]!, bindings[3]!.gateId));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(orca.held).toHaveLength(1);
+
+    orca.held[0]!.release();
+    await waitFor(() => handlerCalls.length === 1 && orca.held.length === 2);
+    expect(handlerCalls).toEqual([bindings[0]!.gateId]);
+    expect(durableCallbacks).toEqual([]);
+    expect(errors).toContain('delivery_event_failed');
+    expect(receiptAckCount(raws[0]!, bindings[0]!.gateId)).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(orca.held).toHaveLength(2);
+
+    orca.held[1]!.release();
+    await waitFor(() => handlerCalls.length === 2 && orca.held.length === 3);
+    expect(errors.filter((code) => code === 'delivery_event_failed')).toHaveLength(2);
+    expect(receiptAckCount(raws[1]!, bindings[1]!.gateId)).toBe(0);
+    orca.held[2]!.reject();
+    await waitFor(() => errors.includes('run_read_failed') && orca.held.length === 4);
+    expect(handlerCalls).toEqual([bindings[0]!.gateId, bindings[1]!.gateId]);
+    expect(receiptAckCount(raws[2]!, bindings[2]!.gateId)).toBe(0);
+    orca.held[3]!.release();
+    await waitFor(() => durableCallbacks.length === 1);
+    await waitFor(() => receiptAckCount(raws[3]!, bindings[3]!.gateId) === 1);
+    expect(handlerCalls).toEqual([
+      bindings[0]!.gateId,
+      bindings[1]!.gateId,
+      bindings[3]!.gateId,
+    ]);
+    expect(durableCallbacks).toEqual([bindings[3]!.gateId]);
+    for (const raw of raws) raw.socket.destroy();
+  });
+
+  it('clears global admission on shutdown and fences every stale or queued completion after restart', async () => {
+    const path = pipePath('production-global-admission-shutdown');
+    const bindings = globalBindings(4, 40);
+    const orca = new GlobalAdmissionOrca(bindings);
+    const durableCallbacks: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      eventValidationTimeoutMs: 1_000,
+      productionEventDeadlineMs: 2_000,
+      maxConcurrentProductionEvents: 2,
+    });
+    servers.push(daemon);
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: ({ gateId }) => durableCallbacks.push(gateId),
+    });
+    await daemon.start();
+    const staleRaws: RawAdapterConnection[] = [];
+    for (const binding of bindings.slice(0, 3)) {
+      staleRaws.push(await openVerifiedRaw(path, binding));
+    }
+    for (let index = 0; index < staleRaws.length; index += 1) {
+      const binding = bindings[index]!;
+      expect(await daemon.deliverGate(binding.runId, binding.gateId)).toMatchObject({ kind: 'sent' });
+      await waitFor(() => staleRaws[index]!.messages.some(
+        (message) => message.type === 'notify' && message.gate_id === binding.gateId,
+      ));
+    }
+
+    orca.hold = true;
+    staleRaws[0]!.socket.write(rawReceiptFrame(staleRaws[0]!, bindings[0]!.gateId));
+    await waitFor(() => orca.held.length === 1);
+    staleRaws[1]!.socket.write(rawReceiptFrame(staleRaws[1]!, bindings[1]!.gateId));
+    await waitFor(() => orca.held.length === 2);
+    staleRaws[2]!.socket.write(rawReceiptFrame(staleRaws[2]!, bindings[2]!.gateId));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(orca.held).toHaveLength(2);
+
+    await daemon.stop();
+    expect(daemon.getResourceSnapshot()).toMatchObject({ listening: false, sockets: 0 });
+    expect(durableCallbacks).toEqual([]);
+    for (let index = 0; index < staleRaws.length; index += 1) {
+      expect(receiptAckCount(staleRaws[index]!, bindings[index]!.gateId)).toBe(0);
+    }
+
+    orca.held[0]!.release();
+    orca.held[1]!.release();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(orca.held).toHaveLength(2);
+    expect(durableCallbacks).toEqual([]);
+    for (let index = 0; index < staleRaws.length; index += 1) {
+      expect(receiptAckCount(staleRaws[index]!, bindings[index]!.gateId)).toBe(0);
+    }
+
+    // Restarting creates a new admission epoch with all permits available; no stale release or
+    // discarded queued event can consume them or cross into the new durable callback stream.
+    orca.hold = false;
+    await daemon.start();
+    const currentBinding = bindings[3]!;
+    const currentRaw = await openVerifiedRaw(path, currentBinding);
+    expect(await daemon.deliverGate(currentBinding.runId, currentBinding.gateId)).toMatchObject({
+      kind: 'sent', generation: 1,
+    });
+    await waitFor(() => currentRaw.messages.some(
+      (message) => message.type === 'notify' && message.gate_id === currentBinding.gateId,
+    ));
+    currentRaw.socket.write(rawReceiptFrame(currentRaw, currentBinding.gateId));
+    await waitFor(() => durableCallbacks.length === 1);
+    await waitFor(() => receiptAckCount(currentRaw, currentBinding.gateId) === 1);
+    expect(durableCallbacks).toEqual([currentBinding.gateId]);
+    currentRaw.socket.destroy();
   });
 
   it('validates a three-Gate slow-route burst concurrently while committing callbacks in wire order', async () => {
