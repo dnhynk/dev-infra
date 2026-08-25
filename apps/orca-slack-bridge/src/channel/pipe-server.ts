@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
+import { performance } from 'node:perf_hooks';
 
 import { listRuns, type OrcaRun, type OrcaRunner } from '../orca/client.js';
 import {
@@ -16,6 +17,8 @@ import {
 
 export const CHANNEL_PIPE_PATH = String.raw`\\.\pipe\orca-slack-bridge-channel-v1`;
 export const DEFAULT_PROBE_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
+const PRODUCTION_RECEIPT_ACK_SAFETY_MS = 50;
+const PRODUCTION_ROUTE_FRESHNESS_MS = 25;
 
 export type ChannelPipeErrorCode =
   | ChannelProtocolErrorCode
@@ -653,7 +656,7 @@ export class ChannelPipeServer {
             break;
           }
           connection.pendingInboundMessages += 1;
-          const receivedAt = Date.now();
+          const receivedAt = performance.now();
           const handled = connection.inbound.then(async () => {
             if (socket.destroyed) return;
             await this.#handleMessage(connection, message, receivedAt);
@@ -771,7 +774,14 @@ export class ChannelPipeServer {
     }
     connection.productionEventQueue.push({
       message,
-      deadlineAt: receivedAt + this.#productionEventDeadlineMs,
+      deadlineAt: receivedAt + (
+        message.type === 'receipt'
+          ? Math.min(
+              this.#productionEventDeadlineMs,
+              Math.max(0, message.ack_budget_ms - PRODUCTION_RECEIPT_ACK_SAFETY_MS),
+            )
+          : this.#productionEventDeadlineMs
+      ),
     });
     this.#drainProductionEvents(connection);
   }
@@ -785,7 +795,7 @@ export class ChannelPipeServer {
       !this.#stopping
     ) {
       const event = connection.productionEventQueue.shift()!;
-      if (Date.now() >= event.deadlineAt) {
+      if (performance.now() >= event.deadlineAt) {
         this.#expireProductionEvent(connection);
         return;
       }
@@ -805,7 +815,7 @@ export class ChannelPipeServer {
     connection: ConnectionState,
     event: QueuedProductionEvent,
   ): Promise<void> {
-    const remainingMs = event.deadlineAt - Date.now();
+    const remainingMs = event.deadlineAt - performance.now();
     if (remainingMs < 1) {
       this.#expireProductionEvent(connection);
       return;
@@ -817,11 +827,35 @@ export class ChannelPipeServer {
       connection,
       event.message.gate_id,
       Math.min(this.#eventValidationTimeoutMs, remainingMs),
-    );
+    ).then((token) => ({ token, validatedAt: performance.now() }));
     const committed = connection.productionCommit.then(async () => {
-      const token = await validation;
+      let { token, validatedAt } = await validation;
       if (token === null || connection.socket.destroyed || this.#stopping) return;
-      if (Date.now() >= event.deadlineAt) {
+      const waitedForWritable = event.message.type === 'receipt' && connection.writeBlocked;
+      if (
+        event.message.type === 'receipt' &&
+        !await this.#waitForWritable(connection, event.deadlineAt)
+      ) {
+        this.#expireProductionEvent(connection);
+        return;
+      }
+      if (
+        waitedForWritable ||
+        performance.now() - validatedAt > PRODUCTION_ROUTE_FRESHNESS_MS
+      ) {
+        const refreshBudgetMs = event.deadlineAt - performance.now();
+        if (refreshBudgetMs < 1) {
+          this.#expireProductionEvent(connection);
+          return;
+        }
+        token = await this.#validateProductionEvent(
+          connection,
+          event.message.gate_id,
+          Math.min(this.#eventValidationTimeoutMs, refreshBudgetMs),
+        );
+        if (token === null || connection.socket.destroyed || this.#stopping) return;
+      }
+      if (performance.now() >= event.deadlineAt) {
         this.#expireProductionEvent(connection);
         return;
       }
@@ -834,11 +868,12 @@ export class ChannelPipeServer {
         return;
       }
       if (event.message.type === 'receipt') {
-        if (Date.now() >= event.deadlineAt || connection.writeBlocked) {
+        const ackBudgetMs = Math.floor(event.deadlineAt - performance.now());
+        if (ackBudgetMs < 1 || connection.writeBlocked) {
           this.#expireProductionEvent(connection);
           return;
         }
-        this.#ackReceipt(connection, event.message.gate_id);
+        this.#ackReceipt(connection, event.message.gate_id, ackBudgetMs);
       }
     });
     connection.productionCommit = committed.catch(() => undefined);
@@ -850,6 +885,34 @@ export class ChannelPipeServer {
     connection.productionEventQueue.length = 0;
     this.#onError('delivery_event_expired');
     connection.socket.destroy();
+  }
+
+  async #waitForWritable(connection: ConnectionState, deadlineAt: number): Promise<boolean> {
+    if (!connection.writeBlocked) return !connection.socket.destroyed;
+    const remainingMs = Math.floor(deadlineAt - performance.now());
+    if (remainingMs < 1 || connection.socket.destroyed || this.#stopping) return false;
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (writable: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        connection.socket.off('drain', drained);
+        connection.socket.off('close', closed);
+        resolve(writable);
+      };
+      const drained = (): void => finish(
+        !connection.socket.destroyed &&
+        !this.#stopping &&
+        !connection.writeBlocked &&
+        performance.now() < deadlineAt,
+      );
+      const closed = (): void => finish(false);
+      const timer = setTimeout(() => finish(false), remainingMs);
+      timer.unref?.();
+      connection.socket.once('drain', drained);
+      connection.socket.once('close', closed);
+    });
   }
 
   async #validateProductionEvent(
@@ -888,8 +951,12 @@ export class ChannelPipeServer {
     return null;
   }
 
-  #ackReceipt(connection: ConnectionState, gateId: string): void {
+  #ackReceipt(connection: ConnectionState, gateId: string, ackBudgetMs?: number): void {
     if (connection.writeBlocked) {
+      if (ackBudgetMs !== undefined) {
+        this.#expireProductionEvent(connection);
+        return;
+      }
       connection.pendingReceiptAcks.add(gateId);
       return;
     }
@@ -899,7 +966,7 @@ export class ChannelPipeServer {
       type: 'receipt_ack',
       connection_epoch: connection.epoch!,
       gate_id: gateId,
-    });
+    }, ackBudgetMs);
   }
 
   #writeProbe(connection: ConnectionState): void {
@@ -980,17 +1047,24 @@ export class ChannelPipeServer {
     else this.#scheduleProbe(connection);
   }
 
-  #write(connection: ConnectionState, message: Parameters<typeof encodeChannelFrame>[0]): boolean {
+  #write(
+    connection: ConnectionState,
+    message: Parameters<typeof encodeChannelFrame>[0],
+    blockTimeoutMs?: number,
+  ): boolean {
     if (connection.writeBlocked || connection.socket.destroyed) return false;
     try {
       const accepted = this.#writeFrame(connection.socket, encodeChannelFrame(message));
       if (!accepted) {
         connection.writeBlocked = true;
         this.#clearTimer(connection);
+        const timeoutMs = blockTimeoutMs === undefined
+          ? this.#writeTimeoutMs
+          : Math.max(1, Math.min(this.#writeTimeoutMs, Math.floor(blockTimeoutMs)));
         connection.timer = setTimeout(() => {
           connection.timer = null;
           this.#rejectConnection(connection, 'write_timeout');
-        }, this.#writeTimeoutMs);
+        }, timeoutMs);
         connection.timer.unref?.();
       }
       return accepted;

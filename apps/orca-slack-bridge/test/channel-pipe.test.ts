@@ -3,7 +3,7 @@ import { createConnection, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ChannelAdapterClient,
@@ -337,6 +337,241 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     expect(daemon.listConnections()[0]?.verified).toBe(true);
   });
 
+  it('pauses multi-Gate MCP notifications behind an attempted-frame drain without losing callbacks', async () => {
+    const path = pipePath('production-attempted-drain');
+    const daemon = server(path);
+    const attempted: string[] = [];
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ gateId }) => attempted.push(gateId),
+      receipted: () => undefined,
+    });
+    await daemon.start();
+
+    const gates = [
+      'gate_444444444444',
+      'gate_555555555555',
+      'gate_666666666666',
+    ];
+    const writes: string[] = [];
+    const adapterErrors: string[] = [];
+    let blockedSocket: Socket | null = null;
+    let client!: ChannelAdapterClient;
+    client = new ChannelAdapterClient({
+      identity: identity(),
+      notificationWriter: {
+        notifyGate: async (gateId) => {
+          if (!gates.includes(gateId)) {
+            await client.reportReceipt(gateId);
+            return;
+          }
+          writes.push(gateId);
+        },
+      },
+      pipePath: path,
+      reconnectDelaysMs: [10],
+      receiptAckTimeoutMs: 1_000,
+      writeTimeoutMs: 1_000,
+      shutdownTimeoutMs: 500,
+      onError: (code) => adapterErrors.push(code),
+      writeFrame: (socket, frame) => {
+        socket.write(frame);
+        if (
+          blockedSocket === null &&
+          frame.includes(Buffer.from('"type":"attempted"')) &&
+          frame.includes(Buffer.from(`"gate_id":"${gates[0]}"`))
+        ) {
+          blockedSocket = socket;
+          return false;
+        }
+        return true;
+      },
+    });
+    adapters.push(client);
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    for (const gateId of gates) {
+      expect(await daemon.deliverGate(RUN_ID, gateId)).toMatchObject({ kind: 'sent' });
+    }
+    await waitFor(() => attempted.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(writes).toEqual([gates[0]]);
+    expect(attempted).toEqual([gates[0]]);
+    expect(client.getResourceSnapshot().writeTimer).toBe(1);
+
+    (blockedSocket as Socket | null)?.emit('drain');
+    await waitFor(() => attempted.length === gates.length);
+    expect(writes).toEqual(gates);
+    expect(attempted).toEqual(gates);
+    expect(adapterErrors).not.toContain('write_timeout');
+  });
+
+  it('carries queued receipt budget through Adapter and daemon drains before durable ACKs', async () => {
+    const path = pipePath('production-receipt-drains');
+    const orca = new FakeOrca();
+    const daemonErrors: string[] = [];
+    const adapterErrors: string[] = [];
+    const gates = ['gate_777777777777', 'gate_888888888888'];
+    let daemonBlockedSocket: Socket | null = null;
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      writeTimeoutMs: 1_000,
+      shutdownTimeoutMs: 500,
+      onError: (code) => daemonErrors.push(code),
+      writeFrame: (socket, frame) => {
+        socket.write(frame);
+        if (
+          daemonBlockedSocket === null &&
+          frame.includes(Buffer.from('"type":"receipt_ack"')) &&
+          frame.includes(Buffer.from(`"gate_id":"${gates[0]}"`))
+        ) {
+          daemonBlockedSocket = socket;
+          return false;
+        }
+        return true;
+      },
+    });
+    servers.push(daemon);
+    const attempted: string[] = [];
+    const receipted: string[] = [];
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ gateId }) => attempted.push(gateId),
+      receipted: ({ gateId }) => receipted.push(gateId),
+    });
+    await daemon.start();
+
+    let adapterBlockedSocket: Socket | null = null;
+    const receiptBudgets = new Map<string, number>();
+    let client!: ChannelAdapterClient;
+    client = new ChannelAdapterClient({
+      identity: identity(),
+      notificationWriter: {
+        notifyGate: async (gateId) => {
+          if (!gates.includes(gateId)) await client.reportReceipt(gateId);
+        },
+      },
+      pipePath: path,
+      reconnectDelaysMs: [10],
+      receiptAckTimeoutMs: 1_000,
+      writeTimeoutMs: 1_000,
+      shutdownTimeoutMs: 500,
+      onError: (code) => adapterErrors.push(code),
+      writeFrame: (socket, frame) => {
+        const message = JSON.parse(frame.toString('utf8')) as {
+          readonly type?: unknown;
+          readonly gate_id?: unknown;
+          readonly ack_budget_ms?: unknown;
+        };
+        socket.write(frame);
+        if (
+          message.type === 'receipt' &&
+          typeof message.gate_id === 'string' &&
+          typeof message.ack_budget_ms === 'number' &&
+          gates.includes(message.gate_id)
+        ) {
+          receiptBudgets.set(message.gate_id, message.ack_budget_ms);
+          if (message.gate_id === gates[0] && adapterBlockedSocket === null) {
+            adapterBlockedSocket = socket;
+            return false;
+          }
+        }
+        return true;
+      },
+    });
+    adapters.push(client);
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+    for (const gateId of gates) {
+      expect(await daemon.deliverGate(RUN_ID, gateId)).toMatchObject({ kind: 'sent' });
+    }
+    await waitFor(() => attempted.length === gates.length);
+    const receiptRouteReadStart = orca.calls;
+
+    const firstReceipt = client.reportReceipt(gates[0]!);
+    const secondReceipt = client.reportReceipt(gates[1]!);
+    await waitFor(() => client.getResourceSnapshot().queuedReceipts === 1);
+    await expect(firstReceipt).resolves.toBe('accepted');
+    expect(receipted).toEqual([gates[0]]);
+    expect(daemonBlockedSocket).not.toBeNull();
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    (adapterBlockedSocket as Socket | null)?.emit('drain');
+    await waitFor(() => receiptBudgets.has(gates[1]!));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(receipted).toEqual([gates[0]]);
+
+    (daemonBlockedSocket as Socket | null)?.emit('drain');
+    await expect(secondReceipt).resolves.toBe('accepted');
+    expect(receipted).toEqual(gates);
+    expect(receiptBudgets.get(gates[1]!)).toBeLessThan(receiptBudgets.get(gates[0]!)!);
+    expect(orca.calls - receiptRouteReadStart).toBe(3);
+    expect(daemonErrors).not.toContain('delivery_event_expired');
+    expect(adapterErrors).not.toContain('wrong_receipt_ack');
+  });
+
+  it('expires a saturated receipt queue on monotonic time despite wall-clock rollback', async () => {
+    const path = pipePath('production-monotonic-expiry');
+    const orca = new FakeOrca();
+    const daemonErrors: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      maxConcurrentProductionEvents: 1,
+      productionEventDeadlineMs: 120,
+      eventValidationTimeoutMs: 200,
+      onError: (code) => daemonErrors.push(code),
+    });
+    servers.push(daemon);
+    const gates = ['gate_999999999999', 'gate_aaaaaaaaaaaa'];
+    const attempted: string[] = [];
+    const receipted: string[] = [];
+    daemon.setProductionDeliveryHandlers({
+      attempted: ({ gateId }) => attempted.push(gateId),
+      receipted: ({ gateId }) => receipted.push(gateId),
+    });
+    await daemon.start();
+
+    const adapterErrors: string[] = [];
+    let client!: ChannelAdapterClient;
+    client = adapter(path, {
+      notifyGate: async (gateId) => {
+        if (!gates.includes(gateId)) await client.reportReceipt(gateId);
+      },
+    }, identity(), adapterErrors);
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+    for (const gateId of gates) {
+      expect(await daemon.deliverGate(RUN_ID, gateId)).toMatchObject({ kind: 'sent' });
+    }
+    await waitFor(() => attempted.length === gates.length);
+    orca.delayMs = 80;
+
+    const originalWall = Date.now();
+    let rollbackWall = originalWall;
+    const wallSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      rollbackWall -= 60_000;
+      return rollbackWall;
+    });
+    let results: PromiseSettledResult<'accepted' | 'duplicate'>[];
+    try {
+      results = await Promise.allSettled(gates.map((gateId) => client.reportReceipt(gateId)));
+    } finally {
+      wallSpy.mockRestore();
+    }
+
+    expect(results[0]).toEqual({ status: 'fulfilled', value: 'accepted' });
+    expect(results[1]).toMatchObject({ status: 'rejected' });
+    expect(receipted).toEqual([gates[0]]);
+    expect(adapterErrors).not.toContain('wrong_receipt_ack');
+    expect(daemonErrors).toContain('run_read_failed');
+  });
+
   it('replays an unreceipted production Gate through a newly verified reconnect epoch', async () => {
     const path = pipePath('production-replay');
     const attemptedEpochs: string[] = [];
@@ -475,6 +710,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       type: 'receipt',
       connection_epoch: probe.connection_epoch,
       gate_id: probe.gate_id,
+      ack_budget_ms: 5_000,
     }));
     await waitFor(() => daemon.listConnections()[0]?.verified === true);
 
@@ -488,6 +724,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       type: 'receipt',
       connection_epoch: probe.connection_epoch,
       gate_id: productionGateId,
+      ack_budget_ms: 5_000,
     });
     raw.socket.write(receipt);
     await waitFor(() => errors.includes('delivery_event_failed'));
@@ -611,6 +848,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       type: 'receipt',
       connection_epoch: `epoch_${randomUUID()}`,
       gate_id: staleNotify.gate_id,
+      ack_budget_ms: 5_000,
     }));
     await waitFor(() => errors.includes('stale_epoch'));
     await waitFor(() => daemon.getResourceSnapshot().sockets === 0);
@@ -623,6 +861,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       type: 'receipt',
       connection_epoch: wrongNotify.connection_epoch,
       gate_id: 'gate_deadbeefcafe',
+      ack_budget_ms: 5_000,
     }));
     await waitFor(() => errors.includes('wrong_receipt'));
     await waitFor(() => daemon.getResourceSnapshot().sockets === 0);
@@ -636,12 +875,14 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
         type: 'receipt',
         connection_epoch: `epoch_${randomUUID()}`,
         gate_id: coalescedNotify.gate_id,
+        ack_budget_ms: 5_000,
       }),
       encodeChannelFrame({
         version: CHANNEL_PROTOCOL_VERSION,
         type: 'receipt',
         connection_epoch: coalescedNotify.connection_epoch,
         gate_id: coalescedNotify.gate_id,
+        ack_budget_ms: 5_000,
       }),
     ]));
     await waitFor(() => errors.filter((code) => code === 'stale_epoch').length === 2);
@@ -656,6 +897,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       type: 'receipt',
       connection_epoch: exactNotify.connection_epoch,
       gate_id: exactNotify.gate_id,
+      ack_budget_ms: 5_000,
     });
     exact.socket.write(Buffer.concat([receipt, receipt]));
     await waitFor(() => exact.messages.filter((message) => message.type === 'receipt_ack').length === 2);
@@ -713,6 +955,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       type: 'receipt',
       connection_epoch: staleNotify.connection_epoch,
       gate_id: staleNotify.gate_id,
+      ack_budget_ms: 5_000,
     }));
     await waitFor(() => (
       daemon.listConnections().some((connection) => (

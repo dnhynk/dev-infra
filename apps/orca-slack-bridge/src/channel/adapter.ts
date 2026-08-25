@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
+import { performance } from 'node:perf_hooks';
 
 import {
+  CHANNEL_MAX_RECEIPT_ACK_BUDGET_MS,
   CHANNEL_PROTOCOL_VERSION,
   ChannelNdjsonDecoder,
   ChannelProtocolError,
@@ -79,6 +81,7 @@ type PendingReceipt = {
   readonly resolve: (result: ReceiptResult) => void;
   readonly reject: (error: ChannelAdapterError) => void;
   readonly timer: ReturnType<typeof setTimeout>;
+  readonly deadlineAt: number;
 };
 
 type ActiveConnection = {
@@ -90,6 +93,7 @@ type ActiveConnection = {
   readonly pendingReceipts: Map<string, PendingReceipt>;
   readonly notificationWrites: Set<string>;
   readonly notificationQueue: string[];
+  readonly queuedAttemptedGateIds: string[];
   epoch: string | null;
   probeGateId: string | null;
   writeBlocked: boolean;
@@ -122,16 +126,20 @@ function finiteMs(value: number, code: string): number {
   return Math.trunc(value);
 }
 
-function deferredReceipt(timeoutMs: number): PendingReceipt {
+function deferredReceipt(timeoutMs: number, onTimeout: () => void): PendingReceipt {
   let resolve!: (result: ReceiptResult) => void;
   let reject!: (error: ChannelAdapterError) => void;
   const promise = new Promise<ReceiptResult>((innerResolve, innerReject) => {
     resolve = innerResolve;
     reject = innerReject;
   });
-  const timer = setTimeout(() => reject(new ChannelAdapterError('receipt_timeout')), timeoutMs);
+  const deadlineAt = performance.now() + timeoutMs;
+  const timer = setTimeout(() => {
+    reject(new ChannelAdapterError('receipt_timeout'));
+    onTimeout();
+  }, timeoutMs);
   timer.unref?.();
-  return { promise, resolve, reject, timer };
+  return { promise, resolve, reject, timer, deadlineAt };
 }
 
 /** Reconnecting session-scoped Adapter client. */
@@ -244,7 +252,14 @@ export class ChannelAdapterClient {
     const existing = active.pendingReceipts.get(gateId);
     if (existing !== undefined) return existing.promise;
 
-    const pending = deferredReceipt(this.#receiptAckTimeoutMs);
+    let pending!: PendingReceipt;
+    pending = deferredReceipt(this.#receiptAckTimeoutMs, () => {
+      // Fence a daemon ACK that could otherwise arrive after this promise timed out and be
+      // misclassified as wrong_receipt_ack on an otherwise-current route.
+      if (active.pendingReceipts.get(gateId) === pending && !active.socket.destroyed) {
+        active.socket.destroy();
+      }
+    });
     active.pendingReceipts.set(gateId, pending);
     void pending.promise.finally(() => {
       clearTimeout(pending.timer);
@@ -255,12 +270,7 @@ export class ChannelAdapterClient {
       active.queuedReceiptGateIds.add(gateId);
       return pending.promise;
     }
-    this.#write(active, {
-      version: CHANNEL_PROTOCOL_VERSION,
-      type: 'receipt',
-      connection_epoch: active.epoch,
-      gate_id: gateId,
-    });
+    this.#writeReceipt(active, gateId, pending);
     return pending.promise;
   }
 
@@ -296,6 +306,7 @@ export class ChannelAdapterClient {
       pendingReceipts: new Map(),
       notificationWrites: new Set(),
       notificationQueue: [],
+      queuedAttemptedGateIds: [],
       epoch: null,
       probeGateId: null,
       writeBlocked: false,
@@ -421,6 +432,8 @@ export class ChannelAdapterClient {
       this.#active !== active ||
       active.socket.destroyed ||
       active.epoch === null ||
+      active.writeBlocked ||
+      active.queuedAttemptedGateIds.length > 0 ||
       this.#pendingNotifications.size > 0
     ) return;
     const gateId = active.notificationQueue.shift();
@@ -429,12 +442,15 @@ export class ChannelAdapterClient {
     const epoch = active.epoch;
     const task = this.#notificationWriter.notifyGate(gateId).then(() => {
       if (this.#active !== active || active.epoch !== epoch || active.socket.destroyed) return;
-      this.#write(active, {
-        version: CHANNEL_PROTOCOL_VERSION,
-        type: 'attempted',
-        connection_epoch: epoch,
-        gate_id: gateId,
-      });
+      if (active.writeBlocked) active.queuedAttemptedGateIds.push(gateId);
+      else {
+        this.#write(active, {
+          version: CHANNEL_PROTOCOL_VERSION,
+          type: 'attempted',
+          connection_epoch: epoch,
+          gate_id: gateId,
+        });
+      }
     }).catch(() => {
       this.#onError('mcp_write_failed');
     }).finally(() => {
@@ -444,6 +460,28 @@ export class ChannelAdapterClient {
       if (current !== null) this.#drainNotificationQueue(current);
     });
     this.#pendingNotifications.add(task);
+  }
+
+  #writeReceipt(active: ActiveConnection, gateId: string, pending: PendingReceipt): boolean {
+    if (active.epoch === null || active.writeBlocked || active.socket.destroyed) return false;
+    // Leave a millisecond for the Adapter timer to retire the socket before any at-budget ACK can
+    // be interpreted. The daemon applies the smaller of this remaining budget and its own cap.
+    const remainingMs = Math.min(
+      CHANNEL_MAX_RECEIPT_ACK_BUDGET_MS,
+      Math.floor(pending.deadlineAt - performance.now()) - 1,
+    );
+    if (remainingMs < 1) {
+      pending.reject(new ChannelAdapterError('receipt_timeout'));
+      active.socket.destroy();
+      return false;
+    }
+    return this.#write(active, {
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: active.epoch,
+      gate_id: gateId,
+      ack_budget_ms: remainingMs,
+    });
   }
 
   #write(active: ActiveConnection, message: Parameters<typeof encodeChannelFrame>[0]): boolean {
@@ -474,23 +512,31 @@ export class ChannelAdapterClient {
     active.writeTimer = null;
     active.writeBlocked = false;
     if (active.epoch === null) return;
-    for (const gateId of [...active.queuedReceiptGateIds]) {
-      active.queuedReceiptGateIds.delete(gateId);
-      if (!active.pendingReceipts.has(gateId)) continue;
+    while (active.queuedAttemptedGateIds.length > 0) {
+      const gateId = active.queuedAttemptedGateIds.shift()!;
       this.#write(active, {
         version: CHANNEL_PROTOCOL_VERSION,
-        type: 'receipt',
+        type: 'attempted',
         connection_epoch: active.epoch,
         gate_id: gateId,
       });
+      if (active.writeBlocked || active.socket.destroyed) return;
+    }
+    for (const gateId of [...active.queuedReceiptGateIds]) {
+      active.queuedReceiptGateIds.delete(gateId);
+      const pending = active.pendingReceipts.get(gateId);
+      if (pending === undefined) continue;
+      this.#writeReceipt(active, gateId, pending);
       if (active.writeBlocked || active.socket.destroyed) break;
     }
+    if (!active.writeBlocked && !active.socket.destroyed) this.#drainNotificationQueue(active);
   }
 
   #clearWriteState(active: ActiveConnection): void {
     if (active.writeTimer !== null) clearTimeout(active.writeTimer);
     active.writeTimer = null;
     active.writeBlocked = false;
+    active.queuedAttemptedGateIds.length = 0;
     active.queuedReceiptGateIds.clear();
     active.notificationQueue.length = 0;
   }

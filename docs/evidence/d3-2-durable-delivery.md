@@ -47,8 +47,15 @@ application receipt, Gate effect, and Task resume as separate facts.
 - Receipt ACK is emitted only after the synchronous durable callback succeeds. A callback failure
   deliberately leaves the Adapter receipt retryable.
 - Fresh Run reads for a bounded callback burst run concurrently, then their durable callbacks and
-  ACKs commit on one arrival-ordered chain. Each event has a 4.5-second daemon deadline below the
-  Adapter's production 5-second receipt timeout; expired or blocked events cannot produce a late ACK.
+  ACKs commit on one arrival-ordered chain. Pipe protocol v2 adds only an Adapter-computed relative
+  ACK budget to its internal receipt frame; the external Channel notification and reply-tool input
+  remain strict Gate-ID-only shapes.
+- Adapter receipt deadlines and daemon callback deadlines use monotonic clocks. Queue time is
+  deducted before the Adapter writes a receipt, the daemon caps that remainder below the production
+  5-second timeout with an ACK safety margin, and socket timeout disconnects fence any late ACK.
+- Adapter notification progress pauses behind attempted-frame backpressure and resumes on drain.
+  On the daemon side, receipt processing waits for ACK writability and then refreshes an aged route
+  before the synchronous durable transition, so delayed drain cannot produce state without an ACK.
 - Connection-local sent/notified sets are bounded and discarded on reconnect. Multi-Gate MCP
   notifications are serialized, receipt/ACK backpressure queues are bounded sets, and the daemon
   rejects an over-cap asynchronous inbound queue.
@@ -82,6 +89,11 @@ The focused suites cover:
   wrong Gate receipt, reconnect replay, and generation-takeover stale receipt rejection;
 - three production Gates with six independent 1.7-second fresh route reads, concurrent validation,
   wire-ordered durable callbacks, and all receipt ACKs inside the default Adapter window;
+- multi-Gate attempted-frame backpressure with notification pause/drain resume and no lost callback;
+- two queued receipts across independent Adapter-send and daemon-ACK drains, decreasing transmitted
+  ACK budget, pre-durable wait, post-wait route refresh, ordered durable callbacks, and no late ACK;
+- saturated single-slot receipt validation under repeated wall-clock rollback, proving monotonic
+  expiry prevents the queued callback and ACK before the Adapter timeout;
 - production daemon startup wiring of the new store/runtime callbacks and reconciliation caller.
 
 ## Verification checkpoint
@@ -91,8 +103,8 @@ product write was performed.
 
 | Command | Result |
 |---|---|
-| focused D3-2/D2 recovery suite | pass — 9 files, 160 tests |
-| `pnpm test` | pass — 49 files, 1083 tests |
+| focused D3-2/D2 recovery/protocol suite | pass — 10 files, 170 tests |
+| `pnpm test` | pass — 49 files, 1086 tests |
 | `pnpm typecheck` | pass |
 | app `typecheck` | pass |
 | app `build` | pass |
@@ -111,8 +123,15 @@ v10 legacy baseline could block lazy seed, rollback during lease defer could bac
 and serial callback validation could exceed the aggregate Adapter ACK window. The implementation now
 quarantines only the unprovable legacy row, clamps defer inside its CAS transaction with matching DDL/
 runtime invariants, and parallelizes bounded fresh reads while preserving ordered durable callbacks.
-This new head is held for another independent schema/crash and delivery/routing audit before
-completion.
+That correction became `e8e8324` and was then independently re-audited.
+
+At `e8e8324`, the next schema/crash audit approved with no findings. The delivery/routing audit found
+three further P2 backpressure/deadline cases: attempted frames could be lost while the Adapter was
+blocked, queued receipt time was not transferred into the daemon ACK window, and wall-clock rollback
+could extend a saturated queue. Protocol v2 now carries only the remaining monotonic ACK budget,
+both pipe directions pause/wait on drain before the next irreversible boundary, and Adapter timeout
+disconnect plus daemon safety margin fence late ACKs. The new head is held for fresh independent
+delivery/routing re-audit before completion.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 
