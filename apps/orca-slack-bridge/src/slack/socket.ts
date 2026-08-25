@@ -61,7 +61,8 @@ export class SocketTransportError extends Error {
 }
 
 const DEFAULT_BACKOFF: SocketBackoff = { initialMs: 500, maxMs: 8_000 };
-export const DEFAULT_SOCKET_TIMEOUTS: SocketTimeouts = { startMs: 30_000, closeMs: 5_000 };
+/** SDK v3의 stalled close cleanup 4번째 5s/3 ping tick(~6.7s)에 bounded headroom을 둔다. */
+export const DEFAULT_SOCKET_TIMEOUTS: SocketTimeouts = { startMs: 30_000, closeMs: 10_000 };
 
 export function reconnectDelay(attempt: number, backoff: SocketBackoff = DEFAULT_BACKOFF): number {
   const exponent = Math.max(0, Math.min(30, Math.trunc(attempt) - 1));

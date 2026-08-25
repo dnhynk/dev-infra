@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseConfig, type SlackConfig } from '../src/project/config.js';
 import {
+  DEFAULT_SOCKET_TIMEOUTS,
   SlackSocketTransport,
   SocketTransportError,
   parseSocketLifecycle,
@@ -188,6 +189,54 @@ describe('Socket hello와 명시적 preflight', () => {
       detail: 'Socket Mode 연결 종료 제한 시간을 넘었다',
     });
     expect(JSON.stringify(result)).not.toContain('PRIVATE');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('production close 기본값은 6.7초 clean handshake를 허용한다', async () => {
+    vi.useFakeTimers();
+    const config: SlackConfig = {
+      teamId: 'T01TEAM', ownerUserIds: ['U01OWNER'],
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+    };
+    const connection = new FakeConnection(
+      () => hello(),
+      () => new Promise<void>((resolve) => setTimeout(resolve, 6_700)),
+    );
+    const check = verifySocketPreflight(
+      config,
+      { [APP_TOKEN_VAR]: ['xapp', 'FAKE', 'PRIVATE'].join('-') } as NodeJS.ProcessEnv,
+      factory([connection]),
+    );
+    await flushMicrotasks();
+    expect(connection.closeCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(6_700);
+
+    expect(await check).toMatchObject({ name: 'socket.hello', ok: true });
+    expect(DEFAULT_SOCKET_TIMEOUTS).toEqual({ startMs: 30_000, closeMs: 10_000 });
+    expect(connection.closeCalls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('production close 기본값도 10초에서 멈추고 cleanup을 한 번 재구동한다', async () => {
+    vi.useFakeTimers();
+    const neverClose = deferred<void>();
+    const connection = new FakeConnection(() => hello(), () => neverClose.promise);
+    const transport = new SlackSocketTransport({ connectionFactory: factory([connection]) });
+    await transport.start();
+
+    let outcome: 'pending' | 'fulfilled' | 'rejected' = 'pending';
+    const stopping = transport.shutdown().then(
+      () => { outcome = 'fulfilled'; },
+      () => { outcome = 'rejected'; },
+    );
+    await vi.advanceTimersByTimeAsync(DEFAULT_SOCKET_TIMEOUTS.closeMs - 1);
+    expect(outcome).toBe('pending');
+
+    await vi.advanceTimersByTimeAsync(1);
+    await stopping;
+    expect(outcome).toBe('rejected');
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_timeout' });
+    expect(connection.closeCalls).toBe(2);
     expect(vi.getTimerCount()).toBe(0);
   });
 
