@@ -41,6 +41,8 @@ export type UpdateMessageInput = {
   readonly ts: string;
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /** Cooperative cancellation for bounded, idempotent card projection. Never serialized to Slack. */
+  readonly signal?: AbortSignal;
 };
 
 /**
@@ -97,6 +99,57 @@ export type PostedMessage = {
 export interface SlackPoster {
   post(input: PostMessageInput): Promise<PostedMessage>;
   update(input: UpdateMessageInput): Promise<PostedMessage>;
+}
+
+/** D2 card updates must finish before their 30-second durable projection/write lease expires. */
+export const DEFAULT_SLACK_UPDATE_TIMEOUT_MS = 15_000;
+
+export class SlackUpdateTimeoutError extends Error {
+  constructor() {
+    super('Slack card update deadline exceeded');
+    this.name = 'SlackUpdateTimeoutError';
+  }
+}
+
+/**
+ * Bounds even an injected SlackPoster that never settles and aborts the production fetch path.
+ * A timed-out update is delivery-unknown, so callers keep/re-arm their durable card outbox.
+ */
+export async function boundedSlackUpdate(
+  slack: SlackPoster,
+  input: UpdateMessageInput,
+  timeoutMs = DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+): Promise<PostedMessage> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 10 || timeoutMs > DEFAULT_SLACK_UPDATE_TIMEOUT_MS) {
+    throw new TypeError(
+      `Slack update timeout must be a finite number between 10 and ${DEFAULT_SLACK_UPDATE_TIMEOUT_MS}`,
+    );
+  }
+  const deadline = Math.trunc(timeoutMs);
+  const abort = new AbortController();
+  const signal = input.signal === undefined
+    ? abort.signal
+    : AbortSignal.any([input.signal, abort.signal]);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const operation = Promise.resolve().then(() => slack.update({ ...input, signal }));
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      abort.abort();
+      reject(new SlackUpdateTimeoutError());
+    }, deadline);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } catch (error) {
+    if (timedOut) throw new SlackUpdateTimeoutError();
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    // An injected client may ignore AbortSignal. Drain its eventual rejection without awaiting it.
+    void operation.catch(() => undefined);
+  }
 }
 
 /**
@@ -163,8 +216,29 @@ export type SlackPosterOptions = {
   /** rate limit 재시도 상한. 소진되면 마지막 코드를 그대로 던진다. */
   readonly maxRetries?: number;
   /** 테스트가 실제 대기를 없애기 위해 주입한다. */
-  readonly sleep?: (ms: number) => Promise<void>;
+  readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 };
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new SlackUpdateTimeoutError());
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(new SlackUpdateTimeoutError());
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
 
 /**
  * bot token을 환경변수에서 읽는다.
@@ -201,12 +275,12 @@ type Attempt =
 export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetries: number;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(private readonly options: SlackPosterOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.maxRetries = options.maxRetries ?? 3;
-    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = options.sleep ?? abortableSleep;
   }
 
   /** 처리되지 않았음이 확실한 실패만 재시도한다. 애매한 것을 재시도하면 루트가 는다. */
@@ -229,6 +303,7 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
       'chat.update',
       { channel: input.channel, ts: input.ts, text: input.text, blocks: input.blocks },
       true,
+      input.signal,
     );
   }
 
@@ -267,20 +342,24 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
     method: string,
     body: Record<string, unknown>,
     retryDeliveryUnknown: boolean,
+    signal?: AbortSignal,
   ): Promise<PostedMessage> {
     for (let attempt = 0; ; attempt += 1) {
+      if (signal?.aborted) throw new SlackUpdateTimeoutError();
       let result: Attempt;
       try {
-        result = await this.attempt(method, body);
+        result = await this.attempt(method, body, signal);
       } catch (e) {
+        if (signal?.aborted) throw e;
         if (!retryDeliveryUnknown || attempt >= this.maxRetries) throw e;
         // 이 경로에는 Retry-After가 없다. 서버가 대기 시간을 말하지 않았다는 뜻이다.
-        await this.sleep(DEFAULT_RETRY_AFTER_MS);
+        await this.sleep(DEFAULT_RETRY_AFTER_MS, signal);
         continue;
       }
       if (result.kind === 'ok') return result.message;
       if (attempt >= this.maxRetries) throw new SlackApiError(method, result.code);
-      await this.sleep(result.afterMs);
+      await this.sleep(result.afterMs, signal);
+      if (signal?.aborted) throw new SlackUpdateTimeoutError();
     }
   }
 
@@ -300,7 +379,11 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
   }
 
   /** 한 번 호출한다. 확정 재시도가 아닌 실패는 여기서 던지고, 재시도 여부는 `call`이 정한다. */
-  private async attempt(method: string, body: Record<string, unknown>): Promise<Attempt> {
+  private async attempt(
+    method: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<Attempt> {
     let res: Response;
     try {
       res = await this.fetchImpl(`${SLACK_API}/${method}`, {
@@ -310,6 +393,7 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
           'content-type': 'application/json; charset=utf-8',
         },
         body: JSON.stringify(body),
+        ...(signal === undefined ? {} : { signal }),
       });
     } catch (e) {
       // 응답을 받지 못했다. 게시 여부를 알 수 없다.

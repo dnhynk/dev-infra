@@ -35,23 +35,33 @@ function nonEmptyString(value: unknown, at: string): string {
   return value;
 }
 
+function boundedString(value: unknown, at: string, cap: number): string {
+  const text = nonEmptyString(value, at);
+  if (text.length > cap) throw new TypeError(`${at}이(가) ${cap}자 상한을 넘었다`);
+  return text;
+}
+
 /** Strict option-array parser shared with durable-store reads. */
 export function parseGateOptionMetadataArray(
   value: unknown,
   at = 'gate registration.options',
 ): readonly GateOptionMetadata[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw new TypeError(`${at}이(가) 비어 있지 않은 array가 아니다`);
+  if (!Array.isArray(value) || value.length === 0 || value.length > 25) {
+    throw new TypeError(`${at}이(가) 1..25개 array가 아니다`);
   }
   const options = value.map((raw, index) => {
     const optionAt = `${at}[${index}]`;
     const option = record(raw, optionAt);
     exactKeys(option, ['id', 'label', 'description', 'resolution'], optionAt);
+    const id = boundedString(option['id'], `${optionAt}.id`, 64);
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+      throw new TypeError(`${optionAt}.id가 stable option ID 형식이 아니다`);
+    }
     return {
-      id: nonEmptyString(option['id'], `${optionAt}.id`),
-      label: nonEmptyString(option['label'], `${optionAt}.label`),
-      description: nonEmptyString(option['description'], `${optionAt}.description`),
-      resolution: nonEmptyString(option['resolution'], `${optionAt}.resolution`),
+      id,
+      label: boundedString(option['label'], `${optionAt}.label`, 75),
+      description: boundedString(option['description'], `${optionAt}.description`, 3000),
+      resolution: boundedString(option['resolution'], `${optionAt}.resolution`, 3000),
     };
   });
   const ids = new Set<string>();
@@ -99,21 +109,22 @@ export function parseGateRegistrationDocument(value: unknown): GateRegistrationD
   }
   return {
     schemaVersion: GATE_REGISTRATION_SCHEMA_VERSION,
-    runId: nonEmptyString(root['runId'], 'gate registration.runId'),
-    askMessageId: nonEmptyString(root['askMessageId'], 'gate registration.askMessageId'),
-    questionThreadId: nonEmptyString(
+    runId: boundedString(root['runId'], 'gate registration.runId', 500),
+    askMessageId: boundedString(root['askMessageId'], 'gate registration.askMessageId', 500),
+    questionThreadId: boundedString(
       root['questionThreadId'],
       'gate registration.questionThreadId',
+      500,
     ),
-    dispatchId: nonEmptyString(root['dispatchId'], 'gate registration.dispatchId'),
-    taskId: nonEmptyString(root['taskId'], 'gate registration.taskId'),
-    gateId: nonEmptyString(root['gateId'], 'gate registration.gateId'),
+    dispatchId: boundedString(root['dispatchId'], 'gate registration.dispatchId', 500),
+    taskId: boundedString(root['taskId'], 'gate registration.taskId', 500),
+    gateId: boundedString(root['gateId'], 'gate registration.gateId', 500),
     options,
     recommendation: {
       optionId,
-      reason: nonEmptyString(recommendation['reason'], 'gate registration.recommendation.reason'),
+      reason: boundedString(recommendation['reason'], 'gate registration.recommendation.reason', 3000),
     },
-    impact: nonEmptyString(root['impact'], 'gate registration.impact'),
+    impact: boundedString(root['impact'], 'gate registration.impact', 3000),
   };
 }
 

@@ -9,9 +9,15 @@ import { APP_TOKEN_VAR, appToken, type Check } from './verify.js';
 
 export type SocketRefreshReason = 'warning' | 'refresh_requested';
 export type SocketHello = { readonly appId: string | null };
+export type SocketSlackEvent = {
+  readonly type: string;
+  readonly body: unknown;
+  readonly ack: (response?: unknown) => void | Promise<void>;
+};
 export type SocketConnectionHooks = {
   readonly refresh: (reason: SocketRefreshReason) => void;
   readonly disconnected: () => void;
+  readonly event?: (event: SocketSlackEvent) => void | Promise<void>;
 };
 export interface SocketConnection {
   start(): Promise<SocketHello>;
@@ -28,6 +34,7 @@ export type SlackSocketTransportOptions = {
   readonly backoff?: SocketBackoff;
   readonly timeouts?: Partial<SocketTimeouts>;
   readonly sleep?: Sleep;
+  readonly event?: (event: SocketSlackEvent) => void | Promise<void>;
 };
 
 export type SocketTransportErrorCode =
@@ -248,6 +255,7 @@ export class SlackSocketTransport {
       connection = this.options.connectionFactory({
         refresh: (reason) => ref !== null && this.handleRefresh(ref, reason),
         disconnected: () => ref !== null && this.handleDisconnected(ref),
+        ...(this.options.event === undefined ? {} : { event: this.options.event }),
       });
       ref = connection;
     } catch {
@@ -827,6 +835,19 @@ class IdentitySocketModeClient extends SocketModeClient {
     this.disposeLifecycle();
     hooks?.disconnected();
   };
+  private readonly slackEventListener = (raw: unknown): void => {
+    const event = raw as Partial<SocketSlackEvent>;
+    if (typeof event.type !== 'string' || typeof event.ack !== 'function') return;
+    const handler = this.lifecycleHooks?.event;
+    if (handler === undefined) return;
+    try {
+      void Promise.resolve(
+        handler({ type: event.type, body: event.body, ack: event.ack }),
+      ).catch(() => undefined);
+    } catch {
+      // Event consumers own their bounded audit. Never expose a raw Slack payload through SDK logs.
+    }
+  };
 
   constructor(
     appTokenValue: string,
@@ -844,6 +865,7 @@ class IdentitySocketModeClient extends SocketModeClient {
     });
     this.lifecycleHooks = hooks;
     this.on('disconnected', this.disconnectedListener);
+    this.on('slack_event', this.slackEventListener);
   }
 
   hello(): SocketHello {
@@ -852,6 +874,7 @@ class IdentitySocketModeClient extends SocketModeClient {
 
   disposeLifecycle(): void {
     this.off('disconnected', this.disconnectedListener);
+    this.off('slack_event', this.slackEventListener);
     this.lifecycleHooks = null;
   }
 

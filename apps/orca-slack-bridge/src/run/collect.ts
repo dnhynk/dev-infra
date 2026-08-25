@@ -54,7 +54,7 @@ import type {
 export type CollectOptions = {
   readonly now?: () => Date;
   readonly inboxLimit?: number;
-  /** D2-A sidecar reader. Omitted callers still get action-free missing-metadata Gate cards. */
+  /** Sidecar reader. Omitted callers get fail-closed, action-free missing-metadata Gate cards. */
   readonly gateStore?: GateStore;
 };
 

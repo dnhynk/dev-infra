@@ -9,6 +9,7 @@ import {
   worktreePathFromIncarnation,
 } from './coerce.js';
 import type { FindingFacts } from '../summarize/contract.js';
+import type { GateResolveResult, GateSnapshot } from '../gate/resolution-types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,15 +24,60 @@ export interface OrcaRunner {
   run(args: readonly string[]): Promise<string>;
 }
 
+export type OrcaCliOptions = {
+  /** Kills the child after this deadline. Omit only for non-daemon legacy callers. */
+  readonly timeoutMs?: number;
+};
+
 export class OrcaCli implements OrcaRunner {
-  constructor(private readonly bin: string) {}
+  private readonly timeoutMs: number | undefined;
+
+  constructor(private readonly bin: string, options: OrcaCliOptions = {}) {
+    if (
+      options.timeoutMs !== undefined &&
+      (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 10)
+    ) {
+      throw new TypeError('Orca CLI timeout must be a finite number >= 10');
+    }
+    this.timeoutMs =
+      options.timeoutMs === undefined ? undefined : Math.trunc(options.timeoutMs);
+  }
+
   async run(args: readonly string[]): Promise<string> {
     const { stdout } = await execFileAsync(this.bin, [...args], {
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
+      ...(this.timeoutMs === undefined ? {} : { timeout: this.timeoutMs }),
     });
     return stdout;
   }
+}
+
+/**
+ * Bounds injected runners too, so daemon startup and shutdown cannot depend on a promise that
+ * never settles. The production OrcaCli also receives the same timeout and kills its subprocess;
+ * this outer fence is the JS lifecycle guarantee for every OrcaRunner implementation.
+ */
+export function boundedOrcaRunner(runner: OrcaRunner, timeoutMs: number): OrcaRunner {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 10) {
+    throw new TypeError('Orca runner timeout must be a finite number >= 10');
+  }
+  const deadline = Math.trunc(timeoutMs);
+  return {
+    async run(args: readonly string[]): Promise<string> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          runner.run(args),
+          new Promise<string>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('Orca command deadline exceeded')), deadline);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    },
+  };
 }
 
 async function call<T>(runner: OrcaRunner, args: readonly string[]): Promise<T> {
@@ -402,6 +448,141 @@ export async function listGates(runner: OrcaRunner, runId: string): Promise<Orca
       resolvedAt: resolvedAt === null ? null : parseOrcaTimestamp(resolvedAt),
     };
   });
+}
+
+export type ExactGateIdentity = {
+  readonly gateId: string;
+  readonly runId: string;
+  readonly taskId: string;
+  readonly options: readonly string[];
+};
+
+function exactObjectKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  at: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (actual.length !== wanted.length || actual.some((key, i) => key !== wanted[i])) {
+    throw new TypeError(`${at}의 structured output shape가 어긋난다`);
+  }
+}
+
+function strictGateSnapshot(raw: unknown, identity: ExactGateIdentity, at: string): GateSnapshot {
+  if (!isRecord(raw)) throw new TypeError(`${at}이(가) object가 아니다`);
+  exactObjectKeys(
+    raw,
+    ['id', 'run_id', 'task_id', 'question', 'options', 'status', 'resolution', 'created_at', 'resolved_at'],
+    at,
+  );
+  const id = raw['id'];
+  const runId = raw['run_id'];
+  const taskId = raw['task_id'];
+  const question = raw['question'];
+  if (id !== identity.gateId || runId !== identity.runId || taskId !== identity.taskId) {
+    throw new TypeError(`${at}의 Gate/run/task correlation이 어긋난다`);
+  }
+  if (typeof question !== 'string') throw new TypeError(`${at}.question이 string이 아니다`);
+  if (typeof raw['created_at'] !== 'string') throw new TypeError(`${at}.created_at이 string이 아니다`);
+  parseOrcaTimestamp(raw['created_at']);
+  const options = parseStringArrayField(raw['options'], [], `${at}.options`);
+  if (
+    options.length !== identity.options.length ||
+    !options.every((option, index) => option === identity.options[index])
+  ) {
+    throw new TypeError(`${at}.options가 durable sidecar identity와 어긋난다`);
+  }
+  const status = raw['status'];
+  if (status !== 'pending' && status !== 'resolved') {
+    throw new TypeError(`${at}.status가 pending/resolved가 아니다`);
+  }
+  const resolution = raw['resolution'];
+  const resolvedAt = raw['resolved_at'];
+  if (resolution !== null && typeof resolution !== 'string') {
+    throw new TypeError(`${at}.resolution이 string/null이 아니다`);
+  }
+  if (resolvedAt !== null && typeof resolvedAt !== 'string') {
+    throw new TypeError(`${at}.resolved_at이 string/null이 아니다`);
+  }
+  if (status === 'pending' && (resolution !== null || resolvedAt !== null)) {
+    throw new TypeError(`${at}의 pending 상태와 resolution/resolved_at이 모순된다`);
+  }
+  if (
+    status === 'resolved' &&
+    (typeof resolution !== 'string' || resolution === '' || typeof resolvedAt !== 'string')
+  ) {
+    throw new TypeError(`${at}의 resolved 상태에 resolution/resolved_at이 없다`);
+  }
+  if (typeof resolution === 'string' && resolution.length > 3000) {
+    throw new TypeError(`${at}.resolution이 durable 상한을 넘었다`);
+  }
+  return {
+    gateId: identity.gateId,
+    runId: identity.runId,
+    taskId: identity.taskId,
+    options,
+    status,
+    resolution,
+    resolvedAt: resolvedAt === null ? null : parseOrcaTimestamp(resolvedAt).toISOString(),
+  };
+}
+
+/** Exact pre/post read used by the resolver; it rejects missing, duplicate, and extra Gate rows. */
+export async function readExactGate(
+  runner: OrcaRunner,
+  identity: ExactGateIdentity,
+): Promise<GateSnapshot> {
+  const result = await call<unknown>(runner, [
+    'orchestration', 'gate-list', '--run', identity.runId, '--json',
+  ]);
+  if (!isRecord(result)) throw new TypeError('gate-list result가 object가 아니다');
+  exactObjectKeys(result, ['runId', 'gates', 'count'], 'gate-list result');
+  if (result['runId'] !== identity.runId || !Array.isArray(result['gates'])) {
+    throw new TypeError('gate-list result의 runId/gates가 어긋난다');
+  }
+  if (!Number.isSafeInteger(result['count']) || result['count'] !== result['gates'].length) {
+    throw new TypeError('gate-list result의 count가 gates 길이와 어긋난다');
+  }
+  const matches = result['gates'].filter(
+    (candidate) => isRecord(candidate) && candidate['id'] === identity.gateId,
+  );
+  if (matches.length !== 1) {
+    throw new TypeError(`gate-list result에 ${identity.gateId}가 정확히 한 건이 아니다`);
+  }
+  return strictGateSnapshot(matches[0], identity, 'gate-list Gate');
+}
+
+/** Official mutation boundary with strict Gate and mutation output parsing. */
+export async function resolveExactGate(
+  runner: OrcaRunner,
+  identity: ExactGateIdentity,
+  resolution: string,
+  retryRequestId: string,
+): Promise<GateResolveResult> {
+  const result = await call<unknown>(runner, [
+    'orchestration', 'gate-resolve',
+    '--id', identity.gateId,
+    '--resolution', resolution,
+    '--retry-request', retryRequestId,
+    '--json',
+  ]);
+  if (!isRecord(result)) throw new TypeError('gate-resolve result가 object가 아니다');
+  exactObjectKeys(result, ['gate', 'mutation'], 'gate-resolve result');
+  const mutation = result['mutation'];
+  if (!isRecord(mutation)) throw new TypeError('gate-resolve mutation이 object가 아니다');
+  exactObjectKeys(mutation, ['requestId', 'replayed'], 'gate-resolve mutation');
+  if (mutation['requestId'] !== retryRequestId || typeof mutation['replayed'] !== 'boolean') {
+    throw new TypeError('gate-resolve mutation requestId/replayed가 어긋난다');
+  }
+  const gate = strictGateSnapshot(result['gate'], identity, 'gate-resolve Gate');
+  if (gate.status !== 'resolved' || gate.resolution !== resolution) {
+    throw new TypeError('gate-resolve Gate가 요청한 resolution으로 resolved되지 않았다');
+  }
+  return {
+    gate,
+    mutation: { requestId: retryRequestId, replayed: mutation['replayed'] },
+  };
 }
 
 /**

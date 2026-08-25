@@ -1,15 +1,36 @@
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, posix, win32 } from 'node:path';
 import type { CheckFact } from '../github/pull-request.js';
 import { parseGateOptionMetadataArray } from '../gate/register.js';
 import type { GateMetadata } from '../gate/types.js';
+import { gateActionId, gateBlockId } from '../gate/actions.js';
+import {
+  GATE_AUDIT_LIMIT,
+  GATE_FACT_CAP,
+  type GateCardState,
+  type GateClaimInput,
+  type GateClaimResult,
+  type GateLocalObservation,
+  type GateObservationSaveResult,
+  type GateLeaseResult,
+  type GateProjectionLeaseResult,
+  type GateProgressUpdate,
+  type GateResolutionIntent,
+  type GateResolutionLifecycle,
+  type GateResolutionOutbox,
+  type GateResolveResult,
+  type GateSnapshot,
+} from '../gate/resolution-types.js';
 import { pullRequestNumber } from '../identity/keys.js';
 import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
   ENABLE_WAL,
+  GATE_V8_SCHEMA_OBJECTS,
+  GATE_V9_SCHEMA_OBJECTS,
   MIGRATIONS,
   SCHEMA_DDL,
   SCHEMA_VERSION,
@@ -304,6 +325,172 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
 const UPDATE_GATE_OBSERVATION = `
 UPDATE gate_message SET render_fingerprint = ?, updated_at = ? WHERE gate_key = ?`;
 
+const UPSERT_GATE_LOCAL_OBSERVATION = `
+INSERT INTO gate_local_observation
+  (gate_key, run_key, task_key, status, resolution, resolved_at, metadata_state, mapping_state,
+   write_owner, write_expires_at, observed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+ON CONFLICT (gate_key) DO UPDATE SET
+  run_key = excluded.run_key,
+  task_key = excluded.task_key,
+  status = excluded.status,
+  resolution = excluded.resolution,
+  resolved_at = excluded.resolved_at,
+  metadata_state = excluded.metadata_state,
+  mapping_state = CASE
+    WHEN gate_local_observation.write_owner IS NOT NULL THEN 'write_pending'
+    WHEN gate_local_observation.mapping_state IN ('missing','mismatched')
+         AND excluded.mapping_state = 'matched'
+      THEN gate_local_observation.mapping_state
+    ELSE excluded.mapping_state
+  END,
+  write_owner = gate_local_observation.write_owner,
+  write_expires_at = gate_local_observation.write_expires_at,
+  observed_at = excluded.observed_at`;
+
+const SELECT_GATE_LOCAL_OBSERVATION = `
+SELECT gate_key, run_key, task_key, status, resolution, resolved_at, metadata_state, mapping_state,
+       write_owner, write_expires_at, observed_at
+  FROM gate_local_observation WHERE gate_key = ?`;
+
+const SELECT_GATE_OBSERVATION_GENERATION = `
+SELECT gate_key, revision FROM gate_observation_generation WHERE gate_key = ?`;
+
+const UPSERT_GATE_OBSERVATION_GENERATION = `
+INSERT INTO gate_observation_generation (gate_key, revision) VALUES (?, ?)
+ON CONFLICT (gate_key) DO UPDATE SET revision = excluded.revision`;
+
+const SELECT_GATE_MESSAGE_BY_SLACK = `
+SELECT gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint,
+       created_at, updated_at
+  FROM gate_message WHERE channel_id = ? AND message_ts = ?`;
+
+const INSERT_GATE_RESOLUTION = `
+INSERT INTO gate_resolution
+  (gate_key, revision, ack_state, lease_owner, lease_expires_at,
+   retry_request_id, option_id, option_resolution,
+   ask_message_id, question_thread_id, dispatch_id, task_id,
+   team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+   block_id, action_id, action_value, lifecycle, mutation_ownership,
+   pre_read_json, resolve_result_json, post_read_json,
+   last_error_code, last_error_detail, created_at, updated_at)
+VALUES (?, 0, 'pending', NULL, NULL,
+        ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        'claimed', 'not_started',
+        NULL, NULL, NULL, NULL, NULL, ?, ?)`;
+
+const SELECT_GATE_RESOLUTION = `
+SELECT gate_key, revision, ack_state, lease_owner, lease_expires_at,
+       retry_request_id, option_id, option_resolution,
+       ask_message_id, question_thread_id, dispatch_id, task_id,
+       team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+       block_id, action_id, action_value, lifecycle, mutation_ownership,
+       pre_read_json, resolve_result_json, post_read_json,
+       last_error_code, last_error_detail, created_at, updated_at
+  FROM gate_resolution WHERE gate_key = ?`;
+
+const SELECT_ALL_GATE_RESOLUTIONS = `
+SELECT gate_key, revision, ack_state, lease_owner, lease_expires_at,
+       retry_request_id, option_id, option_resolution,
+       ask_message_id, question_thread_id, dispatch_id, task_id,
+       team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+       block_id, action_id, action_value, lifecycle, mutation_ownership,
+       pre_read_json, resolve_result_json, post_read_json,
+       last_error_code, last_error_detail, created_at, updated_at
+  FROM gate_resolution ORDER BY gate_key`;
+
+const SELECT_NONTERMINAL_GATE_RESOLUTIONS = `
+SELECT gate_key, revision, ack_state, lease_owner, lease_expires_at,
+       retry_request_id, option_id, option_resolution,
+       ask_message_id, question_thread_id, dispatch_id, task_id,
+       team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+       block_id, action_id, action_value, lifecycle, mutation_ownership,
+       pre_read_json, resolve_result_json, post_read_json,
+       last_error_code, last_error_detail, created_at, updated_at
+  FROM gate_resolution
+ WHERE ack_state = 'acked' AND lifecycle NOT IN ('resolved','conflict','degraded')
+ ORDER BY gate_key`;
+
+const MARK_GATE_RESOLUTION_ACK = `
+UPDATE gate_resolution
+   SET revision = revision + 1, ack_state = ?, updated_at = ?
+ WHERE gate_key = ? AND revision = ? AND lifecycle = 'claimed'
+   AND ack_state IN ('pending','failed')`;
+
+const UPDATE_GATE_RESOLUTION_PROGRESS = `
+UPDATE gate_resolution
+   SET revision = revision + 1,
+       lifecycle = ?, mutation_ownership = ?, pre_read_json = ?, resolve_result_json = ?, post_read_json = ?,
+       last_error_code = ?, last_error_detail = ?, updated_at = ?
+ WHERE gate_key = ? AND revision = ? AND lease_owner = ?
+   AND lifecycle NOT IN ('resolved','conflict','degraded')`;
+
+const INSERT_GATE_OUTBOX = `
+INSERT INTO gate_resolution_outbox
+  (gate_key, revision, card_state, card_pending, notification_state, projected_at,
+   projection_owner, projection_expires_at, last_error_code, created_at, updated_at)
+VALUES (?, 0, 'resolving', 1, 'pending', NULL, NULL, NULL, NULL, ?, ?)`;
+
+const UPSERT_GATE_OUTBOX_PROGRESS = `
+INSERT INTO gate_resolution_outbox
+  (gate_key, revision, card_state, card_pending, notification_state, projected_at,
+   projection_owner, projection_expires_at, last_error_code, created_at, updated_at)
+VALUES (?, 0, ?, 1, 'pending', NULL, NULL, NULL, ?, ?, ?)
+ON CONFLICT (gate_key) DO UPDATE SET
+  revision = gate_resolution_outbox.revision + 1,
+  card_state = excluded.card_state,
+  card_pending = 1,
+  notification_state = 'pending',
+  projected_at = NULL,
+  last_error_code = excluded.last_error_code,
+  updated_at = excluded.updated_at`;
+
+const SELECT_PENDING_GATE_OUTBOXES = `
+SELECT o.gate_key, o.revision, o.card_state, o.card_pending, o.notification_state, o.projected_at,
+       o.projection_owner, o.projection_expires_at, o.last_error_code, o.created_at, o.updated_at
+  FROM gate_resolution_outbox o
+ WHERE o.card_pending = 1
+ ORDER BY o.gate_key`;
+
+const SELECT_ACKNOWLEDGED_GATE_OUTBOXES = `
+SELECT o.gate_key, o.revision, o.card_state, o.card_pending, o.notification_state, o.projected_at,
+       o.projection_owner, o.projection_expires_at, o.last_error_code, o.created_at, o.updated_at
+  FROM gate_resolution_outbox o
+  JOIN gate_resolution r ON r.gate_key = o.gate_key
+ WHERE r.ack_state = 'acked'
+ ORDER BY o.gate_key`;
+
+const SELECT_GATE_OUTBOX = `
+SELECT gate_key, revision, card_state, card_pending, notification_state, projected_at,
+       projection_owner, projection_expires_at, last_error_code, created_at, updated_at
+  FROM gate_resolution_outbox WHERE gate_key = ?`;
+
+const MARK_GATE_OUTBOX_PROJECTED = `
+UPDATE gate_resolution_outbox
+   SET revision = revision + 1, card_pending = 0, projected_at = ?, projection_owner = NULL,
+       projection_expires_at = NULL,
+       updated_at = ?
+ WHERE gate_key = ? AND revision = ? AND projection_owner = ? AND projection_expires_at > ?`;
+
+const INSERT_GATE_AUDIT_BOUNDED = `
+INSERT INTO gate_resolution_audit (gate_key, event, reason, created_at)
+SELECT ?, ?, ?, ?
+ WHERE (SELECT COUNT(*) FROM gate_resolution_audit WHERE gate_key IS ?) <
+       CASE WHEN ? IS NOT NULL AND ? <> 'claimed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM gate_resolution_audit
+                     WHERE gate_key IS ? AND event = 'claimed'
+                  )
+            THEN ? - 1 ELSE ? END`;
+
+const INSERT_GATE_ATTEMPT_BOUNDED = `
+INSERT INTO gate_resolution_attempt (gate_key, phase, outcome, detail, created_at)
+SELECT ?, ?, ?, ?, ?
+ WHERE (SELECT COUNT(*) FROM gate_resolution_attempt WHERE gate_key = ?) < ?`;
+
 /**
  * 이 Run에 연결된 PR과 저장된 상태를 함께 읽는다.
  *
@@ -386,7 +573,479 @@ type GateMessageRow = {
   readonly updated_at: string;
 };
 
+type GateLocalObservationRow = {
+  readonly gate_key: string;
+  readonly run_key: string;
+  readonly task_key: string;
+  readonly status: string;
+  readonly resolution: string | null;
+  readonly resolved_at: string | null;
+  readonly metadata_state: string;
+  readonly mapping_state: string;
+  readonly write_owner: string | null;
+  readonly write_expires_at: string | null;
+  readonly observed_at: string;
+};
+
+type GateObservationGenerationRow = {
+  readonly gate_key: string;
+  readonly revision: number;
+};
+
+type GateResolutionRow = {
+  readonly gate_key: string;
+  readonly revision: number;
+  readonly ack_state: string;
+  readonly lease_owner: string | null;
+  readonly lease_expires_at: string | null;
+  readonly retry_request_id: string;
+  readonly option_id: string;
+  readonly option_resolution: string;
+  readonly ask_message_id: string;
+  readonly question_thread_id: string;
+  readonly dispatch_id: string;
+  readonly task_id: string;
+  readonly team_id: string;
+  readonly owner_user_id: string;
+  readonly api_app_id: string | null;
+  readonly channel_id: string;
+  readonly thread_ts: string;
+  readonly message_ts: string;
+  readonly block_id: string;
+  readonly action_id: string;
+  readonly action_value: string;
+  readonly lifecycle: string;
+  readonly mutation_ownership: string;
+  readonly pre_read_json: string | null;
+  readonly resolve_result_json: string | null;
+  readonly post_read_json: string | null;
+  readonly last_error_code: string | null;
+  readonly last_error_detail: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
+
+type GateOutboxRow = {
+  readonly gate_key: string;
+  readonly revision: number;
+  readonly card_state: string;
+  readonly card_pending: number;
+  readonly notification_state: string;
+  readonly projected_at: string | null;
+  readonly projection_owner: string | null;
+  readonly projection_expires_at: string | null;
+  readonly last_error_code: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
+
+function storedRecord(value: unknown, at: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError(`${at}이(가) object가 아니다`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function storedText(value: unknown, at: string, cap = GATE_FACT_CAP): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > cap) {
+    throw new TypeError(`${at}이(가) 1..${cap}자의 string이 아니다`);
+  }
+  return value;
+}
+
+function storedNullableText(value: unknown, at: string, cap = GATE_FACT_CAP): string | null {
+  return value === null ? null : storedText(value, at, cap);
+}
+
+function storedKey(value: unknown, prefix: string, at: string): string {
+  const key = storedText(value, at);
+  if (!key.startsWith(prefix) || key.length === prefix.length) {
+    throw new TypeError(`${at}이(가) ${prefix} durable key가 아니다`);
+  }
+  return key;
+}
+
+function storedIso(value: unknown, at: string): string {
+  const text = storedText(value, at, 40);
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== text) {
+    throw new TypeError(`${at}이(가) canonical ISO 시각이 아니다`);
+  }
+  return text;
+}
+
+function storedRevision(value: unknown, at: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${at}이(가) non-negative safe integer가 아니다`);
+  }
+  return value;
+}
+
+function storedAckState(value: unknown, at: string): 'pending' | 'acked' | 'failed' {
+  if (value !== 'pending' && value !== 'acked' && value !== 'failed') {
+    throw new TypeError(`${at}이(가) 지원하는 ACK state가 아니다`);
+  }
+  return value;
+}
+
+function storedLeaseOwner(value: unknown, at: string): string {
+  const owner = storedText(value, at, 80);
+  if (!/^(?:p[1-9]\d{0,9}|t)\.[a-z0-9-]{1,64}$/.test(owner)) {
+    throw new TypeError(`${at}이(가) code-owned lease owner가 아니다`);
+  }
+  return owner;
+}
+
+/** Process liveness permits early recovery; persisted expiry is always authoritative. */
+const LIVE_OBSERVATION_WRITE_OWNERS = new Set<string>();
+/** Longer than the bounded production Slack update; expiry wins even if an owner PID is reused. */
+const OBSERVATION_WRITE_LEASE_MS = 30_000;
+
+function observationWriteExpiry(at: string): string {
+  return new Date(new Date(at).valueOf() + OBSERVATION_WRITE_LEASE_MS).toISOString();
+}
+
+function observationOwnerAlive(owner: string): boolean {
+  const match = /^p([1-9]\d{0,9})\./.exec(owner);
+  if (match === null) return true;
+  const pid = Number(match[1]);
+  if (pid === process.pid) return LIVE_OBSERVATION_WRITE_OWNERS.has(owner);
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e instanceof Error && 'code' in e && e.code !== 'ESRCH';
+  }
+}
+
+function storedJson(value: string, at: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch (e) {
+    throw new TypeError(`${at}이(가) JSON이 아니다`, { cause: e });
+  }
+}
+
+function exactStoredKeys(value: Record<string, unknown>, keys: readonly string[], at: string): void {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, i) => key !== expected[i])) {
+    throw new TypeError(`${at}의 필드가 strict shape와 어긋난다`);
+  }
+}
+
+function toGateSnapshot(value: unknown, at: string): GateSnapshot {
+  const row = storedRecord(value, at);
+  exactStoredKeys(
+    row,
+    ['gateId', 'runId', 'taskId', 'options', 'status', 'resolution', 'resolvedAt'],
+    at,
+  );
+  const status = row['status'];
+  if (status !== 'pending' && status !== 'resolved') {
+    throw new TypeError(`${at}.status가 pending/resolved가 아니다`);
+  }
+  if (!Array.isArray(row['options']) || row['options'].length === 0 || row['options'].length > 25) {
+    throw new TypeError(`${at}.options가 1..25개 string 배열이 아니다`);
+  }
+  const options = row['options'].map((option, index) => storedText(option, `${at}.options[${index}]`, 75));
+  const resolution = storedNullableText(row['resolution'], `${at}.resolution`, 3000);
+  const resolvedAt = row['resolvedAt'] === null ? null : storedIso(row['resolvedAt'], `${at}.resolvedAt`);
+  if (status === 'pending' && (resolution !== null || resolvedAt !== null)) {
+    throw new TypeError(`${at}의 pending 상태와 resolution/resolvedAt이 모순된다`);
+  }
+  if (status === 'resolved' && (resolution === null || resolvedAt === null)) {
+    throw new TypeError(`${at}의 resolved 상태에 resolution/resolvedAt이 없다`);
+  }
+  return {
+    gateId: storedText(row['gateId'], `${at}.gateId`),
+    runId: storedText(row['runId'], `${at}.runId`),
+    taskId: storedText(row['taskId'], `${at}.taskId`),
+    options,
+    status,
+    resolution,
+    resolvedAt,
+  };
+}
+
+function toGateResolveResult(value: unknown, at: string): GateResolveResult {
+  const row = storedRecord(value, at);
+  exactStoredKeys(row, ['gate', 'mutation'], at);
+  const mutation = storedRecord(row['mutation'], `${at}.mutation`);
+  exactStoredKeys(mutation, ['requestId', 'replayed'], `${at}.mutation`);
+  if (typeof mutation['replayed'] !== 'boolean') {
+    throw new TypeError(`${at}.mutation.replayed가 boolean이 아니다`);
+  }
+  return {
+    gate: toGateSnapshot(row['gate'], `${at}.gate`),
+    mutation: {
+      requestId: storedText(mutation['requestId'], `${at}.mutation.requestId`, 80),
+      replayed: mutation['replayed'],
+    },
+  };
+}
+
+function parseStoredOptional<T>(
+  value: string | null,
+  at: string,
+  parse: (raw: unknown, at: string) => T,
+): T | null {
+  return value === null ? null : parse(storedJson(value, at), at);
+}
+
+function toGateLocalObservation(row: GateLocalObservationRow): GateLocalObservation {
+  if (row.status !== 'pending' && row.status !== 'resolved' && row.status !== 'unsupported') {
+    throw new TypeError(`${row.gate_key}의 local observation status가 잘못됐다`);
+  }
+  if (row.metadata_state !== 'matched' && row.metadata_state !== 'missing' && row.metadata_state !== 'mismatched') {
+    throw new TypeError(`${row.gate_key}의 local observation metadata_state가 잘못됐다`);
+  }
+  if (
+    row.mapping_state !== 'matched' &&
+    row.mapping_state !== 'missing' &&
+    row.mapping_state !== 'mismatched' &&
+    row.mapping_state !== 'write_pending'
+  ) {
+    throw new TypeError(`${row.gate_key}의 local observation mapping_state가 잘못됐다`);
+  }
+  if (
+    (row.mapping_state === 'write_pending') !== (row.write_owner !== null) ||
+    (row.write_owner === null) !== (row.write_expires_at === null)
+  ) {
+    throw new TypeError(`${row.gate_key}의 local observation write owner shape가 잘못됐다`);
+  }
+  if (row.write_owner !== null) {
+    storedLeaseOwner(row.write_owner, `${row.gate_key}.write_owner`);
+    storedIso(row.write_expires_at, `${row.gate_key}.write_expires_at`);
+    // observed_at is the latest source snapshot, not the lease start. A concurrent observation may
+    // legitimately be at/after the old expiry while the durable owner remains as a repair barrier.
+  }
+  if (row.status === 'pending' && (row.resolution !== null || row.resolved_at !== null)) {
+    throw new TypeError(`${row.gate_key}의 pending local observation이 모순된다`);
+  }
+  if (row.status === 'resolved' && (row.resolution === null || row.resolved_at === null)) {
+    throw new TypeError(`${row.gate_key}의 resolved local observation에 resolution/resolved_at이 없다`);
+  }
+  if (row.status === 'unsupported' && (row.resolution !== null || row.resolved_at !== null)) {
+    throw new TypeError(`${row.gate_key}의 unsupported local observation이 모순된다`);
+  }
+  return {
+    gateKey: storedKey(row.gate_key, 'gate:', 'gate_local_observation.gate_key') as GateKey,
+    runKey: storedKey(row.run_key, 'run:', 'gate_local_observation.run_key') as RunKey,
+    taskKey: storedKey(row.task_key, 'task:', 'gate_local_observation.task_key') as TaskKey,
+    status: row.status,
+    resolution: storedNullableText(row.resolution, `${row.gate_key}.resolution`, 3000),
+    resolvedAt: row.resolved_at === null ? null : storedIso(row.resolved_at, `${row.gate_key}.resolved_at`),
+    metadataState: row.metadata_state,
+    mappingState: row.mapping_state,
+    observedAt: storedIso(row.observed_at, `${row.gate_key}.observed_at`),
+  };
+}
+
+function reconcileObservationMetadataState(
+  observation: Pick<GateLocalObservation, 'runKey' | 'taskKey' | 'metadataState'>,
+  metadata: GateMetadataRow | undefined,
+): GateLocalObservation['metadataState'] {
+  if (metadata === undefined) return 'missing';
+  // A stale `missing` or explicit `mismatched` collection result did not validate the sidecar's
+  // full immutable option facts. Seeing a row now is not enough evidence to upgrade it. The next
+  // production collection must observe and compare those facts before actions become eligible.
+  if (observation.metadataState !== 'matched') return 'mismatched';
+  return metadata.run_key === observation.runKey && metadata.task_key === observation.taskKey
+    ? 'matched'
+    : 'mismatched';
+}
+
+/** The durable row must still describe the snapshot whose bounded Slack call is completing. */
+function observationWriteStillCurrent(
+  row: GateLocalObservationRow,
+  observation: GateLocalObservation,
+  metadataState: GateLocalObservation['metadataState'],
+  allowFailClosedMapping = false,
+): boolean {
+  return (
+    (row.mapping_state === 'write_pending' ||
+      row.mapping_state === 'matched' ||
+      (allowFailClosedMapping &&
+        (row.mapping_state === 'missing' || row.mapping_state === 'mismatched'))) &&
+    row.run_key === observation.runKey &&
+    row.task_key === observation.taskKey &&
+    row.status === observation.status &&
+    row.resolution === observation.resolution &&
+    row.resolved_at === observation.resolvedAt &&
+    row.metadata_state === metadataState &&
+    row.observed_at === observation.observedAt
+  );
+}
+
+/** Advance the additive v9 logical generation inside the caller's write transaction. */
+function advanceGateObservationGeneration(
+  db: DatabaseSync,
+  gateKey: GateKey,
+  afterRevision = -1,
+): number {
+  const row = db.prepare(SELECT_GATE_OBSERVATION_GENERATION).get(gateKey) as
+    | GateObservationGenerationRow
+    | undefined;
+  const currentRevision = row === undefined
+    ? -1
+    : storedRevision(row.revision, `${gateKey}.current observation revision`);
+  const revision = storedRevision(
+    Math.max(currentRevision, afterRevision) + 1,
+    `${gateKey}.next observation revision`,
+  );
+  db.prepare(UPSERT_GATE_OBSERVATION_GENERATION).run(gateKey, revision);
+  return revision;
+}
+
+const RESOLUTION_LIFECYCLES = new Set<GateResolutionLifecycle>([
+  'claimed', 'pre_read', 'resolving', 'uncertain', 'post_read', 'resolved', 'conflict', 'degraded',
+]);
+
+function validateGateLifecycleEvidence(intent: GateResolutionIntent, at: string): void {
+  const nonterminal = ['claimed', 'pre_read', 'resolving', 'uncertain', 'post_read'].includes(
+    intent.lifecycle,
+  );
+  const quietLifecycle = ['claimed', 'pre_read', 'resolving', 'post_read', 'resolved'].includes(
+    intent.lifecycle,
+  );
+  if (
+    (intent.ackState !== 'acked' && intent.lifecycle !== 'claimed') ||
+    ((intent.resolveResult !== null) !== (intent.mutationOwnership === 'structured')) ||
+    (intent.lifecycle === 'claimed' && intent.mutationOwnership !== 'not_started') ||
+    (intent.lifecycle === 'resolving' && intent.mutationOwnership !== 'unknown') ||
+    (nonterminal && intent.postRead !== null) ||
+    (quietLifecycle && (intent.lastErrorCode !== null || intent.lastErrorDetail !== null)) ||
+    (intent.lastErrorDetail !== null && intent.lastErrorCode === null) ||
+    (intent.leaseOwner !== null &&
+      (intent.ackState !== 'acked' ||
+        intent.leaseExpiresAt === null ||
+        intent.leaseExpiresAt <= intent.createdAt ||
+        ['resolved', 'conflict', 'degraded'].includes(intent.lifecycle))) ||
+    (intent.lifecycle === 'claimed' &&
+      (intent.preRead !== null || intent.resolveResult !== null || intent.postRead !== null)) ||
+    (['pre_read', 'resolving', 'post_read', 'resolved', 'conflict'].includes(intent.lifecycle) &&
+      intent.preRead === null) ||
+    (intent.lifecycle === 'post_read' && intent.resolveResult === null) ||
+    (intent.lifecycle === 'conflict' && intent.postRead === null) ||
+    (intent.lifecycle === 'uncertain' && intent.lastErrorCode === null) ||
+    (intent.lifecycle === 'resolved' && intent.lastErrorCode !== null) ||
+    (['conflict', 'degraded'].includes(intent.lifecycle) && intent.lastErrorCode === null) ||
+    (intent.lifecycle === 'resolved' &&
+      (intent.resolveResult === null ||
+        intent.mutationOwnership !== 'structured' ||
+        intent.postRead?.status !== 'resolved' ||
+        intent.postRead.resolution !== intent.optionResolution ||
+        intent.postRead.resolvedAt !== intent.resolveResult.gate.resolvedAt))
+  ) {
+    throw new TypeError(`${at}의 lifecycle evidence가 불완전하다`);
+  }
+}
+
+function toGateResolution(row: GateResolutionRow): GateResolutionIntent {
+  if (!RESOLUTION_LIFECYCLES.has(row.lifecycle as GateResolutionLifecycle)) {
+    throw new TypeError(`${row.gate_key}의 resolution lifecycle이 잘못됐다`);
+  }
+  if (
+    row.mutation_ownership !== 'not_started' &&
+    row.mutation_ownership !== 'unknown' &&
+    row.mutation_ownership !== 'structured'
+  ) {
+    throw new TypeError(`${row.gate_key}의 mutation ownership provenance가 잘못됐다`);
+  }
+  if (
+    !row.gate_key.startsWith('gate:') ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(row.retry_request_id) ||
+    !/^T[A-Z0-9]+$/.test(row.team_id) ||
+    !/^U[A-Z0-9]+$/.test(row.owner_user_id) ||
+    (row.api_app_id !== null && !/^A[A-Z0-9]+$/.test(row.api_app_id)) ||
+    !/^[CG][A-Z0-9]+$/.test(row.channel_id) ||
+    !/^\d+\.\d+$/.test(row.thread_ts) ||
+    !/^\d+\.\d+$/.test(row.message_ts)
+  ) {
+    throw new TypeError(`${row.gate_key}의 resolution identity shape가 잘못됐다`);
+  }
+  if ((row.lease_owner === null) !== (row.lease_expires_at === null)) {
+    throw new TypeError(`${row.gate_key}의 resolution lease shape가 잘못됐다`);
+  }
+  const intent: GateResolutionIntent = {
+    gateKey: storedKey(row.gate_key, 'gate:', 'gate_resolution.gate_key') as GateKey,
+    revision: storedRevision(row.revision, `${row.gate_key}.revision`),
+    ackState: storedAckState(row.ack_state, `${row.gate_key}.ack_state`),
+    leaseOwner:
+      row.lease_owner === null
+        ? null
+        : storedLeaseOwner(row.lease_owner, `${row.gate_key}.lease_owner`),
+    leaseExpiresAt:
+      row.lease_expires_at === null
+        ? null
+        : storedIso(row.lease_expires_at, `${row.gate_key}.lease_expires_at`),
+    retryRequestId: storedText(row.retry_request_id, `${row.gate_key}.retry_request_id`, 80),
+    optionId: storedText(row.option_id, `${row.gate_key}.option_id`, 64),
+    optionResolution: storedText(row.option_resolution, `${row.gate_key}.option_resolution`, 3000),
+    askMessageId: storedText(row.ask_message_id, `${row.gate_key}.ask_message_id`),
+    questionThreadId: storedText(row.question_thread_id, `${row.gate_key}.question_thread_id`),
+    dispatchId: storedText(row.dispatch_id, `${row.gate_key}.dispatch_id`),
+    taskId: storedText(row.task_id, `${row.gate_key}.task_id`),
+    teamId: storedText(row.team_id, `${row.gate_key}.team_id`, 32),
+    ownerUserId: storedText(row.owner_user_id, `${row.gate_key}.owner_user_id`, 32),
+    apiAppId: storedNullableText(row.api_app_id, `${row.gate_key}.api_app_id`, 32),
+    channelId: storedText(row.channel_id, `${row.gate_key}.channel_id`, 32),
+    threadTs: storedText(row.thread_ts, `${row.gate_key}.thread_ts`, 32),
+    messageTs: storedText(row.message_ts, `${row.gate_key}.message_ts`, 32),
+    blockId: storedText(row.block_id, `${row.gate_key}.block_id`, 255),
+    actionId: storedText(row.action_id, `${row.gate_key}.action_id`, 255),
+    actionValue: storedText(row.action_value, `${row.gate_key}.action_value`, 64),
+    lifecycle: row.lifecycle as GateResolutionLifecycle,
+    mutationOwnership: row.mutation_ownership,
+    preRead: parseStoredOptional(row.pre_read_json, `${row.gate_key}.pre_read_json`, toGateSnapshot),
+    resolveResult: parseStoredOptional(row.resolve_result_json, `${row.gate_key}.resolve_result_json`, toGateResolveResult),
+    postRead: parseStoredOptional(row.post_read_json, `${row.gate_key}.post_read_json`, toGateSnapshot),
+    lastErrorCode: storedNullableText(row.last_error_code, `${row.gate_key}.last_error_code`, 80),
+    lastErrorDetail: storedNullableText(row.last_error_detail, `${row.gate_key}.last_error_detail`, GATE_FACT_CAP),
+    createdAt: storedIso(row.created_at, `${row.gate_key}.created_at`),
+    updatedAt: storedIso(row.updated_at, `${row.gate_key}.updated_at`),
+  };
+  validateGateLifecycleEvidence(intent, row.gate_key);
+  return intent;
+}
+
+function toGateOutbox(row: GateOutboxRow): GateResolutionOutbox {
+  const states = new Set<GateCardState>(['resolving', 'resolved', 'conflict', 'degraded']);
+  if (!states.has(row.card_state as GateCardState) || (row.card_pending !== 0 && row.card_pending !== 1)) {
+    throw new TypeError(`${row.gate_key}의 Gate outbox shape가 잘못됐다`);
+  }
+  if (row.notification_state !== 'pending') {
+    throw new TypeError(`${row.gate_key}의 D2 notification state가 pending이 아니다`);
+  }
+  if ((row.projection_owner === null) !== (row.projection_expires_at === null)) {
+    throw new TypeError(`${row.gate_key}의 projection owner expiry shape가 잘못됐다`);
+  }
+  if (row.projection_owner !== null) {
+    storedLeaseOwner(row.projection_owner, `${row.gate_key}.projection_owner`);
+    storedIso(
+      row.projection_expires_at,
+      `${row.gate_key}.projection_expires_at`,
+    );
+    if (row.card_pending !== 1) {
+      throw new TypeError(`${row.gate_key}의 projected outbox에 projection owner가 남아 있다`);
+    }
+  }
+  return {
+    gateKey: storedKey(row.gate_key, 'gate:', 'gate_resolution_outbox.gate_key') as GateKey,
+    revision: storedRevision(row.revision, `${row.gate_key}.outbox revision`),
+    cardState: row.card_state as GateCardState,
+    cardPending: row.card_pending === 1,
+    notificationState: 'pending',
+    projectedAt: row.projected_at === null ? null : storedIso(row.projected_at, `${row.gate_key}.projected_at`),
+    lastErrorCode: storedNullableText(row.last_error_code, `${row.gate_key}.last_error_code`, 80),
+    createdAt: storedIso(row.created_at, `${row.gate_key}.created_at`),
+    updatedAt: storedIso(row.updated_at, `${row.gate_key}.updated_at`),
+  };
+}
+
 function toGateMetadata(row: GateMetadataRow): GateMetadata {
+  storedText(row.options_json, `${row.gate_key}.options_json`, 200_000);
   let parsed: unknown;
   try {
     parsed = JSON.parse(row.options_json);
@@ -403,32 +1062,43 @@ function toGateMetadata(row: GateMetadataRow): GateMetadata {
     );
   }
   return {
-    gateKey: row.gate_key as GateKey,
-    runKey: row.run_key as RunKey,
-    taskKey: row.task_key as TaskKey,
-    dispatchKey: row.dispatch_key as GateMetadata['dispatchKey'],
-    askMessageId: row.ask_message_id,
-    questionThreadId: row.question_thread_id,
+    gateKey: storedKey(row.gate_key, 'gate:', 'gate_metadata.gate_key') as GateKey,
+    runKey: storedKey(row.run_key, 'run:', `${row.gate_key}.run_key`) as RunKey,
+    taskKey: storedKey(row.task_key, 'task:', `${row.gate_key}.task_key`) as TaskKey,
+    dispatchKey: storedKey(
+      row.dispatch_key,
+      'dispatch:',
+      `${row.gate_key}.dispatch_key`,
+    ) as GateMetadata['dispatchKey'],
+    askMessageId: storedText(row.ask_message_id, `${row.gate_key}.ask_message_id`),
+    questionThreadId: storedText(row.question_thread_id, `${row.gate_key}.question_thread_id`),
     options,
     recommendation: {
       optionId: row.recommendation_option_id,
-      reason: row.recommendation_reason,
+      reason: storedText(row.recommendation_reason, `${row.gate_key}.recommendation_reason`, 3000),
     },
-    impact: row.impact,
-    registeredAt: row.registered_at,
+    impact: storedText(row.impact, `${row.gate_key}.impact`, 3000),
+    registeredAt: storedIso(row.registered_at, `${row.gate_key}.registered_at`),
   };
 }
 
 function toGateMessage(row: GateMessageRow): GateMessageRecord {
+  if (
+    !/^[CG][A-Z0-9]+$/.test(row.channel_id) ||
+    !/^\d+\.\d+$/.test(row.thread_ts) ||
+    !/^\d+\.\d+$/.test(row.message_ts)
+  ) {
+    throw new TypeError(`${row.gate_key}의 Gate Slack mapping identity가 잘못됐다`);
+  }
   return {
-    gateKey: row.gate_key as GateKey,
-    runKey: row.run_key as RunKey,
-    channelId: row.channel_id,
-    threadTs: row.thread_ts,
-    messageTs: row.message_ts,
-    renderFingerprint: row.render_fingerprint,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    gateKey: storedKey(row.gate_key, 'gate:', 'gate_message.gate_key') as GateKey,
+    runKey: storedKey(row.run_key, 'run:', `${row.gate_key}.run_key`) as RunKey,
+    channelId: storedText(row.channel_id, `${row.gate_key}.channel_id`, 32),
+    threadTs: storedText(row.thread_ts, `${row.gate_key}.thread_ts`, 32),
+    messageTs: storedText(row.message_ts, `${row.gate_key}.message_ts`, 32),
+    renderFingerprint: storedText(row.render_fingerprint, `${row.gate_key}.render_fingerprint`),
+    createdAt: storedIso(row.created_at, `${row.gate_key}.created_at`),
+    updatedAt: storedIso(row.updated_at, `${row.gate_key}.updated_at`),
   };
 }
 
@@ -604,16 +1274,59 @@ function toRecord(row: PrMessageRow): PrMessageRecord {
   };
 }
 
+function gateCode(value: string, cap: number): string {
+  if (!/^[a-z0-9_.-]+$/.test(value) || value.length === 0 || value.length > cap) {
+    throw new TypeError(`Gate audit code가 허용된 bounded shape가 아니다`);
+  }
+  return value;
+}
+
+/** Never persist tokens, URLs, or unbounded downstream error text. */
+function safeGateFact(value: string | null, cap: number): string | null {
+  if (value === null) return null;
+  const redacted = value
+    .replace(/https?:\/\/\S+/gi, '[redacted-url]')
+    .replace(/(?:xox(?:b|p|a|s|r)|xapp)-\S+/gi, '[redacted-token]')
+    .replace(/response_url\s*[:=]\s*\S+/gi, 'response_url=[redacted]');
+  const bounded = redacted.slice(0, cap);
+  return bounded === '' ? null : bounded;
+}
+
+function cardStateForLifecycle(lifecycle: GateResolutionLifecycle): GateCardState {
+  if (lifecycle === 'resolved') return 'resolved';
+  if (lifecycle === 'conflict') return 'conflict';
+  if (lifecycle === 'degraded' || lifecycle === 'uncertain') return 'degraded';
+  return 'resolving';
+}
+
 export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
   private readonly db: DatabaseSync;
+  private readonly observationWriteOwner: string;
+  private readonly isObservationOwnerAlive: (owner: string) => boolean;
+  private readonly activeObservationWrites = new Map<GateKey, number>();
+  private readonly ownedProjectionWrites = new Set<string>();
 
   /** 파일을 열고 스키마를 준비한다. 부모 디렉터리가 없으면 만든다. */
-  constructor(path: string) {
+  constructor(
+    path: string,
+    options: {
+      readonly validationFault?: (point: 'after_resolution_rows') => void;
+      /** Test seam for an abandoned ordinary-write owner from a crashed process. */
+      readonly observationWriteOwner?: string;
+      readonly observationOwnerAlive?: (owner: string) => boolean;
+    } = {},
+  ) {
+    this.observationWriteOwner = storedLeaseOwner(
+      options.observationWriteOwner ?? `p${process.pid}.${randomUUID()}`,
+      'ordinary Gate write owner',
+    );
+    this.isObservationOwnerAlive = options.observationOwnerAlive ?? observationOwnerAlive;
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     try {
       enableWal(this.db, path);
-      prepareSchema(this.db, path);
+      prepareSchema(this.db, path, options.validationFault);
+      LIVE_OBSERVATION_WRITE_OWNERS.add(this.observationWriteOwner);
     } catch (e) {
       // 스키마 판정에 실패한 파일을 열린 채로 남기지 않는다.
       this.db.close();
@@ -807,6 +1520,21 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
   }
 
   insertGateMetadata(metadata: GateMetadata): void {
+    const optionsJson = JSON.stringify(metadata.options);
+    toGateMetadata({
+      gate_key: metadata.gateKey,
+      run_key: metadata.runKey,
+      task_key: metadata.taskKey,
+      dispatch_key: metadata.dispatchKey,
+      ask_message_id: metadata.askMessageId,
+      question_thread_id: metadata.questionThreadId,
+      options_json: optionsJson,
+      recommendation_option_id: metadata.recommendation.optionId,
+      recommendation_reason: metadata.recommendation.reason,
+      impact: metadata.impact,
+      registered_at: metadata.registeredAt,
+    });
+    this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db
         .prepare(INSERT_GATE_METADATA)
@@ -817,13 +1545,29 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           metadata.dispatchKey,
           metadata.askMessageId,
           metadata.questionThreadId,
-          JSON.stringify(metadata.options),
+          optionsJson,
           metadata.recommendation.optionId,
           metadata.recommendation.reason,
           metadata.impact,
           metadata.registeredAt,
         );
+      const observation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(metadata.gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      if (observation !== undefined) {
+        const metadataState =
+          observation.metadata_state === 'matched' &&
+          observation.run_key === metadata.runKey &&
+          observation.task_key === metadata.taskKey
+            ? 'matched'
+            : 'mismatched';
+        this.db.prepare(
+          'UPDATE gate_local_observation SET metadata_state = ? WHERE gate_key = ?',
+        ).run(metadataState, metadata.gateKey);
+      }
+      this.db.exec('COMMIT');
     } catch (e) {
+      this.db.exec('ROLLBACK');
       const detail = e instanceof Error ? e.message : String(e);
       throw new Error(`${metadata.gateKey}의 sidecar metadata를 기록할 수 없다: ${detail}`, {
         cause: e,
@@ -836,8 +1580,31 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     return row === undefined ? null : toGateMessage(row);
   }
 
-  insertGateMessage(message: NewGateMessage): void {
+  insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void {
+    toGateMessage({
+      gate_key: message.gateKey,
+      run_key: message.runKey,
+      channel_id: message.channelId,
+      thread_ts: message.threadTs,
+      message_ts: message.messageTs,
+      render_fingerprint: message.renderFingerprint,
+      created_at: message.at,
+      updated_at: message.at,
+    });
+    if (
+      observation !== undefined &&
+      (observation.gateKey !== message.gateKey ||
+        observation.runKey !== message.runKey ||
+        observation.mappingState !== 'matched')
+    ) {
+      throw new TypeError(
+        `${message.gateKey}의 첫 Gate message observation correlation이 matched가 아니다`,
+      );
+    }
+    let transactionStarted = false;
     try {
+      this.db.exec('BEGIN IMMEDIATE');
+      transactionStarted = true;
       this.db
         .prepare(INSERT_GATE_MESSAGE)
         .run(
@@ -850,7 +1617,78 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           message.at,
           message.at,
         );
+      if (observation !== undefined) {
+        // The collection snapshot may have raced sidecar registration. Reconcile metadata inside
+        // the same transaction that makes the Slack identity actionable.
+        const metadata = this.db.prepare(SELECT_GATE_METADATA).get(message.gateKey) as
+          | GateMetadataRow
+          | undefined;
+        const metadataState = reconcileObservationMetadataState(observation, metadata);
+        toGateLocalObservation({
+          gate_key: observation.gateKey,
+          run_key: observation.runKey,
+          task_key: observation.taskKey,
+          status: observation.status,
+          resolution: observation.resolution,
+          resolved_at: observation.resolvedAt,
+          metadata_state: metadataState,
+          mapping_state: 'matched',
+          write_owner: null,
+          write_expires_at: null,
+          observed_at: observation.observedAt,
+        });
+        const currentObservation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(
+          observation.gateKey,
+        ) as GateLocalObservationRow | undefined;
+        const existingMetadataState = currentObservation === undefined
+          ? null
+          : metadataState === 'matched' &&
+              (currentObservation.metadata_state !== 'matched' ||
+                currentObservation.run_key !== observation.runKey ||
+                currentObservation.task_key !== observation.taskKey)
+            ? 'mismatched'
+            : metadataState;
+        const existingMappingState = currentObservation?.run_key === message.runKey
+          ? 'matched'
+          : 'mismatched';
+        if (currentObservation !== undefined && existingMetadataState !== null) {
+          // The existing row may contain newer terminal facts, so update only correlation. Never
+          // upgrade a fail-closed metadata row from this mapping-only boundary; a fresh collection
+          // must validate the immutable option facts before metadata can become matched again.
+          toGateLocalObservation({
+            ...currentObservation,
+            metadata_state: existingMetadataState,
+            mapping_state: existingMappingState,
+            write_owner: null,
+            write_expires_at: null,
+          });
+        }
+        const mapped = currentObservation === undefined
+          ? this.db.prepare(UPSERT_GATE_LOCAL_OBSERVATION).run(
+              observation.gateKey,
+              observation.runKey,
+              observation.taskKey,
+              observation.status,
+              observation.resolution,
+              observation.resolvedAt,
+              metadataState,
+              'matched',
+              observation.observedAt,
+            )
+          : this.db.prepare(
+              `UPDATE gate_local_observation
+                  SET metadata_state = ?, mapping_state = ?
+                WHERE gate_key = ? AND write_owner IS NULL`,
+            ).run(existingMetadataState, existingMappingState, observation.gateKey);
+        if (Number(mapped.changes) !== 1) {
+          throw new Error(`${message.gateKey}의 첫 Gate message mapping을 원자적으로 확정하지 못했다`);
+        }
+        advanceGateObservationGeneration(this.db, observation.gateKey);
+      }
+      this.db.exec('COMMIT');
+      transactionStarted = false;
     } catch (e) {
+      if (transactionStarted) this.db.exec('ROLLBACK');
       const detail = e instanceof Error ? e.message : String(e);
       throw new Error(
         `${message.gateKey}의 thread 메시지를 기록할 수 없다 ` +
@@ -860,17 +1698,1209 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     }
   }
 
-  updateGateObservation(gateKey: GateKey, renderFingerprint: string, at: string): void {
-    const result = this.db.prepare(UPDATE_GATE_OBSERVATION).run(renderFingerprint, at, gateKey);
-    if (Number(result.changes) === 0) {
-      throw new Error(`${gateKey}의 thread 매핑 행이 없어 관찰 결과를 갱신할 수 없다`);
+  updateGateObservation(
+    gateKey: GateKey,
+    renderFingerprint: string,
+    at: string,
+    observation?: GateLocalObservation,
+    expectedRevision?: number,
+  ): void {
+    storedIso(at, `${gateKey}.Gate observation at`);
+    storedText(renderFingerprint, `${gateKey}.Gate observation fingerprint`, 128);
+    if (expectedRevision !== undefined) {
+      storedRevision(expectedRevision, `${gateKey}.ordinary Gate completion revision`);
+    }
+    let transactionStarted = false;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      transactionStarted = true;
+      const rearmResolutionOutbox = (): void => {
+        const intent = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as
+          | GateResolutionRow
+          | undefined;
+        if (intent === undefined) return;
+        const outbox = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as
+          | GateOutboxRow
+          | undefined;
+        if (outbox === undefined) {
+          throw new Error(`${gateKey}의 D2 intent에 대응하는 outbox가 없다`);
+        }
+        // Do not release a live D2 projector here. Advancing its revision fences that in-flight
+        // completion; retaining the owner lets the projector re-read and renew the new generation.
+        const rearmed = this.db.prepare(
+          `UPDATE gate_resolution_outbox
+              SET revision = revision + 1, card_pending = 1, projected_at = NULL, updated_at = ?
+            WHERE gate_key = ? AND revision = ?`,
+        ).run(at, gateKey, outbox.revision);
+        if (Number(rearmed.changes) !== 1) {
+          throw new Error(`${gateKey}의 D2 outbox를 ordinary observation 뒤 재활성화하지 못했다`);
+        }
+      };
+      const local = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      const generation = this.db.prepare(SELECT_GATE_OBSERVATION_GENERATION).get(gateKey) as
+        | GateObservationGenerationRow
+        | undefined;
+      if (local === undefined && observation !== undefined) {
+        throw new Error(`${gateKey}의 local observation이 없어 ordinary write를 확정할 수 없다`);
+      }
+      const activeRevision = this.activeObservationWrites.get(gateKey);
+      const active = activeRevision !== undefined;
+      const fenced = local?.write_owner !== null && local?.write_owner !== undefined;
+      if (!active && (observation !== undefined || expectedRevision !== undefined)) {
+        // A generation-aware completion is single-use and must correspond to the bounded Slack
+        // call this store actually started. Replaying it after a repair would re-drift the card.
+        throw new Error(`${gateKey}의 active ordinary write가 없어 completion을 확정할 수 없다`);
+      }
+      if (!active && fenced) {
+        // Preserve the pre-generation API behavior: a caller that did not start the local write
+        // may never settle (or repair) somebody else's durable owner.
+        throw new Error(`${gateKey}의 ordinary write owner가 달라 완료를 확정할 수 없다`);
+      }
+      let activeObservation: GateLocalObservation | null = null;
+      let activeExpectedRevision: number | null = null;
+      let settledMetadataState: GateLocalObservation['metadataState'] | null = null;
+      if (active) {
+        if (
+          observation === undefined ||
+          expectedRevision === undefined ||
+          activeRevision !== expectedRevision ||
+          observation.gateKey !== gateKey ||
+          observation.mappingState !== 'matched' ||
+          observation.metadataState !== 'matched'
+        ) {
+          throw new Error(`${gateKey}의 ordinary write owner/revision 입력이 달라 완료를 확정할 수 없다`);
+        }
+        activeObservation = observation;
+        activeExpectedRevision = expectedRevision;
+        const messageRow = this.db.prepare(SELECT_GATE_MESSAGE).get(gateKey) as
+          | GateMessageRow
+          | undefined;
+        if (messageRow === undefined) {
+          throw new Error(`${gateKey}의 Gate message correlation이 없어 ordinary write를 확정할 수 없다`);
+        }
+        const message = toGateMessage(messageRow);
+        if (message.gateKey !== gateKey || message.runKey !== observation.runKey) {
+          throw new Error(`${gateKey}의 Gate message/run correlation이 ordinary observation과 어긋난다`);
+        }
+        const metadata = this.db.prepare(SELECT_GATE_METADATA).get(gateKey) as
+          | GateMetadataRow
+          | undefined;
+        settledMetadataState = reconcileObservationMetadataState(observation, metadata);
+        // Validate the exact rows that would be committed before executing either correlated
+        // update. Type assertions or future callers cannot persist a shape that fails on restart.
+        toGateLocalObservation({
+          gate_key: gateKey,
+          run_key: observation.runKey,
+          task_key: observation.taskKey,
+          status: observation.status,
+          resolution: observation.resolution,
+          resolved_at: observation.resolvedAt,
+          metadata_state: settledMetadataState,
+          mapping_state: 'matched',
+          write_owner: null,
+          write_expires_at: null,
+          observed_at: observation.observedAt,
+        });
+      }
+      const ownsFence = fenced && local?.write_owner === this.observationWriteOwner;
+      const ownsLiveFence =
+        ownsFence && local?.write_expires_at !== null && local?.write_expires_at !== undefined &&
+        local.write_expires_at > at;
+      const invalidatedActiveCompletion =
+        activeObservation !== null &&
+        activeExpectedRevision !== null &&
+        local !== undefined &&
+        settledMetadataState !== null &&
+        (!ownsLiveFence ||
+          generation?.revision !== activeExpectedRevision ||
+          !observationWriteStillCurrent(local, activeObservation, settledMetadataState));
+      if (invalidatedActiveCompletion) {
+        // Slack already accepted this call. Its fingerprint is therefore the best durable
+        // description of the remote card even if expiry recovery or a newer completion cleared or
+        // replaced our owner while the request was in flight.
+        const remote = this.db.prepare(UPDATE_GATE_OBSERVATION).run(renderFingerprint, at, gateKey);
+        if (Number(remote.changes) !== 1) {
+          throw new Error(`${gateKey}의 무효화된 Slack 결과 fingerprint를 기록하지 못했다`);
+        }
+        if (fenced) {
+          // The present owner, including a replacement owner, remains the exclusive repair
+          // barrier. If it is a replacement, its already-rendered generation must lose after this
+          // older physical Slack write landed.
+          const retained = this.db.prepare(
+            `UPDATE gate_local_observation SET mapping_state = 'write_pending'
+              WHERE gate_key = ? AND write_owner = ? AND write_expires_at IS NOT NULL`,
+          ).run(gateKey, local.write_owner);
+          if (Number(retained.changes) !== 1) {
+            throw new Error(`${gateKey}의 무효화된 ordinary write repair barrier를 남기지 못했다`);
+          }
+        } else {
+          // A newer ordinary completion may already have cleared its owner before this older Slack
+          // response arrived last. The remote card is now uncertain, so matched is unsafe until a
+          // fresh exact observation repairs it.
+          const failedClosed = this.db.prepare(
+            `UPDATE gate_local_observation
+                SET mapping_state = 'mismatched', write_owner = NULL, write_expires_at = NULL
+              WHERE gate_key = ? AND write_owner IS NULL`,
+          ).run(gateKey);
+          if (Number(failedClosed.changes) !== 1) {
+            throw new Error(`${gateKey}의 무효화된 ordinary write mapping을 차단하지 못했다`);
+          }
+        }
+        if (!ownsFence) {
+          // Fence a replacement owner's eventual completion, or force a fresh generation when no
+          // owner remains. Advancing beyond our expected revision is also safe under malformed
+          // external row deletion and cannot accidentally recreate the stale token.
+          if (activeExpectedRevision === null) {
+            throw new Error(`${gateKey}의 무효화된 ordinary write generation이 없다`);
+          }
+          advanceGateObservationGeneration(this.db, gateKey, activeExpectedRevision);
+        }
+        rearmResolutionOutbox();
+        this.db.exec('COMMIT');
+        transactionStarted = false;
+        this.activeObservationWrites.delete(gateKey);
+        throw new Error(`${gateKey}의 ordinary write fence가 더 새 관찰로 무효화되어 완료할 수 없다`);
+      }
+      const result = this.db.prepare(UPDATE_GATE_OBSERVATION).run(renderFingerprint, at, gateKey);
+      if (Number(result.changes) === 0) {
+        throw new Error(`${gateKey}의 thread 매핑 행이 없어 관찰 결과를 갱신할 수 없다`);
+      }
+      if (
+        activeObservation !== null &&
+        activeExpectedRevision !== null &&
+        settledMetadataState !== null
+      ) {
+        const settled = this.db.prepare(
+          `UPDATE gate_local_observation
+              SET run_key = ?, task_key = ?, status = ?, resolution = ?, resolved_at = ?,
+                   metadata_state = ?, mapping_state = 'matched', write_owner = NULL,
+                   write_expires_at = NULL,
+                   observed_at = ?
+            WHERE gate_key = ? AND write_owner = ?
+              AND write_expires_at > ?`,
+        ).run(
+          activeObservation.runKey,
+          activeObservation.taskKey,
+          activeObservation.status,
+          activeObservation.resolution,
+          activeObservation.resolvedAt,
+          settledMetadataState,
+          activeObservation.observedAt,
+          gateKey,
+          this.observationWriteOwner,
+          at,
+        );
+        if (Number(settled.changes) !== 1) {
+          throw new Error(`${gateKey}의 ordinary write fence를 원자적으로 확정하지 못했다`);
+        }
+      }
+      // An ordinary observer can complete after D2 projected a newer card. Re-arm that durable
+      // generation in the same transaction as the static fingerprint so a crash before the
+      // in-process repair is always recovered by startup reconciliation.
+      rearmResolutionOutbox();
+      this.db.exec('COMMIT');
+      transactionStarted = false;
+      if (active) this.activeObservationWrites.delete(gateKey);
+    } catch (e) {
+      if (transactionStarted) this.db.exec('ROLLBACK');
+      throw e;
     }
   }
 
+  saveGateLocalObservation(
+    observation: GateLocalObservation,
+    expectedFirstMessage?: { readonly channelId: string; readonly threadTs: string | null },
+    expectedRevision?: number,
+  ): GateObservationSaveResult {
+    if (expectedRevision !== undefined) {
+      storedRevision(expectedRevision, `${observation.gateKey}.observation confirmation revision`);
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      let reconciledObservation = observation;
+      if (expectedFirstMessage !== undefined) {
+        const currentMessage = this.db.prepare(SELECT_GATE_MESSAGE).get(observation.gateKey) as
+          | GateMessageRow
+          | undefined;
+        if (currentMessage !== undefined) {
+          // The caller rendered from an `existing === null` snapshot, but another publisher made
+          // the immutable identity durable first. Preserve the caller's current Orca facts while
+          // deriving correlation from that now-authoritative message instead of writing `missing`.
+          const message = toGateMessage(currentMessage);
+          reconciledObservation = {
+            ...observation,
+            mappingState:
+              expectedFirstMessage.threadTs === null
+                ? 'missing'
+                : message.runKey === observation.runKey &&
+                    message.channelId === expectedFirstMessage.channelId &&
+                    message.threadTs === expectedFirstMessage.threadTs
+                  ? 'matched'
+                  : 'mismatched',
+          };
+        }
+      }
+      const currentObservation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(
+        reconciledObservation.gateKey,
+      ) as GateLocalObservationRow | undefined;
+      // Reconcile the caller's earlier collection snapshot against sidecar state in this exact
+      // write transaction. A concurrent gate-register may commit between collect and publish;
+      // persisting that stale `missing` value would make an otherwise valid store fail on restart.
+      const metadata = this.db.prepare(SELECT_GATE_METADATA).get(reconciledObservation.gateKey) as
+        | GateMetadataRow
+        | undefined;
+      const requestedMetadataState = reconcileObservationMetadataState(reconciledObservation, metadata);
+      // Validate the caller before any terminal/stale reconciliation can hide a malformed shape.
+      toGateLocalObservation({
+        gate_key: reconciledObservation.gateKey,
+        run_key: reconciledObservation.runKey,
+        task_key: reconciledObservation.taskKey,
+        status: reconciledObservation.status,
+        resolution: reconciledObservation.resolution,
+        resolved_at: reconciledObservation.resolvedAt,
+        metadata_state: requestedMetadataState,
+        mapping_state: reconciledObservation.mappingState,
+        write_owner: null,
+        write_expires_at: null,
+        observed_at: reconciledObservation.observedAt,
+      });
+
+      const currentGeneration = this.db.prepare(SELECT_GATE_OBSERVATION_GENERATION).get(
+        reconciledObservation.gateKey,
+      ) as GateObservationGenerationRow | undefined;
+      if (expectedRevision !== undefined && currentGeneration?.revision !== expectedRevision) {
+        if (currentObservation === undefined || currentGeneration === undefined) {
+          throw new Error(
+            `${reconciledObservation.gateKey}의 observation reservation correlation이 불완전하다`,
+          );
+        }
+        // A stale reservation cannot replace current Orca facts. It may only make a newly observed
+        // correlation fail closed; exact identity leaves the newer mapping untouched.
+        const failClosedMapping = reconciledObservation.mappingState === 'matched'
+          ? currentObservation.mapping_state
+          : reconciledObservation.mappingState;
+        const failClosedMetadata = requestedMetadataState === 'matched'
+          ? currentObservation.metadata_state
+          : requestedMetadataState;
+        const correlationChanged =
+          currentObservation.write_owner === null &&
+          (currentObservation.mapping_state !== failClosedMapping ||
+            currentObservation.metadata_state !== failClosedMetadata);
+        let revision = currentGeneration.revision;
+        if (correlationChanged) {
+          const failedClosed = this.db.prepare(
+            `UPDATE gate_local_observation
+                SET metadata_state = ?, mapping_state = ?
+              WHERE gate_key = ? AND write_owner IS NULL`,
+          ).run(
+            failClosedMetadata,
+            failClosedMapping,
+            reconciledObservation.gateKey,
+          );
+          if (Number(failedClosed.changes) !== 1) {
+            throw new Error(
+              `${reconciledObservation.gateKey}의 stale observation correlation을 차단하지 못했다`,
+            );
+          }
+          revision = advanceGateObservationGeneration(this.db, reconciledObservation.gateKey);
+        }
+        const durableRow = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(
+          reconciledObservation.gateKey,
+        ) as GateLocalObservationRow | undefined;
+        if (durableRow === undefined) {
+          throw new Error(`${reconciledObservation.gateKey}의 current observation이 사라졌다`);
+        }
+        this.db.exec('COMMIT');
+        return { observation: toGateLocalObservation(durableRow), current: false, revision };
+      }
+
+      const sourceIsStale =
+        currentObservation !== undefined &&
+        reconciledObservation.observedAt < currentObservation.observed_at;
+      const terminalAdvance =
+        currentObservation !== undefined &&
+        currentObservation.status !== 'resolved' &&
+        reconciledObservation.status === 'resolved';
+      const terminalSuperseded =
+        currentObservation?.status === 'resolved' &&
+        (reconciledObservation.status !== 'resolved' ||
+          reconciledObservation.resolution !== currentObservation.resolution ||
+          reconciledObservation.resolvedAt !== currentObservation.resolved_at);
+      const callerIsCurrent =
+        currentObservation === undefined ||
+        terminalAdvance ||
+        (!sourceIsStale && !terminalSuperseded);
+      const preserveFacts =
+        currentObservation !== undefined && !terminalAdvance && (sourceIsStale || terminalSuperseded);
+      const durableMappingState =
+        currentObservation !== undefined &&
+        sourceIsStale &&
+        reconciledObservation.mappingState === 'matched'
+          ? currentObservation.mapping_state === 'write_pending'
+            ? 'matched'
+            : currentObservation.mapping_state
+          : reconciledObservation.mappingState;
+      const durableMetadataState =
+        currentObservation !== undefined &&
+        sourceIsStale &&
+        requestedMetadataState === 'matched'
+          ? currentObservation.metadata_state
+          : requestedMetadataState;
+      const durableObservation: GateLocalObservation = {
+        ...reconciledObservation,
+        runKey: preserveFacts ? currentObservation.run_key as RunKey : reconciledObservation.runKey,
+        taskKey: preserveFacts ? currentObservation.task_key as TaskKey : reconciledObservation.taskKey,
+        status: preserveFacts
+          ? currentObservation.status as GateLocalObservation['status']
+          : reconciledObservation.status,
+        resolution: preserveFacts ? currentObservation.resolution : reconciledObservation.resolution,
+        resolvedAt: preserveFacts ? currentObservation.resolved_at : reconciledObservation.resolvedAt,
+        metadataState: durableMetadataState as GateLocalObservation['metadataState'],
+        mappingState: durableMappingState as GateLocalObservation['mappingState'],
+        observedAt:
+          currentObservation !== undefined && sourceIsStale
+            ? currentObservation.observed_at
+            : reconciledObservation.observedAt,
+      };
+      // Revalidate the exact durable candidate before its monotonic generation advances.
+      toGateLocalObservation({
+        gate_key: durableObservation.gateKey,
+        run_key: durableObservation.runKey,
+        task_key: durableObservation.taskKey,
+        status: durableObservation.status,
+        resolution: durableObservation.resolution,
+        resolved_at: durableObservation.resolvedAt,
+        metadata_state: durableObservation.metadataState,
+        mapping_state: durableObservation.mappingState,
+        write_owner: null,
+        write_expires_at: null,
+        observed_at: durableObservation.observedAt,
+      });
+      // A live/dead/expired owner always remains write_pending here, and an ownerless fail-closed
+      // mapping cannot become matched in this save transaction. Only an exact begin CAS may move
+      // either state directly to write_pending ownership. The separate generation advances even
+      // when the visible v8 row is byte-identical (same timestamp, wrong identity, or render-only
+      // change), fencing every older completion.
+      this.db.prepare(UPSERT_GATE_LOCAL_OBSERVATION).run(
+        durableObservation.gateKey,
+        durableObservation.runKey,
+        durableObservation.taskKey,
+        durableObservation.status,
+        durableObservation.resolution,
+        durableObservation.resolvedAt,
+        durableObservation.metadataState,
+        durableObservation.mappingState,
+        durableObservation.observedAt,
+      );
+      const revision = expectedRevision ??
+        advanceGateObservationGeneration(this.db, durableObservation.gateKey);
+      this.db.exec('COMMIT');
+      return { observation: durableObservation, current: callerIsCurrent, revision };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  findGateLocalObservation(gateKey: GateKey): GateLocalObservation | null {
+    const row = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(gateKey) as
+      | GateLocalObservationRow
+      | undefined;
+    return row === undefined ? null : toGateLocalObservation(row);
+  }
+
+  claimGateResolution(input: GateClaimInput): GateClaimResult {
+    storedIso(input.at, 'gate resolution claim.at');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const message = this.db
+        .prepare(SELECT_GATE_MESSAGE_BY_SLACK)
+        .get(input.channelId, input.messageTs) as GateMessageRow | undefined;
+      if (message === undefined) {
+        this.insertGateAudit(null, 'rejected', 'unknown_message', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'unknown_message' };
+      }
+      const gate = toGateMessage(message);
+      const metadataRow = this.db.prepare(SELECT_GATE_METADATA).get(gate.gateKey) as
+        | GateMetadataRow
+        | undefined;
+      const observationRow = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(gate.gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      if (metadataRow === undefined || observationRow === undefined) {
+        this.insertGateAudit(gate.gateKey, 'rejected', 'missing_sidecar_or_observation', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'missing_sidecar_or_observation' };
+      }
+      const metadata = toGateMetadata(metadataRow);
+      const observation = toGateLocalObservation(observationRow);
+      const optionMatches = metadata.options.filter((option) => option.id === input.actionValue);
+      // Validate the immutable Slack envelope and action against the durable Gate/message facts
+      // before consulting mutable observer state. An exact redelivery may need to recover a
+      // pre-ACK winner after a later ordinary Slack completion fail-closed the mapping.
+      const immutableReason =
+        !/^T[A-Z0-9]+$/.test(input.teamId) ||
+        !/^U[A-Z0-9]+$/.test(input.ownerUserId) ||
+        (input.apiAppId !== null && !/^A[A-Z0-9]+$/.test(input.apiAppId)) ||
+        !/^[CG][A-Z0-9]+$/.test(input.channelId) ||
+        !/^\d+\.\d+$/.test(input.threadTs) ||
+        !/^\d+\.\d+$/.test(input.messageTs)
+          ? 'invalid_slack_identity'
+          : gate.channelId !== input.channelId || gate.messageTs !== input.messageTs
+          ? 'message_identity_mismatch'
+          : gate.threadTs !== input.threadTs
+            ? 'thread_identity_mismatch'
+            : gate.runKey !== metadata.runKey
+              ? 'run_identity_mismatch'
+              : input.blockId !== gateBlockId(gate.gateKey)
+                ? 'unknown_block'
+                : optionMatches.length !== 1
+                  ? 'unknown_or_ambiguous_option'
+                  : input.actionId !== gateActionId(gate.gateKey, input.actionValue)
+                    ? 'unknown_action'
+                    : null;
+      if (immutableReason !== null) {
+        this.insertGateAudit(gate.gateKey, 'rejected', immutableReason, input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: immutableReason };
+      }
+      const option = optionMatches[0];
+      if (option === undefined) throw new Error('validated Gate option disappeared');
+      const existingRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(gate.gateKey) as
+        | GateResolutionRow
+        | undefined;
+      const existing = existingRow === undefined ? null : toGateResolution(existingRow);
+      const finishExisting = (intent: GateResolutionIntent): GateClaimResult => {
+        const exactStoredWinner =
+          intent.optionId === option.id &&
+          intent.optionResolution === option.resolution &&
+          intent.teamId === input.teamId &&
+          intent.apiAppId === input.apiAppId &&
+          intent.channelId === input.channelId &&
+          intent.threadTs === input.threadTs &&
+          intent.messageTs === input.messageTs &&
+          intent.blockId === input.blockId &&
+          intent.actionId === input.actionId &&
+          intent.actionValue === input.actionValue;
+        if (exactStoredWinner) {
+          this.insertGateAudit(gate.gateKey, 'duplicate', 'same_transition', input.at);
+          this.db.exec('COMMIT');
+          return { kind: 'duplicate', intent, metadata };
+        }
+        this.insertGateAudit(gate.gateKey, 'lost', 'different_transition', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'lost', intent };
+      };
+      if (existing !== null && existing.ackState !== 'acked') {
+        // pending/failed intents are intentionally absent from startup reconciliation, and an
+        // ordinary repair cannot start once the intent exists. Exact Slack redelivery is therefore
+        // their only recovery path and must not be blocked by a later mutable observation mismatch.
+        return finishExisting(existing);
+      }
+      const mutableObservationReason =
+        observation.runKey !== metadata.runKey
+          ? 'run_identity_mismatch'
+          : observation.gateKey !== gate.gateKey || observation.taskKey !== metadata.taskKey
+            ? 'gate_task_identity_mismatch'
+            : observation.metadataState !== 'matched'
+              ? 'sidecar_not_matched'
+              : observation.mappingState !== 'matched' || observationRow.write_owner !== null
+                ? 'card_mapping_not_matched'
+                : null;
+      if (mutableObservationReason !== null) {
+        this.insertGateAudit(gate.gateKey, 'rejected', mutableObservationReason, input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: mutableObservationReason };
+      }
+      if (existing !== null) return finishExisting(existing);
+      if (observation.status !== 'pending') {
+        this.insertGateAudit(gate.gateKey, 'rejected', 'stale_or_resolved', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'stale_or_resolved' };
+      }
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.retryRequestId)) {
+        this.insertGateAudit(gate.gateKey, 'rejected', 'invalid_retry_request', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'invalid_retry_request' };
+      }
+      this.db.prepare(INSERT_GATE_RESOLUTION).run(
+        gate.gateKey,
+        input.retryRequestId,
+        option.id,
+        option.resolution,
+        metadata.askMessageId,
+        metadata.questionThreadId,
+        metadata.dispatchKey.slice('dispatch:'.length),
+        metadata.taskKey.slice('task:'.length),
+        input.teamId,
+        input.ownerUserId,
+        input.apiAppId,
+        input.channelId,
+        input.threadTs,
+        input.messageTs,
+        input.blockId,
+        input.actionId,
+        input.actionValue,
+        input.at,
+        input.at,
+      );
+      this.db.prepare(INSERT_GATE_OUTBOX).run(gate.gateKey, input.at, input.at);
+      if (!this.insertGateAudit(gate.gateKey, 'claimed', 'first_valid_selection', input.at)) {
+        // The first winner audit is part of the same required local transaction. If bounded
+        // evidence is already exhausted, roll the intent/outbox back rather than commit a winner
+        // whose initial audit fact is missing.
+        throw new Error(`${gate.gateKey}의 first-winner audit를 원자적으로 기록할 수 없다`);
+      }
+      const claimedRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(gate.gateKey) as GateResolutionRow;
+      const claimed = toGateResolution(claimedRow);
+      this.db.exec('COMMIT');
+      return { kind: 'claimed', intent: claimed, metadata };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  findGateResolution(gateKey: GateKey): GateResolutionIntent | null {
+    const row = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as GateResolutionRow | undefined;
+    return row === undefined ? null : toGateResolution(row);
+  }
+
+  listNonterminalGateResolutions(): readonly GateResolutionIntent[] {
+    return (this.db.prepare(SELECT_NONTERMINAL_GATE_RESOLUTIONS).all() as GateResolutionRow[]).map(
+      toGateResolution,
+    );
+  }
+
+  acquireGateResolutionLease(
+    gateKey: GateKey,
+    owner: string,
+    at: string,
+    expiresAt: string,
+  ): GateLeaseResult {
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.lease owner`);
+    const acquiredAt = storedIso(at, `${gateKey}.lease at`);
+    const expiry = storedIso(expiresAt, `${gateKey}.lease expiresAt`);
+    if (expiry <= acquiredAt) throw new TypeError(`${gateKey}의 lease expiry가 미래가 아니다`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateResolution(gateKey);
+      if (
+        current === null ||
+        current.ackState !== 'acked' ||
+        ['resolved', 'conflict', 'degraded'].includes(current.lifecycle)
+      ) {
+        this.db.exec('COMMIT');
+        return { kind: 'unavailable' };
+      }
+      if (
+        current.leaseOwner !== null &&
+        current.leaseOwner !== safeOwner &&
+        current.leaseExpiresAt !== null &&
+        current.leaseExpiresAt > acquiredAt
+      ) {
+        this.db.exec('COMMIT');
+        return { kind: 'busy', expiresAt: current.leaseExpiresAt };
+      }
+      const result = this.db.prepare(
+        `UPDATE gate_resolution SET lease_owner = ?, lease_expires_at = ?
+          WHERE gate_key = ? AND revision = ?`,
+      ).run(safeOwner, expiry, gateKey, current.revision);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return { kind: 'busy', expiresAt: expiry };
+      }
+      const leased = this.findGateResolution(gateKey);
+      if (leased === null) throw new Error(`${gateKey}의 acquired lease를 다시 읽지 못했다`);
+      this.db.exec('COMMIT');
+      return { kind: 'acquired', intent: leased };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  renewGateResolutionLease(
+    gateKey: GateKey,
+    owner: string,
+    at: string,
+    expiresAt: string,
+  ): boolean {
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.renewed lease owner`);
+    const renewedAt = storedIso(at, `${gateKey}.renewed lease at`);
+    const expiry = storedIso(expiresAt, `${gateKey}.renewed lease expiresAt`);
+    if (expiry <= renewedAt) throw new TypeError(`${gateKey}의 renewed lease expiry가 미래가 아니다`);
+    const result = this.db.prepare(
+      `UPDATE gate_resolution SET lease_expires_at = ?
+        WHERE gate_key = ? AND lease_owner = ?
+          AND lease_expires_at > ?
+          AND lifecycle NOT IN ('resolved','conflict','degraded')`,
+    ).run(expiry, gateKey, safeOwner, renewedAt);
+    return Number(result.changes) === 1;
+  }
+
+  releaseGateResolutionLease(gateKey: GateKey, owner: string): void {
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.released lease owner`);
+    this.db.prepare(
+      `UPDATE gate_resolution SET lease_owner = NULL, lease_expires_at = NULL
+        WHERE gate_key = ? AND lease_owner = ?`,
+    ).run(gateKey, safeOwner);
+  }
+
+  markGateResolutionAck(
+    gateKey: GateKey,
+    expectedRevision: number,
+    ackState: 'acked' | 'failed',
+    at: string,
+  ): GateResolutionIntent | null {
+    storedRevision(expectedRevision, `${gateKey}.ACK expected revision`);
+    storedIso(at, `${gateKey}.ACK at`);
+    const result = this.db.prepare(MARK_GATE_RESOLUTION_ACK).run(
+      ackState,
+      at,
+      gateKey,
+      expectedRevision,
+    );
+    if (Number(result.changes) !== 1) return null;
+    return this.findGateResolution(gateKey);
+  }
+
+  updateGateResolution(
+    gateKey: GateKey,
+    expectedRevision: number,
+    leaseOwner: string,
+    update: GateProgressUpdate,
+  ): GateResolutionIntent | null {
+    storedIso(update.at, `${gateKey}.resolution update.at`);
+    storedRevision(expectedRevision, `${gateKey}.expected revision`);
+    const safeLeaseOwner = storedLeaseOwner(leaseOwner, `${gateKey}.progress lease owner`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.findGateResolution(gateKey);
+      if (current === null) throw new Error(`${gateKey}의 resolution intent가 없다`);
+      if (
+        current.revision !== expectedRevision ||
+        current.ackState !== 'acked' ||
+        current.leaseOwner !== safeLeaseOwner ||
+        current.leaseExpiresAt === null ||
+        current.leaseExpiresAt <= update.at ||
+        ['resolved', 'conflict', 'degraded'].includes(current.lifecycle)
+      ) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const preRead = Object.hasOwn(update, 'preRead') ? (update.preRead ?? null) : current.preRead;
+      const resolveResult = Object.hasOwn(update, 'resolveResult')
+        ? (update.resolveResult ?? null)
+        : current.resolveResult;
+      const postRead = Object.hasOwn(update, 'postRead') ? (update.postRead ?? null) : current.postRead;
+      if (preRead !== null) toGateSnapshot(preRead, `${gateKey}.preRead`);
+      if (resolveResult !== null) toGateResolveResult(resolveResult, `${gateKey}.resolveResult`);
+      if (postRead !== null) toGateSnapshot(postRead, `${gateKey}.postRead`);
+      const errorCode = Object.hasOwn(update, 'errorCode')
+        ? safeGateFact(update.errorCode ?? null, 80)
+        : current.lastErrorCode;
+      const errorDetail = Object.hasOwn(update, 'errorDetail')
+        ? safeGateFact(update.errorDetail ?? null, GATE_FACT_CAP)
+        : current.lastErrorDetail;
+      const cardState = cardStateForLifecycle(update.lifecycle);
+      const mutationOwnership =
+        resolveResult !== null
+          ? 'structured'
+          : update.lifecycle === 'resolving' || current.mutationOwnership === 'unknown'
+            ? 'unknown'
+            : current.mutationOwnership;
+      if (update.cardState !== undefined && update.cardState !== cardState) {
+        throw new TypeError(`${gateKey}의 lifecycle과 card projection state가 어긋난다`);
+      }
+      if (errorCode !== null) gateCode(errorCode, 80);
+      if (
+        resolveResult !== null &&
+        (resolveResult.mutation.requestId !== current.retryRequestId ||
+          resolveResult.gate.status !== 'resolved' ||
+          resolveResult.gate.resolution !== current.optionResolution)
+      ) {
+        throw new TypeError(`${gateKey}의 structured resolve evidence가 winner와 어긋난다`);
+      }
+      const releasesLease = ['uncertain', 'resolved', 'conflict', 'degraded'].includes(
+        update.lifecycle,
+      );
+      validateGateLifecycleEvidence(
+        {
+          ...current,
+          revision: current.revision + 1,
+          leaseOwner: releasesLease ? null : current.leaseOwner,
+          leaseExpiresAt: releasesLease ? null : current.leaseExpiresAt,
+          lifecycle: update.lifecycle,
+          mutationOwnership,
+          preRead,
+          resolveResult,
+          postRead,
+          lastErrorCode: errorCode,
+          lastErrorDetail: errorDetail,
+          updatedAt: update.at,
+        },
+        `${gateKey}.resolution update`,
+      );
+      const result = this.db.prepare(UPDATE_GATE_RESOLUTION_PROGRESS).run(
+        update.lifecycle,
+        mutationOwnership,
+        preRead === null ? null : JSON.stringify(preRead),
+        resolveResult === null ? null : JSON.stringify(resolveResult),
+        postRead === null ? null : JSON.stringify(postRead),
+        errorCode,
+        errorDetail,
+        update.at,
+        gateKey,
+        expectedRevision,
+        safeLeaseOwner,
+      );
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const existingOutbox = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as GateOutboxRow | undefined;
+      const createdAt = existingOutbox?.created_at ?? current.createdAt;
+      this.db.prepare(UPSERT_GATE_OUTBOX_PROGRESS).run(
+        gateKey,
+        cardState,
+        errorCode,
+        createdAt,
+        update.at,
+      );
+      if (releasesLease) {
+        this.db.prepare(
+          `UPDATE gate_resolution SET lease_owner = NULL, lease_expires_at = NULL
+            WHERE gate_key = ? AND lease_owner = ?`,
+        ).run(gateKey, safeLeaseOwner);
+      }
+      const updatedRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as GateResolutionRow;
+      const updated = toGateResolution(updatedRow);
+      this.db.exec('COMMIT');
+      return updated;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  listPendingGateOutboxes(): readonly GateResolutionOutbox[] {
+    return (this.db.prepare(SELECT_PENDING_GATE_OUTBOXES).all() as GateOutboxRow[]).map(toGateOutbox);
+  }
+
+  listAcknowledgedGateOutboxes(): readonly GateResolutionOutbox[] {
+    return (this.db.prepare(SELECT_ACKNOWLEDGED_GATE_OUTBOXES).all() as GateOutboxRow[]).map(
+      toGateOutbox,
+    );
+  }
+
+  findGateResolutionOutbox(gateKey: GateKey): GateResolutionOutbox | null {
+    const row = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as GateOutboxRow | undefined;
+    return row === undefined ? null : toGateOutbox(row);
+  }
+
+  beginGateObservationWrite(
+    gateKey: GateKey,
+    at: string,
+    expectedObservation: GateLocalObservation,
+    expectedRevision: number,
+    expectedMessageIdentity?: {
+      readonly channelId: string;
+      readonly threadTs: string | null;
+    },
+  ): boolean {
+    storedIso(at, `${gateKey}.ordinary Gate write fence at`);
+    storedRevision(expectedRevision, `${gateKey}.ordinary Gate expected revision`);
+    if (
+      expectedObservation.gateKey !== gateKey ||
+      expectedObservation.mappingState !== 'matched' ||
+      expectedObservation.metadataState !== 'matched'
+    ) {
+      return false;
+    }
+    const expiresAt = observationWriteExpiry(at);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const intent = this.db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as
+        | GateResolutionRow
+        | undefined;
+      if (intent !== undefined) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const observation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      if (observation === undefined) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const generation = this.db.prepare(SELECT_GATE_OBSERVATION_GENERATION).get(gateKey) as
+        | GateObservationGenerationRow
+        | undefined;
+      if (generation === undefined || generation.revision !== expectedRevision) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const metadata = this.db.prepare(SELECT_GATE_METADATA).get(gateKey) as
+        | GateMetadataRow
+        | undefined;
+      const metadataState = reconcileObservationMetadataState(expectedObservation, metadata);
+      if (metadataState !== 'matched') {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const messageRow = this.db.prepare(SELECT_GATE_MESSAGE).get(gateKey) as
+        | GateMessageRow
+        | undefined;
+      const messageIdentityMatched =
+        expectedMessageIdentity !== undefined &&
+        expectedMessageIdentity.threadTs !== null &&
+        messageRow !== undefined &&
+        messageRow.run_key === expectedObservation.runKey &&
+        messageRow.channel_id === expectedMessageIdentity.channelId &&
+        messageRow.thread_ts === expectedMessageIdentity.threadTs;
+      if (
+        expectedMessageIdentity !== undefined &&
+        !messageIdentityMatched
+      ) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      if (
+        (observation.mapping_state === 'missing' || observation.mapping_state === 'mismatched') &&
+        !messageIdentityMatched
+      ) {
+        // A fail-closed mapping is repairable only when this exact transaction revalidates the
+        // publisher's canonical channel/thread identity. It must never become matched in a prior
+        // save transaction where another daemon could claim the still-dirty remote card.
+        this.db.exec('COMMIT');
+        return false;
+      }
+      // The transaction holds SQLite's writer slot from this exact comparison through the owner
+      // write. A publisher collected before a newer observation therefore cannot start Slack from
+      // its stale snapshot, even when saveGateLocalObservation latched newer terminal facts.
+      if (!observationWriteStillCurrent(
+        observation,
+        expectedObservation,
+        metadataState,
+        true,
+      )) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const exactSnapshot = `
+        run_key = ? AND task_key = ? AND status = ? AND resolution IS ? AND resolved_at IS ?
+        AND metadata_state = ? AND observed_at = ?`;
+      const exactValues = [
+        expectedObservation.runKey,
+        expectedObservation.taskKey,
+        expectedObservation.status,
+        expectedObservation.resolution,
+        expectedObservation.resolvedAt,
+        metadataState,
+        expectedObservation.observedAt,
+      ] as const;
+      if (observation.mapping_state === 'write_pending') {
+        const previousOwner = observation.write_owner;
+        if (
+          previousOwner === this.observationWriteOwner &&
+          !this.activeObservationWrites.has(gateKey)
+        ) {
+          const renewed = this.db.prepare(
+            `UPDATE gate_local_observation
+                SET write_expires_at = ?
+              WHERE gate_key = ? AND write_owner = ?
+                AND mapping_state = 'write_pending' AND ${exactSnapshot}`,
+          ).run(expiresAt, gateKey, previousOwner, ...exactValues);
+          if (Number(renewed.changes) !== 1) {
+            this.db.exec('COMMIT');
+            return false;
+          }
+          this.activeObservationWrites.set(gateKey, expectedRevision);
+          this.db.exec('COMMIT');
+          return true;
+        }
+        const previousExpiry = observation.write_expires_at;
+        if (
+          previousOwner === null ||
+          previousExpiry === null ||
+          this.activeObservationWrites.has(gateKey) ||
+          (previousExpiry > at && this.isObservationOwnerAlive(previousOwner))
+        ) {
+          this.db.exec('COMMIT');
+          return false;
+        }
+        const recovered = this.db.prepare(
+          `UPDATE gate_local_observation
+              SET write_owner = ?, write_expires_at = ?
+            WHERE gate_key = ? AND write_owner = ?
+              AND mapping_state = 'write_pending' AND ${exactSnapshot}`,
+        ).run(this.observationWriteOwner, expiresAt, gateKey, previousOwner, ...exactValues);
+        if (Number(recovered.changes) !== 1) {
+          this.db.exec('COMMIT');
+          return false;
+        }
+        this.activeObservationWrites.set(gateKey, expectedRevision);
+        this.db.exec('COMMIT');
+        return true;
+      }
+      const result = this.db.prepare(
+        `UPDATE gate_local_observation
+            SET mapping_state = 'write_pending', write_owner = ?, write_expires_at = ?
+          WHERE gate_key = ? AND mapping_state = ? AND write_owner IS NULL
+            AND ${exactSnapshot}`,
+      ).run(
+        this.observationWriteOwner,
+        expiresAt,
+        gateKey,
+        observation.mapping_state,
+        ...exactValues,
+      );
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      this.activeObservationWrites.set(gateKey, expectedRevision);
+      this.db.exec('COMMIT');
+      return true;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  abandonGateObservationWrite(gateKey: GateKey): void {
+    this.activeObservationWrites.delete(gateKey);
+  }
+
+  acquireGateOutboxProjection(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    at: string,
+  ): GateProjectionLeaseResult {
+    storedRevision(expectedRevision, `${gateKey}.projection expected revision`);
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.projection owner`);
+    storedIso(at, `${gateKey}.projection acquire at`);
+    const expiresAt = observationWriteExpiry(at);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as GateOutboxRow | undefined;
+      if (row === undefined || row.revision !== expectedRevision) {
+        this.db.exec('COMMIT');
+        return 'superseded';
+      }
+      // A completed generation is never leasable. The projector must first durably re-arm and
+      // advance it, then re-read that pending row before any Slack call.
+      if (row.card_pending !== 1) {
+        this.db.exec('COMMIT');
+        return 'superseded';
+      }
+      if (
+        row.projection_owner === safeOwner &&
+        row.projection_expires_at !== null &&
+        row.projection_expires_at > at
+      ) {
+        const renewed = this.db.prepare(
+          `UPDATE gate_resolution_outbox
+              SET projection_expires_at = ?, updated_at = ?
+            WHERE gate_key = ? AND revision = ? AND card_pending = 1
+              AND projection_owner = ? AND projection_expires_at > ?`,
+        ).run(expiresAt, at, gateKey, expectedRevision, safeOwner, at);
+        if (Number(renewed.changes) !== 1) {
+          this.db.exec('COMMIT');
+          return 'superseded';
+        }
+        LIVE_OBSERVATION_WRITE_OWNERS.add(safeOwner);
+        this.ownedProjectionWrites.add(safeOwner);
+        this.db.exec('COMMIT');
+        return 'acquired';
+      }
+      if (row.projection_owner !== null) {
+        if (row.projection_expires_at === null) {
+          throw new Error(`${gateKey}의 projection owner expiry가 없다`);
+        }
+        if (
+          row.projection_expires_at > at &&
+          this.isObservationOwnerAlive(row.projection_owner)
+        ) {
+          this.db.exec('COMMIT');
+          return 'busy';
+        }
+        // A crashed projector may have applied its stale card. Take ownership while advancing the
+        // generation and forcing a fresh snapshot; the caller must loop before making Slack calls.
+        const recovered = this.db.prepare(
+          `UPDATE gate_resolution_outbox
+              SET revision = revision + 1, card_pending = 1, projected_at = NULL,
+                  projection_owner = ?, projection_expires_at = ?, updated_at = ?
+            WHERE gate_key = ? AND revision = ? AND projection_owner = ?`,
+        ).run(safeOwner, expiresAt, at, gateKey, expectedRevision, row.projection_owner);
+        if (Number(recovered.changes) !== 1) {
+          this.db.exec('COMMIT');
+          return 'superseded';
+        }
+        LIVE_OBSERVATION_WRITE_OWNERS.add(safeOwner);
+        this.ownedProjectionWrites.add(safeOwner);
+        this.db.exec('COMMIT');
+        return 'recovered';
+      }
+      const acquired = this.db.prepare(
+        `UPDATE gate_resolution_outbox
+            SET projection_owner = ?, projection_expires_at = ?, updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND projection_owner IS NULL`,
+      ).run(safeOwner, expiresAt, at, gateKey, expectedRevision);
+      if (Number(acquired.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return 'superseded';
+      }
+      LIVE_OBSERVATION_WRITE_OWNERS.add(safeOwner);
+      this.ownedProjectionWrites.add(safeOwner);
+      this.db.exec('COMMIT');
+      return 'acquired';
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  rearmGateOutboxProjection(
+    gateKey: GateKey,
+    expectedRevision: number,
+    at: string,
+  ): boolean {
+    storedRevision(expectedRevision, `${gateKey}.projection rearm expected revision`);
+    storedIso(at, `${gateKey}.projection rearm at`);
+    const result = this.db.prepare(
+      `UPDATE gate_resolution_outbox
+          SET revision = revision + 1, card_pending = 1, projected_at = NULL,
+              projection_owner = NULL, projection_expires_at = NULL, updated_at = ?
+        WHERE gate_key = ? AND revision = ? AND card_pending = 0
+          AND projection_owner IS NULL AND projection_expires_at IS NULL`,
+    ).run(at, gateKey, expectedRevision);
+    return Number(result.changes) === 1;
+  }
+
+  markGateOutboxProjected(
+    gateKey: GateKey,
+    expectedRevision: number,
+    renderFingerprint: string,
+    owner: string,
+    at: string,
+  ): boolean {
+    storedIso(at, `${gateKey}.outbox projected_at`);
+    storedRevision(expectedRevision, `${gateKey}.outbox expected revision`);
+    storedText(renderFingerprint, `${gateKey}.resolution render fingerprint`, 128);
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.projection completion owner`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare(MARK_GATE_OUTBOX_PROJECTED).run(
+        at,
+        at,
+        gateKey,
+        expectedRevision,
+        safeOwner,
+        at,
+      );
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const message = this.db.prepare(UPDATE_GATE_OBSERVATION).run(renderFingerprint, at, gateKey);
+      if (Number(message.changes) !== 1) {
+        throw new Error(`${gateKey}의 Gate message projection fingerprint를 갱신하지 못했다`);
+      }
+      this.db.exec('COMMIT');
+      LIVE_OBSERVATION_WRITE_OWNERS.delete(safeOwner);
+      this.ownedProjectionWrites.delete(safeOwner);
+      return true;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  releaseGateOutboxProjection(gateKey: GateKey, owner: string, at: string): boolean {
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.projection release owner`);
+    storedIso(at, `${gateKey}.projection release at`);
+    const result = this.db.prepare(
+      `UPDATE gate_resolution_outbox
+          SET revision = revision + 1, card_pending = 1, projected_at = NULL,
+              projection_owner = NULL, projection_expires_at = NULL, updated_at = ?
+        WHERE gate_key = ? AND projection_owner = ?`,
+    ).run(at, gateKey, safeOwner);
+    LIVE_OBSERVATION_WRITE_OWNERS.delete(safeOwner);
+    this.ownedProjectionWrites.delete(safeOwner);
+    return Number(result.changes) === 1;
+  }
+
+  recordGateAudit(gateKey: GateKey | null, event: string, reason: string, at: string): void {
+    storedIso(at, 'gate resolution audit.at');
+    if (event === 'claimed' || reason === 'first_valid_selection') {
+      throw new TypeError('canonical winner audit은 Gate claim transaction만 기록할 수 있다');
+    }
+    this.insertGateAudit(gateKey, event, reason, at);
+  }
+
+  recordGateAttempt(
+    gateKey: GateKey,
+    phase: string,
+    outcome: string,
+    detail: string | null,
+    at: string,
+  ): void {
+    storedIso(at, `${gateKey}.attempt.at`);
+    const safePhase = gateCode(phase, 40);
+    const safeOutcome = gateCode(outcome, 40);
+    this.db.prepare(INSERT_GATE_ATTEMPT_BOUNDED).run(
+      gateKey,
+      safePhase,
+      safeOutcome,
+      safeGateFact(detail, GATE_FACT_CAP),
+      at,
+      gateKey,
+      GATE_AUDIT_LIMIT,
+    );
+  }
+
+  private insertGateAudit(
+    gateKey: GateKey | null,
+    event: string,
+    reason: string,
+    at: string,
+  ): boolean {
+    const safeEvent = gateCode(event, 40);
+    const safeReason = gateCode(reason, 80);
+    const result = this.db.prepare(INSERT_GATE_AUDIT_BOUNDED).run(
+      gateKey,
+      safeEvent,
+      safeReason,
+      at,
+      gateKey,
+      gateKey,
+      safeEvent,
+      gateKey,
+      GATE_AUDIT_LIMIT,
+      GATE_AUDIT_LIMIT,
+    );
+    return Number(result.changes) === 1;
+  }
+
   close(): void {
-    // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    this.db.close();
+    try {
+      // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      this.db.close();
+    } finally {
+      LIVE_OBSERVATION_WRITE_OWNERS.delete(this.observationWriteOwner);
+      for (const owner of this.ownedProjectionWrites) {
+        LIVE_OBSERVATION_WRITE_OWNERS.delete(owner);
+      }
+      this.ownedProjectionWrites.clear();
+    }
   }
 }
 
@@ -1040,6 +3070,116 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
     throw new Error(`dry-run은 store에 쓰지 않는다. Gate 관찰 결과를 갱신하려 했다: ${this.path}`);
   }
 
+  saveGateLocalObservation(): GateObservationSaveResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate local observation을 기록하려 했다: ${this.path}`);
+  }
+
+  findGateLocalObservation(gateKey: GateKey): GateLocalObservation | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(gateKey) as
+      | GateLocalObservationRow
+      | undefined;
+    return row === undefined ? null : toGateLocalObservation(row);
+  }
+
+  claimGateResolution(): GateClaimResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate resolution을 claim하려 했다: ${this.path}`);
+  }
+
+  findGateResolution(gateKey: GateKey): GateResolutionIntent | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_RESOLUTION).get(gateKey) as GateResolutionRow | undefined;
+    return row === undefined ? null : toGateResolution(row);
+  }
+
+  listNonterminalGateResolutions(): readonly GateResolutionIntent[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_NONTERMINAL_GATE_RESOLUTIONS).all() as GateResolutionRow[]).map(
+      toGateResolution,
+    );
+  }
+
+  acquireGateResolutionLease(): GateLeaseResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate resolution lease를 획득하려 했다: ${this.path}`);
+  }
+
+  renewGateResolutionLease(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate resolution lease를 갱신하려 했다: ${this.path}`);
+  }
+
+  releaseGateResolutionLease(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate resolution lease를 해제하려 했다: ${this.path}`);
+  }
+
+  markGateResolutionAck(): GateResolutionIntent | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate ACK state를 갱신하려 했다: ${this.path}`);
+  }
+
+  updateGateResolution(): GateResolutionIntent | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate resolution을 갱신하려 했다: ${this.path}`);
+  }
+
+  findGateResolutionOutbox(gateKey: GateKey): GateResolutionOutbox | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_OUTBOX).get(gateKey) as GateOutboxRow | undefined;
+    return row === undefined ? null : toGateOutbox(row);
+  }
+
+  listPendingGateOutboxes(): readonly GateResolutionOutbox[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_PENDING_GATE_OUTBOXES).all() as GateOutboxRow[]).map(toGateOutbox);
+  }
+
+  listAcknowledgedGateOutboxes(): readonly GateResolutionOutbox[] {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return [];
+    return (db.prepare(SELECT_ACKNOWLEDGED_GATE_OUTBOXES).all() as GateOutboxRow[]).map(
+      toGateOutbox,
+    );
+  }
+
+  beginGateObservationWrite(
+    _gateKey: GateKey,
+    _at: string,
+    _expectedObservation: GateLocalObservation,
+    _expectedRevision: number,
+  ): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate ordinary write fence를 세우려 했다: ${this.path}`);
+  }
+
+  abandonGateObservationWrite(): void {
+    throw new Error(`dry-run은 store의 Gate ordinary write를 포기할 수 없다: ${this.path}`);
+  }
+
+  acquireGateOutboxProjection(): GateProjectionLeaseResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate projection lease를 얻으려 했다: ${this.path}`);
+  }
+
+  rearmGateOutboxProjection(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate outbox를 재활성화하려 했다: ${this.path}`);
+  }
+
+  markGateOutboxProjected(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate outbox를 확정하려 했다: ${this.path}`);
+  }
+
+  releaseGateOutboxProjection(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate projection lease를 놓으려 했다: ${this.path}`);
+  }
+
+  recordGateAudit(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate audit을 기록하려 했다: ${this.path}`);
+  }
+
+  recordGateAttempt(): void {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate attempt를 기록하려 했다: ${this.path}`);
+  }
+
   close(): void {
     // 복사본이므로 checkpoint하지 않는다. 원본에는 애초에 열린 handle이 없다.
     this.opened.db?.close();
@@ -1095,7 +3235,10 @@ function openCopy(path: string): OpenedCopy {
     // 올리는 대상은 **복사본**이다. 원본은 v1인 채로 남고, 다음 실제 실행이 원본을 올린다.
     // 복사본을 올리지 않으면 dry-run이 v2 컬럼을 읽지 못해 실제 실행과 다른 판정을 낸다.
     const version = readSchemaVersion(db, path);
-    if (version !== null) applyMigrations(db, path, version);
+    if (version !== null) {
+      applyMigrations(db, path, version);
+      validateCurrentGateStore(db, path);
+    }
     return { db, scratch, schemaReady: version !== null };
   } catch (e) {
     db?.close();
@@ -1125,6 +3268,304 @@ function enableWal(db: DatabaseSync, path: string): void {
   }
 }
 
+const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  gate_metadata: [
+    'gate_key', 'run_key', 'task_key', 'dispatch_key', 'ask_message_id',
+    'question_thread_id', 'options_json', 'recommendation_option_id',
+    'recommendation_reason', 'impact', 'registered_at',
+  ],
+  gate_message: [
+    'gate_key', 'run_key', 'channel_id', 'thread_ts', 'message_ts',
+    'render_fingerprint', 'created_at', 'updated_at',
+  ],
+  gate_local_observation: [
+    'gate_key', 'run_key', 'task_key', 'status', 'resolution', 'resolved_at',
+    'metadata_state', 'mapping_state', 'write_owner', 'write_expires_at', 'observed_at',
+  ],
+  gate_observation_generation: ['gate_key', 'revision'],
+  gate_resolution: [
+    'gate_key', 'revision', 'ack_state', 'lease_owner', 'lease_expires_at',
+    'retry_request_id', 'option_id', 'option_resolution',
+    'ask_message_id', 'question_thread_id', 'dispatch_id', 'task_id',
+    'team_id', 'owner_user_id', 'api_app_id', 'channel_id', 'thread_ts', 'message_ts',
+    'block_id', 'action_id', 'action_value', 'lifecycle', 'mutation_ownership', 'pre_read_json',
+    'resolve_result_json', 'post_read_json', 'last_error_code', 'last_error_detail',
+    'created_at', 'updated_at',
+  ],
+  gate_resolution_outbox: [
+    'gate_key', 'revision', 'card_state', 'card_pending', 'notification_state', 'projected_at',
+    'projection_owner', 'projection_expires_at', 'last_error_code', 'created_at', 'updated_at',
+  ],
+  gate_resolution_attempt: ['id', 'gate_key', 'phase', 'outcome', 'detail', 'created_at'],
+  gate_resolution_audit: ['id', 'gate_key', 'event', 'reason', 'created_at'],
+};
+
+/** Current Gate schema is a fail-closed boundary: exact shape, SQLite integrity, and every row. */
+function validateCurrentGateStore(
+  db: DatabaseSync,
+  path: string,
+  fault?: (point: 'after_resolution_rows') => void,
+): void {
+  // Cross-table invariants must be evaluated from one WAL read snapshot. Without this transaction,
+  // a live daemon can commit intent+outbox between the two SELECTs and make another valid opener
+  // reject an internally consistent store as corrupt.
+  db.exec('BEGIN');
+  try {
+  const integrity = db.prepare('PRAGMA quick_check').all() as Record<string, unknown>[];
+  if (integrity.length !== 1 || Object.values(integrity[0] ?? {})[0] !== 'ok') {
+    throw new Error(`store 파일의 SQLite integrity check가 실패했다: ${path}`);
+  }
+  for (const [table, expected] of Object.entries(CURRENT_GATE_COLUMNS)) {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { readonly name: string }[];
+    const actual = rows.map((row) => row.name);
+    if (actual.length !== expected.length || actual.some((name, i) => name !== expected[i])) {
+      throw new Error(`store 파일의 ${table} persisted shape가 current Gate schema와 어긋난다: ${path}`);
+    }
+  }
+  const normalizeSql = (sql: string): string => sql.replace(/\s+/g, ' ').trim().replace(/;$/, '');
+  const gateSchemaObjects = { ...GATE_V8_SCHEMA_OBJECTS, ...GATE_V9_SCHEMA_OBJECTS };
+  for (const [name, expected] of Object.entries(gateSchemaObjects)) {
+    const row = db.prepare(
+      `SELECT sql FROM sqlite_master WHERE name = ? AND type IN ('table', 'index')`,
+    ).get(name) as { readonly sql: string | null } | undefined;
+    if (row?.sql === null || row === undefined || normalizeSql(row.sql) !== normalizeSql(expected)) {
+      throw new Error(`store 파일의 ${name} persisted DDL이 strict Gate shape와 어긋난다: ${path}`);
+    }
+  }
+  const expectedD2Objects = new Set(Object.keys(gateSchemaObjects));
+  const unexpectedD2Objects = (db.prepare(
+    `SELECT type, name, tbl_name FROM sqlite_master
+      WHERE (type = 'trigger' AND tbl_name IN
+              ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_resolution',
+               'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit'))
+         OR (type = 'table' AND
+              (name LIKE 'gate_metadata%' OR name LIKE 'gate_message%' OR
+               name LIKE 'gate_local_observation%' OR name LIKE 'gate_observation_generation%' OR
+               name LIKE 'gate_resolution%'))
+         OR (type = 'index' AND tbl_name IN
+              ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_resolution',
+               'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit'))`,
+  ).all() as {
+    readonly type: string;
+    readonly name: string;
+    readonly tbl_name: string;
+  }[]).filter((row) =>
+    !row.name.startsWith('sqlite_autoindex_') && !expectedD2Objects.has(row.name),
+  );
+  if (unexpectedD2Objects.length > 0) {
+    throw new Error(`store 파일에 code-owned v8 shape 밖의 schema object가 있다: ${path}`);
+  }
+
+  const metadatas = (db.prepare(
+    `SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
+            options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+       FROM gate_metadata ORDER BY gate_key`,
+  ).all() as GateMetadataRow[]).map(toGateMetadata);
+  const messages = (db.prepare(
+    `SELECT gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint,
+            created_at, updated_at FROM gate_message ORDER BY gate_key`,
+  ).all() as GateMessageRow[]).map(toGateMessage);
+  const observationRows = db.prepare(
+    `SELECT gate_key, run_key, task_key, status, resolution, resolved_at,
+            metadata_state, mapping_state, write_owner, write_expires_at, observed_at
+       FROM gate_local_observation ORDER BY gate_key`,
+  ).all() as GateLocalObservationRow[];
+  const observations = observationRows.map(toGateLocalObservation);
+  const generations = db.prepare(
+    `SELECT gate_key, revision FROM gate_observation_generation ORDER BY gate_key`,
+  ).all() as GateObservationGenerationRow[];
+  const observationGateKeys = new Set(observationRows.map((observation) => observation.gate_key));
+  for (const generation of generations) {
+    storedKey(generation.gate_key, 'gate:', 'gate_observation_generation.gate_key');
+    storedRevision(generation.revision, `${generation.gate_key}.observation revision`);
+    if (!observationGateKeys.has(generation.gate_key)) {
+      throw new Error(`store 파일에 local observation 없는 generation이 있다: ${path}`);
+    }
+  }
+  const intents = (db.prepare(SELECT_ALL_GATE_RESOLUTIONS).all() as GateResolutionRow[]).map(
+    toGateResolution,
+  );
+  fault?.('after_resolution_rows');
+  const outboxes = (db.prepare(
+    `SELECT gate_key, revision, card_state, card_pending, notification_state, projected_at,
+            projection_owner, projection_expires_at, last_error_code, created_at, updated_at
+       FROM gate_resolution_outbox ORDER BY gate_key`,
+  ).all() as GateOutboxRow[]).map(toGateOutbox);
+  const observationByGate = new Map(observations.map((row) => [row.gateKey, row]));
+  const metadataByGate = new Map(metadatas.map((row) => [row.gateKey, row]));
+  const messageByGate = new Map(messages.map((row) => [row.gateKey, row]));
+  const intentByGate = new Map(intents.map((row) => [row.gateKey, row]));
+  const outboxByGate = new Map(outboxes.map((row) => [row.gateKey, row]));
+
+  for (const observation of observations) {
+    const metadata = metadataByGate.get(observation.gateKey);
+    const message = messageByGate.get(observation.gateKey);
+    if (
+      (observation.metadataState === 'matched' &&
+        (metadata === undefined ||
+          metadata.runKey !== observation.runKey ||
+          metadata.taskKey !== observation.taskKey)) ||
+      (observation.metadataState === 'missing' && metadata !== undefined) ||
+      (observation.metadataState === 'mismatched' && metadata === undefined) ||
+      ((observation.mappingState === 'matched' || observation.mappingState === 'write_pending') &&
+        (message === undefined ||
+          message.runKey !== observation.runKey ||
+          message.gateKey !== observation.gateKey)) ||
+      (observation.mappingState === 'mismatched' && message === undefined)
+    ) {
+      throw new Error(`store 파일의 ${observation.gateKey} local observation correlation이 어긋난다: ${path}`);
+    }
+  }
+
+  if (outboxes.some((row) => !intentByGate.has(row.gateKey))) {
+    throw new Error(`store 파일에 Gate resolution 없는 orphan outbox가 있다: ${path}`);
+  }
+  if (
+    observations.some(
+      (observation) =>
+        observation.mappingState === 'write_pending' &&
+        (intentByGate.has(observation.gateKey) || outboxByGate.has(observation.gateKey)),
+    )
+  ) {
+    // beginGateObservationWrite and claimGateResolution are serialized BEGIN IMMEDIATE
+    // transactions. This combination therefore cannot be produced by this code and would make
+    // ordinary/D2 projection precedence unknowable.
+    throw new Error(`store 파일에 ordinary write fence와 Gate resolution이 함께 존재한다: ${path}`);
+  }
+  for (const intent of intents) {
+    const metadata = metadataByGate.get(intent.gateKey);
+    const message = messageByGate.get(intent.gateKey);
+    const observation = observationByGate.get(intent.gateKey);
+    const outbox = outboxByGate.get(intent.gateKey);
+    if (metadata === undefined || message === undefined || observation === undefined || outbox === undefined) {
+      throw new Error(`store 파일의 ${intent.gateKey} resolution correlation row가 불완전하다: ${path}`);
+    }
+    const option = metadata.options.filter((candidate) => candidate.id === intent.optionId);
+    if (
+      option.length !== 1 || option[0]?.resolution !== intent.optionResolution ||
+      metadata.askMessageId !== intent.askMessageId ||
+      metadata.questionThreadId !== intent.questionThreadId ||
+      metadata.dispatchKey !== `dispatch:${intent.dispatchId}` ||
+      metadata.taskKey !== `task:${intent.taskId}` ||
+      message.runKey !== metadata.runKey || message.channelId !== intent.channelId ||
+      message.threadTs !== intent.threadTs || message.messageTs !== intent.messageTs ||
+      observation.runKey !== metadata.runKey || observation.taskKey !== metadata.taskKey ||
+      intent.blockId !== gateBlockId(intent.gateKey) ||
+      intent.actionId !== gateActionId(intent.gateKey, intent.optionId) ||
+      intent.actionValue !== intent.optionId
+    ) {
+      throw new Error(`store 파일의 ${intent.gateKey} resolution correlation이 어긋난다: ${path}`);
+    }
+    for (const snapshot of [intent.preRead, intent.resolveResult?.gate ?? null, intent.postRead]) {
+      if (snapshot === null) continue;
+      if (
+        `gate:${snapshot.gateId}` !== intent.gateKey ||
+        `run:${snapshot.runId}` !== metadata.runKey ||
+        `task:${snapshot.taskId}` !== metadata.taskKey ||
+        snapshot.options.length !== metadata.options.length ||
+        !snapshot.options.every((label, index) => label === metadata.options[index]?.label)
+      ) {
+        throw new Error(`store 파일의 ${intent.gateKey} persisted Orca snapshot이 어긋난다: ${path}`);
+      }
+    }
+    if (
+      intent.resolveResult !== null &&
+      (intent.resolveResult.mutation.requestId !== intent.retryRequestId ||
+        intent.resolveResult.gate.status !== 'resolved' ||
+        intent.resolveResult.gate.resolution !== intent.optionResolution)
+    ) {
+      throw new Error(`store 파일의 ${intent.gateKey} retry request identity가 어긋난다: ${path}`);
+    }
+    const expectedCard = cardStateForLifecycle(intent.lifecycle);
+    if (
+      outbox.cardState !== expectedCard ||
+      outbox.lastErrorCode !== intent.lastErrorCode ||
+      outbox.createdAt !== intent.createdAt ||
+      (outbox.cardPending && outbox.projectedAt !== null) ||
+      (!outbox.cardPending && outbox.projectedAt === null)
+    ) {
+      throw new Error(`store 파일의 ${intent.gateKey} lifecycle/outbox projection이 어긋난다: ${path}`);
+    }
+    // `toGateResolution` already applies the same lifecycle/evidence matrix used before every
+    // progress write. The remaining checks in this loop are cross-table correlations only.
+  }
+
+  const attempts = db.prepare(
+    `SELECT gate_key, phase, outcome, detail, created_at FROM gate_resolution_attempt ORDER BY id`,
+  ).all() as {
+    readonly gate_key: string;
+    readonly phase: string;
+    readonly outcome: string;
+    readonly detail: string | null;
+    readonly created_at: string;
+  }[];
+  for (const row of attempts) {
+    const gateKey = storedKey(row.gate_key, 'gate:', 'gate_resolution_attempt.gate_key') as GateKey;
+    if (!intentByGate.has(gateKey)) {
+      throw new Error(`store 파일에 resolution intent 없는 Gate attempt가 있다: ${path}`);
+    }
+    gateCode(row.phase, 40);
+    gateCode(row.outcome, 40);
+    if (row.detail !== null) storedText(row.detail, 'gate resolution attempt.detail', GATE_FACT_CAP);
+    storedIso(row.created_at, 'gate resolution attempt.created_at');
+  }
+  const audits = db.prepare(
+    `SELECT gate_key, event, reason, created_at FROM gate_resolution_audit ORDER BY id`,
+  ).all() as {
+    readonly gate_key: string | null;
+    readonly event: string;
+    readonly reason: string;
+    readonly created_at: string;
+  }[];
+  const winnerAuditCounts = new Map<GateKey, number>();
+  for (const row of audits) {
+    let correlatedGate: GateKey | null = null;
+    if (row.gate_key !== null) {
+      correlatedGate = storedKey(
+        row.gate_key,
+        'gate:',
+        'gate_resolution_audit.gate_key',
+      ) as GateKey;
+      if (!messageByGate.has(correlatedGate)) {
+        throw new Error(`store 파일에 Gate message 없는 correlated audit가 있다: ${path}`);
+      }
+    }
+    gateCode(row.event, 40);
+    gateCode(row.reason, 80);
+    const createdAt = storedIso(row.created_at, 'gate resolution audit.created_at');
+    if (row.event === 'claimed' || row.reason === 'first_valid_selection') {
+      if (
+        row.event !== 'claimed' ||
+        row.reason !== 'first_valid_selection' ||
+        correlatedGate === null
+      ) {
+        throw new Error(`store 파일의 canonical winner audit shape가 어긋난다: ${path}`);
+      }
+      const intent = intentByGate.get(correlatedGate);
+      if (intent === undefined || createdAt !== intent.createdAt) {
+        throw new Error(`store 파일에 resolution intent 없는 orphan claimed audit가 있다: ${path}`);
+      }
+      winnerAuditCounts.set(correlatedGate, (winnerAuditCounts.get(correlatedGate) ?? 0) + 1);
+    }
+  }
+  for (const intent of intents) {
+    if (winnerAuditCounts.get(intent.gateKey) !== 1) {
+      throw new Error(`store 파일의 ${intent.gateKey} canonical winner audit가 정확히 하나가 아니다: ${path}`);
+    }
+  }
+  const overLimit = db.prepare(
+    `SELECT gate_key FROM gate_resolution_attempt GROUP BY gate_key HAVING COUNT(*) > ?
+      UNION ALL
+     SELECT gate_key FROM gate_resolution_audit GROUP BY gate_key HAVING COUNT(*) > ?`,
+  ).all(GATE_AUDIT_LIMIT, GATE_AUDIT_LIMIT);
+  if (overLimit.length > 0) throw new Error(`store 파일의 Gate append-only evidence가 상한을 넘었다: ${path}`);
+  db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
 /**
  * 스키마 버전을 확인하고, 비어 있으면 DDL을 적용하고, 낮으면 올린다.
  *
@@ -1135,7 +3576,11 @@ function enableWal(db: DatabaseSync, path: string): void {
  * DDL과 버전 기록을 한 트랜잭션에 묶는다. 둘 사이에서 죽으면 다음 실행이 "테이블은 있는데
  * 버전은 모르는" 파일을 만나 판정할 근거를 잃는다.
  */
-function prepareSchema(db: DatabaseSync, path: string): void {
+function prepareSchema(
+  db: DatabaseSync,
+  path: string,
+  validationFault?: (point: 'after_resolution_rows') => void,
+): void {
   const version = readSchemaVersion(db, path);
 
   if (version === null) {
@@ -1151,10 +3596,12 @@ function prepareSchema(db: DatabaseSync, path: string): void {
       db.exec('ROLLBACK');
       throw e;
     }
+    validateCurrentGateStore(db, path, validationFault);
     return;
   }
 
   applyMigrations(db, path, version);
+  validateCurrentGateStore(db, path, validationFault);
 }
 
 /**

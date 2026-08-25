@@ -66,6 +66,7 @@ describe('명령 분기', () => {
       ['digest', '--socket'],
       ['runs', '--socket'],
       ['gate-register', '--input', 'gate.json', '--socket'],
+      ['daemon', '--socket'],
     ]) {
       const p = parseArgs(argv);
       expect(p.kind).toBe('error');
@@ -97,8 +98,28 @@ describe('명령 분기', () => {
     }
   });
 
+  it('daemon은 config/state/orca만 받고 dry-run·json·PR 범위를 거부한다', () => {
+    const parsed = parseArgs(['daemon', '--config', 'bridge.json', '--state', 'state.db', '--orca', 'orca-test']);
+    expect(parsed.kind).toBe('run');
+    if (parsed.kind === 'run') expect(parsed).toMatchObject({ command: 'daemon', statePath: 'state.db' });
+    for (const extra of [['--dry-run'], ['--json'], ['--pr', '1'], ['--pr-limit', '1'], ['stray']]) {
+      expect(parseArgs(['daemon', ...extra]).kind).toBe('error');
+    }
+  });
+
+  it('daemon value flags never fall back when their value is missing or another flag', () => {
+    for (const flag of ['--config', '--state', '--orca']) {
+      const missing = parseArgs(['daemon', flag]);
+      expect(missing.kind).toBe('error');
+      if (missing.kind === 'error') expect(missing.message).toContain(flag);
+      const displaced = parseArgs(['daemon', flag, '--state', 'state.db']);
+      expect(displaced.kind).toBe('error');
+      if (displaced.kind === 'error') expect(displaced.message).toContain(flag);
+    }
+  });
+
   it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs']) expect(parseArgs([c]).kind).toBe('run');
+    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon']) expect(parseArgs([c]).kind).toBe('run');
     expect(parseArgs(['gate-register', '--input', 'gate.json']).kind).toBe('run');
   });
 
@@ -241,7 +262,7 @@ describe('gate-register transport', () => {
   });
 
   it('--input은 gate-register 외 모든 명령에서 command-scoped unknown이다', () => {
-    for (const command of ['snapshot', 'verify-slack', 'digest', 'runs'] as const) {
+    for (const command of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon'] as const) {
       const p = parseArgs([command, '--input', 'gate.json']);
       expect(p.kind).toBe('error');
       if (p.kind === 'error') {
