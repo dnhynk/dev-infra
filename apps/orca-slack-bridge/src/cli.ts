@@ -60,6 +60,7 @@ import { GateChannelDeliveryEngine } from './channel/delivery.js';
 import {
   ChannelPipeServer,
   type ChannelDeliverySendResult,
+  type ChannelProductionCommitFence,
   type ChannelProductionDeliveryEvent,
   type ChannelProductionDeliveryHandlers,
 } from './channel/pipe-server.js';
@@ -335,7 +336,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
-const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter>
+export const CLI_USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
@@ -370,14 +371,15 @@ gate-register 전용:
 
 daemon 전용:
 
-  --state <path>    v10 durable store 경로 (dry-run 없음)
+  --state <path>    v11 durable store 경로 (additive migration, dry-run 없음)
 
 snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
 runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
 하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080). gate-register는 Orca Gate를
 read-only로 재조회한 뒤 local SQLite에만 쓰고 Slack/Orca mutation을 하지 않는다. daemon은
-Bridge-owned fixed-option action과 D3-1 receipt probe pipe를 실행한다. D3-1은 production Gate를
-Channel에 보내지 않으며 schema/Slack projection을 바꾸지 않는다. channel-adapter는 옵션이 없다.`;
+Bridge-owned fixed-option action과 verified Channel pipe를 실행하고, v11 delivery를 lazy seed해 exact
+production Gate ID를 전달·receipt·consume한다. D3 delivery 상태는 아직 Slack에 투영하거나 Task를
+resume하지 않는다. channel-adapter는 옵션이 없다.`;
 
 /**
  * summarizer provider를 만든다.
@@ -734,8 +736,14 @@ export type ChannelDaemonServer = {
 
 export type ChannelDeliveryRuntime = {
   reconcile(): Promise<void>;
-  recordAttempted(event: ChannelProductionDeliveryEvent): unknown;
-  recordReceipted(event: ChannelProductionDeliveryEvent): unknown;
+  recordAttempted(
+    event: ChannelProductionDeliveryEvent,
+    commitFence?: ChannelProductionCommitFence,
+  ): unknown;
+  recordReceipted(
+    event: ChannelProductionDeliveryEvent,
+    commitFence?: ChannelProductionCommitFence,
+  ): unknown;
 };
 
 export type DaemonDependencies = {
@@ -851,11 +859,11 @@ export async function runDaemonCommand(
     channelDelivery = dependencies.createChannelDelivery?.(store, orca, channelServer) ??
       new GateChannelDeliveryEngine({ store, orca, transport: channelServer });
     channelServer.setProductionDeliveryHandlers?.({
-      attempted: (event: ChannelProductionDeliveryEvent) => {
-        channelDelivery?.recordAttempted(event);
+      attempted: (event: ChannelProductionDeliveryEvent, commitFence) => {
+        channelDelivery?.recordAttempted(event, commitFence);
       },
-      receipted: (event: ChannelProductionDeliveryEvent) => {
-        channelDelivery?.recordReceipted(event);
+      receipted: (event: ChannelProductionDeliveryEvent, commitFence) => {
+        channelDelivery?.recordReceipted(event, commitFence);
       },
     });
     await channelServer.start();
@@ -955,11 +963,11 @@ export async function main(
 ): Promise<number> {
   const parsed = parseArgs(argv);
   if (parsed.kind === 'help') {
-    process.stdout.write(USAGE + '\n');
+    process.stdout.write(CLI_USAGE + '\n');
     return 0;
   }
   if (parsed.kind === 'error') {
-    process.stderr.write(parsed.message + '\n\n' + USAGE + '\n');
+    process.stderr.write(parsed.message + '\n\n' + CLI_USAGE + '\n');
     return 2;
   }
 

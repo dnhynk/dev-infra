@@ -28,7 +28,12 @@ application receipt, Gate effect, and Task resume as separate facts.
   inside the revision/owner transaction, and schema plus runtime validation require every lifecycle
   event timestamp to be at or before `updated_at`.
 - Every state transition and the existing Gate card-outbox re-arm share one `BEGIN IMMEDIATE`
-  transaction. A stale card projection revision cannot clear the newer generation.
+  transaction. The v11 row records the exact re-armed outbox revision as durable provenance; a
+  stale card projection revision cannot clear the newer generation.
+- A Channel-originated outbox generation is deliberately deferred from the unchanged D2 projector.
+  Periodic reconciliation omits that exact revision, direct projection returns without a Slack
+  call, and the row remains `card_pending=1` across restart. The store exposes only an exact
+  delivery-revision plus outbox-revision claim for D3-3 to acquire that generation later.
 - `attempted` means only that the Adapter's MCP notification write resolved. `receipted` is only the
   reply-tool application callback. Neither is delivery consumption or Task resume.
 - `consumed` requires a fresh strict `gate-list` reread whose Gate/run/task/options, resolved status,
@@ -46,16 +51,21 @@ application receipt, Gate effect, and Task resume as separate facts.
   cannot suppress replay to the new current generation.
 - Receipt ACK is emitted only after the synchronous durable callback succeeds. A callback failure
   deliberately leaves the Adapter receipt retryable.
-- Fresh Run reads for a bounded callback burst run concurrently, then their durable callbacks and
-  ACKs commit on one arrival-ordered chain. Pipe protocol v2 adds only an Adapter-computed relative
-  ACK budget to its internal receipt frame; the external Channel notification and reply-tool input
-  remain strict Gate-ID-only shapes.
+- Fresh Run reads for different Gates start concurrently and durable callbacks stay on one
+  arrival-ordered chain. Each completed validation records the exact predecessor-callback revision;
+  if an earlier callback commits afterward, or receipt processing waits on a drain, the event must
+  reread authority at its own commit boundary. There is no elapsed-time freshness heuristic. Pipe
+  protocol v2 adds only an Adapter-computed relative ACK budget to its internal receipt frame; the
+  external Channel notification and reply-tool input remain strict Gate-ID-only shapes.
 - Adapter receipt deadlines and daemon callback deadlines use monotonic clocks. Queue time is
   deducted before the Adapter writes a receipt, the daemon caps that remainder below the production
   5-second timeout with an ACK safety margin, and socket timeout disconnects fence any late ACK.
 - Adapter notification progress pauses behind attempted-frame backpressure and resumes on drain.
-  On the daemon side, receipt processing waits for ACK writability and then refreshes an aged route
-  before the synchronous durable transition, so delayed drain cannot produce state without an ACK.
+  On the daemon side, receipt processing waits for ACK writability and then performs its commit-time
+  route read, so delayed drain cannot produce state without an ACK.
+- The daemon passes a monotonic connection/deadline fence through the production handler into the
+  SQLite transition. The store evaluates it after delivery plus card re-arm writes and immediately
+  before `COMMIT`; a closed fence rolls the whole transaction back and the pipe emits no ACK.
 - Connection-local sent/notified sets are bounded and discarded on reconnect. Multi-Gate MCP
   notifications are serialized, receipt/ACK backpressure queues are bounded sets, and the daemon
   rejects an over-cap asynchronous inbound queue.
@@ -89,12 +99,20 @@ The focused suites cover:
   wrong Gate receipt, reconnect replay, and generation-takeover stale receipt rejection;
 - three production Gates with six independent 1.7-second fresh route reads, concurrent validation,
   wire-ordered durable callbacks, and all receipt ACKs inside the default Adapter window;
+- a raw protocol-v2 pair of different-Gate receipts whose generation-1 validations both complete
+  behind a drain before callback A is released; A synchronously takes over generation 2 and B then
+  performs a new commit-boundary Run read, makes no durable callback, and receives no ACK;
+- a synchronous receipt handler crossing its monotonic deadline plus direct SQLite fence tests,
+  proving delivery state and the atomic card re-arm both roll back before ACK;
 - multi-Gate attempted-frame backpressure with notification pause/drain resume and no lost callback;
 - two queued receipts across independent Adapter-send and daemon-ACK drains, decreasing transmitted
   ACK budget, pre-durable wait, post-wait route refresh, ordered durable callbacks, and no late ACK;
 - saturated single-slot receipt validation under repeated wall-clock rollback, proving monotonic
   expiry prevents the queued callback and ACK before the Adapter timeout;
 - production daemon startup wiring of the new store/runtime callbacks and reconciliation caller.
+- ordinary D2 projection followed by pending/attempted/receipted/consumed D3 transitions, proving
+  one pre-D3 Slack update, zero D3 Slack updates, exact pending provenance across restart, reconcile
+  omission without a hot loop, and a future D3-3 exact claim of that same generation.
 
 ## Verification checkpoint
 
@@ -103,8 +121,8 @@ product write was performed.
 
 | Command | Result |
 |---|---|
-| focused D3-2/D2 recovery/protocol suite | pass — 10 files, 170 tests |
-| `pnpm test` | pass — 49 files, 1086 tests |
+| focused D3-2/D2 recovery/protocol suite | pass — 10 files, 190 tests |
+| `pnpm test` | pass — 49 files, 1090 tests |
 | `pnpm typecheck` | pass |
 | app `typecheck` | pass |
 | app `build` | pass |
@@ -132,6 +150,13 @@ could extend a saturated queue. Protocol v2 now carries only the remaining monot
 both pipe directions pause/wait on drain before the next irreversible boundary, and Adapter timeout
 disconnect plus daemon safety margin fence late ACKs. The new head is held for fresh independent
 delivery/routing re-audit before completion.
+
+The next independent pair at `7d335d8` found four P2 issues: stale v10/D3-1 CLI help, a sub-25ms
+ordered-commit route takeover, a durable receipt transition that could finish after its callback
+deadline, and unchanged D2 projection consuming D3-originated card generations before D3-3. This
+repair updates the live v11 help contract, replaces elapsed freshness with same-Gate commit-boundary
+authority reads, carries the monotonic fence into the SQLite transaction, and records an exact
+durable outbox-revision provenance fence. It is held for a fresh independent audit pair.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 

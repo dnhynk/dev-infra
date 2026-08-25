@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -35,6 +36,7 @@ class FakeOrca implements OrcaRunner {
   fail = false;
   delayMs = 0;
   calls = 0;
+  completions = 0;
 
   run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
     this.calls += 1;
@@ -59,10 +61,14 @@ class FakeOrca implements OrcaRunner {
         runs: this.missingRun ? [] : this.duplicateRun ? [row, { ...row }] : [row],
       },
     });
-    if (this.delayMs === 0) return Promise.resolve(response);
+    if (this.delayMs === 0) {
+      this.completions += 1;
+      return Promise.resolve(response);
+    }
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         options.signal?.removeEventListener('abort', abort);
+        this.completions += 1;
         resolve(response);
       }, this.delayMs);
       const abort = (): void => {
@@ -337,6 +343,102 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     expect(daemon.listConnections()[0]?.verified).toBe(true);
   });
 
+  it('freshly fences a different-Gate prevalidation after its predecessor commits a takeover', async () => {
+    const path = pipePath('production-cross-gate-commit-takeover');
+    const orca = new FakeOrca();
+    const errors: string[] = [];
+    const blockerGateId = 'gate_121212121212';
+    const firstGateId = 'gate_343434343434';
+    const secondGateId = 'gate_565656565656';
+    let blockedSocket: Socket | null = null;
+    const daemon = new ChannelPipeServer({
+      orca,
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      writeTimeoutMs: 1_000,
+      shutdownTimeoutMs: 500,
+      onError: (code) => errors.push(code),
+      writeFrame: (socket, frame) => {
+        socket.write(frame);
+        if (
+          blockedSocket === null &&
+          frame.includes(Buffer.from('"type":"receipt_ack"')) &&
+          frame.includes(Buffer.from(`"gate_id":"${blockerGateId}"`))
+        ) {
+          blockedSocket = socket;
+          return false;
+        }
+        return true;
+      },
+    });
+    servers.push(daemon);
+    const durableReceipts: string[] = [];
+    let takeoverDurationMs = Number.POSITIVE_INFINITY;
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: ({ gateId }) => {
+        if (gateId === blockerGateId) return;
+        durableReceipts.push(gateId);
+        if (gateId === firstGateId) {
+          const began = performance.now();
+          orca.generation = 2;
+          takeoverDurationMs = performance.now() - began;
+        }
+      },
+    });
+    await daemon.start();
+    const raw = await rawAdapter(path);
+    const probe = raw.messages.find((message) => message.type === 'notify')!;
+    raw.socket.write(encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: probe.connection_epoch,
+      gate_id: probe.gate_id,
+      ack_budget_ms: 5_000,
+    }));
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    for (const gateId of [blockerGateId, firstGateId, secondGateId]) {
+      expect(await daemon.deliverGate(RUN_ID, gateId)).toMatchObject({ kind: 'sent' });
+    }
+    await waitFor(() => [blockerGateId, firstGateId, secondGateId].every((gateId) =>
+      raw.messages.some((message) => message.type === 'notify' && message.gate_id === gateId)));
+    const receipt = (gateId: string): Buffer => encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: probe.connection_epoch,
+      gate_id: gateId,
+      ack_budget_ms: 5_000,
+    });
+
+    // A preceding ACK holds the server drain boundary. The two different-Gate prevalidations can
+    // both finish at generation 1, but neither durable callback can pass the global commit chain.
+    raw.socket.write(receipt(blockerGateId));
+    await waitFor(() => blockedSocket !== null);
+    orca.delayMs = 10;
+    const completionStart = orca.completions;
+    raw.socket.write(Buffer.concat([receipt(firstGateId), receipt(secondGateId)]));
+    await waitFor(() => orca.completions >= completionStart + 2);
+    expect(durableReceipts).toEqual([]);
+    expect(orca.generation).toBe(1);
+
+    // Releasing the drain lets A refresh/commit and synchronously switch authority. B's already
+    // resolved generation-1 token is fenced by the predecessor revision and must reread generation 2.
+    (blockedSocket as Socket | null)?.emit('drain');
+    await waitFor(() => errors.includes('stale_delivery'));
+    await waitFor(() => daemon.getResourceSnapshot().sockets === 0);
+    expect(durableReceipts).toEqual([firstGateId]);
+    expect(takeoverDurationMs).toBeLessThan(5);
+    expect(raw.messages.filter(
+      (message) => message.type === 'receipt_ack' && message.gate_id === firstGateId,
+    )).toHaveLength(1);
+    expect(raw.messages.filter(
+      (message) => message.type === 'receipt_ack' && message.gate_id === secondGateId,
+    )).toHaveLength(0);
+    raw.socket.destroy();
+  });
+
   it('pauses multi-Gate MCP notifications behind an attempted-frame drain without losing callbacks', async () => {
     const path = pipePath('production-attempted-drain');
     const daemon = server(path);
@@ -507,6 +609,7 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     await expect(secondReceipt).resolves.toBe('accepted');
     expect(receipted).toEqual(gates);
     expect(receiptBudgets.get(gates[1]!)).toBeLessThan(receiptBudgets.get(gates[0]!)!);
+    // Both prevalidate concurrently; the second also performs one exact post-drain refresh.
     expect(orca.calls - receiptRouteReadStart).toBe(3);
     expect(daemonErrors).not.toContain('delivery_event_expired');
     expect(adapterErrors).not.toContain('wrong_receipt_ack');
@@ -737,6 +840,65 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       (message) => message.type === 'receipt_ack' && message.gate_id === productionGateId,
     ));
     expect(receiptCalls).toBe(2);
+    raw.socket.destroy();
+  });
+
+  it('closes the transactional commit fence when a receipt handler crosses its monotonic deadline', async () => {
+    const path = pipePath('production-receipt-commit-deadline');
+    const errors: string[] = [];
+    const daemon = new ChannelPipeServer({
+      orca: new FakeOrca(),
+      pipePath: path,
+      probeDelaysMs: [15, 30],
+      helloTimeoutMs: 500,
+      shutdownTimeoutMs: 500,
+      eventValidationTimeoutMs: 100,
+      productionEventDeadlineMs: 30,
+      onError: (code) => errors.push(code),
+    });
+    servers.push(daemon);
+    let durableReceipts = 0;
+    daemon.setProductionDeliveryHandlers({
+      attempted: () => undefined,
+      receipted: (_event, commitFence) => {
+        const blockedUntil = performance.now() + 60;
+        while (performance.now() < blockedUntil) {
+          // Model synchronous SQLite work that reaches its in-transaction fence after expiry.
+        }
+        if (!commitFence()) throw new Error('deadline fence closed');
+        durableReceipts += 1;
+      },
+    });
+    await daemon.start();
+    const raw = await rawAdapter(path);
+    const probe = raw.messages.find((message) => message.type === 'notify')!;
+    raw.socket.write(encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: probe.connection_epoch,
+      gate_id: probe.gate_id,
+      ack_budget_ms: 5_000,
+    }));
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    const productionGateId = 'gate_565656565656';
+    expect(await daemon.deliverGate(RUN_ID, productionGateId)).toMatchObject({ kind: 'sent' });
+    await waitFor(() => raw.messages.some(
+      (message) => message.type === 'notify' && message.gate_id === productionGateId,
+    ));
+    raw.socket.write(encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: probe.connection_epoch,
+      gate_id: productionGateId,
+      ack_budget_ms: 5_000,
+    }));
+    await waitFor(() => errors.includes('delivery_event_expired'));
+    await waitFor(() => daemon.getResourceSnapshot().sockets === 0);
+    expect(durableReceipts).toBe(0);
+    expect(raw.messages.filter(
+      (message) => message.type === 'receipt_ack' && message.gate_id === productionGateId,
+    )).toHaveLength(0);
     raw.socket.destroy();
   });
 

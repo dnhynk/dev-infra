@@ -29,7 +29,9 @@ import {
   GATE_FACT_CAP,
   type GateChannelConsumeResult,
   type GateChannelDelivery,
+  type GateChannelDeliveryCommitFence,
   type GateChannelDeliveryLeaseResult,
+  type GateChannelProjectionClaim,
   type GateChannelDeliveryState,
   type GateCardState,
   type GateClaimInput,
@@ -539,6 +541,10 @@ SELECT o.gate_key, o.revision, o.card_state, o.card_pending, o.notification_stat
   FROM gate_resolution_outbox o
   JOIN gate_resolution r ON r.gate_key = o.gate_key
  WHERE r.ack_state = 'acked'
+   AND NOT EXISTS (
+     SELECT 1 FROM gate_channel_delivery d
+      WHERE d.gate_key = o.gate_key AND d.deferred_outbox_revision = o.revision
+   )
  ORDER BY o.gate_key`;
 
 const SELECT_GATE_OUTBOX = `
@@ -547,19 +553,22 @@ SELECT gate_key, revision, card_state, card_pending, notification_state, project
   FROM gate_resolution_outbox WHERE gate_key = ?`;
 
 const SELECT_GATE_CHANNEL_DELIVERY = `
-SELECT gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+SELECT gate_key, run_key, task_key, source_dispatch_id, revision, deferred_outbox_revision,
+       state, attempt_count,
        last_attempt_at, next_attempt_at, receipted_at, consumed_at,
        lease_owner, lease_expires_at, last_error_code, created_at, updated_at
   FROM gate_channel_delivery WHERE gate_key = ?`;
 
 const SELECT_ALL_GATE_CHANNEL_DELIVERIES = `
-SELECT gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+SELECT gate_key, run_key, task_key, source_dispatch_id, revision, deferred_outbox_revision,
+       state, attempt_count,
        last_attempt_at, next_attempt_at, receipted_at, consumed_at,
        lease_owner, lease_expires_at, last_error_code, created_at, updated_at
   FROM gate_channel_delivery ORDER BY gate_key`;
 
 const SELECT_DUE_GATE_CHANNEL_DELIVERIES = `
-SELECT gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+SELECT gate_key, run_key, task_key, source_dispatch_id, revision, deferred_outbox_revision,
+       state, attempt_count,
        last_attempt_at, next_attempt_at, receipted_at, consumed_at,
        lease_owner, lease_expires_at, last_error_code, created_at, updated_at
   FROM gate_channel_delivery
@@ -581,10 +590,11 @@ SELECT o.gate_key
 
 const INSERT_GATE_CHANNEL_DELIVERY = `
 INSERT INTO gate_channel_delivery
-  (gate_key, run_key, task_key, source_dispatch_id, revision, state, attempt_count,
+  (gate_key, run_key, task_key, source_dispatch_id, revision, deferred_outbox_revision,
+   state, attempt_count,
    last_attempt_at, next_attempt_at, receipted_at, consumed_at,
    lease_owner, lease_expires_at, last_error_code, created_at, updated_at)
-VALUES (?, ?, ?, ?, 0, 'pending', 0, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`;
+VALUES (?, ?, ?, ?, 0, ?, 'pending', 0, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`;
 
 const MARK_GATE_OUTBOX_PROJECTED = `
 UPDATE gate_resolution_outbox
@@ -790,6 +800,7 @@ type GateChannelDeliveryRow = {
   readonly task_key: string;
   readonly source_dispatch_id: string;
   readonly revision: number;
+  readonly deferred_outbox_revision: number;
   readonly state: string;
   readonly attempt_count: number;
   readonly last_attempt_at: string | null;
@@ -1365,6 +1376,10 @@ function toGateChannelDelivery(row: GateChannelDeliveryRow): GateChannelDelivery
       500,
     ),
     revision: storedRevision(row.revision, `${row.gate_key}.delivery revision`),
+    deferredOutboxRevision: storedRevision(
+      row.deferred_outbox_revision,
+      `${row.gate_key}.delivery deferred outbox revision`,
+    ),
     state,
     attemptCount: row.attempt_count,
     lastAttemptAt,
@@ -1639,7 +1654,7 @@ function rearmGateOutboxForChannelTransition(
   db: DatabaseSync,
   gateKey: GateKey,
   at: string,
-): void {
+): number {
   const result = db.prepare(
     `UPDATE gate_resolution_outbox
         SET revision = revision + 1, card_pending = 1, projected_at = NULL,
@@ -1650,6 +1665,10 @@ function rearmGateOutboxForChannelTransition(
   if (Number(result.changes) !== 1) {
     throw new Error(`${gateKey}의 D2 outbox를 Channel transition과 함께 re-arm하지 못했다`);
   }
+  const row = db.prepare('SELECT revision FROM gate_resolution_outbox WHERE gate_key = ?')
+    .get(gateKey) as { readonly revision: number } | undefined;
+  if (row === undefined) throw new Error(`${gateKey}의 re-armed D2 outbox revision을 읽지 못했다`);
+  return storedRevision(row.revision, `${gateKey}.Channel deferred outbox revision`);
 }
 
 export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
@@ -3331,16 +3350,21 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
           intent.resolveResult.gate.resolvedAt!,
           intent.postRead.resolvedAt!,
         ].reduce((latest, candidate) => candidate > latest ? candidate : latest);
+        const deferredOutboxRevision = rearmGateOutboxForChannelTransition(
+          this.db,
+          gateKey,
+          deliveryAt,
+        );
         this.db.prepare(INSERT_GATE_CHANNEL_DELIVERY).run(
           gateKey,
           metadata.runKey,
           metadata.taskKey,
           intent.dispatchId,
+          deferredOutboxRevision,
           deliveryAt,
           deliveryAt,
           deliveryAt,
         );
-        rearmGateOutboxForChannelTransition(this.db, gateKey, deliveryAt);
         const inserted = this.db.prepare(SELECT_GATE_CHANNEL_DELIVERY).get(gateKey) as
           | GateChannelDeliveryRow
           | undefined;
@@ -3510,6 +3534,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     gateKey: GateKey,
     at: string,
     nextAttemptAt: string,
+    commitFence?: GateChannelDeliveryCommitFence,
   ): GateChannelDelivery | null {
     const attemptedAt = storedIso(at, `${gateKey}.Channel attempted at`);
     const next = storedIso(nextAttemptAt, `${gateKey}.Channel attempted nextAttemptAt`);
@@ -3529,19 +3554,35 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         throw new TypeError(`${gateKey}의 Channel attempted evidence가 현재 row와 어긋난다`);
       }
       const firstTransition = current.state === 'pending';
+      const deferredOutboxRevision = firstTransition
+        ? rearmGateOutboxForChannelTransition(this.db, gateKey, attemptedAt)
+        : current.deferredOutboxRevision;
       const result = this.db.prepare(
         `UPDATE gate_channel_delivery
             SET revision = revision + 1, state = 'attempted', attempt_count = attempt_count + 1,
                 last_attempt_at = ?, next_attempt_at = ?, lease_owner = NULL,
-                lease_expires_at = NULL, last_error_code = NULL, updated_at = ?
+                lease_expires_at = NULL, last_error_code = NULL,
+                deferred_outbox_revision = ?, updated_at = ?
           WHERE gate_key = ? AND revision = ? AND state IN ('pending','attempted')`,
-      ).run(attemptedAt, next, attemptedAt, gateKey, current.revision);
+      ).run(
+        attemptedAt,
+        next,
+        deferredOutboxRevision,
+        attemptedAt,
+        gateKey,
+        current.revision,
+      );
       if (Number(result.changes) !== 1) {
-        this.db.exec('COMMIT');
+        // The outbox was re-armed earlier in this transaction. A lost delivery CAS must unwind
+        // both writes so it cannot manufacture an uncorrelated pending card generation.
+        this.db.exec('ROLLBACK');
         return this.findGateChannelDelivery(gateKey);
       }
-      if (firstTransition) rearmGateOutboxForChannelTransition(this.db, gateKey, attemptedAt);
       const updated = this.findGateChannelDelivery(gateKey);
+      if (commitFence !== undefined && !commitFence()) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
       this.db.exec('COMMIT');
       return updated;
     } catch (e) {
@@ -3550,7 +3591,11 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     }
   }
 
-  markGateChannelReceipted(gateKey: GateKey, at: string): GateChannelDelivery | null {
+  markGateChannelReceipted(
+    gateKey: GateKey,
+    at: string,
+    commitFence?: GateChannelDeliveryCommitFence,
+  ): GateChannelDelivery | null {
     const receiptedAt = storedIso(at, `${gateKey}.Channel receipted at`);
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -3566,21 +3611,37 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       if (receiptedAt < current.updatedAt) {
         throw new TypeError(`${gateKey}의 Channel receipt clock이 역행했다`);
       }
+      const deferredOutboxRevision = rearmGateOutboxForChannelTransition(
+        this.db,
+        gateKey,
+        receiptedAt,
+      );
       const result = this.db.prepare(
         `UPDATE gate_channel_delivery
             SET revision = revision + 1, state = 'receipted',
                 attempt_count = CASE WHEN attempt_count = 0 THEN 1 ELSE attempt_count END,
                 last_attempt_at = COALESCE(last_attempt_at, ?), next_attempt_at = ?,
                 receipted_at = ?, lease_owner = NULL, lease_expires_at = NULL,
-                last_error_code = NULL, updated_at = ?
+                last_error_code = NULL, deferred_outbox_revision = ?, updated_at = ?
           WHERE gate_key = ? AND revision = ? AND state IN ('pending','attempted')`,
-      ).run(receiptedAt, receiptedAt, receiptedAt, receiptedAt, gateKey, current.revision);
+      ).run(
+        receiptedAt,
+        receiptedAt,
+        receiptedAt,
+        deferredOutboxRevision,
+        receiptedAt,
+        gateKey,
+        current.revision,
+      );
       if (Number(result.changes) !== 1) {
-        this.db.exec('COMMIT');
+        this.db.exec('ROLLBACK');
         return this.findGateChannelDelivery(gateKey);
       }
-      rearmGateOutboxForChannelTransition(this.db, gateKey, receiptedAt);
       const updated = this.findGateChannelDelivery(gateKey);
+      if (commitFence !== undefined && !commitFence()) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
       this.db.exec('COMMIT');
       return updated;
     } catch (e) {
@@ -3660,19 +3721,31 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         this.db.exec('COMMIT');
         return { kind: 'mismatch' };
       }
+      const deferredOutboxRevision = rearmGateOutboxForChannelTransition(
+        this.db,
+        gateKey,
+        consumedAt,
+      );
       const result = this.db.prepare(
         `UPDATE gate_channel_delivery
             SET revision = revision + 1, state = 'consumed', next_attempt_at = NULL,
                 consumed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
-                last_error_code = NULL, updated_at = ?
+                last_error_code = NULL, deferred_outbox_revision = ?, updated_at = ?
           WHERE gate_key = ? AND revision = ? AND state = 'receipted'
             AND lease_owner = ? AND lease_expires_at > ?`,
-      ).run(consumedAt, consumedAt, gateKey, expectedRevision, safeOwner, consumedAt);
+      ).run(
+        consumedAt,
+        deferredOutboxRevision,
+        consumedAt,
+        gateKey,
+        expectedRevision,
+        safeOwner,
+        consumedAt,
+      );
       if (Number(result.changes) !== 1) {
-        this.db.exec('COMMIT');
+        this.db.exec('ROLLBACK');
         return { kind: 'superseded' };
       }
-      rearmGateOutboxForChannelTransition(this.db, gateKey, consumedAt);
       const consumed = this.findGateChannelDelivery(gateKey);
       if (consumed === null) throw new Error(`${gateKey}의 consumed Channel row를 다시 읽지 못했다`);
       this.db.exec('COMMIT');
@@ -3863,6 +3936,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     expectedRevision: number,
     owner: string,
     at: string,
+    channelClaim?: GateChannelProjectionClaim,
   ): GateProjectionLeaseResult {
     storedRevision(expectedRevision, `${gateKey}.projection expected revision`);
     const safeOwner = storedLeaseOwner(owner, `${gateKey}.projection owner`);
@@ -3880,6 +3954,28 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       if (row.card_pending !== 1) {
         this.db.exec('COMMIT');
         return 'superseded';
+      }
+      const deliveryRow = this.db.prepare(SELECT_GATE_CHANNEL_DELIVERY).get(gateKey) as
+        | GateChannelDeliveryRow
+        | undefined;
+      if (
+        deliveryRow !== undefined &&
+        deliveryRow.deferred_outbox_revision === expectedRevision
+      ) {
+        const authorized =
+          channelClaim !== undefined &&
+          storedRevision(
+            channelClaim.expectedDeliveryRevision,
+            `${gateKey}.Channel projection claim delivery revision`,
+          ) === deliveryRow.revision &&
+          storedRevision(
+            channelClaim.expectedOutboxRevision,
+            `${gateKey}.Channel projection claim outbox revision`,
+          ) === expectedRevision;
+        if (!authorized) {
+          this.db.exec('COMMIT');
+          return 'deferred';
+        }
       }
       if (
         row.projection_owner === safeOwner &&
@@ -4562,7 +4658,8 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   gate_resolution_attempt: ['id', 'gate_key', 'phase', 'outcome', 'detail', 'created_at'],
   gate_resolution_audit: ['id', 'gate_key', 'event', 'reason', 'created_at'],
   gate_channel_delivery: [
-    'gate_key', 'run_key', 'task_key', 'source_dispatch_id', 'revision', 'state',
+    'gate_key', 'run_key', 'task_key', 'source_dispatch_id', 'revision',
+    'deferred_outbox_revision', 'state',
     'attempt_count', 'last_attempt_at', 'next_attempt_at', 'receipted_at', 'consumed_at',
     'lease_owner', 'lease_expires_at', 'last_error_code', 'created_at', 'updated_at',
   ],
@@ -4837,6 +4934,11 @@ function validateCurrentGateStore(
       delivery.runKey !== metadata.runKey || delivery.taskKey !== metadata.taskKey ||
       delivery.sourceDispatchId !== intent.dispatchId ||
       outbox.notificationState !== 'pending' ||
+      delivery.deferredOutboxRevision > outbox.revision ||
+      (
+        delivery.deferredOutboxRevision === outbox.revision &&
+        (!outbox.cardPending || outbox.projectedAt !== null)
+      ) ||
       delivery.createdAt < intent.createdAt ||
       delivery.createdAt < intent.updatedAt ||
       delivery.createdAt < outbox.createdAt ||

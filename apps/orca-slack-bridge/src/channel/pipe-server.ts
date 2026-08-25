@@ -18,7 +18,6 @@ import {
 export const CHANNEL_PIPE_PATH = String.raw`\\.\pipe\orca-slack-bridge-channel-v1`;
 export const DEFAULT_PROBE_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
 const PRODUCTION_RECEIPT_ACK_SAFETY_MS = 50;
-const PRODUCTION_ROUTE_FRESHNESS_MS = 25;
 
 export type ChannelPipeErrorCode =
   | ChannelProtocolErrorCode
@@ -87,10 +86,19 @@ export type ChannelProductionDeliveryEvent = {
   readonly connectionEpoch: string;
 };
 
+/** Rechecked by the durable store inside its transaction immediately before COMMIT. */
+export type ChannelProductionCommitFence = () => boolean;
+
 export type ChannelProductionDeliveryHandlers = {
   /** Synchronous so a receipt ACK can never cross the pipe before its durable commit. */
-  readonly attempted: (event: ChannelProductionDeliveryEvent) => void;
-  readonly receipted: (event: ChannelProductionDeliveryEvent) => void;
+  readonly attempted: (
+    event: ChannelProductionDeliveryEvent,
+    commitFence: ChannelProductionCommitFence,
+  ) => void;
+  readonly receipted: (
+    event: ChannelProductionDeliveryEvent,
+    commitFence: ChannelProductionCommitFence,
+  ) => void;
 };
 
 type ProductionAdapterMessage = Extract<
@@ -120,6 +128,7 @@ type ConnectionState = {
   readonly productionEventQueue: QueuedProductionEvent[];
   productionEventsActive: number;
   productionCommit: Promise<void>;
+  productionCommitRevision: number;
   inbound: Promise<void>;
   pendingInboundMessages: number;
   timer: ReturnType<typeof setTimeout> | null;
@@ -636,6 +645,7 @@ export class ChannelPipeServer {
       productionEventQueue: [],
       productionEventsActive: 0,
       productionCommit: Promise.resolve(),
+      productionCommitRevision: 0,
       inbound: Promise.resolve(),
       pendingInboundMessages: 0,
       timer: null,
@@ -815,21 +825,25 @@ export class ChannelPipeServer {
     connection: ConnectionState,
     event: QueuedProductionEvent,
   ): Promise<void> {
+    const gateId = event.message.gate_id;
     const remainingMs = event.deadlineAt - performance.now();
     if (remainingMs < 1) {
       this.#expireProductionEvent(connection);
       return;
     }
-    // Start the expensive fresh Run read in parallel, but append its durable callback and ACK to
-    // one arrival-ordered commit chain. This keeps callback serialization without summing route
-    // latency across a burst and consuming the Adapter's aggregate receipt timeout.
+    // Expensive reads start concurrently. Their completion captures the exact predecessor-callback
+    // revision: if an earlier callback commits after this snapshot, this event must reread at its
+    // own commit boundary regardless of elapsed time.
     const validation = this.#validateProductionEvent(
       connection,
-      event.message.gate_id,
+      gateId,
       Math.min(this.#eventValidationTimeoutMs, remainingMs),
-    ).then((token) => ({ token, validatedAt: performance.now() }));
+    ).then((token) => ({
+      token,
+      predecessorRevision: connection.productionCommitRevision,
+    }));
     const committed = connection.productionCommit.then(async () => {
-      let { token, validatedAt } = await validation;
+      let { token, predecessorRevision } = await validation;
       if (token === null || connection.socket.destroyed || this.#stopping) return;
       const waitedForWritable = event.message.type === 'receipt' && connection.writeBlocked;
       if (
@@ -841,7 +855,7 @@ export class ChannelPipeServer {
       }
       if (
         waitedForWritable ||
-        performance.now() - validatedAt > PRODUCTION_ROUTE_FRESHNESS_MS
+        predecessorRevision !== connection.productionCommitRevision
       ) {
         const refreshBudgetMs = event.deadlineAt - performance.now();
         if (refreshBudgetMs < 1) {
@@ -850,21 +864,44 @@ export class ChannelPipeServer {
         }
         token = await this.#validateProductionEvent(
           connection,
-          event.message.gate_id,
+          gateId,
           Math.min(this.#eventValidationTimeoutMs, refreshBudgetMs),
         );
         if (token === null || connection.socket.destroyed || this.#stopping) return;
       }
-      if (performance.now() >= event.deadlineAt) {
+      const commitFence: ChannelProductionCommitFence = () =>
+        performance.now() < event.deadlineAt &&
+        this.#connections.has(connection) &&
+        !connection.socket.destroyed &&
+        !this.#stopping &&
+        connection.epoch === token.connectionEpoch &&
+        connection.productionDeliveries.get(gateId) === token;
+      if (!commitFence()) {
         this.#expireProductionEvent(connection);
         return;
       }
+      let callbackBoundaryAdvanced = false;
+      const advanceCallbackBoundary = (): void => {
+        if (callbackBoundaryAdvanced) return;
+        callbackBoundaryAdvanced = true;
+        connection.productionCommitRevision += 1;
+      };
       try {
-        if (event.message.type === 'attempted') this.#productionHandlers?.attempted(token);
-        else this.#productionHandlers?.receipted(token);
+        if (event.message.type === 'attempted') {
+          this.#productionHandlers?.attempted(token, commitFence);
+        } else {
+          this.#productionHandlers?.receipted(token, commitFence);
+        }
       } catch {
+        advanceCallbackBoundary();
         // No receipt ACK: the Adapter's receipt tool remains retryable and cannot outrun durable state.
-        this.#onError('delivery_event_failed');
+        if (performance.now() >= event.deadlineAt) this.#expireProductionEvent(connection);
+        else this.#onError('delivery_event_failed');
+        return;
+      }
+      advanceCallbackBoundary();
+      if (!commitFence()) {
+        this.#expireProductionEvent(connection);
         return;
       }
       if (event.message.type === 'receipt') {
@@ -873,7 +910,7 @@ export class ChannelPipeServer {
           this.#expireProductionEvent(connection);
           return;
         }
-        this.#ackReceipt(connection, event.message.gate_id, ackBudgetMs);
+        this.#ackReceipt(connection, gateId, ackBudgetMs);
       }
     });
     connection.productionCommit = committed.catch(() => undefined);

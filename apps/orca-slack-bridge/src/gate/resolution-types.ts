@@ -148,7 +148,21 @@ export type GateLeaseResult =
   | { readonly kind: 'busy'; readonly expiresAt: string }
   | { readonly kind: 'unavailable' };
 
-export type GateProjectionLeaseResult = 'acquired' | 'recovered' | 'busy' | 'superseded';
+export type GateProjectionLeaseResult =
+  | 'acquired'
+  | 'recovered'
+  | 'busy'
+  | 'superseded'
+  | 'deferred';
+
+/** Exact D3-3 opt-in for the one Channel-originated card generation it is authorized to render. */
+export type GateChannelProjectionClaim = {
+  readonly expectedDeliveryRevision: number;
+  readonly expectedOutboxRevision: number;
+};
+
+/** Checked inside the SQLite transaction immediately before its durable commit. */
+export type GateChannelDeliveryCommitFence = () => boolean;
 
 export type GateChannelDeliveryState = 'pending' | 'attempted' | 'receipted' | 'consumed';
 
@@ -163,6 +177,8 @@ export type GateChannelDelivery = {
   readonly sourceDispatchId: string;
   /** Monotonic CAS/fencing generation for delivery state and lease ownership. */
   readonly revision: number;
+  /** Exact D2 card-outbox generation re-armed by the latest D3 transition and deferred to D3-3. */
+  readonly deferredOutboxRevision: number;
   readonly state: GateChannelDeliveryState;
   /** Number of Adapter-confirmed MCP transport writes, not daemon pipe writes. */
   readonly attemptCount: number;
@@ -216,9 +232,14 @@ export interface GateChannelDeliveryStore {
     gateKey: GateKey,
     at: string,
     nextAttemptAt: string,
+    commitFence?: GateChannelDeliveryCommitFence,
   ): GateChannelDelivery | null;
   /** Application receipt only; it deliberately does not consume the event. */
-  markGateChannelReceipted(gateKey: GateKey, at: string): GateChannelDelivery | null;
+  markGateChannelReceipted(
+    gateKey: GateKey,
+    at: string,
+    commitFence?: GateChannelDeliveryCommitFence,
+  ): GateChannelDelivery | null;
   /**
    * Commit `consumed` only when the fresh exact Gate matches the stored D2 pending→resolved
    * evidence. The state transition and D2 card-outbox re-arm are one SQLite transaction.
@@ -313,6 +334,7 @@ export interface GateResolutionStore {
     expectedRevision: number,
     owner: string,
     at: string,
+    channelClaim?: GateChannelProjectionClaim,
   ): GateProjectionLeaseResult;
   /** A completed card whose deterministic renderer changed must become a new pending generation. */
   rearmGateOutboxProjection(gateKey: GateKey, expectedRevision: number, at: string): boolean;

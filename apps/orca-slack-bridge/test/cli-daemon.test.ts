@@ -339,11 +339,11 @@ describe('daemon production wiring', () => {
         channel.productionHandlers!.attempted({
           gateId: 'gate_aaaaaaaaaaaa', runId: RUN_ID,
           consumerGeneration: 1, connectionEpoch: 'epoch_test',
-        });
+        }, () => true);
         channel.productionHandlers!.receipted({
           gateId: 'gate_aaaaaaaaaaaa', runId: RUN_ID,
           consumerGeneration: 1, connectionEpoch: 'epoch_test',
-        });
+        }, () => true);
       },
     });
 

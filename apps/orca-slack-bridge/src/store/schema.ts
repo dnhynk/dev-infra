@@ -509,6 +509,8 @@ CREATE TABLE gate_channel_delivery (
   task_key            TEXT NOT NULL,
   source_dispatch_id  TEXT NOT NULL CHECK (length(source_dispatch_id) BETWEEN 1 AND 500),
   revision            INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
+  deferred_outbox_revision INTEGER NOT NULL
+    CHECK (deferred_outbox_revision BETWEEN 0 AND 9007199254740991),
   state               TEXT NOT NULL CHECK (state IN ('pending','attempted','receipted','consumed')),
   attempt_count       INTEGER NOT NULL CHECK (attempt_count BETWEEN 0 AND 1000000),
   last_attempt_at     TEXT,

@@ -6,6 +6,7 @@ import { readExactGate, type OrcaRunner } from '../orca/client.js';
 import type { GateStore } from '../store/schema.js';
 import type {
   ChannelDeliverySendResult,
+  ChannelProductionCommitFence,
   ChannelProductionDeliveryEvent,
 } from './pipe-server.js';
 
@@ -164,7 +165,10 @@ export class GateChannelDeliveryEngine {
   }
 
   /** Adapter-confirmed MCP transport write; never promoted to receipt or effect. */
-  recordAttempted(event: ChannelProductionDeliveryEvent): GateChannelDelivery {
+  recordAttempted(
+    event: ChannelProductionDeliveryEvent,
+    commitFence?: ChannelProductionCommitFence,
+  ): GateChannelDelivery {
     const key = gateKey(event.gateId);
     const current = this.#store.findGateChannelDelivery(key);
     if (current === null) throw new Error('delivery_not_found');
@@ -174,13 +178,21 @@ export class GateChannelDeliveryEngine {
       current.attemptCount,
       this.#attemptDelaysMs.length - 1,
     )]!;
-    const attempted = this.#store.markGateChannelAttempted(key, at, later(at, delay));
+    const attempted = this.#store.markGateChannelAttempted(
+      key,
+      at,
+      later(at, delay),
+      commitFence,
+    );
     if (attempted === null) throw new Error('delivery_not_found');
     return attempted;
   }
 
   /** Application receipt only. It stays due for an exact Gate effect reread. */
-  recordReceipted(event: ChannelProductionDeliveryEvent): GateChannelDelivery {
+  recordReceipted(
+    event: ChannelProductionDeliveryEvent,
+    commitFence?: ChannelProductionCommitFence,
+  ): GateChannelDelivery {
     const key = gateKey(event.gateId);
     const current = this.#store.findGateChannelDelivery(key);
     if (current === null) throw new Error('delivery_not_found');
@@ -188,6 +200,7 @@ export class GateChannelDeliveryEngine {
     const receipted = this.#store.markGateChannelReceipted(
       key,
       this.#now().toISOString(),
+      commitFence,
     );
     // The pipe withholds its ACK when this throws, so an unknown production Gate can never be
     // acknowledged without corresponding durable state.
