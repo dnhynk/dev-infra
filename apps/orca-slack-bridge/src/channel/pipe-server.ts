@@ -365,25 +365,38 @@ export class ChannelPipeServer {
       connection.hello.pane_key === run.coordinatorPaneKey,
     );
     if (candidates.length === 0) return { kind: 'pending', code: 'no_candidate' };
-    if (candidates.length > 1) return { kind: 'ambiguous', code: 'same_binding' };
-    const candidate = candidates[0]!;
-    if (!candidate.verified) return { kind: 'pending', code: 'unverified' };
 
     const currentGeneration = run.consumerGeneration.value;
-    const boundGenerations = bindings.get(candidate);
-    if (boundGenerations === null) {
-      candidate.socket.destroy();
-      return { kind: 'pending', code: 'run_read_failed' };
+    const key = bindingKey(run.coordinatorHandle, run.coordinatorPaneKey);
+    const currentCandidates: ConnectionState[] = [];
+    let retiredFailedRead = false;
+    let retiredStaleGeneration = false;
+    for (const candidate of candidates) {
+      const boundGenerations = bindings.get(candidate);
+      if (boundGenerations === null) {
+        candidate.socket.destroy();
+        retiredFailedRead = true;
+        continue;
+      }
+      const boundGeneration = boundGenerations?.get(key)?.get(run.id);
+      if (boundGeneration === undefined || boundGeneration !== currentGeneration) {
+        // A fresh connection must capture the new generation at hello; an existing claim can never
+        // lazily adopt a Run that appeared later or a generation created by coordinator takeover.
+        candidate.socket.destroy();
+        retiredStaleGeneration = true;
+        continue;
+      }
+      currentCandidates.push(candidate);
     }
-    const boundGeneration = boundGenerations
-      ?.get(bindingKey(run.coordinatorHandle, run.coordinatorPaneKey))
-      ?.get(run.id);
-    if (boundGeneration === undefined || boundGeneration !== currentGeneration) {
-      // A fresh connection must capture the new generation at hello; an existing claim can never
-      // lazily adopt a Run that appeared later or a generation created by coordinator takeover.
-      candidate.socket.destroy();
-      return { kind: 'pending', code: 'stale_generation' };
+    if (currentCandidates.length === 0) {
+      if (retiredFailedRead) return { kind: 'pending', code: 'run_read_failed' };
+      if (retiredStaleGeneration) return { kind: 'pending', code: 'stale_generation' };
+      return { kind: 'pending', code: 'no_candidate' };
     }
+    if (currentCandidates.length > 1) return { kind: 'ambiguous', code: 'same_binding' };
+    const candidate = currentCandidates[0]!;
+    if (!candidate.verified) return { kind: 'pending', code: 'unverified' };
+
     return {
       kind: 'eligible_but_disabled',
       epoch: candidate.epoch!,

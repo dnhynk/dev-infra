@@ -26,10 +26,11 @@ This slice connects one production vertical seam without enabling production Gat
   instance ID, and connection ID. They are routing claims, not authentication. `CLAUDE_PID` is not
   read or transmitted.
 - The read-only router shell calls the existing Orca `listRuns` reader, exact-matches current
-  handle/pane, rejects duplicate Run rows and same-binding candidates, records the current
-  `consumer_generation`, and fences later generation changes. Concurrent hello-time reads share
-  one bounded snapshot; shutdown aborts the production Orca child and retires that shared read. It
-  never broadcasts.
+  handle/pane, and rejects duplicate Run rows. Before routing, it checks every same-binding
+  candidate's hello-time snapshot for the exact current Run ID and `consumer_generation`, retires
+  absent or stale captures, and computes zero/one/many only across current-generation candidates.
+  Concurrent hello-time reads share one bounded snapshot; shutdown aborts the production Orca
+  child and retires that shared read. It never broadcasts.
 - Every connection epoch receives one random opaque Gate-ID-shaped probe, repeated with bounded
   exponential pacing. MCP initialize, tools/list, pipe writes, Adapter `attempted`, argv, and env
   never verify opt-in. Only the exact receipt callback accepted by the daemon for that epoch and
@@ -81,7 +82,8 @@ treated only as a transport-write attempt; it is never promoted to application r
   deadline, and only the current receipt/ack can occupy the one-element deferred slot. Receipt/ACK
   races preserve the deadline and flush on drain. The initial Run generation is captured at hello,
   a failed capture reconnects, and a takeover or newly appearing Run forces a fresh epoch rather
-  than letting an existing claim adopt a generation lazily.
+  than letting an existing claim adopt a generation lazily. A stale claim overlapping a fresh
+  same-binding claim is retired before ambiguity is evaluated.
 
 All integration tests use fake Orca readers, an in-memory MCP transport, and unique local OS pipe
 endpoints. On this Windows host, the named-pipe cases exercised the real `\\.\pipe\...` path.
@@ -93,8 +95,8 @@ other product write was performed.
 
 | Command | Result |
 |---|---|
-| focused Channel + CLI/daemon suite | pass — 6 files, 94 tests |
-| `pnpm test` | pass — 47 files, 1059 tests |
+| focused Channel + CLI/daemon suite | pass — 6 files, 95 tests |
+| `pnpm test` | pass — 47 files, 1060 tests |
 | `pnpm typecheck` | pass |
 | `pnpm --filter @dev-infra/orca-slack-bridge typecheck` | pass |
 | `pnpm --filter @dev-infra/orca-slack-bridge build` | pass |
@@ -104,11 +106,12 @@ other product write was performed.
 
 Focused coverage includes byte-boundary fragmentation, coalesced frames, strict shapes and cap,
 malformed-input redaction, daemon-first, Adapter-first `ENOENT`, reconnect/new epoch, stale/wrong/
-duplicate receipts, same-binding ambiguity, generation fencing, write-without-receipt, repeated
-probe identity, zero pre-receipt production writes, exact MCP capability/notification/tool shapes,
-second-daemon ownership, daemon/Adapter receipt backpressure races, hello-read coalescing and abort,
-transient binding-read recovery, a globally capped hanging MCP write across four reconnect epochs,
-bounded hanging writes, CLI ordering, and listener/socket/timer/Orca-child cleanup.
+duplicate receipts, true current-generation same-binding ambiguity, generation fencing, stale/fresh
+same-binding pruning across repeated route evaluations, write-without-receipt, repeated probe
+identity, zero production writes, exact MCP capability/notification/tool shapes, second-daemon
+ownership, daemon/Adapter receipt backpressure races, hello-read coalescing and abort, transient
+binding-read recovery, a globally capped hanging MCP write across four reconnect epochs, bounded
+hanging writes, CLI ordering, and listener/socket/timer/Orca-child cleanup.
 
 The changed-source audit found no `CLAUDE_PID`, raw-frame logger, production Gate mutation/write,
 schema-version change, Slack action/projection change, or `작업 재개` string. Environment routing
@@ -117,19 +120,19 @@ claim names; no credential value was read, printed, copied, or logged during val
 
 ## Independent read-only audits
 
-Two independent read-only GPT reviewers inspected the refreshed staged tree after all material
-findings were fixed. The protocol/security reviewer reported **PASS — no remaining P0–P2
-protocol/security defect** and verified strict framing/shapes, minimal MCP/hello data, exact epoch
-and receipt handling, generation fencing, redaction, and forbidden-scope absence. The
-lifecycle/concurrency reviewer reported **PASS — no remaining P0–P2 lifecycle/concurrency defect**
-and verified both write/backpressure paths, cross-epoch MCP-write bounds, coalesced cancellable Orca
-reads, retry recovery, ownership, production CLI composition, and bounded resource cleanup.
+Two independent post-fix read-only GPT reviewers inspected the final diff after all material
+findings were fixed. The routing-semantics reviewer reported **PASS — no remaining P0–P2
+correctness/security defect** and verified exact per-candidate Run/generation fencing, stale
+retirement before cardinality, preserved lone-stale behavior, and structural zero Gate writes. The
+lifecycle/test reviewer reported **PASS — no remaining P0–P2 concurrency or regression-coverage
+defect** and verified repeated evaluation, stale socket removal, fresh exact-epoch eligibility,
+true current-candidate ambiguity, and deterministic cleanup.
 
 ## Diff size
 
-The final staged diff contains 15 files, 4,304 insertions, and 20 deletions: production/package
-code is 1,794 additions and 18 deletions; tests are 1,615 additions and 2 deletions; evidence is
-141 additions; and the exact dependency lock update is 754 additions.
+The final staged diff contains 15 files, 4,368 insertions, and 20 deletions: production/package
+code is 1,807 additions and 18 deletions; tests are 1,663 additions and 2 deletions; evidence is
+144 additions; and the exact dependency lock update is 754 additions.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 

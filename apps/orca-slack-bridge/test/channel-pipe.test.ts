@@ -398,6 +398,54 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     expect(daemon.getResourceSnapshot().productionGateWrites).toBe(0);
   });
 
+  it('retires a stale same-binding claim before routing the current generation', async () => {
+    const path = pipePath('stale-and-current');
+    const orca = new FakeOrca();
+    const daemon = server(path, orca);
+    await daemon.start();
+
+    const stale = await rawAdapter(path);
+    const staleNotify = stale.messages.find((message) => message.type === 'notify')!;
+    stale.socket.write(encodeChannelFrame({
+      version: CHANNEL_PROTOCOL_VERSION,
+      type: 'receipt',
+      connection_epoch: staleNotify.connection_epoch,
+      gate_id: staleNotify.gate_id,
+    }));
+    await waitFor(() => (
+      daemon.listConnections().some((connection) => (
+        connection.epoch === staleNotify.connection_epoch && connection.verified
+      )) && daemon.getResourceSnapshot().bindingReads === 0
+    ));
+
+    orca.generation = 2;
+    let current!: ChannelAdapterClient;
+    current = adapter(
+      path,
+      { notifyGate: async (gateId) => { await current.reportReceipt(gateId); } },
+      identity('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+    );
+    current.start();
+    await waitFor(() => daemon.listConnections().filter((value) => value.verified).length === 2);
+    const currentConnection = daemon.listConnections().find(
+      (connection) => connection.epoch !== staleNotify.connection_epoch,
+    )!;
+    const expected = {
+      kind: 'eligible_but_disabled',
+      epoch: currentConnection.epoch,
+      generation: 2,
+      productionDeliveryEnabled: false,
+    } as const;
+
+    expect(await daemon.evaluateProductionRoute(RUN_ID)).toEqual(expected);
+    expect(await daemon.evaluateProductionRoute(RUN_ID)).toEqual(expected);
+    await waitFor(() => daemon.getResourceSnapshot().sockets === 1);
+    expect(daemon.listConnections().map((connection) => connection.epoch)).toEqual([
+      currentConnection.epoch,
+    ]);
+    expect(daemon.getResourceSnapshot().productionGateWrites).toBe(0);
+  });
+
   it('keeps an exact Run route pending when every verified claim has the wrong binding', async () => {
     const path = pipePath('wrong-binding');
     const daemon = server(path);
