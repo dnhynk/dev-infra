@@ -67,6 +67,7 @@ describe('명령 분기', () => {
       ['runs', '--socket'],
       ['gate-register', '--input', 'gate.json', '--socket'],
       ['daemon', '--socket'],
+      ['channel-adapter', '--socket'],
     ]) {
       const p = parseArgs(argv);
       expect(p.kind).toBe('error');
@@ -118,8 +119,26 @@ describe('명령 분기', () => {
     }
   });
 
+  it('channel-adapter는 옵션이나 위치 인자 없이만 실행된다', () => {
+    const parsed = parseArgs(['channel-adapter']);
+    expect(parsed.kind).toBe('run');
+    if (parsed.kind === 'run') expect(parsed.command).toBe('channel-adapter');
+    for (const extra of [
+      ['--config', 'bridge.json'],
+      ['--state', 'state.db'],
+      ['--orca', 'orca-test'],
+      ['--json'],
+      ['--dry-run'],
+      ['stray'],
+    ]) {
+      expect(parseArgs(['channel-adapter', ...extra]).kind).toBe('error');
+    }
+  });
+
   it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon']) expect(parseArgs([c]).kind).toBe('run');
+    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon', 'channel-adapter']) {
+      expect(parseArgs([c]).kind).toBe('run');
+    }
     expect(parseArgs(['gate-register', '--input', 'gate.json']).kind).toBe('run');
   });
 
@@ -262,7 +281,7 @@ describe('gate-register transport', () => {
   });
 
   it('--input은 gate-register 외 모든 명령에서 command-scoped unknown이다', () => {
-    for (const command of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon'] as const) {
+    for (const command of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon', 'channel-adapter'] as const) {
       const p = parseArgs([command, '--input', 'gate.json']);
       expect(p.kind).toBe('error');
       if (p.kind === 'error') {
