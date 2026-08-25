@@ -171,6 +171,13 @@ export type GateChannelSeedResult =
 export type GateChannelDeliveryState = 'pending' | 'attempted' | 'receipted' | 'consumed';
 
 /**
+ * v11 rows are `unavailable`: they may already have crossed the pipe before this code existed, so
+ * a later snapshot can never be called pre-send. Only v12-created rows start `required` and may
+ * advance to immutable `recorded` evidence before their first transport call.
+ */
+export type GateResumeBaselineState = 'unavailable' | 'required' | 'recorded';
+
+/**
  * Additive D3 delivery state. The v10 Gate outbox remains the immutable D2 source row; this row is
  * a lazy materialization that can be retried without changing `notification_state='pending'`.
  */
@@ -183,6 +190,7 @@ export type GateChannelDelivery = {
   readonly revision: number;
   /** Exact D2 card-outbox generation re-armed by the latest D3 transition and deferred to D3-3. */
   readonly deferredOutboxRevision: number;
+  readonly resumeBaselineState: GateResumeBaselineState;
   readonly state: GateChannelDeliveryState;
   /** Number of Adapter-confirmed MCP transport writes, not daemon pipe writes. */
   readonly attemptCount: number;
@@ -198,6 +206,57 @@ export type GateChannelDelivery = {
   readonly createdAt: string;
   readonly updatedAt: string;
 };
+
+/** Normalized Orca facts only. Task result, worker resource, terminal text, and payloads are absent. */
+export type GateResumeDispatchFact = {
+  readonly dispatchId: string;
+  readonly status: string;
+};
+
+export type GateResumeTaskFact = {
+  readonly taskId: string;
+  readonly status: string;
+  readonly currentDispatchId: string | null;
+  readonly dispatches: readonly GateResumeDispatchFact[];
+};
+
+/** Source identity plus the deterministic dependency-descendant closure at one strict reread. */
+export type GateResumeSnapshot = {
+  readonly schemaVersion: 1;
+  readonly sourceTaskId: string;
+  readonly sourceDispatchId: string;
+  readonly candidates: readonly GateResumeTaskFact[];
+};
+
+export type GateResumeEvidence = {
+  readonly kind: 'new_dispatch' | 'status_transition';
+  readonly taskId: string;
+  readonly dispatchId: string;
+  readonly fromStatus: string | null;
+  readonly toStatus: 'dispatched' | 'completed';
+};
+
+export type GateResumeObservation = {
+  readonly gateKey: GateKey;
+  readonly revision: number;
+  readonly baseline: GateResumeSnapshot;
+  readonly latest: GateResumeSnapshot | null;
+  /** First positive evidence is latched and can never be downgraded by a later read failure. */
+  readonly evidence: GateResumeEvidence | null;
+  readonly nextObservationAt: string | null;
+  readonly observedAt: string | null;
+  readonly leaseOwner: string | null;
+  readonly leaseExpiresAt: string | null;
+  /** Bounded code only. Raw Orca output is never persisted. */
+  readonly lastErrorCode: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type GateResumeLeaseResult =
+  | { readonly kind: 'acquired'; readonly observation: GateResumeObservation }
+  | { readonly kind: 'busy'; readonly expiresAt: string }
+  | { readonly kind: 'unavailable' };
 
 export type GateChannelDeliveryLeaseResult =
   | { readonly kind: 'acquired'; readonly delivery: GateChannelDelivery }
@@ -259,6 +318,39 @@ export interface GateChannelDeliveryStore {
     freshGate: GateSnapshot,
     at: string,
   ): GateChannelConsumeResult;
+
+  /** Persist the immutable strict pre-send baseline while retaining the exact delivery lease. */
+  recordGateResumeBaseline(
+    gateKey: GateKey,
+    expectedDeliveryRevision: number,
+    owner: string,
+    baseline: GateResumeSnapshot,
+    at: string,
+  ): GateChannelDelivery | null;
+  findGateResumeObservation(gateKey: GateKey): GateResumeObservation | null;
+  listDueGateResumeObservations(at: string, limit?: number): readonly GateResumeObservation[];
+  acquireGateResumeLease(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    at: string,
+    expiresAt: string,
+  ): GateResumeLeaseResult;
+  /**
+   * Commit one normalized reread. Positive evidence atomically re-arms the exact existing-card
+   * generation; a stale resume owner advances neither fact nor projection.
+   */
+  recordGateResumeObservation(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    latest: GateResumeSnapshot | null,
+    evidence: GateResumeEvidence | null,
+    at: string,
+    nextObservationAt: string,
+    errorCode: string | null,
+  ): GateResumeObservation | null;
+  releaseGateResumeLease(gateKey: GateKey, owner: string, at: string): boolean;
 }
 
 export type GateProgressUpdate = {

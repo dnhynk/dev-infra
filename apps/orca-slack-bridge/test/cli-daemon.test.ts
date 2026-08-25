@@ -836,7 +836,7 @@ describe('daemon production wiring', () => {
     expect(starts).toBe(1);
     expect(slack.updates).toHaveLength(3);
     expect(orca.calls.map((call) => call[1])).toEqual([
-      'gate-list', 'gate-list', 'gate-resolve', 'gate-list',
+      'gate-list', 'gate-list', 'gate-resolve', 'gate-list', 'task-list',
     ]);
     const reopened = new SqliteDigestStore(statePath);
     expect(reopened.findGateResolution(GATE)).toMatchObject({

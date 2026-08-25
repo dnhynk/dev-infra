@@ -14,7 +14,7 @@ import type {
   ChannelProductionDeliveryEvent,
 } from '../src/channel/pipe-server.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
-import type { GateSnapshot } from '../src/gate/resolution-types.js';
+import type { GateChannelDelivery, GateSnapshot } from '../src/gate/resolution-types.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
@@ -311,6 +311,45 @@ function callback(gateId = GATE_ID): ChannelProductionDeliveryEvent {
   };
 }
 
+function testBaseline(delivery: GateChannelDelivery) {
+  return {
+    schemaVersion: 1 as const,
+    sourceTaskId: delivery.taskKey.slice('task:'.length),
+    sourceDispatchId: delivery.sourceDispatchId,
+    candidates: [{
+      taskId: delivery.taskKey.slice('task:'.length),
+      status: 'completed',
+      currentDispatchId: delivery.sourceDispatchId,
+      dispatches: [{ dispatchId: delivery.sourceDispatchId, status: 'completed' }],
+    }],
+  };
+}
+
+function recordTestBaseline(
+  store: SqliteDigestStore,
+  delivery: GateChannelDelivery,
+  at = START,
+): void {
+  const owner = 't.test-baseline';
+  const lease = store.acquireGateChannelDeliveryLease(
+    delivery.gateKey,
+    owner,
+    at,
+    new Date(new Date(at).valueOf() + 60_000).toISOString(),
+  );
+  if (lease.kind !== 'acquired') throw new Error(`test baseline lease ${lease.kind}`);
+  if (store.recordGateResumeBaseline(
+    delivery.gateKey,
+    lease.delivery.revision,
+    owner,
+    testBaseline(delivery),
+    at,
+  ) === null) throw new Error('test baseline record failed');
+  if (!store.releaseGateChannelDeliveryLease(delivery.gateKey, owner, at)) {
+    throw new Error('test baseline release failed');
+  }
+}
+
 function engine(
   store: SqliteDigestStore,
   orca: OrcaRunner,
@@ -319,6 +358,20 @@ function engine(
   errors: GateChannelDeliveryErrorCode[] = [],
   bounds: { concurrency?: number; reconcileDeadlineMs?: number } = {},
 ): GateChannelDeliveryEngine {
+  const ensureBaseline = (
+    delivery: GateChannelDelivery,
+    owner: string,
+  ): Promise<GateChannelDelivery | null> => {
+    if (delivery.resumeBaselineState === 'recorded') return Promise.resolve(delivery);
+    if (delivery.resumeBaselineState === 'unavailable') return Promise.resolve(delivery);
+    return Promise.resolve(store.recordGateResumeBaseline(
+      delivery.gateKey,
+      delivery.revision,
+      owner,
+      testBaseline(delivery),
+      time.now().toISOString(),
+    ));
+  };
   return new GateChannelDeliveryEngine({
     store,
     orca,
@@ -328,6 +381,7 @@ function engine(
     receiptBackoffMs: 3_000,
     attemptDelaysMs: [1_000, 2_000],
     ...bounds,
+    resume: { ensureBaseline, reconcile: () => Promise.resolve() },
     onError: (code) => errors.push(code),
   });
 }
@@ -457,9 +511,12 @@ describe('durable Channel delivery engine', () => {
       requestId: '33333333-3333-4333-8333-333333333333', messageSuffix: '004',
     });
     const gateKeys = [GATE, gateKey(second.gateId), gateKey(third.gateId)];
-    expect(store.seedPendingGateChannelDeliveries(START, 1_000, () => true)).toMatchObject({
+    const seeded = store.seedPendingGateChannelDeliveries(START, 1_000, () => true);
+    expect(seeded).toMatchObject({
       kind: 'committed', deliveries: [{}, {}, {}],
     });
+    if (seeded.kind !== 'committed') throw new Error('seed fenced');
+    for (const delivery of seeded.deliveries) recordTestBaseline(store, delivery);
     for (const key of gateKeys) {
       expect(store.markGateChannelReceipted(key, START)?.state).toBe('receipted');
     }

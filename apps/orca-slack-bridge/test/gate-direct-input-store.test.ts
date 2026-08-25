@@ -204,15 +204,15 @@ describe('D2-D durable modal schema', () => {
   it('migrates v9 additively and persists no raw trigger field', () => {
     new SqliteDigestStore(path).close();
     const v9 = new DatabaseSync(path);
-    v9.exec('DROP TABLE gate_direct_modal; DROP TABLE gate_channel_delivery');
+    v9.exec('DROP TABLE gate_resume_observation; DROP TABLE gate_direct_modal; DROP TABLE gate_channel_delivery');
     v9.prepare('UPDATE schema_version SET version = 9 WHERE id = 1').run();
     v9.close();
 
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path, { readOnly: true });
-    expect(SCHEMA_VERSION).toBe(11);
+    expect(SCHEMA_VERSION).toBe(12);
     expect(raw.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({
-      version: 11,
+      version: 12,
     });
     const columns = (raw.prepare('PRAGMA table_info(gate_direct_modal)').all() as {
       readonly name: string;
@@ -230,7 +230,7 @@ describe('D2-D durable modal schema', () => {
   it('rolls back the v9→v10 version step when the additive table creation fails', () => {
     new SqliteDigestStore(path).close();
     const conflicted = new DatabaseSync(path);
-    conflicted.exec('DROP TABLE gate_direct_modal; DROP TABLE gate_channel_delivery');
+    conflicted.exec('DROP TABLE gate_resume_observation; DROP TABLE gate_direct_modal; DROP TABLE gate_channel_delivery');
     conflicted.prepare('UPDATE schema_version SET version = 9 WHERE id = 1').run();
     conflicted.exec('CREATE TABLE gate_direct_modal (unexpected TEXT)');
     conflicted.close();

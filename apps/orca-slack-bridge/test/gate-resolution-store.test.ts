@@ -102,7 +102,7 @@ function lease(store: SqliteDigestStore) {
 }
 
 describe('strict persisted Gate schema', () => {
-  it('fresh v11과 v7→v8→v9→v10→v11이 같은 additive resolution tables를 만든다', () => {
+  it('fresh v12와 v7→v8→v9→v10→v11→v12가 같은 additive resolution tables를 만든다', () => {
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path);
     raw.exec(`
@@ -112,6 +112,7 @@ describe('strict persisted Gate schema', () => {
       DROP TABLE gate_resolution;
       DROP TABLE gate_observation_generation;
       DROP TABLE gate_direct_modal;
+      DROP TABLE gate_resume_observation;
       DROP TABLE gate_channel_delivery;
       DROP TABLE gate_local_observation;
     `);
@@ -123,8 +124,8 @@ describe('strict persisted Gate schema', () => {
     const tables = (migrated.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'gate_resolution%' ORDER BY name",
     ).all() as { readonly name: string }[]).map((row) => row.name);
-    expect(SCHEMA_VERSION).toBe(11);
-    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 11 });
+    expect(SCHEMA_VERSION).toBe(12);
+    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 12 });
     expect(tables).toEqual([
       'gate_resolution',
       'gate_resolution_attempt',
@@ -143,7 +144,7 @@ describe('strict persisted Gate schema', () => {
     v8Store.close();
     const raw = new DatabaseSync(path);
     raw.exec(
-      'DROP TABLE gate_observation_generation; DROP TABLE gate_direct_modal; DROP TABLE gate_channel_delivery',
+      'DROP TABLE gate_resume_observation; DROP TABLE gate_observation_generation; DROP TABLE gate_direct_modal; DROP TABLE gate_channel_delivery',
     );
     raw.prepare('UPDATE schema_version SET version = 8 WHERE id = 1').run();
     raw.close();

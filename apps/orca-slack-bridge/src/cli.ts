@@ -779,7 +779,7 @@ function processStop(): Promise<void> {
   });
 }
 
-/** Production D2+D3-2 path: strict v11 startup → durable reconcile → one consumer. */
+/** Production D2+D3 path: strict v12 startup → delivery/resume reconcile → existing-card projection. */
 export async function runDaemonCommand(
   parsed: RunArgs,
   config: BridgeConfig,

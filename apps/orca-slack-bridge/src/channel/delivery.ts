@@ -9,6 +9,7 @@ import type {
   ChannelProductionCommitFence,
   ChannelProductionDeliveryEvent,
 } from './pipe-server.js';
+import { GateResumeEngine } from './resume.js';
 
 export const DEFAULT_DELIVERY_ATTEMPT_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
 export const DEFAULT_DELIVERY_RECEIPT_BACKOFF_MS = 30_000;
@@ -28,6 +29,7 @@ export type GateChannelDeliveryErrorCode =
   | 'gate_effect_mismatch'
   | 'gate_effect_pending'
   | 'channel_send_failed'
+  | 'resume_baseline_read_failed'
   | 'delivery_reconcile_deadline'
   | 'delivery_reconcile_failed'
   | `route_${Exclude<ChannelDeliverySendResult['kind'], 'sent'>}_${string}`;
@@ -48,6 +50,8 @@ export type GateChannelDeliveryEngineOptions = {
   readonly reconcileDeadlineMs?: number;
   /** Bounded codes only. No downstream message or payload is exposed. */
   readonly onError?: (code: GateChannelDeliveryErrorCode) => void;
+  /** Test seam; production always uses the strict persisted resume engine. */
+  readonly resume?: Pick<GateResumeEngine, 'ensureBaseline' | 'reconcile'>;
 };
 
 function finiteMs(value: number, code: string): number {
@@ -82,6 +86,7 @@ export class GateChannelDeliveryEngine {
   readonly #concurrency: number;
   readonly #reconcileDeadlineMs: number;
   readonly #onError: (code: GateChannelDeliveryErrorCode) => void;
+  readonly #resume: Pick<GateResumeEngine, 'ensureBaseline' | 'reconcile'>;
   #singleSlotPrefersSeed = true;
 
   constructor(options: GateChannelDeliveryEngineOptions) {
@@ -119,6 +124,13 @@ export class GateChannelDeliveryEngine {
       throw new TypeError('delivery_reconcile_deadline_must_precede_lease_expiry');
     }
     this.#onError = options.onError ?? (() => undefined);
+    this.#resume = options.resume ?? new GateResumeEngine({
+      store: options.store,
+      orca: options.orca,
+      now: this.#now,
+      leaseMs: this.#leaseMs,
+      batchLimit: this.#batchLimit,
+    });
   }
 
   /** Lazy seed plus one bounded, concurrent, deadline-limited due batch. */
@@ -190,6 +202,7 @@ export class GateChannelDeliveryEngine {
         return;
       }
       if (due.length > 0) await this.#runBatch(due, controller.signal);
+      if (commitFence()) await this.#resume.reconcile(controller.signal);
     })();
     try {
       await Promise.race([work, deadline]);
@@ -318,6 +331,31 @@ export class GateChannelDeliveryEngine {
     signal.addEventListener('abort', abortLease, { once: true });
     if (signal.aborted) abortLease();
     try {
+      if (signal.aborted) return;
+      try {
+        const baselined = await this.#resume.ensureBaseline(current, owner, signal);
+        if (baselined === null) {
+          this.#onError('resume_baseline_read_failed');
+          released = this.#defer(
+            current,
+            owner,
+            this.#retryDelay(current),
+            'resume_baseline_read_failed',
+          );
+          return;
+        }
+        current = baselined;
+      } catch {
+        if (signal.aborted) return;
+        this.#onError('resume_baseline_read_failed');
+        released = this.#defer(
+          current,
+          owner,
+          this.#retryDelay(current),
+          'resume_baseline_read_failed',
+        );
+        return;
+      }
       if (signal.aborted) return;
       if (current.state === 'receipted') {
         let fresh;
