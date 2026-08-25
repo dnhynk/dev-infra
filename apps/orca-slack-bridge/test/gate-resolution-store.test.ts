@@ -47,7 +47,7 @@ function localObservation(
   };
 }
 
-function seed(store: SqliteDigestStore, status: 'pending' | 'resolved' = 'pending'): void {
+function insertMetadata(store: SqliteDigestStore): void {
   store.insertGateMetadata({
     gateKey: GATE,
     runKey: RUN,
@@ -63,6 +63,10 @@ function seed(store: SqliteDigestStore, status: 'pending' | 'resolved' = 'pendin
     impact: '후속 구현 방향',
     registeredAt: AT,
   });
+}
+
+function seed(store: SqliteDigestStore, status: 'pending' | 'resolved' = 'pending'): void {
+  insertMetadata(store);
   store.insertGateMessage({
     gateKey: GATE,
     runKey: RUN,
@@ -464,6 +468,101 @@ describe('strict persisted Gate schema', () => {
     observer.close();
     const reopened = new SqliteDigestStore(path);
     expect(reopened.findGateLocalObservation(GATE)?.metadataState).toBe('mismatched');
+    reopened.close();
+  });
+
+  it('atomically persists registered metadata reconciliation with an existing staged first observation', () => {
+    const store = new SqliteDigestStore(path);
+    store.saveGateLocalObservation({
+      ...localObservation(),
+      metadataState: 'missing',
+      mappingState: 'missing',
+    });
+    // The public registrar already fail-closes an existing observation. Freeze the external
+    // audit's asserted missing+present precondition with a second SQLite writer so this regression
+    // isolates the mapping transaction's own obligation to persist both correlation axes.
+    const registrar = new DatabaseSync(path);
+    registrar.prepare(
+      `INSERT INTO gate_metadata
+        (gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
+         options_json, recommendation_option_id, recommendation_reason, impact, registered_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      GATE,
+      RUN,
+      TASK,
+      dispatchKey('ctx_d2c'),
+      'msg_d2c',
+      'thread_d2c',
+      JSON.stringify([
+        { id: 'keep', label: '현행 유지', description: '호환성을 유지한다', resolution: '현행 유지' },
+        { id: 'change', label: '변경', description: '새 경로로 간다', resolution: '변경' },
+      ]),
+      'keep',
+      '호환성',
+      '후속 구현 방향',
+      AT,
+    );
+    registrar.close();
+
+    store.insertGateMessage({
+      gateKey: GATE,
+      runKey: RUN,
+      channelId: CHANNEL,
+      threadTs: THREAD_TS,
+      messageTs: MESSAGE_TS,
+      renderFingerprint: 'staged-fp',
+      at: AT,
+    }, {
+      ...localObservation(),
+      metadataState: 'missing',
+    });
+
+    expect(store.findGateLocalObservation(GATE)).toMatchObject({
+      metadataState: 'mismatched',
+      mappingState: 'matched',
+    });
+    expect(claim(store)).toEqual({ kind: 'rejected', reason: 'sidecar_not_matched' });
+    store.close();
+    const reopened = new SqliteDigestStore(path);
+    expect(reopened.findGateLocalObservation(GATE)).toMatchObject({
+      metadataState: 'mismatched',
+      mappingState: 'matched',
+    });
+    reopened.close();
+  });
+
+  it('atomically fail-closes invalid metadata while staging an existing first observation', () => {
+    const store = new SqliteDigestStore(path);
+    insertMetadata(store);
+    store.saveGateLocalObservation({
+      ...localObservation(),
+      mappingState: 'missing',
+    });
+
+    store.insertGateMessage({
+      gateKey: GATE,
+      runKey: RUN,
+      channelId: CHANNEL,
+      threadTs: THREAD_TS,
+      messageTs: MESSAGE_TS,
+      renderFingerprint: 'staged-fp',
+      at: AT,
+    }, {
+      ...localObservation(),
+      metadataState: 'mismatched',
+    });
+
+    expect(store.findGateLocalObservation(GATE)).toMatchObject({
+      metadataState: 'mismatched',
+      mappingState: 'matched',
+    });
+    store.close();
+    const reopened = new SqliteDigestStore(path);
+    expect(reopened.findGateLocalObservation(GATE)).toMatchObject({
+      metadataState: 'mismatched',
+      mappingState: 'matched',
+    });
     reopened.close();
   });
 

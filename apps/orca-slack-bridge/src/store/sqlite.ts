@@ -1640,6 +1640,29 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         const currentObservation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(
           observation.gateKey,
         ) as GateLocalObservationRow | undefined;
+        const existingMetadataState = currentObservation === undefined
+          ? null
+          : metadataState === 'matched' &&
+              (currentObservation.metadata_state !== 'matched' ||
+                currentObservation.run_key !== observation.runKey ||
+                currentObservation.task_key !== observation.taskKey)
+            ? 'mismatched'
+            : metadataState;
+        const existingMappingState = currentObservation?.run_key === message.runKey
+          ? 'matched'
+          : 'mismatched';
+        if (currentObservation !== undefined && existingMetadataState !== null) {
+          // The existing row may contain newer terminal facts, so update only correlation. Never
+          // upgrade a fail-closed metadata row from this mapping-only boundary; a fresh collection
+          // must validate the immutable option facts before metadata can become matched again.
+          toGateLocalObservation({
+            ...currentObservation,
+            metadata_state: existingMetadataState,
+            mapping_state: existingMappingState,
+            write_owner: null,
+            write_expires_at: null,
+          });
+        }
         const mapped = currentObservation === undefined
           ? this.db.prepare(UPSERT_GATE_LOCAL_OBSERVATION).run(
               observation.gateKey,
@@ -1654,9 +1677,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
             )
           : this.db.prepare(
               `UPDATE gate_local_observation
-                  SET mapping_state = CASE WHEN run_key = ? THEN 'matched' ELSE 'mismatched' END
+                  SET metadata_state = ?, mapping_state = ?
                 WHERE gate_key = ? AND write_owner IS NULL`,
-            ).run(message.runKey, observation.gateKey);
+            ).run(existingMetadataState, existingMappingState, observation.gateKey);
         if (Number(mapped.changes) !== 1) {
           throw new Error(`${message.gateKey}의 첫 Gate message mapping을 원자적으로 확정하지 못했다`);
         }

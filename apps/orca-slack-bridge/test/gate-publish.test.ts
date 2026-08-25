@@ -555,6 +555,79 @@ describe('collect → project → render → existing Run thread publish', () =>
     }
   });
 
+  it('reopens a staged first mapping when its missing sidecar registers after the inert reply', async () => {
+    const orca = new MutableFakeOrca();
+    const publisher = new SqliteDigestStore(dbPath);
+    const registrar = new SqliteDigestStore(dbPath);
+    const preview = await runRunObserver(orca, {
+      config: CONFIG,
+      channel: CHANNEL,
+      store: publisher,
+      slack: null,
+      thread: null,
+      now: () => new Date(AT),
+    });
+    const gate = preview.facts.runs[0]?.gates.find((candidate) => candidate.gateId === GATE_ID);
+    if (gate === undefined) throw new Error('missing-sidecar Gate preview missing');
+    expect(gate.metadataState).toBe('missing');
+    const slack = new FakeSlack();
+    await expect(publishGateCard(
+      {
+        store: publisher,
+        slack,
+        thread: slack,
+        channel: CHANNEL,
+        now: () => new Date(AT),
+        fault: (point) => {
+          if (point === 'after_staged_first_reply_before_mapping') insertSidecar(registrar);
+          if (point === 'after_staged_first_mapping_before_action_update') {
+            throw new Error('process died after concurrent sidecar mapping');
+          }
+        },
+      },
+      runKey(RUN_ID),
+      RUN_ROOT_TS,
+      gate,
+    )).rejects.toThrow(/concurrent sidecar mapping/);
+    expect(slack.replies).toHaveLength(1);
+    expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
+    expect(slack.updates).toEqual([]);
+    expect(publisher.findGateMessage(gate.key)?.messageTs).toBe(FIRST_GATE_TS);
+    expect(publisher.findGateLocalObservation(gate.key)).toMatchObject({
+      metadataState: 'mismatched',
+      mappingState: 'matched',
+    });
+    registrar.close();
+    publisher.close();
+
+    const reopened = new SqliteDigestStore(dbPath);
+    try {
+      const currentGate = await matchedGateFacts(reopened, orca);
+      await publishGateCard(
+        {
+          store: reopened,
+          slack,
+          thread: slack,
+          channel: CHANNEL,
+          now: () => new Date('2026-08-24T07:01:00.000Z'),
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        currentGate,
+      );
+      expect(slack.replies).toHaveLength(1);
+      expect(slack.updates).toHaveLength(1);
+      expect(noActionBlocks(slack.updates[0] ?? { blocks: [] })).toBe(false);
+      expect(slack.updates[0]?.ts).toBe(FIRST_GATE_TS);
+      expect(reopened.findGateLocalObservation(gate.key)).toMatchObject({
+        metadataState: 'matched',
+        mappingState: 'matched',
+      });
+    } finally {
+      reopened.close();
+    }
+  });
+
   it('leaves only an inert orphan when a second SQLite writer blocks first mapping persistence', async () => {
     const orca = new MutableFakeOrca();
     const store = new SqliteDigestStore(dbPath);

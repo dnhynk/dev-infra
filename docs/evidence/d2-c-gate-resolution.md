@@ -97,6 +97,11 @@ Base: `origin/main@d26be4db4943a67ff7caaabd35a5391c22eaca5a`
   visible row to remain `write_pending`, while the v9 generation still durably records the
   invalidation and fences that call's completion. The canonical card rejects clicks fail-closed
   across restart; only an exact run/channel/thread publisher can repair and restore `matched`.
+  When first-message insertion finds an existing observation, that transaction persists both the
+  reconciled `metadata_state` and `mapping_state` while leaving run/task/status/resolution/source-
+  time facts untouched. This mapping-only boundary may fail close metadata but cannot promote
+  `missing` or `mismatched` to `matched`; only a fresh collection that validates the immutable
+  option sidecar may do that.
 
 ## Adversarial and fault evidence
 
@@ -109,6 +114,9 @@ output, equal- and different-text external resolution before mutation and before
 restart reconciliation, bounded startup/shutdown Orca calls, stale outbox completion and
 projector-success-before-local crash recovery, two-store observer/card races,
 first-reply and ordinary-write restart settlement (including catchable same-daemon retry),
+  two-store missing-sidecar registration after an inert first reply followed by staged mapping,
+  crash/reopen, and in-place promotion, plus existing-row metadata/mapping atomicity and invalid-
+  option-metadata fail-closed companions,
   v7-to-v8 plus populated-v8-to-v9 additive migration, a shared write/startup lifecycle-evidence
   matrix, unknown D2 schema objects, orphan/malformed v9 generation rows and linear generation-to-
   observation validation, plus map-backed linear intent/outbox/ordinary-owner cross-table startup
@@ -157,7 +165,7 @@ Focused command:
 ```text
 pnpm --dir apps/orca-slack-bridge exec vitest run test/gate-resolution-store.test.ts test/gate-action-handler.test.ts test/gate-resolve.test.ts test/gate-publish.test.ts test/cli-daemon.test.ts test/post.test.ts
 
-6 test files passed; 150 tests passed.
+6 test files passed; 153 tests passed.
 ```
 
 Full local suite at the implementation checkpoint:
@@ -165,7 +173,7 @@ Full local suite at the implementation checkpoint:
 ```text
 pnpm test
 
-39 test files passed; 952 tests passed.
+39 test files passed; 955 tests passed.
 ```
 
 The root and app typechecks, the app production build, `pnpm audit --audit-level high`, and
@@ -250,6 +258,19 @@ The combined two-store expiry/crash/restart regression now proves immutable exac
 that original pending UUID before mutable mapping/status checks, while invalid identity still rejects,
 another valid option loses, and already-ACKed mismatches retain the terminal repair fence.
 
+The final external audit identified that `insertGateMessage` computed a reconciled metadata state
+but its existing-observation branch committed only the mapping state. The exact public two-store
+schedule was also made explicit: registration after the inert reply already changes `missing` to
+`mismatched` atomically, staged mapping survives the injected process crash, reopen succeeds, and a
+fresh exact collection promotes the same reply in place. Because that public registrar transition
+means the audit's literal `missing`-beside-present precondition was not reachable through
+`insertGateMetadata`, a second-connection store fixture freezes that asserted precondition and
+isolates the mapping transaction; on `d1a536e` it retained `missing`, while the public invalid-
+metadata companion retained an unsafe older `matched` state (`2 failed; 26 passed`). The fixed
+transaction validates and writes both correlation axes together, preserves all newer terminal and
+source facts plus owner fences, refuses any mapping-only upgrade to `matched`, reopens cleanly, and
+keeps invalid metadata rejected (`28/28` store tests; `55/55` combined store/publish tests).
+
 ## Base-fails / head-passes contract evidence
 
 The head version of `test/gate-render.test.ts` was copied into a temporary archive extraction of
@@ -276,6 +297,9 @@ head: exit 0
 The temporary extracted base was deleted after the comparison.
 
 ## Residual platform risk
+
+The existing-row correlation repair changes only one local SQLite transaction; every external
+platform window documented below is unchanged.
 
 Orca exposes retry replay but no Gate CAS/version token. The second exact pre-read narrows the race,
 but an external resolver can still commit after that read and before this Bridge's non-CAS
