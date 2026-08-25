@@ -37,6 +37,8 @@ export type GateChannelDeliveryEngineOptions = {
   readonly orca: OrcaRunner;
   readonly transport: GateChannelDeliveryTransport;
   readonly now?: () => Date;
+  /** Test seam; production uses the process monotonic clock. */
+  readonly monotonicNow?: () => number;
   readonly leaseMs?: number;
   readonly routeRetryMs?: number;
   readonly receiptBackoffMs?: number;
@@ -71,6 +73,7 @@ export class GateChannelDeliveryEngine {
   readonly #orca: OrcaRunner;
   readonly #transport: GateChannelDeliveryTransport;
   readonly #now: () => Date;
+  readonly #monotonicNow: () => number;
   readonly #leaseMs: number;
   readonly #routeRetryMs: number;
   readonly #receiptBackoffMs: number;
@@ -79,12 +82,15 @@ export class GateChannelDeliveryEngine {
   readonly #concurrency: number;
   readonly #reconcileDeadlineMs: number;
   readonly #onError: (code: GateChannelDeliveryErrorCode) => void;
+  #singleSlotPrefersSeed = true;
 
   constructor(options: GateChannelDeliveryEngineOptions) {
     this.#store = options.store;
     this.#orca = options.orca;
     this.#transport = options.transport;
     this.#now = options.now ?? (() => new Date());
+    this.#monotonicNow = options.monotonicNow ??
+      (() => Number(process.hrtime.bigint()) / 1_000_000);
     this.#leaseMs = finiteMs(options.leaseMs ?? 30_000, 'delivery_lease_invalid');
     this.#routeRetryMs = finiteMs(options.routeRetryMs ?? 5_000, 'delivery_route_retry_invalid');
     this.#receiptBackoffMs = finiteMs(
@@ -117,23 +123,74 @@ export class GateChannelDeliveryEngine {
 
   /** Lazy seed plus one bounded, concurrent, deadline-limited due batch. */
   async reconcile(): Promise<void> {
-    const at = this.#now().toISOString();
-    this.#store.seedPendingGateChannelDeliveries(at);
-    const due = this.#store.listDueGateChannelDeliveries(at, this.#batchLimit);
-    if (due.length === 0) return;
     const controller = new AbortController();
     let expired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const work = this.#runBatch(due, controller.signal);
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(() => {
-        expired = true;
-        this.#onError('delivery_reconcile_deadline');
-        controller.abort();
-        resolve();
-      }, this.#reconcileDeadlineMs);
-      timer.unref?.();
-    });
+    const startedAt = this.#monotonicNow();
+    if (!Number.isFinite(startedAt)) throw new TypeError('delivery_monotonic_clock_invalid');
+    const deadlineAt = startedAt + this.#reconcileDeadlineMs;
+    let resolveDeadline!: () => void;
+    const deadline = new Promise<void>((resolve) => { resolveDeadline = resolve; });
+    const expire = (): void => {
+      if (expired) return;
+      expired = true;
+      this.#onError('delivery_reconcile_deadline');
+      controller.abort();
+      resolveDeadline();
+    };
+    const commitFence = (): boolean => {
+      const current = this.#monotonicNow();
+      if (!Number.isFinite(current)) return false;
+      return !controller.signal.aborted && current < deadlineAt;
+    };
+    timer = setTimeout(expire, this.#reconcileDeadlineMs);
+    timer.unref?.();
+    const work = (async (): Promise<void> => {
+      const at = this.#now().toISOString();
+      let due: readonly GateChannelDelivery[] = [];
+      if (this.#batchLimit === 1) {
+        if (this.#singleSlotPrefersSeed) {
+          const seed = this.#store.seedPendingGateChannelDeliveries(at, 1, commitFence);
+          if (seed.kind === 'fenced') {
+            expire();
+            return;
+          }
+          if (seed.deliveries.length === 0 && commitFence()) {
+            due = this.#store.listDueGateChannelDeliveries(at, 1);
+          }
+        } else {
+          if (commitFence()) due = this.#store.listDueGateChannelDeliveries(at, 1);
+          if (due.length === 0 && commitFence()) {
+            const seed = this.#store.seedPendingGateChannelDeliveries(at, 1, commitFence);
+            if (seed.kind === 'fenced') {
+              expire();
+              return;
+            }
+          }
+        }
+        this.#singleSlotPrefersSeed = !this.#singleSlotPrefersSeed;
+      } else {
+        const seedQuota = Math.max(1, Math.floor(this.#batchLimit / 2));
+        const seed = this.#store.seedPendingGateChannelDeliveries(at, seedQuota, commitFence);
+        if (seed.kind === 'fenced') {
+          expire();
+          return;
+        }
+        if (!commitFence()) {
+          expire();
+          return;
+        }
+        const sendLimit = this.#batchLimit - seed.deliveries.length;
+        if (sendLimit > 0) {
+          due = this.#store.listDueGateChannelDeliveries(at, sendLimit);
+        }
+      }
+      if (!commitFence()) {
+        expire();
+        return;
+      }
+      if (due.length > 0) await this.#runBatch(due, controller.signal);
+    })();
     try {
       await Promise.race([work, deadline]);
     } catch (error) {
@@ -164,7 +221,10 @@ export class GateChannelDeliveryEngine {
     await Promise.all(workers);
   }
 
-  /** Adapter-confirmed MCP transport write; never promoted to receipt or effect. */
+  /**
+   * Adapter-confirmed MCP transport write only: no Orca call or receipt authority, and the row
+   * retains a finite attempt retry deadline so this historical fact cannot suppress replay.
+   */
   recordAttempted(
     event: ChannelProductionDeliveryEvent,
     commitFence?: ChannelProductionCommitFence,

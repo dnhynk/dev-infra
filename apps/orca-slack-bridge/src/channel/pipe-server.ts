@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
-import { performance } from 'node:perf_hooks';
 
 import { listRuns, type OrcaRun, type OrcaRunner } from '../orca/client.js';
 import {
@@ -17,7 +16,20 @@ import {
 
 export const CHANNEL_PIPE_PATH = String.raw`\\.\pipe\orca-slack-bridge-channel-v1`;
 export const DEFAULT_PROBE_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
-const PRODUCTION_RECEIPT_ACK_SAFETY_MS = 50;
+const NS_PER_MS = 1_000_000n;
+
+function msAsNs(value: number): bigint {
+  return BigInt(Math.trunc(value)) * NS_PER_MS;
+}
+
+function earliestNs(...values: readonly bigint[]): bigint {
+  return values.reduce((earliest, value) => value < earliest ? value : earliest);
+}
+
+function remainingDeadlineMs(deadlineNs: bigint): number {
+  const remainingNs = deadlineNs - process.hrtime.bigint();
+  return remainingNs <= 0n ? 0 : Math.max(1, Number(remainingNs / NS_PER_MS));
+}
 
 export type ChannelPipeErrorCode =
   | ChannelProtocolErrorCode
@@ -90,11 +102,16 @@ export type ChannelProductionDeliveryEvent = {
 export type ChannelProductionCommitFence = () => boolean;
 
 export type ChannelProductionDeliveryHandlers = {
-  /** Synchronous so a receipt ACK can never cross the pipe before its durable commit. */
+  /**
+   * Historical Adapter transport-write evidence only. It emits no daemon ACK, grants no
+   * application/Orca authority, leaves the Gate replayable, and still revalidates after every
+   * preceding receipt boundary before this synchronous durable callback may run.
+   */
   readonly attempted: (
     event: ChannelProductionDeliveryEvent,
     commitFence: ChannelProductionCommitFence,
   ) => void;
+  /** The sole application-receipt/ACK boundary; synchronous durable commit must precede its ACK. */
   readonly receipted: (
     event: ChannelProductionDeliveryEvent,
     commitFence: ChannelProductionCommitFence,
@@ -108,7 +125,7 @@ type ProductionAdapterMessage = Extract<
 
 type QueuedProductionEvent = {
   readonly message: ProductionAdapterMessage;
-  readonly deadlineAt: number;
+  readonly deadlineNs: bigint;
 };
 
 type ConnectionState = {
@@ -666,10 +683,10 @@ export class ChannelPipeServer {
             break;
           }
           connection.pendingInboundMessages += 1;
-          const receivedAt = performance.now();
+          const receivedNs = process.hrtime.bigint();
           const handled = connection.inbound.then(async () => {
             if (socket.destroyed) return;
-            await this.#handleMessage(connection, message, receivedAt);
+            await this.#handleMessage(connection, message, receivedNs);
           });
           connection.inbound = handled
             .catch(() => {
@@ -700,7 +717,7 @@ export class ChannelPipeServer {
   async #handleMessage(
     connection: ConnectionState,
     message: AdapterToDaemonMessage,
-    receivedAt: number,
+    receivedNs: bigint,
   ): Promise<void> {
     if (message.type === 'hello') {
       if (connection.hello !== null) {
@@ -726,6 +743,9 @@ export class ChannelPipeServer {
         version: CHANNEL_PROTOCOL_VERSION,
         type: 'hello_ack',
         connection_epoch: connection.epoch,
+        // Floor the sample: the Adapter turns this into a lower-bound clock offset, so transport
+        // latency and sub-millisecond rounding only shorten its mapped receipt deadline.
+        monotonic_ns: process.hrtime.bigint().toString(),
       });
       this.#writeProbe(connection);
       return;
@@ -749,7 +769,7 @@ export class ChannelPipeServer {
       }
       connection.attemptedWrites += 1;
       if (message.gate_id !== connection.probeGateId) {
-        this.#enqueueProductionEvent(connection, message, receivedAt);
+        this.#enqueueProductionEvent(connection, message, receivedNs);
       }
       return;
     }
@@ -764,7 +784,7 @@ export class ChannelPipeServer {
         if (!connection.writeBlocked) this.#clearTimer(connection);
       }
       if (!probeReceipt) {
-        this.#enqueueProductionEvent(connection, message, receivedAt);
+        this.#enqueueProductionEvent(connection, message, receivedNs);
         return;
       }
       this.#ackReceipt(connection, message.gate_id);
@@ -774,7 +794,7 @@ export class ChannelPipeServer {
   #enqueueProductionEvent(
     connection: ConnectionState,
     message: ProductionAdapterMessage,
-    receivedAt: number,
+    receivedNs: bigint,
   ): void {
     if (
       connection.productionEventsActive + connection.productionEventQueue.length >= 256
@@ -784,14 +804,13 @@ export class ChannelPipeServer {
     }
     connection.productionEventQueue.push({
       message,
-      deadlineAt: receivedAt + (
-        message.type === 'receipt'
-          ? Math.min(
-              this.#productionEventDeadlineMs,
-              Math.max(0, message.ack_budget_ms - PRODUCTION_RECEIPT_ACK_SAFETY_MS),
-            )
-          : this.#productionEventDeadlineMs
-      ),
+      deadlineNs: message.type === 'receipt'
+        ? earliestNs(
+            receivedNs + msAsNs(this.#productionEventDeadlineMs),
+            receivedNs + msAsNs(message.ack_budget_ms),
+            BigInt(message.ack_deadline_ns),
+          )
+        : receivedNs + msAsNs(this.#productionEventDeadlineMs),
     });
     this.#drainProductionEvents(connection);
   }
@@ -805,7 +824,7 @@ export class ChannelPipeServer {
       !this.#stopping
     ) {
       const event = connection.productionEventQueue.shift()!;
-      if (performance.now() >= event.deadlineAt) {
+      if (process.hrtime.bigint() >= event.deadlineNs) {
         this.#expireProductionEvent(connection);
         return;
       }
@@ -826,56 +845,86 @@ export class ChannelPipeServer {
     event: QueuedProductionEvent,
   ): Promise<void> {
     const gateId = event.message.gate_id;
-    const remainingMs = event.deadlineAt - performance.now();
+    const remainingMs = remainingDeadlineMs(event.deadlineNs);
     if (remainingMs < 1) {
       this.#expireProductionEvent(connection);
       return;
     }
-    // Expensive reads start concurrently. Their completion captures the exact predecessor-callback
-    // revision: if an earlier callback commits after this snapshot, this event must reread at its
-    // own commit boundary regardless of elapsed time.
-    const validation = this.#validateProductionEvent(
-      connection,
-      gateId,
+    // Snapshot the receipt callback boundary at arrival/start, before this validation can settle.
+    // Reading it from a `.then` would let a slow stale validation inherit an already-advanced
+    // predecessor receipt and skip the mandatory fresh authority read.
+    const validateAtCurrentRevision = async (
+      timeoutMs: number,
+    ): Promise<{
+      readonly token: ChannelProductionDeliveryEvent | null;
+      readonly validationRevision: number;
+    }> => {
+      // The revision belongs to the instant this authority read starts, never to its settlement.
+      // Otherwise a slow stale read could inherit an intervening predecessor callback revision.
+      const validationRevision = connection.productionCommitRevision;
+      const token = await this.#validateProductionEvent(connection, gateId, timeoutMs);
+      return { token, validationRevision };
+    };
+    const validation = validateAtCurrentRevision(
       Math.min(this.#eventValidationTimeoutMs, remainingMs),
-    ).then((token) => ({
-      token,
-      predecessorRevision: connection.productionCommitRevision,
-    }));
+    ).then(async (initial) => {
+      if (
+        initial.token === null ||
+        initial.validationRevision === connection.productionCommitRevision
+      ) {
+        return initial;
+      }
+      // A predecessor advanced while the first authority read was in flight. Start the mandatory
+      // reread immediately, outside the ordered callback chain, so a burst refreshes concurrently
+      // without weakening its later commit-boundary revision check. This read carries its own
+      // start revision: a second predecessor may advance while the speculative refresh is pending.
+      const refreshBudgetMs = remainingDeadlineMs(event.deadlineNs);
+      if (refreshBudgetMs < 1) return { token: null, validationRevision: -1 };
+      return await validateAtCurrentRevision(
+        Math.min(this.#eventValidationTimeoutMs, refreshBudgetMs),
+      );
+    });
     const committed = connection.productionCommit.then(async () => {
-      let { token, predecessorRevision } = await validation;
+      let { token, validationRevision } = await validation;
       if (token === null || connection.socket.destroyed || this.#stopping) return;
       const waitedForWritable = event.message.type === 'receipt' && connection.writeBlocked;
-      if (
-        event.message.type === 'receipt' &&
-        !await this.#waitForWritable(connection, event.deadlineAt)
-      ) {
-        this.#expireProductionEvent(connection);
-        return;
+      if (waitedForWritable) {
+        if (!await this.#waitForWritable(connection, event.deadlineNs)) {
+          this.#expireProductionEvent(connection);
+          return;
+        }
       }
       if (
         waitedForWritable ||
-        predecessorRevision !== connection.productionCommitRevision
+        validationRevision !== connection.productionCommitRevision
       ) {
-        const refreshBudgetMs = event.deadlineAt - performance.now();
+        const refreshBudgetMs = remainingDeadlineMs(event.deadlineNs);
         if (refreshBudgetMs < 1) {
           this.#expireProductionEvent(connection);
           return;
         }
-        token = await this.#validateProductionEvent(
-          connection,
-          gateId,
+        const refreshed = await validateAtCurrentRevision(
           Math.min(this.#eventValidationTimeoutMs, refreshBudgetMs),
         );
+        token = refreshed.token;
         if (token === null || connection.socket.destroyed || this.#stopping) return;
+        validationRevision = refreshed.validationRevision;
+        // This event owns the ordered commit boundary while awaiting the read, so no successor can
+        // advance the revision. Keep the comparison explicit to preserve the start/settle contract
+        // if the queue implementation changes later.
+        if (validationRevision !== connection.productionCommitRevision) return;
       }
       const commitFence: ChannelProductionCommitFence = () =>
-        performance.now() < event.deadlineAt &&
+        process.hrtime.bigint() < event.deadlineNs &&
         this.#connections.has(connection) &&
         !connection.socket.destroyed &&
         !this.#stopping &&
         connection.epoch === token.connectionEpoch &&
-        connection.productionDeliveries.get(gateId) === token;
+        connection.productionDeliveries.get(gateId) === token &&
+        (
+          event.message.type !== 'receipt' ||
+          this.#receiptCommitWritable(connection)
+        );
       if (!commitFence()) {
         this.#expireProductionEvent(connection);
         return;
@@ -884,7 +933,11 @@ export class ChannelPipeServer {
       const advanceCallbackBoundary = (): void => {
         if (callbackBoundaryAdvanced) return;
         callbackBoundaryAdvanced = true;
-        connection.productionCommitRevision += 1;
+        // Attempted is a historical transport-write fact and emits no daemon ACK. It neither
+        // suppresses replay nor asserts current application authority, so it cannot invalidate a
+        // concurrently started receipt authority read. A receipt callback is the authority/ACK
+        // boundary: every later receipt must have a read that began after that boundary.
+        if (event.message.type === 'receipt') connection.productionCommitRevision += 1;
       };
       try {
         if (event.message.type === 'attempted') {
@@ -895,7 +948,7 @@ export class ChannelPipeServer {
       } catch {
         advanceCallbackBoundary();
         // No receipt ACK: the Adapter's receipt tool remains retryable and cannot outrun durable state.
-        if (performance.now() >= event.deadlineAt) this.#expireProductionEvent(connection);
+        if (process.hrtime.bigint() >= event.deadlineNs) this.#expireProductionEvent(connection);
         else this.#onError('delivery_event_failed');
         return;
       }
@@ -905,8 +958,8 @@ export class ChannelPipeServer {
         return;
       }
       if (event.message.type === 'receipt') {
-        const ackBudgetMs = Math.floor(event.deadlineAt - performance.now());
-        if (ackBudgetMs < 1 || connection.writeBlocked) {
+        const ackBudgetMs = remainingDeadlineMs(event.deadlineNs);
+        if (ackBudgetMs < 1 || !this.#receiptCommitWritable(connection)) {
           this.#expireProductionEvent(connection);
           return;
         }
@@ -924,9 +977,22 @@ export class ChannelPipeServer {
     connection.socket.destroy();
   }
 
-  async #waitForWritable(connection: ConnectionState, deadlineAt: number): Promise<boolean> {
+  #receiptCommitWritable(connection: ConnectionState): boolean {
+    return (
+      this.#connections.has(connection) &&
+      !connection.socket.destroyed &&
+      connection.socket.writable &&
+      !connection.socket.writableEnded &&
+      !connection.socket.writableFinished &&
+      !connection.socket.writableNeedDrain &&
+      !connection.writeBlocked &&
+      !this.#stopping
+    );
+  }
+
+  async #waitForWritable(connection: ConnectionState, deadlineNs: bigint): Promise<boolean> {
     if (!connection.writeBlocked) return !connection.socket.destroyed;
-    const remainingMs = Math.floor(deadlineAt - performance.now());
+    const remainingMs = remainingDeadlineMs(deadlineNs);
     if (remainingMs < 1 || connection.socket.destroyed || this.#stopping) return false;
     return await new Promise<boolean>((resolve) => {
       let settled = false;
@@ -942,7 +1008,7 @@ export class ChannelPipeServer {
         !connection.socket.destroyed &&
         !this.#stopping &&
         !connection.writeBlocked &&
-        performance.now() < deadlineAt,
+        process.hrtime.bigint() < deadlineNs,
       );
       const closed = (): void => finish(false);
       const timer = setTimeout(() => finish(false), remainingMs);

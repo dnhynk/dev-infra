@@ -23,10 +23,12 @@ application receipt, Gate effect, and Task resume as separate facts.
 - Delivery state is monotonic `pending -> attempted -> receipted -> consumed`, with a revision CAS,
   acquisition-specific expiring lease ownership, bounded retry/error fields, and strict timestamp,
   lifecycle, D2-correlation, foreign-key, column, DDL, and allowed-object validation.
-- A regressed process clock is clamped to the latest persisted D2 evidence before seed and outbox
-  re-arm. Defer similarly derives its effective update/retry clock from persisted causal timestamps
-  inside the revision/owner transaction, and schema plus runtime validation require every lifecycle
-  event timestamp to be at or before `updated_at`.
+- Delivery scheduling uses a process-monotonic logical clock initialized from the greatest persisted
+  v11 lifecycle timestamp. Every due check and mutation advances by at least monotonic elapsed time
+  and clamps to wall time plus row-local causal evidence inside the CAS transaction, so rollback,
+  equality, and a slowly advancing wall cannot stall retries or leases. Requested delays and lease
+  durations are preserved from that effective time, and every lifecycle event remains at or before
+  `updated_at`.
 - Every state transition and the existing Gate card-outbox re-arm share one `BEGIN IMMEDIATE`
   transaction. The v11 row records the exact re-armed outbox revision as durable provenance; a
   stale card projection revision cannot clear the newer generation.
@@ -34,6 +36,11 @@ application receipt, Gate effect, and Task resume as separate facts.
   Periodic reconciliation omits that exact revision, direct projection returns without a Slack
   call, and the row remains `card_pending=1` across restart. The store exposes only an exact
   delivery-revision plus outbox-revision claim for D3-3 to acquire that generation later.
+- Exact-claim recovery, takeover, and explicit release advance the outbox generation, delivery
+  revision, deferred provenance, and new claim identity together. A stale projection owner cannot
+  consume the replacement generation, while the ordinary D2 projector still sees no deferred row.
+  The same dual CAS preserves a live independent delivery lease and clears it at exact expiry, so
+  provenance advancement cannot violate the v11 lease clock or revive its stale delivery owner.
 - `attempted` means only that the Adapter's MCP notification write resolved. `receipted` is only the
   reply-tool application callback. Neither is delivery consumption or Task resume.
 - `consumed` requires a fresh strict `gate-list` reread whose Gate/run/task/options, resolved status,
@@ -52,27 +59,33 @@ application receipt, Gate effect, and Task resume as separate facts.
 - Receipt ACK is emitted only after the synchronous durable callback succeeds. A callback failure
   deliberately leaves the Adapter receipt retryable.
 - Fresh Run reads for different Gates start concurrently and durable callbacks stay on one
-  arrival-ordered chain. Each completed validation records the exact predecessor-callback revision;
-  if an earlier callback commits afterward, or receipt processing waits on a drain, the event must
-  reread authority at its own commit boundary. There is no elapsed-time freshness heuristic. Pipe
-  protocol v2 adds only an Adapter-computed relative ACK budget to its internal receipt frame; the
-  external Channel notification and reply-tool input remain strict Gate-ID-only shapes.
-- Adapter receipt deadlines and daemon callback deadlines use monotonic clocks. Queue time is
-  deducted before the Adapter writes a receipt, the daemon caps that remainder below the production
-  5-second timeout with an ACK safety margin, and socket timeout disconnects fence any late ACK.
+  arrival-ordered chain. Every authority read carries the production callback revision captured
+  before that read starts; if a receipt boundary advances while any initial, speculative, or
+  commit-boundary read is pending, the stale result cannot inherit the newer revision. `attempted`
+  records only a historical transport write and emits no daemon ACK; receipt alone advances the
+  authority/ACK boundary, and every later event still honors the latest preceding receipt boundary.
+- Adapter receipt deadlines and daemon callback deadlines use monotonic clocks. Protocol v2
+  calibrates the two process-monotonic domains during each connection hello, then carries both the
+  translated absolute Adapter deadline and its remaining budget. The daemon chooses the earliest
+  bound, so Adapter queue/write/drain, pipe transit, validation, ordered wait, durable commit, and ACK
+  drain share one non-extensible deadline; equality expires and reconnect recalibrates the mapping.
+  External Channel notifications and reply-tool inputs remain strict Gate-ID-only shapes.
 - Adapter notification progress pauses behind attempted-frame backpressure and resumes on drain.
-  On the daemon side, receipt processing waits for ACK writability and then performs its commit-time
-  route read, so delayed drain cannot produce state without an ACK.
+  On the daemon side, the same SQLite commit fence requires the current exact token/epoch, time
+  budget, writable socket, and no ended, finished, drain-blocked, or write-blocked state immediately
+  before commit. Delayed drain or same-socket backpressure therefore cannot produce durable state
+  without a sendable ACK.
 - The daemon passes a monotonic connection/deadline fence through the production handler into the
   SQLite transition. The store evaluates it after delivery plus card re-arm writes and immediately
   before `COMMIT`; a closed fence rolls the whole transaction back and the pipe emits no ACK.
 - Connection-local sent/notified sets are bounded and discarded on reconnect. Multi-Gate MCP
   notifications are serialized, receipt/ACK backpressure queues are bounded sets, and the daemon
   rejects an over-cap asynchronous inbound queue.
-- One delivery pass processes a bounded batch with bounded concurrency and a 20-second overall
-  deadline that precedes the 30-second lease expiry. Deadline abort synchronously defers/releases
-  active leases; even an injected runner that ignores `AbortSignal` cannot write the store after
-  shutdown or close.
+- One delivery pass shares a strict batch budget between a limited lazy-seed page and due sends;
+  `batchLimit=1` alternates seed and send so neither side starves. Seed uses a transaction commit
+  fence, rolls back the whole page on deadline/stop, releases the SQLite writer promptly, and resumes
+  idempotently from the next bounded page. Bounded send concurrency plus the 20-second overall
+  deadline remains below the 30-second lease expiry, and late injected work cannot write after stop.
 - The D2 post-mutation restart path recognizes a persisted structured resolve result as the missing
   post-read. It never overwrites the original pending baseline with the current resolved Gate, so
   restart can finish D2, seed D3, reopen, and start the daemon without corrupting the evidence.
@@ -97,18 +110,29 @@ The focused suites cover:
 - overlapping reconcile fencing and multi-row hung-Orca deadline/late-completion safety;
 - verified-only production send, ordered multi-Gate callbacks, durable receipt ACK fencing,
   wrong Gate receipt, reconnect replay, and generation-takeover stale receipt rejection;
-- three production Gates with six independent 1.7-second fresh route reads, concurrent validation,
-  wire-ordered durable callbacks, and all receipt ACKs inside the default Adapter window;
-- a raw protocol-v2 pair of different-Gate receipts whose generation-1 validations both complete
-  behind a drain before callback A is released; A synchronously takes over generation 2 and B then
-  performs a new commit-boundary Run read, makes no durable callback, and receives no ACK;
+- a receipt-before-attempted boundary requiring an exact fresh third authority read, with attempted
+  producing no ACK or Orca read, preserving its finite retry deadline, and leaving the Gate resendable;
+- three production Gates with overlapping attempted plus receipt events, 1.4-second authority reads,
+  exactly nine reads across the required initial/speculative/commit waves, wire-ordered callbacks,
+  and all three receipt ACKs inside 4.5 seconds under the production 5-second Adapter window;
+- a raw protocol-v2 A/B/C nested race where C's stale initial read is followed by an in-flight
+  speculative refresh, A and then B advance the receipt boundary around it, and C settles with zero
+  durable effect and zero ACK while the connection fails closed for retry;
+- a same-socket receipt/deliver race where ACK writability disappears during the read/drain gap,
+  proving zero receipt/re-arm state and zero ACK before replay succeeds on a new connection epoch;
 - a synchronous receipt handler crossing its monotonic deadline plus direct SQLite fence tests,
   proving delivery state and the atomic card re-arm both roll back before ACK;
 - multi-Gate attempted-frame backpressure with notification pause/drain resume and no lost callback;
 - two queued receipts across independent Adapter-send and daemon-ACK drains, decreasing transmitted
   ACK budget, pre-durable wait, post-wait route refresh, ordered durable callbacks, and no late ACK;
-- saturated single-slot receipt validation under repeated wall-clock rollback, proving monotonic
-  expiry prevents the queued callback and ACK before the Adapter timeout;
+- Adapter-write-to-daemon-dispatch transit delay, exact deadline equality, forward/backward wall
+  jumps, queued timeout, and reconnect recalibration, proving the original end-to-end budget cannot
+  be re-anchored or extended and a late ACK cannot damage the current route;
+- frozen-equality and one-millisecond-per-second wall regressions across retry, lease expiry/recovery,
+  release, and reopen, proving the persisted logical floor advances at least with monotonic elapsed;
+- 2,048 eligible seed rows across bounded pages and restart, whole-page fence rollback, progress by
+  a competing writer, disjoint pages from two open writers, production stop during synchronous seed,
+  restart progress, combined batch accounting, and one-slot seed/send alternation;
 - production daemon startup wiring of the new store/runtime callbacks and reconciliation caller.
 - ordinary D2 projection followed by pending/attempted/receipted/consumed D3 transitions, proving
   one pre-D3 Slack update, zero D3 Slack updates, exact pending provenance across restart, reconcile
@@ -121,8 +145,8 @@ product write was performed.
 
 | Command | Result |
 |---|---|
-| focused D3-2/D2 recovery/protocol suite | pass — 10 files, 190 tests |
-| `pnpm test` | pass — 49 files, 1090 tests |
+| focused D3-2 store/delivery/protocol suite | pass — 5 files, 73 tests |
+| `pnpm test` | pass — 50 files, 1106 tests |
 | `pnpm typecheck` | pass |
 | app `typecheck` | pass |
 | app `build` | pass |
@@ -157,6 +181,19 @@ deadline, and unchanged D2 projection consuming D3-originated card generations b
 repair updates the live v11 help contract, replaces elapsed freshness with same-Gate commit-boundary
 authority reads, carries the monotonic fence into the SQLite transaction, and records an exact
 durable outbox-revision provenance fence. It is held for a fresh independent audit pair.
+
+The FINAL4 independent pair at `ec0d891` then identified six P2 boundaries: deferred exact-claim
+recovery provenance, predecessor-read revision capture, transactional ACK writability, cross-process
+end-to-end monotonic deadlines, rollback-safe causal scheduling, and bounded lazy seed. The combined
+repair advances deferred claim identity atomically, snapshots every authority-read start, fences
+socket state inside the store commit, calibrates monotonic clock domains, uses a persisted logical
+clock, and pages seed within the shared batch/stop budget. Coordinator live-diff review additionally
+found a nested speculative-read race plus frozen-equality and slow-forward clock stalls; exact A/B/C,
+equality, slow-forward, concurrent-writer, and production stop/restart regressions now close those
+cases. A final adversarial preflight also reproduced exact provenance recovery/release crossing an
+independently expired delivery lease; the dual CAS now clears that lease at equality and proves all
+late owner writes are zero-effect across restart. This repair remains held for a fresh exact-head
+independent audit pair.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 

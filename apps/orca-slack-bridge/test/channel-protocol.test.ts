@@ -39,7 +39,12 @@ describe('Channel protocol v2 NDJSON codec', () => {
       connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
       gate_id: 'gate_1234abcdef56',
     };
-    const receipt = { ...attempted, type: 'receipt' as const, ack_budget_ms: 5_000 };
+    const receipt = {
+      ...attempted,
+      type: 'receipt' as const,
+      ack_budget_ms: 5_000,
+      ack_deadline_ns: '123456789012345',
+    };
     const decoder = new ChannelNdjsonDecoder(decodeAdapterMessage);
     expect(decoder.push(Buffer.concat([
       encodeChannelFrame(HELLO),
@@ -54,6 +59,7 @@ describe('Channel protocol v2 NDJSON codec', () => {
       version: CHANNEL_PROTOCOL_VERSION,
       type: 'hello_ack',
       connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+      monotonic_ns: '123456789012345',
     }))).toHaveLength(1);
     expect(decoder.push(encodeChannelFrame({
       version: CHANNEL_PROTOCOL_VERSION,
@@ -80,6 +86,25 @@ describe('Channel protocol v2 NDJSON codec', () => {
         connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
         gate_id: 'gate_1234abcdef56',
         ack_budget_ms: ackBudget,
+        ack_deadline_ns: '123456789012345',
+      })).toThrow(ChannelProtocolError);
+    }
+    for (const ackDeadline of [undefined, 0, '', '0', '01', '-1', '1.5', '1'.repeat(31)]) {
+      expect(() => decodeAdapterMessage({
+        version: CHANNEL_PROTOCOL_VERSION,
+        type: 'receipt',
+        connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+        gate_id: 'gate_1234abcdef56',
+        ack_budget_ms: 5_000,
+        ack_deadline_ns: ackDeadline,
+      })).toThrow(ChannelProtocolError);
+    }
+    for (const monotonicNs of [undefined, 0, '', '0', '01', '-1', '1.5', '1'.repeat(31)]) {
+      expect(() => decodeDaemonMessage({
+        version: CHANNEL_PROTOCOL_VERSION,
+        type: 'hello_ack',
+        connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+        monotonic_ns: monotonicNs,
       })).toThrow(ChannelProtocolError);
     }
   });

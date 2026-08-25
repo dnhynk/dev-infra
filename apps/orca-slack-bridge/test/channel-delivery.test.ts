@@ -334,7 +334,7 @@ function engine(
 
 describe('durable Channel delivery engine', () => {
   it('keeps send, attempted, receipt, and exact Gate effect consumption distinct', async () => {
-    const store = new SqliteDigestStore(path);
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
     const orca = new FakeOrca();
     const transport = new FakeTransport();
@@ -353,8 +353,22 @@ describe('durable Channel delivery engine', () => {
 
     time.advance(10);
     expect(delivery.recordAttempted(callback())).toMatchObject({
-      state: 'attempted', attemptCount: 1, receiptedAt: null,
+      state: 'attempted', attemptCount: 1,
+      lastAttemptAt: '2026-08-24T10:00:02.010Z',
+      nextAttemptAt: '2026-08-24T10:00:03.010Z',
+      receiptedAt: null, consumedAt: null,
     });
+    expect(orca.calls).toHaveLength(0);
+    await delivery.reconcile();
+    expect(transport.calls).toHaveLength(1);
+    time.advance(999);
+    await delivery.reconcile();
+    expect(transport.calls).toHaveLength(1);
+    time.advance(1);
+    await delivery.reconcile();
+    expect(transport.calls).toHaveLength(2);
+    expect(orca.calls).toHaveLength(0);
+
     time.advance(10);
     expect(delivery.recordReceipted(callback())).toMatchObject({
       state: 'receipted', consumedAt: null,
@@ -375,7 +389,7 @@ describe('durable Channel delivery engine', () => {
   });
 
   it('recovers a receipted row after restart before consuming the fresh exact effect', async () => {
-    let store = new SqliteDigestStore(path);
+    let store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
     const time = clock();
     const first = engine(store, new FakeOrca(), new FakeTransport(), time);
@@ -387,7 +401,7 @@ describe('durable Channel delivery engine', () => {
     expect(store.findGateChannelDelivery(GATE)?.state).toBe('receipted');
     store.close();
 
-    store = new SqliteDigestStore(path);
+    store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     const restartedOrca = new FakeOrca();
     const restartedTransport = new FakeTransport();
     await engine(store, restartedOrca, restartedTransport, time).reconcile();
@@ -398,7 +412,7 @@ describe('durable Channel delivery engine', () => {
   });
 
   it('fences overlapping reconciles with acquisition-specific leases', async () => {
-    const store = new SqliteDigestStore(path);
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
     const time = clock();
     let release!: () => void;
@@ -432,7 +446,7 @@ describe('durable Channel delivery engine', () => {
   });
 
   it('bounds a concurrent multi-row reconcile and fences late hung-Orca completions after close', async () => {
-    let store = new SqliteDigestStore(path);
+    let store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
     const second = resolveAdditionalD2(store, {
       gateId: 'gate_bbbbbbbbbbbb', taskId: 'task_delivery_b', dispatchId: 'ctx_delivery_b',
@@ -443,7 +457,9 @@ describe('durable Channel delivery engine', () => {
       requestId: '33333333-3333-4333-8333-333333333333', messageSuffix: '004',
     });
     const gateKeys = [GATE, gateKey(second.gateId), gateKey(third.gateId)];
-    expect(store.seedPendingGateChannelDeliveries(START)).toHaveLength(3);
+    expect(store.seedPendingGateChannelDeliveries(START, 1_000, () => true)).toMatchObject({
+      kind: 'committed', deliveries: [{}, {}, {}],
+    });
     for (const key of gateKeys) {
       expect(store.markGateChannelReceipted(key, START)?.state).toBe('receipted');
     }
@@ -466,7 +482,7 @@ describe('durable Channel delivery engine', () => {
     )).toHaveLength(2);
     store.close();
 
-    store = new SqliteDigestStore(path);
+    store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     heldOrca.release();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(gateKeys.map((key) => store.findGateChannelDelivery(key))).toEqual(beforeClose);
@@ -474,7 +490,7 @@ describe('durable Channel delivery engine', () => {
   });
 
   it('does not consume a receipt while the exact Gate is pending and retries at slower pacing', async () => {
-    const store = new SqliteDigestStore(path);
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
     const time = clock();
     const orca = new FakeOrca();
@@ -502,7 +518,7 @@ describe('durable Channel delivery engine', () => {
   });
 
   it('persists bounded read/mismatch/route errors without leaking downstream text', async () => {
-    const store = new SqliteDigestStore(path);
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);
     const time = clock();
     const orca = new FakeOrca();

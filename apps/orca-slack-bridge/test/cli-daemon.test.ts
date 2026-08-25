@@ -382,7 +382,11 @@ describe('daemon production wiring', () => {
     expect(reopened.findGateChannelDelivery(GATE)).toMatchObject({
       state: 'pending', attemptCount: 0,
     });
-    expect(reopened.seedPendingGateChannelDeliveries(new Date().toISOString())).toEqual([]);
+    expect(reopened.seedPendingGateChannelDeliveries(
+      new Date().toISOString(),
+      1_000,
+      () => true,
+    )).toEqual({ kind: 'committed', deliveries: [] });
     reopened.close();
   });
 

@@ -507,13 +507,22 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
       preRead: { status: 'pending', resolution: null, resolvedAt: null },
       postRead: { status: 'resolved', resolution: '현행 유지', resolvedAt: AT },
     });
-    const seeded = store.seedPendingGateChannelDeliveries(new Date().toISOString());
-    expect(seeded).toHaveLength(1);
-    expect(seeded[0]).toMatchObject({ state: 'pending', gateKey: GATE });
+    const seeded = store.seedPendingGateChannelDeliveries(
+      new Date().toISOString(),
+      1_000,
+      () => true,
+    );
+    expect(seeded).toMatchObject({
+      kind: 'committed', deliveries: [{ state: 'pending', gateKey: GATE }],
+    });
     store.close();
 
     store = new SqliteDigestStore(dbPath);
-    expect(store.seedPendingGateChannelDeliveries(new Date().toISOString())).toEqual([]);
+    expect(store.seedPendingGateChannelDeliveries(
+      new Date().toISOString(),
+      1_000,
+      () => true,
+    )).toEqual({ kind: 'committed', deliveries: [] });
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
       state: 'pending', attemptCount: 0,
     });

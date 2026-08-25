@@ -164,6 +164,10 @@ export type GateChannelProjectionClaim = {
 /** Checked inside the SQLite transaction immediately before its durable commit. */
 export type GateChannelDeliveryCommitFence = () => boolean;
 
+export type GateChannelSeedResult =
+  | { readonly kind: 'committed'; readonly deliveries: readonly GateChannelDelivery[] }
+  | { readonly kind: 'fenced' };
+
 export type GateChannelDeliveryState = 'pending' | 'attempted' | 'receipted' | 'consumed';
 
 /**
@@ -207,8 +211,12 @@ export type GateChannelConsumeResult =
 
 /** Durable D3 API. Every remote side effect is outside SQLite and therefore fenced by this CAS. */
 export interface GateChannelDeliveryStore {
-  /** Idempotently materialize every eligible terminal D2 pending notification. */
-  seedPendingGateChannelDeliveries(at: string): readonly GateChannelDelivery[];
+  /** Idempotently materialize one bounded page of eligible terminal D2 pending notifications. */
+  seedPendingGateChannelDeliveries(
+    at: string,
+    limit: number,
+    commitFence: GateChannelDeliveryCommitFence,
+  ): GateChannelSeedResult;
   findGateChannelDelivery(gateKey: GateKey): GateChannelDelivery | null;
   listDueGateChannelDeliveries(at: string, limit?: number): readonly GateChannelDelivery[];
   acquireGateChannelDeliveryLease(
@@ -344,9 +352,15 @@ export interface GateResolutionStore {
     renderFingerprint: string,
     owner: string,
     at: string,
+    channelClaim?: GateChannelProjectionClaim,
   ): boolean;
   /** Release an ordinary completion and force the latest generation pending after ambiguity/failure. */
-  releaseGateOutboxProjection(gateKey: GateKey, owner: string, at: string): boolean;
+  releaseGateOutboxProjection(
+    gateKey: GateKey,
+    owner: string,
+    at: string,
+    channelClaim?: GateChannelProjectionClaim,
+  ): boolean;
   recordGateAudit(gateKey: GateKey | null, event: string, reason: string, at: string): void;
   recordGateAttempt(gateKey: GateKey, phase: string, outcome: string, detail: string | null, at: string): void;
 }

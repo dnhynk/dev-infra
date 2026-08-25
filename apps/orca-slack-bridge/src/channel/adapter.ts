@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
-import { performance } from 'node:perf_hooks';
 
 import {
   CHANNEL_MAX_RECEIPT_ACK_BUDGET_MS,
@@ -17,6 +16,7 @@ import {
 import { CHANNEL_PIPE_PATH } from './pipe-server.js';
 
 export const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
+const NS_PER_MS = 1_000_000n;
 
 export type ChannelAdapterErrorCode =
   | ChannelProtocolErrorCode
@@ -81,7 +81,7 @@ type PendingReceipt = {
   readonly resolve: (result: ReceiptResult) => void;
   readonly reject: (error: ChannelAdapterError) => void;
   readonly timer: ReturnType<typeof setTimeout>;
-  readonly deadlineAt: number;
+  readonly deadlineNs: bigint;
 };
 
 type ActiveConnection = {
@@ -95,6 +95,8 @@ type ActiveConnection = {
   readonly notificationQueue: string[];
   readonly queuedAttemptedGateIds: string[];
   epoch: string | null;
+  daemonMonotonicSampleNs: bigint | null;
+  adapterMonotonicSampleNs: bigint | null;
   probeGateId: string | null;
   writeBlocked: boolean;
   writeTimer: ReturnType<typeof setTimeout> | null;
@@ -133,13 +135,13 @@ function deferredReceipt(timeoutMs: number, onTimeout: () => void): PendingRecei
     resolve = innerResolve;
     reject = innerReject;
   });
-  const deadlineAt = performance.now() + timeoutMs;
+  const deadlineNs = process.hrtime.bigint() + BigInt(timeoutMs) * NS_PER_MS;
   const timer = setTimeout(() => {
     reject(new ChannelAdapterError('receipt_timeout'));
     onTimeout();
   }, timeoutMs);
   timer.unref?.();
-  return { promise, resolve, reject, timer, deadlineAt };
+  return { promise, resolve, reject, timer, deadlineNs };
 }
 
 /** Reconnecting session-scoped Adapter client. */
@@ -308,6 +310,8 @@ export class ChannelAdapterClient {
       notificationQueue: [],
       queuedAttemptedGateIds: [],
       epoch: null,
+      daemonMonotonicSampleNs: null,
+      adapterMonotonicSampleNs: null,
       probeGateId: null,
       writeBlocked: false,
       writeTimer: null,
@@ -380,6 +384,11 @@ export class ChannelAdapterClient {
         return;
       }
       active.epoch = message.connection_epoch;
+      // The daemon sampled its monotonic clock before writing hello_ack. Subtracting our clock at
+      // receipt includes daemon→Adapter transit in the conservative direction, so a mapped
+      // Adapter deadline is never later than the corresponding daemon-local deadline.
+      active.daemonMonotonicSampleNs = BigInt(message.monotonic_ns);
+      active.adapterMonotonicSampleNs = process.hrtime.bigint();
       this.#reconnectDelayIndex = 0;
       return;
     }
@@ -400,6 +409,13 @@ export class ChannelAdapterClient {
           this.#onError('wrong_receipt_ack');
           active.socket.destroy();
         }
+        return;
+      }
+      // Timer callbacks can be delayed by a busy event loop. The fixed monotonic deadline remains
+      // authoritative, so a late ACK cannot revive a timed-out receipt or the old connection.
+      if (process.hrtime.bigint() >= pending.deadlineNs) {
+        pending.reject(new ChannelAdapterError('receipt_timeout'));
+        active.socket.destroy();
         return;
       }
       active.acknowledgedGateIds.add(message.gate_id);
@@ -463,14 +479,29 @@ export class ChannelAdapterClient {
   }
 
   #writeReceipt(active: ActiveConnection, gateId: string, pending: PendingReceipt): boolean {
-    if (active.epoch === null || active.writeBlocked || active.socket.destroyed) return false;
+    if (
+      active.epoch === null ||
+      active.daemonMonotonicSampleNs === null ||
+      active.adapterMonotonicSampleNs === null ||
+      active.writeBlocked ||
+      active.socket.destroyed
+    ) return false;
     // Leave a millisecond for the Adapter timer to retire the socket before any at-budget ACK can
     // be interpreted. The daemon applies the smaller of this remaining budget and its own cap.
+    const nowNs = process.hrtime.bigint();
+    const remainingNs = pending.deadlineNs - nowNs;
     const remainingMs = Math.min(
       CHANNEL_MAX_RECEIPT_ACK_BUDGET_MS,
-      Math.floor(pending.deadlineAt - performance.now()) - 1,
+      Number(remainingNs / NS_PER_MS) - 1,
     );
     if (remainingMs < 1) {
+      pending.reject(new ChannelAdapterError('receipt_timeout'));
+      active.socket.destroy();
+      return false;
+    }
+    const daemonDeadlineNs = active.daemonMonotonicSampleNs +
+      (pending.deadlineNs - active.adapterMonotonicSampleNs) - 1n;
+    if (daemonDeadlineNs < 1n) {
       pending.reject(new ChannelAdapterError('receipt_timeout'));
       active.socket.destroy();
       return false;
@@ -481,6 +512,7 @@ export class ChannelAdapterClient {
       connection_epoch: active.epoch,
       gate_id: gateId,
       ack_budget_ms: remainingMs,
+      ack_deadline_ns: daemonDeadlineNs.toString(),
     });
   }
 

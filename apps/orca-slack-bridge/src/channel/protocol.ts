@@ -62,6 +62,12 @@ export type AdapterReceipt = {
   readonly gate_id: string;
   /** Remaining monotonic Adapter ACK budget at the instant this pipe frame is written. */
   readonly ack_budget_ms: number;
+  /**
+   * The Adapter deadline mapped conservatively into the daemon's monotonic clock domain. The
+   * mapping is calibrated from `hello_ack.monotonic_ns`, so pipe transit can only shorten this
+   * deadline; it can never re-anchor the remaining budget at daemon receipt time.
+   */
+  readonly ack_deadline_ns: string;
 };
 
 export type AdapterToDaemonMessage = AdapterHello | AdapterAttempted | AdapterReceipt;
@@ -70,6 +76,8 @@ export type DaemonHelloAck = {
   readonly version: typeof CHANNEL_PROTOCOL_VERSION;
   readonly type: 'hello_ack';
   readonly connection_epoch: string;
+  /** Daemon-local monotonic sample taken immediately before this frame is written. */
+  readonly monotonic_ns: string;
 };
 
 export type DaemonNotify = {
@@ -208,7 +216,14 @@ function decodeAttempted(value: Record<string, unknown>): AdapterAttempted {
 }
 
 function decodeReceipt(value: Record<string, unknown>): AdapterReceipt {
-  exactKeys(value, ['version', 'type', 'connection_epoch', 'gate_id', 'ack_budget_ms']);
+  exactKeys(value, [
+    'version',
+    'type',
+    'connection_epoch',
+    'gate_id',
+    'ack_budget_ms',
+    'ack_deadline_ns',
+  ]);
   if (!isEpoch(value['connection_epoch'])) {
     throw new ChannelProtocolError('invalid_epoch');
   }
@@ -219,7 +234,9 @@ function decodeReceipt(value: Record<string, unknown>): AdapterReceipt {
     typeof value['ack_budget_ms'] !== 'number' ||
     !Number.isSafeInteger(value['ack_budget_ms']) ||
     value['ack_budget_ms'] < 1 ||
-    value['ack_budget_ms'] > CHANNEL_MAX_RECEIPT_ACK_BUDGET_MS
+    value['ack_budget_ms'] > CHANNEL_MAX_RECEIPT_ACK_BUDGET_MS ||
+    typeof value['ack_deadline_ns'] !== 'string' ||
+    !/^[1-9][0-9]{0,29}$/.test(value['ack_deadline_ns'])
   ) {
     throw new ChannelProtocolError('invalid_receipt_budget');
   }
@@ -229,6 +246,7 @@ function decodeReceipt(value: Record<string, unknown>): AdapterReceipt {
     connection_epoch: value['connection_epoch'],
     gate_id: value['gate_id'],
     ack_budget_ms: value['ack_budget_ms'],
+    ack_deadline_ns: value['ack_deadline_ns'],
   };
 }
 
@@ -245,14 +263,21 @@ export function decodeDaemonMessage(value: unknown): DaemonToAdapterMessage {
   const decoded = object(value);
   const type = versionAndType(decoded);
   if (type === 'hello_ack') {
-    exactKeys(decoded, ['version', 'type', 'connection_epoch']);
+    exactKeys(decoded, ['version', 'type', 'connection_epoch', 'monotonic_ns']);
     if (!isEpoch(decoded['connection_epoch'])) {
       throw new ChannelProtocolError('invalid_epoch');
+    }
+    if (
+      typeof decoded['monotonic_ns'] !== 'string' ||
+      !/^[1-9][0-9]{0,29}$/.test(decoded['monotonic_ns'])
+    ) {
+      throw new ChannelProtocolError('invalid_shape');
     }
     return {
       version: CHANNEL_PROTOCOL_VERSION,
       type,
       connection_epoch: decoded['connection_epoch'],
+      monotonic_ns: decoded['monotonic_ns'],
     };
   }
   if (type === 'notify' || type === 'receipt_ack') {
