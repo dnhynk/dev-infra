@@ -86,7 +86,9 @@ async function call<T>(runner: OrcaRunner, args: readonly string[]): Promise<T> 
   try {
     raw = JSON.parse(out);
   } catch {
-    throw new SyntaxError(`orca ${args.join(' ')} 출력이 JSON이 아니다: ${out.slice(0, 200)}`);
+    // Command arguments and output can contain direct-input resolution text. Diagnostics at this
+    // shared boundary must identify the failure class without copying either private payload.
+    throw new SyntaxError('orca command 출력이 JSON이 아니다');
   }
   return unwrap<T>(raw);
 }
@@ -560,13 +562,21 @@ export async function resolveExactGate(
   resolution: string,
   retryRequestId: string,
 ): Promise<GateResolveResult> {
-  const result = await call<unknown>(runner, [
-    'orchestration', 'gate-resolve',
-    '--id', identity.gateId,
-    '--resolution', resolution,
-    '--retry-request', retryRequestId,
-    '--json',
-  ]);
+  let result: unknown;
+  try {
+    result = await call<unknown>(runner, [
+      'orchestration', 'gate-resolve',
+      '--id', identity.gateId,
+      '--resolution', resolution,
+      '--retry-request', retryRequestId,
+      '--json',
+    ]);
+  } catch {
+    // Orca/runner diagnostics may echo argv or response data. The resolver treats every mutation
+    // failure as response-unknown, so a fixed error preserves the safety semantics without leaking
+    // free-form modal input through message, cause, data, or stack text.
+    throw new Error('Orca gate-resolve failed');
+  }
   if (!isRecord(result)) throw new TypeError('gate-resolve result가 object가 아니다');
   exactObjectKeys(result, ['gate', 'mutation'], 'gate-resolve result');
   const mutation = result['mutation'];

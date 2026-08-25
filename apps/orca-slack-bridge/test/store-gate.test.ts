@@ -179,14 +179,14 @@ describe('schema v6 → current', () => {
     const fresh = join(dir, 'fresh', 'state.db');
     new SqliteDigestStore(fresh).close();
 
-    expect(SCHEMA_VERSION).toBe(9);
+    expect(SCHEMA_VERSION).toBe(10);
     expect(gateMasterShape(dbPath)).toEqual(gateMasterShape(fresh));
     expect(schemaShape(dbPath)).toEqual(schemaShape(fresh));
     expect(schemaShape(dbPath).map(({ table }) => table)).toContain('gate_metadata');
     expect(schemaShape(dbPath).map(({ table }) => table)).toContain('gate_message');
   });
 
-  it('기존 v1~v6 계열의 PR/Run/collection 행을 보존하고 두 Gate 표만 비어 붙는다', () => {
+  it('기존 v1~v6 계열의 PR/Run/collection 행을 보존하고 current Gate 표들을 비어 붙인다', () => {
     writeV6(dbPath);
     const store = new SqliteDigestStore(dbPath);
     expect(store.findPrMessage(pullRequestKey(1057758478, 31))?.messageTs).toBe('1700.1');
@@ -200,7 +200,7 @@ describe('schema v6 → current', () => {
     store.close();
 
     const db = new DatabaseSync(dbPath);
-    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 9 });
+    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 10 });
     db.close();
   });
 

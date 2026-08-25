@@ -3,6 +3,7 @@ import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import type { GateMetadata } from '../gate/types.js';
 import type { GateLocalObservation, GateResolutionStore } from '../gate/resolution-types.js';
+import type { GateDirectInputStore } from '../gate/direct-input-types.js';
 
 /**
  * durable store 스키마와 접근 경계.
@@ -67,7 +68,7 @@ import type { GateLocalObservation, GateResolutionStore } from '../gate/resoluti
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -357,6 +358,54 @@ CREATE TABLE gate_observation_generation (
   revision  INTEGER NOT NULL CHECK (revision >= 0)
 )`;
 
+/** D2-D server-side modal correlation. Trigger ids and unaccepted input never enter SQLite. */
+const GATE_DIRECT_MODAL_TABLE = `
+CREATE TABLE gate_direct_modal (
+  session_id          TEXT PRIMARY KEY,
+  revision            INTEGER NOT NULL CHECK (revision >= 0),
+  button_event_key    TEXT NOT NULL UNIQUE,
+  gate_key            TEXT NOT NULL,
+  team_id             TEXT NOT NULL,
+  owner_user_id       TEXT NOT NULL,
+  api_app_id          TEXT NOT NULL,
+  channel_id          TEXT NOT NULL,
+  thread_ts           TEXT NOT NULL,
+  message_ts          TEXT NOT NULL,
+  block_id            TEXT NOT NULL,
+  action_id           TEXT NOT NULL,
+  action_value        TEXT NOT NULL,
+  callback_id         TEXT NOT NULL,
+  input_block_id      TEXT NOT NULL,
+  input_action_id     TEXT NOT NULL,
+  state               TEXT NOT NULL CHECK (state IN ('prepared','opening','opened','failed','accepted')),
+  view_id             TEXT UNIQUE,
+  failure_code        TEXT CHECK (failure_code IS NULL OR length(failure_code) BETWEEN 1 AND 80),
+  resolution_text     TEXT CHECK (resolution_text IS NULL OR length(resolution_text) BETWEEN 1 AND 3000),
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  opened_at           TEXT,
+  accepted_at         TEXT,
+  CHECK (
+    (state = 'prepared' AND revision = 0)
+    OR (state = 'opening' AND revision = 1)
+    OR (state IN ('opened','failed') AND revision = 2)
+    OR (state = 'accepted' AND revision = 3)
+  ),
+  CHECK (
+    (state IN ('prepared','opening') AND view_id IS NULL AND failure_code IS NULL
+      AND resolution_text IS NULL AND opened_at IS NULL AND accepted_at IS NULL)
+    OR (state = 'opened' AND view_id IS NOT NULL AND failure_code IS NULL
+      AND resolution_text IS NULL AND opened_at IS NOT NULL AND accepted_at IS NULL)
+    OR (state = 'failed' AND view_id IS NULL AND failure_code IS NOT NULL
+      AND resolution_text IS NULL AND opened_at IS NULL AND accepted_at IS NULL)
+    OR (state = 'accepted' AND view_id IS NOT NULL AND failure_code IS NULL
+      AND resolution_text IS NOT NULL AND opened_at IS NOT NULL AND accepted_at IS NOT NULL)
+  )
+)`;
+
+const GATE_DIRECT_MODAL_GATE_INDEX = `
+CREATE INDEX gate_direct_modal_gate ON gate_direct_modal (gate_key, state, session_id)`;
+
 const GATE_RESOLUTION_TABLE = `
 CREATE TABLE gate_resolution (
   gate_key             TEXT PRIMARY KEY,
@@ -465,6 +514,12 @@ export const GATE_V9_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_observation_generation: GATE_OBSERVATION_GENERATION_TABLE,
 };
 
+/** v10 adds only the durable direct-input modal sidecar. */
+export const GATE_V10_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  gate_direct_modal: GATE_DIRECT_MODAL_TABLE,
+  gate_direct_modal_gate: GATE_DIRECT_MODAL_GATE_INDEX,
+};
+
 /**
  * 전체 DDL. `DatabaseSync#exec`로 한 번에 실행한다.
  *
@@ -521,6 +576,8 @@ ${GATE_MESSAGE_TABLE};
 ${GATE_MESSAGE_INDEX};
 ${GATE_LOCAL_OBSERVATION_TABLE};
 ${GATE_OBSERVATION_GENERATION_TABLE};
+${GATE_DIRECT_MODAL_TABLE};
+${GATE_DIRECT_MODAL_GATE_INDEX};
 ${GATE_RESOLUTION_TABLE};
 ${GATE_RESOLUTION_LIFECYCLE_INDEX};
 ${GATE_RESOLUTION_OUTBOX_TABLE};
@@ -591,6 +648,9 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // v8 → v9: monotonic ordinary-write generations fence identical/same-timestamp observations.
   // Existing v8 rows are not inferred or rewritten; the next observation save creates revision 0.
   [GATE_OBSERVATION_GENERATION_TABLE],
+  // v9 → v10: durable server-owned correlation for the D2-D direct-input modal. Existing Gate
+  // rows are not inferred and no trigger id or unaccepted resolution text is backfilled.
+  [GATE_DIRECT_MODAL_TABLE, GATE_DIRECT_MODAL_GATE_INDEX],
 ];
 
 /**
@@ -921,7 +981,7 @@ export type NewGateMessage = {
  * Gate metadata/card mapping plus the D2-C resolution boundary. It remains separate from PR and
  * Run-root interfaces so callers request only the effects they use.
  */
-export interface GateStore extends GateResolutionStore {
+export interface GateStore extends GateResolutionStore, GateDirectInputStore {
   findGateMetadata(gateKey: GateKey): GateMetadata | null;
   /** Gate key order is fixed in SQL so source-row order cannot change render fingerprints. */
   listGateMetadata(runKey: RunKey): readonly GateMetadata[];

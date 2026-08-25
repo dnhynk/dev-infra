@@ -1,7 +1,13 @@
 import type { RenderedCard } from '../digest/render.js';
 import type { SlackBlock } from '../slack/post.js';
 import type { GateDecisionFacts, GateTaskFacts } from './types.js';
-import { gateActionId, gateBlockId } from './actions.js';
+import {
+  gateActionId,
+  gateBlockId,
+  gateDirectActionId,
+  gateDirectActionValue,
+  gateDirectBlockId,
+} from './actions.js';
 
 const SECTION_TEXT_CAP = 3000;
 const SECTION_TRUNCATION_MARK = '\n…(표시 한도 3000자를 넘어 잘림)';
@@ -120,6 +126,21 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
         value: option.id,
         ...(gate.recommendation?.optionId === option.id ? { style: 'primary' } : {}),
       })),
+    });
+  }
+
+  const directActionable =
+    gate.status === 'pending' && gate.metadataState === 'matched' && gate.correlation !== null;
+  if (directActionable) {
+    blocks.push({
+      type: 'actions',
+      block_id: gateDirectBlockId(gate.key),
+      elements: [{
+        type: 'button',
+        text: { type: 'plain_text', text: '직접 입력', emoji: true },
+        action_id: gateDirectActionId(gate.key),
+        value: gateDirectActionValue(gate.key),
+      }],
     });
   }
 

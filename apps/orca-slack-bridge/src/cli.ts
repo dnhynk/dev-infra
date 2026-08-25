@@ -40,7 +40,15 @@ import {
   type SummaryProvider,
 } from './summarize/index.js';
 import { GateActionHandler } from './gate/action-handler.js';
+import {
+  GateDirectInputHandler,
+  isGateDirectInputEvent,
+} from './gate/direct-input-handler.js';
 import { GateResolutionEngine } from './gate/resolve.js';
+import {
+  SlackWebApiViewOpener,
+  type SlackViewOpener,
+} from './slack/views.js';
 
 export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register' | 'daemon';
 
@@ -604,6 +612,7 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
 export type DaemonDependencies = {
   readonly orca?: OrcaRunner;
   readonly slack?: SlackPoster;
+  readonly viewOpener?: SlackViewOpener;
   readonly connectionFactory?: SocketConnectionFactory;
   readonly socketTimeouts?: Partial<SocketTimeouts>;
   /** Production defaults to fifteen seconds and kills the real Orca subprocess at expiry. */
@@ -627,7 +636,7 @@ function processStop(): Promise<void> {
   });
 }
 
-/** Production D2-C path: strict v8 startup → reconcile → Socket Mode fixed-option consumer. */
+/** Production D2 path: strict v10 startup → reconcile → exactly-one interactive consumer. */
 export async function runDaemonCommand(
   parsed: RunArgs,
   config: BridgeConfig,
@@ -662,7 +671,15 @@ export async function runDaemonCommand(
       { timeoutMs: orcaTimeoutMs },
     );
     const orca = boundedOrcaRunner(rawOrca, orcaTimeoutMs);
-    const slack = dependencies.slack ?? new SlackWebApiPoster({ token: botToken(process.env) });
+    const productionBotToken = dependencies.slack === undefined || dependencies.viewOpener === undefined
+      ? (dependencies.slack === undefined ? botToken(process.env) : null)
+      : null;
+    const slack = dependencies.slack ?? new SlackWebApiPoster({ token: productionBotToken! });
+    const viewOpener = dependencies.viewOpener ?? (
+      productionBotToken === null
+        ? { open: () => Promise.reject(new Error('Slack modal opener is not injected')) }
+        : new SlackWebApiViewOpener({ token: productionBotToken })
+    );
     const engine = new GateResolutionEngine({
       store,
       orca,
@@ -671,14 +688,23 @@ export async function runDaemonCommand(
         ? {}
         : { slackTimeoutMs: dependencies.slackTimeoutMs }),
     });
+    const schedule = (job: () => Promise<void>): void => {
+      const task = job().catch(() => undefined).finally(() => pending.delete(task));
+      pending.add(task);
+    };
     const handler = new GateActionHandler({
       config: config.slack,
       store,
       engine,
-      schedule: (job) => {
-        const task = job().catch(() => undefined).finally(() => pending.delete(task));
-        pending.add(task);
-      },
+      schedule,
+      abortSignal: inboundAbort.signal,
+    });
+    const directHandler = new GateDirectInputHandler({
+      config: config.slack,
+      store,
+      opener: viewOpener,
+      engine,
+      schedule,
       abortSignal: inboundAbort.signal,
     });
 
@@ -713,7 +739,8 @@ export async function runDaemonCommand(
         // A connection may invoke a retained callback while its bounded close is still draining.
         // Leave that envelope unACKed for Slack redelivery instead of starting work after stop.
         if (!acceptingInbound) return Promise.resolve();
-        const task = handler.handle(event).then(() => undefined).finally(() => inbound.delete(task));
+        const consumer = isGateDirectInputEvent(event) ? directHandler : handler;
+        const task = consumer.handle(event).then(() => undefined).finally(() => inbound.delete(task));
         inbound.add(task);
         return task;
       },

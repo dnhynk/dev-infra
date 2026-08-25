@@ -1,5 +1,6 @@
 import type { RenderedCard } from '../digest/render.js';
 import type { GateResolutionIntent, GateResolutionOutbox } from './resolution-types.js';
+import { GATE_DIRECT_OPTION_ID } from './direct-input-types.js';
 
 function cut(value: string, cap: number): string {
   return value.length <= cap ? value : `${value.slice(0, Math.max(0, cap - 1))}…`;
@@ -34,6 +35,7 @@ export function renderGateResolutionCard(
     intent.resolveResult === null
       ? 'Orca mutation 응답 없음'
       : `Orca mutation ${intent.resolveResult.mutation.requestId} · replayed ${intent.resolveResult.mutation.replayed ? 'yes' : 'no'}`;
+  const selection = intent.optionId === GATE_DIRECT_OPTION_ID ? '직접 입력' : intent.optionId;
   return {
     text: `${outbox.cardState} · ${intent.gateKey.slice('gate:'.length)} · Coordinator 통지 대기`,
     blocks: [
@@ -50,7 +52,7 @@ export function renderGateResolutionCard(
         text: {
           type: 'plain_text',
           text:
-            `선택 ${intent.optionId}\n` +
+            `선택 ${selection}\n` +
             `resolution ${cut(intent.optionResolution, 2500)}\n` +
             `상태 ${status}\n` +
             `owner ${intent.ownerUserId} · 선택 시각 ${intent.createdAt}`,

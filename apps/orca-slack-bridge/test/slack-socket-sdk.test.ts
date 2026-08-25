@@ -1,14 +1,37 @@
 import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { runInNewContext } from 'node:vm';
 import { SocketModeClient } from '@slack/socket-mode';
 import { Response as UndiciResponse } from 'undici';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { parseArgs, runDaemonCommand } from '../src/cli.js';
+import {
+  gateDirectActionId,
+  gateDirectActionValue,
+  gateDirectBlockId,
+  gateDirectInputActionId,
+  gateDirectInputBlockId,
+} from '../src/gate/actions.js';
+import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
+import type { OrcaRunner } from '../src/orca/client.js';
+import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
+import type {
+  PostMessageInput,
+  PostedMessage,
+  SlackPoster,
+  UpdateMessageInput,
+} from '../src/slack/post.js';
 import {
   SlackSocketTransport,
   slackSdkConnectionFactory,
 } from '../src/slack/socket.js';
+import { SlackWebApiViewOpener } from '../src/slack/views.js';
+import { APP_TOKEN_VAR } from '../src/slack/verify.js';
+import { SqliteDigestStore } from '../src/store/sqlite.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -33,13 +56,27 @@ type HelloServer = {
   readonly send: (index: number, payload: object) => void;
   readonly sendBatch: (index: number, payloads: readonly object[]) => void;
   readonly disconnect: (index: number) => void;
+  readonly received: (index: number) => readonly unknown[];
   readonly close: () => Promise<void>;
 };
 
 function textFrame(payload: object): Buffer {
   const encoded = Buffer.from(JSON.stringify(payload));
-  if (encoded.length > 125) throw new Error('test WebSocket frame is too large');
-  return Buffer.concat([Buffer.from([0x81, encoded.length]), encoded]);
+  if (encoded.length <= 125) {
+    return Buffer.concat([Buffer.from([0x81, encoded.length]), encoded]);
+  }
+  if (encoded.length <= 0xffff) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(encoded.length, 2);
+    return Buffer.concat([header, encoded]);
+  }
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(encoded.length), 2);
+  return Buffer.concat([header, encoded]);
 }
 
 const CLOSE_FRAME = Buffer.from([0x88, 0x02, 0x03, 0xe8]);
@@ -52,11 +89,16 @@ async function startHelloServer(options: {
   const server = createServer();
   const liveSockets = new Set<Duplex>();
   const sockets: Duplex[] = [];
+  const receivedFrames: unknown[][] = [];
+  const pendingBytes: Buffer[] = [];
   const serverClosing = new WeakSet<Duplex>();
   let upgradeCount = 0;
   server.on('upgrade', (request, socket) => {
     upgradeCount += 1;
     sockets.push(socket);
+    receivedFrames.push([]);
+    pendingBytes.push(Buffer.alloc(0));
+    const socketIndex = sockets.length - 1;
     liveSockets.add(socket);
     socket.once('close', () => liveSockets.delete(socket));
     const key = request.headers['sec-websocket-key'];
@@ -73,13 +115,49 @@ async function startHelloServer(options: {
       + 'Connection: Upgrade\r\n'
       + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
-    if (options.replyToClose === true) {
-      socket.on('data', (chunk: Buffer) => {
-        if (chunk.length === 0 || (chunk[0]! & 0x0f) !== 0x08) return;
-        if (!serverClosing.has(socket) && !socket.destroyed) socket.write(CLOSE_FRAME);
-        socket.end();
-      });
-    }
+    socket.on('data', (chunk: Buffer) => {
+      let pending = Buffer.concat([pendingBytes[socketIndex] ?? Buffer.alloc(0), chunk]);
+      for (;;) {
+        if (pending.length < 2) break;
+        const opcode = pending[0]! & 0x0f;
+        const masked = (pending[1]! & 0x80) !== 0;
+        let length = pending[1]! & 0x7f;
+        let offset = 2;
+        if (length === 126) {
+          if (pending.length < 4) break;
+          length = pending.readUInt16BE(2);
+          offset = 4;
+        } else if (length === 127) {
+          if (pending.length < 10) break;
+          const wide = pending.readBigUInt64BE(2);
+          if (wide > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('test frame is too large');
+          length = Number(wide);
+          offset = 10;
+        }
+        const maskBytes = masked ? 4 : 0;
+        if (pending.length < offset + maskBytes + length) break;
+        const mask = masked ? pending.subarray(offset, offset + 4) : null;
+        const encoded = pending.subarray(offset + maskBytes, offset + maskBytes + length);
+        const decoded = Buffer.from(encoded);
+        if (mask !== null) {
+          for (let index = 0; index < decoded.length; index += 1) {
+            decoded[index] = decoded[index]! ^ mask[index % 4]!;
+          }
+        }
+        pending = pending.subarray(offset + maskBytes + length);
+        if (opcode === 0x01) {
+          try {
+            receivedFrames[socketIndex]?.push(JSON.parse(decoded.toString('utf8')));
+          } catch {
+            receivedFrames[socketIndex]?.push(decoded.toString('utf8'));
+          }
+        } else if (opcode === 0x08 && options.replyToClose === true) {
+          if (!serverClosing.has(socket) && !socket.destroyed) socket.write(CLOSE_FRAME);
+          socket.end();
+        }
+      }
+      pendingBytes[socketIndex] = pending;
+    });
     if (options.autoHello !== false) {
       socket.write(textFrame({
         type: 'hello',
@@ -109,6 +187,7 @@ async function startHelloServer(options: {
       serverClosing.add(socket);
       socket.write(CLOSE_FRAME);
     },
+    received: (index) => [...(receivedFrames[index] ?? [])],
     close: async () => {
       for (const socket of liveSockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -165,6 +244,238 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
     } finally {
       await transport.shutdown().catch(() => undefined);
       await server.close();
+    }
+  });
+
+  it('view_submission errors ACK를 installed SDK의 exact envelope payload로 한 번 전송한다', async () => {
+    const server = await startHelloServer({ replyToClose: true });
+    vi.stubGlobal('fetch', vi.fn(async () => connectionsOpenResponse(server.url)));
+    let deliveries = 0;
+    const transport = new SlackSocketTransport({
+      connectionFactory: slackSdkConnectionFactory('xapp-test'),
+      timeouts: { startMs: 500, closeMs: 100 },
+      event: async (event) => {
+        deliveries += 1;
+        await event.ack({
+          response_action: 'errors',
+          errors: { orca_gate_direct_input_v1_deadbeef: '결정 내용을 입력하세요.' },
+        });
+      },
+    });
+    try {
+      await transport.start();
+      server.send(0, {
+        envelope_id: 'e-errors',
+        type: 'interactive',
+        accepts_response_payload: true,
+        payload: { type: 'view_submission' },
+      });
+      await vi.waitFor(() => expect(server.received(0)).toEqual([{
+        envelope_id: 'e-errors',
+        payload: {
+          response_action: 'errors',
+          errors: { orca_gate_direct_input_v1_deadbeef: '결정 내용을 입력하세요.' },
+        },
+      }]));
+      expect(deliveries).toBe(1);
+    } finally {
+      await transport.shutdown().catch(() => undefined);
+      await server.close();
+    }
+  });
+
+  it('composes runDaemon with real Socket SDK ACKs and real WebClient views.open wire shape', async () => {
+    const server = await startHelloServer({ replyToClose: true });
+    const dir = mkdtempSync(join(tmpdir(), 'orca-sdk-direct-daemon-'));
+    const statePath = join(dir, 'state.db');
+    const previousAppToken = process.env[APP_TOKEN_VAR];
+    process.env[APP_TOKEN_VAR] = ['xapp', 'FAKE', 'LOCAL', 'ONLY'].join('-');
+    vi.stubGlobal('fetch', vi.fn(async () => connectionsOpenResponse(server.url)));
+
+    const gate = gateKey('gate_sdk_direct');
+    const run = runKey('run_sdk_direct');
+    const task = taskKey('task_sdk_direct');
+    const channel = 'C0AGENTRUNS';
+    const threadTs = '1787554800.000001';
+    const messageTs = '1787554800.000002';
+    const at = '2026-08-25T10:00:00.000Z';
+    const config: BridgeConfig = {
+      slack: {
+        teamId: 'T0TEAM',
+        apiAppId: 'A01BRIDGE',
+        ownerUserIds: ['U0OWNER'],
+        channels: { prDigest: 'C0PRDIGEST', agentRuns: channel },
+      },
+      projects: [],
+      correlationKeys: DEFAULT_CORRELATION_KEYS,
+    };
+    const seed = new SqliteDigestStore(statePath);
+    seed.insertGateMetadata({
+      gateKey: gate,
+      runKey: run,
+      taskKey: task,
+      dispatchKey: dispatchKey('ctx_sdk_direct'),
+      askMessageId: 'msg_sdk_direct',
+      questionThreadId: 'thread_sdk_direct',
+      options: [{
+        id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지',
+      }],
+      recommendation: { optionId: 'keep', reason: '호환성' },
+      impact: '후속 방향',
+      registeredAt: at,
+    });
+    seed.insertGateMessage({
+      gateKey: gate, runKey: run, channelId: channel, threadTs, messageTs,
+      renderFingerprint: 'fp-sdk-direct', at,
+    });
+    seed.saveGateLocalObservation({
+      gateKey: gate, runKey: run, taskKey: task, status: 'pending', resolution: null,
+      resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: at,
+    });
+    seed.close();
+
+    const viewCalls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+    const viewFetch: typeof fetch = async (url, init) => {
+      const request = { url: String(url), init: init ?? {} };
+      viewCalls.push(request);
+      const form = new URLSearchParams(String(request.init.body));
+      const view = JSON.parse(form.get('view') ?? 'null') as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        ok: true,
+        view: {
+          ...view,
+          id: 'VSDKDIRECT',
+          team_id: 'T0TEAM',
+          app_id: 'A01BRIDGE',
+          type: 'modal',
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const opener = new SlackWebApiViewOpener({
+      token: ['xoxb', 'FAKE', 'LOCAL', 'ONLY'].join('-'),
+      fetchImpl: viewFetch,
+    });
+    const slack: SlackPoster = {
+      post: (_input: PostMessageInput): Promise<PostedMessage> =>
+        Promise.reject(new Error('not used')),
+      update: (input: UpdateMessageInput): Promise<PostedMessage> =>
+        Promise.resolve({ channel: input.channel, ts: input.ts }),
+    };
+    const orcaCalls: string[][] = [];
+    const orca: OrcaRunner = {
+      run: (args) => {
+        orcaCalls.push([...args]);
+        return Promise.reject(new Error('Orca must not run for a local validation error'));
+      },
+    };
+
+    try {
+      const parsed = parseArgs(['daemon', '--state', statePath]);
+      if (parsed.kind !== 'run') throw new Error('daemon args failed');
+      const code = await runDaemonCommand(parsed, config, {
+        orca,
+        slack,
+        viewOpener: opener,
+        connectionFactory: slackSdkConnectionFactory('xapp-test'),
+        socketTimeouts: { startMs: 500, closeMs: 100 },
+        waitForStop: async () => {
+          server.send(0, {
+            envelope_id: 'e-direct-button',
+            type: 'interactive',
+            accepts_response_payload: true,
+            payload: {
+              type: 'block_actions',
+              api_app_id: 'A01BRIDGE',
+              trigger_id: 'TRIGGER_LOCAL_ONLY',
+              team: { id: 'T0TEAM' },
+              user: { id: 'U0OWNER', team_id: 'T0TEAM' },
+              channel: { id: channel },
+              container: {
+                type: 'message', channel_id: channel, message_ts: messageTs,
+                thread_ts: threadTs, is_ephemeral: false,
+              },
+              message: { ts: messageTs, thread_ts: threadTs },
+              actions: [{
+                type: 'button',
+                block_id: gateDirectBlockId(gate),
+                action_id: gateDirectActionId(gate),
+                value: gateDirectActionValue(gate),
+                action_ts: '1787554900.000001',
+                text: { type: 'plain_text', text: '직접 입력' },
+              }],
+            },
+          });
+          await vi.waitFor(() => expect(server.received(0)).toContainEqual({
+            envelope_id: 'e-direct-button',
+            payload: {},
+          }));
+          await vi.waitFor(() => expect(viewCalls).toHaveLength(1));
+
+          const call = viewCalls[0]!;
+          expect(call.url).toBe('https://slack.com/api/views.open');
+          expect(new Headers(call.init.headers).get('authorization')).toBe(
+            `Bearer ${['xoxb', 'FAKE', 'LOCAL', 'ONLY'].join('-')}`,
+          );
+          const form = new URLSearchParams(String(call.init.body));
+          expect([...form.keys()].sort()).toEqual(['trigger_id', 'view']);
+          expect(form.get('trigger_id')).toBe('TRIGGER_LOCAL_ONLY');
+          const view = JSON.parse(form.get('view') ?? 'null') as Record<string, unknown>;
+          expect(view).toMatchObject({
+            type: 'modal',
+            callback_id: expect.any(String),
+            private_metadata: expect.any(String),
+          });
+
+          server.send(0, {
+            envelope_id: 'e-direct-errors',
+            type: 'interactive',
+            accepts_response_payload: true,
+            payload: {
+              type: 'view_submission',
+              api_app_id: 'A01BRIDGE',
+              team: { id: 'T0TEAM' },
+              user: { id: 'U0OWNER', team_id: 'T0TEAM' },
+              view: {
+                id: 'VSDKDIRECT',
+                type: 'modal',
+                team_id: 'T0TEAM',
+                app_id: 'A01BRIDGE',
+                callback_id: view['callback_id'],
+                private_metadata: view['private_metadata'],
+                state: { values: {
+                  [gateDirectInputBlockId(gate)]: {
+                    [gateDirectInputActionId(gate)]: {
+                      type: 'plain_text_input', value: '  \n\t',
+                    },
+                  },
+                } },
+              },
+            },
+          });
+          await vi.waitFor(() => expect(server.received(0)).toContainEqual({
+            envelope_id: 'e-direct-errors',
+            payload: {
+              response_action: 'errors',
+              errors: {
+                [gateDirectInputBlockId(gate)]: '1~3000자의 유효한 결정 내용을 입력하세요.',
+              },
+            },
+          }));
+        },
+      });
+      expect(code).toBe(0);
+      expect(orcaCalls).toEqual([]);
+      const reopened = new SqliteDigestStore(statePath);
+      expect(reopened.findGateResolution(gate)).toBeNull();
+      reopened.close();
+    } finally {
+      if (previousAppToken === undefined) delete process.env[APP_TOKEN_VAR];
+      else process.env[APP_TOKEN_VAR] = previousAppToken;
+      await server.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
