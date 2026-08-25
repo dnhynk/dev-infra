@@ -6,7 +6,24 @@ import { dirname, join, posix, win32 } from 'node:path';
 import type { CheckFact } from '../github/pull-request.js';
 import { parseGateOptionMetadataArray } from '../gate/register.js';
 import type { GateMetadata } from '../gate/types.js';
-import { gateActionId, gateBlockId } from '../gate/actions.js';
+import {
+  gateActionId,
+  gateBlockId,
+  gateDirectActionId,
+  gateDirectActionValue,
+  gateDirectBlockId,
+  gateDirectCallbackId,
+  gateDirectInputActionId,
+  gateDirectInputBlockId,
+} from '../gate/actions.js';
+import {
+  GATE_DIRECT_OPTION_ID,
+  type GateDirectClaimInput,
+  type GateDirectModalSession,
+  type GateDirectOpenResult,
+  type GateDirectPrepareInput,
+  type GateDirectPrepareResult,
+} from '../gate/direct-input-types.js';
 import {
   GATE_AUDIT_LIMIT,
   GATE_FACT_CAP,
@@ -31,6 +48,7 @@ import {
   ENABLE_WAL,
   GATE_V8_SCHEMA_OBJECTS,
   GATE_V9_SCHEMA_OBJECTS,
+  GATE_V10_SCHEMA_OBJECTS,
   MIGRATIONS,
   SCHEMA_DDL,
   SCHEMA_VERSION,
@@ -365,6 +383,61 @@ SELECT gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint,
        created_at, updated_at
   FROM gate_message WHERE channel_id = ? AND message_ts = ?`;
 
+const SELECT_GATE_DIRECT_MODAL = `
+SELECT session_id, revision, button_event_key, gate_key,
+       team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+       block_id, action_id, action_value, callback_id, input_block_id, input_action_id,
+       state, view_id, failure_code, resolution_text,
+       created_at, updated_at, opened_at, accepted_at
+  FROM gate_direct_modal WHERE session_id = ?`;
+
+const SELECT_GATE_DIRECT_MODAL_BY_EVENT = `
+SELECT session_id, revision, button_event_key, gate_key,
+       team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+       block_id, action_id, action_value, callback_id, input_block_id, input_action_id,
+       state, view_id, failure_code, resolution_text,
+       created_at, updated_at, opened_at, accepted_at
+  FROM gate_direct_modal WHERE button_event_key = ?`;
+
+const SELECT_ALL_GATE_DIRECT_MODALS = `
+SELECT session_id, revision, button_event_key, gate_key,
+       team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+       block_id, action_id, action_value, callback_id, input_block_id, input_action_id,
+       state, view_id, failure_code, resolution_text,
+       created_at, updated_at, opened_at, accepted_at
+  FROM gate_direct_modal ORDER BY session_id`;
+
+const INSERT_GATE_DIRECT_MODAL = `
+INSERT INTO gate_direct_modal
+  (session_id, revision, button_event_key, gate_key,
+   team_id, owner_user_id, api_app_id, channel_id, thread_ts, message_ts,
+   block_id, action_id, action_value, callback_id, input_block_id, input_action_id,
+   state, view_id, failure_code, resolution_text,
+   created_at, updated_at, opened_at, accepted_at)
+VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        'prepared', NULL, NULL, NULL, ?, ?, NULL, NULL)`;
+
+const BEGIN_GATE_DIRECT_MODAL_OPEN = `
+UPDATE gate_direct_modal
+   SET revision = revision + 1, state = 'opening', updated_at = ?
+ WHERE session_id = ? AND revision = ? AND state = 'prepared'`;
+
+const FINISH_GATE_DIRECT_MODAL_OPENED = `
+UPDATE gate_direct_modal
+   SET revision = revision + 1, state = 'opened', view_id = ?, opened_at = ?, updated_at = ?
+ WHERE session_id = ? AND revision = ? AND state = 'opening'`;
+
+const FINISH_GATE_DIRECT_MODAL_FAILED = `
+UPDATE gate_direct_modal
+   SET revision = revision + 1, state = 'failed', failure_code = ?, updated_at = ?
+ WHERE session_id = ? AND revision = ? AND state = 'opening'`;
+
+const ACCEPT_GATE_DIRECT_MODAL = `
+UPDATE gate_direct_modal
+   SET revision = revision + 1, state = 'accepted', resolution_text = ?,
+       accepted_at = ?, updated_at = ?
+ WHERE session_id = ? AND revision = ? AND state = 'opened'`;
+
 const INSERT_GATE_RESOLUTION = `
 INSERT INTO gate_resolution
   (gate_key, revision, ack_state, lease_owner, lease_expires_at,
@@ -590,6 +663,33 @@ type GateLocalObservationRow = {
 type GateObservationGenerationRow = {
   readonly gate_key: string;
   readonly revision: number;
+};
+
+type GateDirectModalRow = {
+  readonly session_id: string;
+  readonly revision: number;
+  readonly button_event_key: string;
+  readonly gate_key: string;
+  readonly team_id: string;
+  readonly owner_user_id: string;
+  readonly api_app_id: string;
+  readonly channel_id: string;
+  readonly thread_ts: string;
+  readonly message_ts: string;
+  readonly block_id: string;
+  readonly action_id: string;
+  readonly action_value: string;
+  readonly callback_id: string;
+  readonly input_block_id: string;
+  readonly input_action_id: string;
+  readonly state: string;
+  readonly view_id: string | null;
+  readonly failure_code: string | null;
+  readonly resolution_text: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly opened_at: string | null;
+  readonly accepted_at: string | null;
 };
 
 type GateResolutionRow = {
@@ -896,6 +996,88 @@ function advanceGateObservationGeneration(
   );
   db.prepare(UPSERT_GATE_OBSERVATION_GENERATION).run(gateKey, revision);
   return revision;
+}
+
+function toGateDirectModal(row: GateDirectModalRow): GateDirectModalSession {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      row.session_id,
+    ) ||
+    !/^[0-9a-f]{64}$/.test(row.button_event_key) ||
+    !/^T[A-Z0-9]+$/.test(row.team_id) ||
+    !/^U[A-Z0-9]+$/.test(row.owner_user_id) ||
+    !/^A[A-Z0-9]+$/.test(row.api_app_id) ||
+    !/^[CG][A-Z0-9]+$/.test(row.channel_id) ||
+    !/^\d+\.\d+$/.test(row.thread_ts) ||
+    !/^\d+\.\d+$/.test(row.message_ts) ||
+    (row.view_id !== null && !/^V[A-Z0-9]+$/.test(row.view_id))
+  ) {
+    throw new TypeError(`${row.gate_key}의 direct modal identity shape가 잘못됐다`);
+  }
+  if (!['prepared', 'opening', 'opened', 'failed', 'accepted'].includes(row.state)) {
+    throw new TypeError(`${row.gate_key}의 direct modal state가 잘못됐다`);
+  }
+  const gateKey = storedKey(row.gate_key, 'gate:', 'gate_direct_modal.gate_key') as GateKey;
+  const state = row.state as GateDirectModalSession['state'];
+  const viewId = storedNullableText(row.view_id, `${row.session_id}.view_id`, 64);
+  const failureCode = storedNullableText(row.failure_code, `${row.session_id}.failure_code`, 80);
+  const resolutionText = storedNullableText(
+    row.resolution_text,
+    `${row.session_id}.resolution_text`,
+    3000,
+  );
+  const openedAt = row.opened_at === null
+    ? null
+    : storedIso(row.opened_at, `${row.session_id}.opened_at`);
+  const acceptedAt = row.accepted_at === null
+    ? null
+    : storedIso(row.accepted_at, `${row.session_id}.accepted_at`);
+  const validRevision =
+    (state === 'prepared' && row.revision === 0) ||
+    (state === 'opening' && row.revision === 1) ||
+    ((state === 'opened' || state === 'failed') && row.revision === 2) ||
+    (state === 'accepted' && row.revision === 3);
+  const validState =
+    ((state === 'prepared' || state === 'opening') &&
+      viewId === null && failureCode === null && resolutionText === null &&
+      openedAt === null && acceptedAt === null) ||
+    (state === 'opened' && viewId !== null && failureCode === null && resolutionText === null &&
+      openedAt !== null && acceptedAt === null) ||
+    (state === 'failed' && viewId === null && failureCode !== null && resolutionText === null &&
+      openedAt === null && acceptedAt === null) ||
+    (state === 'accepted' && viewId !== null && failureCode === null && resolutionText !== null &&
+      resolutionText.trim() !== '' &&
+      !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(resolutionText) &&
+      openedAt !== null && acceptedAt !== null);
+  if (!validRevision || !validState) {
+    throw new TypeError(`${gateKey}의 direct modal lifecycle evidence가 불완전하다`);
+  }
+  return {
+    sessionId: storedText(row.session_id, `${gateKey}.session_id`, 36),
+    revision: storedRevision(row.revision, `${row.session_id}.revision`),
+    buttonEventKey: storedText(row.button_event_key, `${row.session_id}.button_event_key`, 64),
+    gateKey,
+    teamId: storedText(row.team_id, `${row.session_id}.team_id`, 32),
+    ownerUserId: storedText(row.owner_user_id, `${row.session_id}.owner_user_id`, 32),
+    apiAppId: storedText(row.api_app_id, `${row.session_id}.api_app_id`, 32),
+    channelId: storedText(row.channel_id, `${row.session_id}.channel_id`, 32),
+    threadTs: storedText(row.thread_ts, `${row.session_id}.thread_ts`, 32),
+    messageTs: storedText(row.message_ts, `${row.session_id}.message_ts`, 32),
+    blockId: storedText(row.block_id, `${row.session_id}.block_id`, 255),
+    actionId: storedText(row.action_id, `${row.session_id}.action_id`, 255),
+    actionValue: storedText(row.action_value, `${row.session_id}.action_value`, 255),
+    callbackId: storedText(row.callback_id, `${row.session_id}.callback_id`, 255),
+    inputBlockId: storedText(row.input_block_id, `${row.session_id}.input_block_id`, 255),
+    inputActionId: storedText(row.input_action_id, `${row.session_id}.input_action_id`, 255),
+    state,
+    viewId,
+    failureCode,
+    resolutionText,
+    createdAt: storedIso(row.created_at, `${row.session_id}.created_at`),
+    updatedAt: storedIso(row.updated_at, `${row.session_id}.updated_at`),
+    openedAt,
+    acceptedAt,
+  };
 }
 
 const RESOLUTION_LIFECYCLES = new Set<GateResolutionLifecycle>([
@@ -2111,6 +2293,422 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     return row === undefined ? null : toGateLocalObservation(row);
   }
 
+  prepareGateDirectModal(input: GateDirectPrepareInput): GateDirectPrepareResult {
+    storedIso(input.at, 'gate direct modal prepare.at');
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        input.sessionId,
+      ) ||
+      !/^[0-9a-f]{64}$/.test(input.buttonEventKey)
+    ) {
+      return { kind: 'rejected', reason: 'invalid_modal_correlation' };
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const messageRow = this.db.prepare(SELECT_GATE_MESSAGE_BY_SLACK).get(
+        input.channelId,
+        input.messageTs,
+      ) as GateMessageRow | undefined;
+      if (messageRow === undefined) {
+        this.insertGateAudit(null, 'rejected', 'unknown_message', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'unknown_message' };
+      }
+      const message = toGateMessage(messageRow);
+      const metadataRow = this.db.prepare(SELECT_GATE_METADATA).get(message.gateKey) as
+        | GateMetadataRow
+        | undefined;
+      const observationRow = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(message.gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      if (metadataRow === undefined || observationRow === undefined) {
+        this.insertGateAudit(message.gateKey, 'rejected', 'missing_sidecar_or_observation', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'missing_sidecar_or_observation' };
+      }
+      const metadata = toGateMetadata(metadataRow);
+      const observation = toGateLocalObservation(observationRow);
+      const immutableReason =
+        !/^T[A-Z0-9]+$/.test(input.teamId) ||
+        !/^U[A-Z0-9]+$/.test(input.ownerUserId) ||
+        !/^A[A-Z0-9]+$/.test(input.apiAppId) ||
+        !/^[CG][A-Z0-9]+$/.test(input.channelId) ||
+        !/^\d+\.\d+$/.test(input.threadTs) ||
+        !/^\d+\.\d+$/.test(input.messageTs)
+          ? 'invalid_slack_identity'
+          : message.channelId !== input.channelId || message.messageTs !== input.messageTs
+            ? 'message_identity_mismatch'
+            : message.threadTs !== input.threadTs
+              ? 'thread_identity_mismatch'
+              : message.runKey !== metadata.runKey
+                ? 'run_identity_mismatch'
+                : input.blockId !== gateDirectBlockId(message.gateKey)
+                  ? 'unknown_direct_block'
+                  : input.actionId !== gateDirectActionId(message.gateKey)
+                    ? 'unknown_direct_action'
+                    : input.actionValue !== gateDirectActionValue(message.gateKey)
+                      ? 'unknown_direct_value'
+                      : null;
+      if (immutableReason !== null) {
+        this.insertGateAudit(message.gateKey, 'rejected', immutableReason, input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: immutableReason };
+      }
+      const existingEventRow = this.db.prepare(SELECT_GATE_DIRECT_MODAL_BY_EVENT).get(
+        input.buttonEventKey,
+      ) as GateDirectModalRow | undefined;
+      if (existingEventRow !== undefined) {
+        const existing = toGateDirectModal(existingEventRow);
+        const exact =
+          existing.gateKey === message.gateKey &&
+          existing.teamId === input.teamId &&
+          existing.ownerUserId === input.ownerUserId &&
+          existing.apiAppId === input.apiAppId &&
+          existing.channelId === input.channelId &&
+          existing.threadTs === input.threadTs &&
+          existing.messageTs === input.messageTs &&
+          existing.blockId === input.blockId &&
+          existing.actionId === input.actionId &&
+          existing.actionValue === input.actionValue;
+        if (!exact) {
+          this.insertGateAudit(message.gateKey, 'rejected', 'button_event_collision', input.at);
+          this.db.exec('COMMIT');
+          return { kind: 'rejected', reason: 'button_event_collision' };
+        }
+        this.db.exec('COMMIT');
+        return { kind: 'duplicate', session: existing, metadata };
+      }
+      if (this.db.prepare(SELECT_GATE_RESOLUTION).get(message.gateKey) !== undefined) {
+        this.insertGateAudit(message.gateKey, 'rejected', 'resolution_already_claimed', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'resolution_already_claimed' };
+      }
+      const mutableReason =
+        observation.runKey !== metadata.runKey
+          ? 'run_identity_mismatch'
+          : observation.gateKey !== message.gateKey || observation.taskKey !== metadata.taskKey
+            ? 'gate_task_identity_mismatch'
+            : observation.metadataState !== 'matched'
+              ? 'sidecar_not_matched'
+              : observation.mappingState !== 'matched' || observationRow.write_owner !== null
+                ? 'card_mapping_not_matched'
+                : observation.status !== 'pending'
+                  ? 'stale_or_resolved'
+                  : null;
+      if (mutableReason !== null) {
+        this.insertGateAudit(message.gateKey, 'rejected', mutableReason, input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: mutableReason };
+      }
+      this.db.prepare(INSERT_GATE_DIRECT_MODAL).run(
+        input.sessionId,
+        input.buttonEventKey,
+        message.gateKey,
+        input.teamId,
+        input.ownerUserId,
+        input.apiAppId,
+        input.channelId,
+        input.threadTs,
+        input.messageTs,
+        input.blockId,
+        input.actionId,
+        input.actionValue,
+        gateDirectCallbackId(message.gateKey),
+        gateDirectInputBlockId(message.gateKey),
+        gateDirectInputActionId(message.gateKey),
+        input.at,
+        input.at,
+      );
+      const sessionRow = this.db.prepare(SELECT_GATE_DIRECT_MODAL).get(input.sessionId) as
+        GateDirectModalRow;
+      const session = toGateDirectModal(sessionRow);
+      this.db.exec('COMMIT');
+      return { kind: 'prepared', session, metadata };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  findGateDirectModal(sessionId: string): GateDirectModalSession | null {
+    const row = this.db.prepare(SELECT_GATE_DIRECT_MODAL).get(sessionId) as
+      | GateDirectModalRow
+      | undefined;
+    return row === undefined ? null : toGateDirectModal(row);
+  }
+
+  beginGateDirectModalOpen(
+    sessionId: string,
+    expectedRevision: number,
+    at: string,
+  ): GateDirectModalSession | null {
+    storedRevision(expectedRevision, `${sessionId}.open expected revision`);
+    storedIso(at, `${sessionId}.open at`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const sessionRow = this.db.prepare(SELECT_GATE_DIRECT_MODAL).get(sessionId) as
+        | GateDirectModalRow
+        | undefined;
+      if (sessionRow === undefined) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const session = toGateDirectModal(sessionRow);
+      if (session.revision !== expectedRevision || session.state !== 'prepared') {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const metadataRow = this.db.prepare(SELECT_GATE_METADATA).get(session.gateKey) as
+        | GateMetadataRow
+        | undefined;
+      const messageRow = this.db.prepare(SELECT_GATE_MESSAGE).get(session.gateKey) as
+        | GateMessageRow
+        | undefined;
+      const observationRow = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(session.gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      const metadata = metadataRow === undefined ? null : toGateMetadata(metadataRow);
+      const message = messageRow === undefined ? null : toGateMessage(messageRow);
+      const observation = observationRow === undefined ? null : toGateLocalObservation(observationRow);
+      const resolutionExists = this.db.prepare(SELECT_GATE_RESOLUTION).get(session.gateKey) !== undefined;
+      const stillCurrent =
+        metadata !== null && message !== null && observation !== null && !resolutionExists &&
+        message.gateKey === session.gateKey && message.runKey === metadata.runKey &&
+        message.channelId === session.channelId && message.threadTs === session.threadTs &&
+        message.messageTs === session.messageTs && observation.gateKey === session.gateKey &&
+        observation.runKey === metadata.runKey && observation.taskKey === metadata.taskKey &&
+        observation.metadataState === 'matched' && observation.mappingState === 'matched' &&
+        observationRow?.write_owner === null && observation.status === 'pending';
+      if (!stillCurrent) {
+        this.insertGateAudit(session.gateKey, 'rejected', 'modal_open_sidecar_stale', at);
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const result = this.db.prepare(BEGIN_GATE_DIRECT_MODAL_OPEN).run(
+        at,
+        sessionId,
+        expectedRevision,
+      );
+      if (Number(result.changes) !== 1) {
+        throw new Error(`${session.gateKey}의 direct modal open edge를 원자적으로 기록할 수 없다`);
+      }
+      const openedRow = this.db.prepare(SELECT_GATE_DIRECT_MODAL).get(sessionId) as GateDirectModalRow;
+      const opening = toGateDirectModal(openedRow);
+      this.db.exec('COMMIT');
+      return opening;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  finishGateDirectModalOpen(
+    sessionId: string,
+    expectedRevision: number,
+    result: GateDirectOpenResult,
+    at: string,
+  ): GateDirectModalSession | null {
+    storedRevision(expectedRevision, `${sessionId}.open result expected revision`);
+    storedIso(at, `${sessionId}.open result at`);
+    const current = this.findGateDirectModal(sessionId);
+    if (current === null || current.revision !== expectedRevision || current.state !== 'opening') {
+      return null;
+    }
+    let updated;
+    if (result.kind === 'opened') {
+      const exactIdentity =
+        /^V[A-Z0-9]+$/.test(result.viewId) &&
+        result.teamId === current.teamId &&
+        result.apiAppId === current.apiAppId &&
+        result.callbackId === current.callbackId &&
+        result.privateMetadata === current.sessionId;
+      if (exactIdentity) {
+        updated = this.db.prepare(FINISH_GATE_DIRECT_MODAL_OPENED).run(
+          result.viewId,
+          at,
+          at,
+          sessionId,
+          expectedRevision,
+        );
+      } else {
+        updated = this.db.prepare(FINISH_GATE_DIRECT_MODAL_FAILED).run(
+          'response_identity_mismatch',
+          at,
+          sessionId,
+          expectedRevision,
+        );
+      }
+    } else {
+      updated = this.db.prepare(FINISH_GATE_DIRECT_MODAL_FAILED).run(
+        gateCode(result.code, 80),
+        at,
+        sessionId,
+        expectedRevision,
+      );
+    }
+    return Number(updated.changes) === 1 ? this.findGateDirectModal(sessionId) : null;
+  }
+
+  claimGateDirectResolution(input: GateDirectClaimInput): GateClaimResult {
+    storedIso(input.at, 'gate direct resolution claim.at');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const sessionRow = this.db.prepare(SELECT_GATE_DIRECT_MODAL).get(input.sessionId) as
+        | GateDirectModalRow
+        | undefined;
+      if (sessionRow === undefined) {
+        this.insertGateAudit(null, 'rejected', 'unknown_modal_session', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'unknown_modal_session' };
+      }
+      const session = toGateDirectModal(sessionRow);
+      const metadataRow = this.db.prepare(SELECT_GATE_METADATA).get(session.gateKey) as
+        | GateMetadataRow
+        | undefined;
+      const messageRow = this.db.prepare(SELECT_GATE_MESSAGE).get(session.gateKey) as
+        | GateMessageRow
+        | undefined;
+      const observationRow = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(session.gateKey) as
+        | GateLocalObservationRow
+        | undefined;
+      if (metadataRow === undefined || messageRow === undefined || observationRow === undefined) {
+        this.insertGateAudit(session.gateKey, 'rejected', 'missing_sidecar_or_observation', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'missing_sidecar_or_observation' };
+      }
+      const metadata = toGateMetadata(metadataRow);
+      const message = toGateMessage(messageRow);
+      const observation = toGateLocalObservation(observationRow);
+      const immutableReason =
+        input.privateMetadata !== input.sessionId ||
+        input.teamId !== session.teamId ||
+        input.ownerUserId !== session.ownerUserId ||
+        input.apiAppId !== session.apiAppId ||
+        input.viewId !== session.viewId ||
+        input.callbackId !== session.callbackId ||
+        input.inputBlockId !== session.inputBlockId ||
+        input.inputActionId !== session.inputActionId
+          ? 'modal_identity_mismatch'
+          : message.gateKey !== session.gateKey ||
+              message.runKey !== metadata.runKey ||
+              message.channelId !== session.channelId ||
+              message.threadTs !== session.threadTs ||
+              message.messageTs !== session.messageTs
+            ? 'modal_message_mismatch'
+            : metadata.taskKey.slice('task:'.length) === ''
+              ? 'modal_metadata_mismatch'
+              : null;
+      if (immutableReason !== null) {
+        this.insertGateAudit(session.gateKey, 'rejected', immutableReason, input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: immutableReason };
+      }
+      const existingRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(session.gateKey) as
+        | GateResolutionRow
+        | undefined;
+      const existing = existingRow === undefined ? null : toGateResolution(existingRow);
+      if (existing !== null) {
+        const exact =
+          session.state === 'accepted' &&
+          session.resolutionText === input.resolutionText &&
+          existing.optionId === GATE_DIRECT_OPTION_ID &&
+          existing.optionResolution === input.resolutionText &&
+          existing.teamId === input.teamId &&
+          existing.ownerUserId === input.ownerUserId &&
+          existing.apiAppId === input.apiAppId &&
+          existing.channelId === session.channelId &&
+          existing.threadTs === session.threadTs &&
+          existing.messageTs === session.messageTs &&
+          existing.blockId === session.inputBlockId &&
+          existing.actionId === session.inputActionId &&
+          existing.actionValue === session.sessionId;
+        if (exact) {
+          this.insertGateAudit(session.gateKey, 'duplicate', 'same_transition', input.at);
+          this.db.exec('COMMIT');
+          return { kind: 'duplicate', intent: existing, metadata };
+        }
+        this.insertGateAudit(session.gateKey, 'lost', 'different_transition', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'lost', intent: existing };
+      }
+      if (session.state !== 'opened') {
+        this.insertGateAudit(session.gateKey, 'rejected', 'modal_not_opened', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'modal_not_opened' };
+      }
+      const mutableReason =
+        observation.runKey !== metadata.runKey || observation.taskKey !== metadata.taskKey
+          ? 'gate_task_identity_mismatch'
+          : observation.metadataState !== 'matched'
+            ? 'sidecar_not_matched'
+            : observation.mappingState !== 'matched' || observationRow.write_owner !== null
+              ? 'card_mapping_not_matched'
+              : observation.status !== 'pending'
+                ? 'stale_or_resolved'
+                : null;
+      if (mutableReason !== null) {
+        this.insertGateAudit(session.gateKey, 'rejected', mutableReason, input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: mutableReason };
+      }
+      if (
+        input.resolutionText.length === 0 || input.resolutionText.length > 3000 ||
+        input.resolutionText.trim() === '' ||
+        /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(input.resolutionText) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          input.retryRequestId,
+        )
+      ) {
+        this.insertGateAudit(session.gateKey, 'rejected', 'invalid_direct_claim', input.at);
+        this.db.exec('COMMIT');
+        return { kind: 'rejected', reason: 'invalid_direct_claim' };
+      }
+      this.db.prepare(INSERT_GATE_RESOLUTION).run(
+        session.gateKey,
+        input.retryRequestId,
+        GATE_DIRECT_OPTION_ID,
+        input.resolutionText,
+        metadata.askMessageId,
+        metadata.questionThreadId,
+        metadata.dispatchKey.slice('dispatch:'.length),
+        metadata.taskKey.slice('task:'.length),
+        input.teamId,
+        input.ownerUserId,
+        input.apiAppId,
+        session.channelId,
+        session.threadTs,
+        session.messageTs,
+        session.inputBlockId,
+        session.inputActionId,
+        session.sessionId,
+        input.at,
+        input.at,
+      );
+      const accepted = this.db.prepare(ACCEPT_GATE_DIRECT_MODAL).run(
+        input.resolutionText,
+        input.at,
+        input.at,
+        session.sessionId,
+        session.revision,
+      );
+      if (Number(accepted.changes) !== 1) {
+        throw new Error(`${session.gateKey}의 direct modal winner를 원자적으로 기록할 수 없다`);
+      }
+      this.db.prepare(INSERT_GATE_OUTBOX).run(session.gateKey, input.at, input.at);
+      if (!this.insertGateAudit(session.gateKey, 'claimed', 'first_valid_selection', input.at)) {
+        throw new Error(`${session.gateKey}의 first-winner audit를 원자적으로 기록할 수 없다`);
+      }
+      const claimedRow = this.db.prepare(SELECT_GATE_RESOLUTION).get(session.gateKey) as
+        GateResolutionRow;
+      const claimed = toGateResolution(claimedRow);
+      this.db.exec('COMMIT');
+      return { kind: 'claimed', intent: claimed, metadata };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   claimGateResolution(input: GateClaimInput): GateClaimResult {
     storedIso(input.at, 'gate resolution claim.at');
     this.db.exec('BEGIN IMMEDIATE');
@@ -3083,6 +3681,31 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
     return row === undefined ? null : toGateLocalObservation(row);
   }
 
+  prepareGateDirectModal(): GateDirectPrepareResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate direct modal을 준비하려 했다: ${this.path}`);
+  }
+
+  findGateDirectModal(sessionId: string): GateDirectModalSession | null {
+    const { db, schemaReady } = this.opened;
+    if (db === null || !schemaReady) return null;
+    const row = db.prepare(SELECT_GATE_DIRECT_MODAL).get(sessionId) as
+      | GateDirectModalRow
+      | undefined;
+    return row === undefined ? null : toGateDirectModal(row);
+  }
+
+  beginGateDirectModalOpen(): GateDirectModalSession | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate direct modal open을 시작하려 했다: ${this.path}`);
+  }
+
+  finishGateDirectModalOpen(): GateDirectModalSession | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate direct modal open을 확정하려 했다: ${this.path}`);
+  }
+
+  claimGateDirectResolution(): GateClaimResult {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate direct resolution을 claim하려 했다: ${this.path}`);
+  }
+
   claimGateResolution(): GateClaimResult {
     throw new Error(`dry-run은 store에 쓰지 않는다. Gate resolution을 claim하려 했다: ${this.path}`);
   }
@@ -3283,6 +3906,13 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     'metadata_state', 'mapping_state', 'write_owner', 'write_expires_at', 'observed_at',
   ],
   gate_observation_generation: ['gate_key', 'revision'],
+  gate_direct_modal: [
+    'session_id', 'revision', 'button_event_key', 'gate_key',
+    'team_id', 'owner_user_id', 'api_app_id', 'channel_id', 'thread_ts', 'message_ts',
+    'block_id', 'action_id', 'action_value', 'callback_id', 'input_block_id', 'input_action_id',
+    'state', 'view_id', 'failure_code', 'resolution_text',
+    'created_at', 'updated_at', 'opened_at', 'accepted_at',
+  ],
   gate_resolution: [
     'gate_key', 'revision', 'ack_state', 'lease_owner', 'lease_expires_at',
     'retry_request_id', 'option_id', 'option_resolution',
@@ -3323,7 +3953,11 @@ function validateCurrentGateStore(
     }
   }
   const normalizeSql = (sql: string): string => sql.replace(/\s+/g, ' ').trim().replace(/;$/, '');
-  const gateSchemaObjects = { ...GATE_V8_SCHEMA_OBJECTS, ...GATE_V9_SCHEMA_OBJECTS };
+  const gateSchemaObjects = {
+    ...GATE_V8_SCHEMA_OBJECTS,
+    ...GATE_V9_SCHEMA_OBJECTS,
+    ...GATE_V10_SCHEMA_OBJECTS,
+  };
   for (const [name, expected] of Object.entries(gateSchemaObjects)) {
     const row = db.prepare(
       `SELECT sql FROM sqlite_master WHERE name = ? AND type IN ('table', 'index')`,
@@ -3336,14 +3970,15 @@ function validateCurrentGateStore(
   const unexpectedD2Objects = (db.prepare(
     `SELECT type, name, tbl_name FROM sqlite_master
       WHERE (type = 'trigger' AND tbl_name IN
-              ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_resolution',
+              ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_direct_modal','gate_resolution',
                'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit'))
          OR (type = 'table' AND
               (name LIKE 'gate_metadata%' OR name LIKE 'gate_message%' OR
                name LIKE 'gate_local_observation%' OR name LIKE 'gate_observation_generation%' OR
+               name LIKE 'gate_direct_modal%' OR
                name LIKE 'gate_resolution%'))
          OR (type = 'index' AND tbl_name IN
-              ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_resolution',
+              ('gate_metadata','gate_message','gate_local_observation','gate_observation_generation','gate_direct_modal','gate_resolution',
                'gate_resolution_outbox','gate_resolution_attempt','gate_resolution_audit'))`,
   ).all() as {
     readonly type: string;
@@ -3353,7 +3988,7 @@ function validateCurrentGateStore(
     !row.name.startsWith('sqlite_autoindex_') && !expectedD2Objects.has(row.name),
   );
   if (unexpectedD2Objects.length > 0) {
-    throw new Error(`store 파일에 code-owned v8 shape 밖의 schema object가 있다: ${path}`);
+    throw new Error(`store 파일에 current code-owned Gate shape 밖의 schema object가 있다: ${path}`);
   }
 
   const metadatas = (db.prepare(
@@ -3382,6 +4017,8 @@ function validateCurrentGateStore(
       throw new Error(`store 파일에 local observation 없는 generation이 있다: ${path}`);
     }
   }
+  const modalSessions = (db.prepare(SELECT_ALL_GATE_DIRECT_MODALS).all() as GateDirectModalRow[])
+    .map(toGateDirectModal);
   const intents = (db.prepare(SELECT_ALL_GATE_RESOLUTIONS).all() as GateResolutionRow[]).map(
     toGateResolution,
   );
@@ -3396,6 +4033,7 @@ function validateCurrentGateStore(
   const messageByGate = new Map(messages.map((row) => [row.gateKey, row]));
   const intentByGate = new Map(intents.map((row) => [row.gateKey, row]));
   const outboxByGate = new Map(outboxes.map((row) => [row.gateKey, row]));
+  const modalBySession = new Map(modalSessions.map((row) => [row.sessionId, row]));
 
   for (const observation of observations) {
     const metadata = metadataByGate.get(observation.gateKey);
@@ -3414,6 +4052,42 @@ function validateCurrentGateStore(
       (observation.mappingState === 'mismatched' && message === undefined)
     ) {
       throw new Error(`store 파일의 ${observation.gateKey} local observation correlation이 어긋난다: ${path}`);
+    }
+  }
+
+  for (const session of modalSessions) {
+    const metadata = metadataByGate.get(session.gateKey);
+    const message = messageByGate.get(session.gateKey);
+    const intent = intentByGate.get(session.gateKey);
+    if (
+      metadata === undefined || message === undefined ||
+      message.runKey !== metadata.runKey ||
+      message.channelId !== session.channelId ||
+      message.threadTs !== session.threadTs ||
+      message.messageTs !== session.messageTs ||
+      session.blockId !== gateDirectBlockId(session.gateKey) ||
+      session.actionId !== gateDirectActionId(session.gateKey) ||
+      session.actionValue !== gateDirectActionValue(session.gateKey) ||
+      session.callbackId !== gateDirectCallbackId(session.gateKey) ||
+      session.inputBlockId !== gateDirectInputBlockId(session.gateKey) ||
+      session.inputActionId !== gateDirectInputActionId(session.gateKey)
+    ) {
+      throw new Error(`store 파일의 ${session.gateKey} direct modal correlation이 어긋난다: ${path}`);
+    }
+    if (session.state === 'accepted') {
+      if (
+        intent === undefined || intent.optionId !== GATE_DIRECT_OPTION_ID ||
+        intent.optionResolution !== session.resolutionText ||
+        intent.teamId !== session.teamId || intent.ownerUserId !== session.ownerUserId ||
+        intent.apiAppId !== session.apiAppId || intent.channelId !== session.channelId ||
+        intent.threadTs !== session.threadTs || intent.messageTs !== session.messageTs ||
+        intent.blockId !== session.inputBlockId || intent.actionId !== session.inputActionId ||
+        intent.actionValue !== session.sessionId
+      ) {
+        throw new Error(`store 파일의 ${session.gateKey} accepted modal winner가 어긋난다: ${path}`);
+      }
+    } else if (intent?.optionId === GATE_DIRECT_OPTION_ID && intent.actionValue === session.sessionId) {
+      throw new Error(`store 파일의 ${session.gateKey} direct winner modal이 accepted가 아니다: ${path}`);
     }
   }
 
@@ -3440,19 +4114,31 @@ function validateCurrentGateStore(
     if (metadata === undefined || message === undefined || observation === undefined || outbox === undefined) {
       throw new Error(`store 파일의 ${intent.gateKey} resolution correlation row가 불완전하다: ${path}`);
     }
+    const directSession = intent.optionId === GATE_DIRECT_OPTION_ID
+      ? modalBySession.get(intent.actionValue)
+      : undefined;
     const option = metadata.options.filter((candidate) => candidate.id === intent.optionId);
+    const sourceCorrelation = directSession === undefined
+      ? option.length === 1 &&
+        option[0]?.resolution === intent.optionResolution &&
+        intent.blockId === gateBlockId(intent.gateKey) &&
+        intent.actionId === gateActionId(intent.gateKey, intent.optionId) &&
+        intent.actionValue === intent.optionId
+      : directSession.state === 'accepted' &&
+        directSession.gateKey === intent.gateKey &&
+        directSession.resolutionText === intent.optionResolution &&
+        directSession.inputBlockId === intent.blockId &&
+        directSession.inputActionId === intent.actionId &&
+        directSession.sessionId === intent.actionValue;
     if (
-      option.length !== 1 || option[0]?.resolution !== intent.optionResolution ||
+      !sourceCorrelation ||
       metadata.askMessageId !== intent.askMessageId ||
       metadata.questionThreadId !== intent.questionThreadId ||
       metadata.dispatchKey !== `dispatch:${intent.dispatchId}` ||
       metadata.taskKey !== `task:${intent.taskId}` ||
       message.runKey !== metadata.runKey || message.channelId !== intent.channelId ||
       message.threadTs !== intent.threadTs || message.messageTs !== intent.messageTs ||
-      observation.runKey !== metadata.runKey || observation.taskKey !== metadata.taskKey ||
-      intent.blockId !== gateBlockId(intent.gateKey) ||
-      intent.actionId !== gateActionId(intent.gateKey, intent.optionId) ||
-      intent.actionValue !== intent.optionId
+      observation.runKey !== metadata.runKey || observation.taskKey !== metadata.taskKey
     ) {
       throw new Error(`store 파일의 ${intent.gateKey} resolution correlation이 어긋난다: ${path}`);
     }

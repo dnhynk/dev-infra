@@ -4,12 +4,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, runDaemonCommand } from '../src/cli.js';
-import { gateActionId, gateBlockId } from '../src/gate/actions.js';
+import {
+  gateActionId,
+  gateBlockId,
+  gateDirectActionId,
+  gateDirectActionValue,
+  gateDirectBlockId,
+  gateDirectInputActionId,
+  gateDirectInputBlockId,
+} from '../src/gate/actions.js';
+import { GATE_DIRECT_OPTION_ID } from '../src/gate/direct-input-types.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
 import type { PostMessageInput, PostedMessage, SlackPoster, UpdateMessageInput } from '../src/slack/post.js';
 import type { SocketConnectionFactory, SocketConnectionHooks } from '../src/slack/socket.js';
+import type { OpenSlackViewInput, OpenedSlackView, SlackViewOpener } from '../src/slack/views.js';
 import { APP_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 
@@ -126,6 +136,7 @@ async function waitFor(check: () => boolean): Promise<void> {
 
 class FakeOrca implements OrcaRunner {
   resolved = false;
+  resolution = '현행 유지';
   blockFirstList = false;
   readonly calls: string[][] = [];
   private releaseBlockedList!: () => void;
@@ -134,7 +145,7 @@ class FakeOrca implements OrcaRunner {
     return {
       id: GATE_ID, run_id: RUN_ID, task_id: TASK_ID, question: '표시용',
       options: '["현행 유지"]', status: this.resolved ? 'resolved' : 'pending',
-      resolution: this.resolved ? '현행 유지' : null,
+      resolution: this.resolved ? this.resolution : null,
       created_at: '2026-08-24T09:00:00.000Z', resolved_at: this.resolved ? AT : null,
     };
   }
@@ -149,6 +160,7 @@ class FakeOrca implements OrcaRunner {
     }
     if (args[1] === 'gate-resolve') {
       this.resolved = true;
+      this.resolution = args[args.indexOf('--resolution') + 1] ?? this.resolution;
       const request = args[args.indexOf('--retry-request') + 1];
       return Promise.resolve(JSON.stringify({
         id: 'x', ok: true,
@@ -160,6 +172,20 @@ class FakeOrca implements OrcaRunner {
 
   releaseList(): void {
     this.releaseBlockedList();
+  }
+}
+
+class FakeViewOpener implements SlackViewOpener {
+  readonly calls: OpenSlackViewInput[] = [];
+  async open(input: OpenSlackViewInput): Promise<OpenedSlackView> {
+    this.calls.push(input);
+    return {
+      id: 'V0DIRECT',
+      teamId: 'T0TEAM',
+      appId: 'A0APP',
+      callbackId: input.view.callback_id ?? '',
+      privateMetadata: input.view.private_metadata ?? '',
+    };
   }
 }
 
@@ -192,6 +218,112 @@ class NeverSettlingSlack implements SlackPoster {
 }
 
 describe('daemon production wiring', () => {
+  it('direct button → modal errors → valid ACK → fake Orca → durable projection을 잇는다', async () => {
+    seed();
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const orca = new FakeOrca();
+    const slack = new FakeSlack();
+    const opener = new FakeViewOpener();
+    let hooks: SocketConnectionHooks | null = null;
+    let buttonAcks = 0;
+    const invalidAcks: unknown[] = [];
+    let validAcks = 0;
+    const connectionFactory: SocketConnectionFactory = (received) => {
+      hooks = received;
+      return {
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      };
+    };
+
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      orca,
+      slack,
+      viewOpener: opener,
+      connectionFactory,
+      waitForStop: async () => {
+        const consume = hooks?.event;
+        if (consume === undefined) throw new Error('Socket event consumer was not wired');
+        await consume({
+          type: 'interactive',
+          ack: () => { buttonAcks += 1; },
+          body: {
+            type: 'block_actions', api_app_id: 'A0APP', trigger_id: 'TRIGGER_PRIVATE',
+            team: { id: 'T0TEAM' }, user: { id: 'U0OWNER', team_id: 'T0TEAM' },
+            channel: { id: CHANNEL },
+            container: {
+              type: 'message', channel_id: CHANNEL, message_ts: MESSAGE_TS, is_ephemeral: false,
+            },
+            message: { ts: MESSAGE_TS, thread_ts: THREAD_TS },
+            actions: [{
+              type: 'button', block_id: gateDirectBlockId(GATE),
+              action_id: gateDirectActionId(GATE), value: gateDirectActionValue(GATE),
+              action_ts: '1787554900.000011', text: { type: 'plain_text', text: '직접 입력' },
+            }],
+          },
+        });
+        expect(buttonAcks).toBe(1);
+        expect(opener.calls).toHaveLength(1);
+        const view = opener.calls[0]?.view;
+        if (view === undefined) throw new Error('modal view missing');
+        const input = view.blocks[0];
+        expect(input).toMatchObject({
+          type: 'input',
+          block_id: gateDirectInputBlockId(GATE),
+          element: {
+            type: 'plain_text_input',
+            action_id: gateDirectInputActionId(GATE),
+          },
+        });
+        const submission = (value: string) => ({
+          type: 'view_submission', api_app_id: 'A0APP',
+          team: { id: 'T0TEAM' }, user: { id: 'U0OWNER', team_id: 'T0TEAM' },
+          view: {
+            id: 'V0DIRECT', type: 'modal', team_id: 'T0TEAM', app_id: 'A0APP',
+            callback_id: view.callback_id, private_metadata: view.private_metadata,
+            state: { values: {
+              [gateDirectInputBlockId(GATE)]: {
+                [gateDirectInputActionId(GATE)]: { type: 'plain_text_input', value },
+              },
+            } },
+          },
+        });
+        await consume({
+          type: 'interactive',
+          ack: (body) => { invalidAcks.push(body); },
+          body: submission('   \n\t'),
+        });
+        expect(invalidAcks).toEqual([{
+          response_action: 'errors',
+          errors: { [gateDirectInputBlockId(GATE)]: '1~3000자의 유효한 결정 내용을 입력하세요.' },
+        }]);
+        await consume({
+          type: 'interactive',
+          ack: () => { validAcks += 1; },
+          body: submission('직접 입력으로 최종 결정'),
+        });
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(validAcks).toBe(1);
+    expect(opener.calls[0]?.triggerId).toBe('TRIGGER_PRIVATE');
+    expect(orca.calls.filter((call) => call[1] === 'gate-resolve')).toHaveLength(1);
+    expect(orca.calls.find((call) => call[1] === 'gate-resolve')).toContain('직접 입력으로 최종 결정');
+    expect(JSON.stringify(slack.updates.at(-1))).toContain('직접 입력');
+    expect(JSON.stringify(slack.updates.at(-1))).not.toContain('작업 재개');
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findGateResolution(GATE)).toMatchObject({
+      optionId: GATE_DIRECT_OPTION_ID,
+      optionResolution: '직접 입력으로 최종 결정',
+      lifecycle: 'resolved',
+      ackState: 'acked',
+    });
+    expect(reopened.listPendingGateOutboxes()).toEqual([]);
+    reopened.close();
+  });
+
   it('Socket event → ACK → durable CAS → Orca resolve → existing card update를 실제 CLI path로 잇는다', async () => {
     seed();
     const parsed = parseArgs(['daemon', '--state', statePath]);

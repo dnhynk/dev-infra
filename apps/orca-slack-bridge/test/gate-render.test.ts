@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { renderFingerprint } from '../src/digest/render.js';
 import { renderGateDecisionCard } from '../src/gate/render.js';
+import {
+  gateDirectActionId,
+  gateDirectActionValue,
+  gateDirectBlockId,
+} from '../src/gate/actions.js';
 import type { GateDecisionFacts } from '../src/gate/types.js';
 import { gateKey } from '../src/identity/keys.js';
 
@@ -64,12 +69,33 @@ describe('Gate decision renderer', () => {
     expect(rendered).toContain('task_side');
     expect(rendered).toContain('msg_ask');
     expect(rendered).toContain('ctx_gate');
-    expect(card.blocks.filter((block) => block['type'] === 'actions')).toHaveLength(1);
+    expect(card.blocks.filter((block) => block['type'] === 'actions')).toHaveLength(2);
     expect(json).toContain('"type":"button"');
     expect(json).toContain('orca_gate_fixed_options_v1');
     expect(json).toContain('orca_gate_resolve_v1');
+    expect(json).toContain('orca_gate_direct_open_v1');
+    expect(json).toContain('orca_gate_direct_controls_v1');
+    expect(json).toContain('직접 입력');
     expect(json).toContain('"value":"keep"');
     expect(json).toContain('"value":"change"');
+    expect(json).toContain(gateDirectBlockId(facts().key));
+    expect(json).toContain(gateDirectActionId(facts().key));
+    expect(json).toContain(gateDirectActionValue(facts().key));
+  });
+
+  it('25 fixed options와 Gate-specific direct action을 서로 다른 actions block에 둔다', () => {
+    const options = Array.from({ length: 25 }, (_, index) => ({
+      id: `option_${index}`,
+      label: `선택 ${index}`,
+      description: `설명 ${index}`,
+      resolution: `결정 ${index}`,
+    }));
+    const card = renderGateDecisionCard(facts({ options }));
+    const actionBlocks = card.blocks.filter((block) => block['type'] === 'actions');
+    expect(actionBlocks).toHaveLength(2);
+    expect((actionBlocks[0]?.['elements'] as readonly unknown[])).toHaveLength(25);
+    expect((actionBlocks[1]?.['elements'] as readonly unknown[])).toHaveLength(1);
+    expect(actionBlocks[0]?.['block_id']).not.toBe(actionBlocks[1]?.['block_id']);
   });
 
   it('degraded card는 recommendation/impact를 추측하지 않고 판정 불가 Task를 드러낸다', () => {
