@@ -1,7 +1,7 @@
 # dev-infra 문서 인덱스
 
-상태: **C1 구현·검증 반영, 후속 slice 명세 초안**
-기준일: **2026-08-23**
+상태: **C1~D3 offline 구현·검증 반영, D3 live acceptance 대기**
+기준일: **2026-08-26**
 
 이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
 
@@ -19,8 +19,9 @@
 10. [미결정 사항](open-decisions.md)
 11. [검증된 플랫폼 역량과 제약](platform-capabilities.md)
 12. [Slack App 준비 절차](ops/slack-app-setup.md)
-13. [요구사항 추적표](traceability.md)
-14. [Phase 0 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
+13. [Channel Adapter 운영·live acceptance](ops/channel-adapter-acceptance.md)
+14. [요구사항 추적표](traceability.md)
+15. [Phase 0/D3 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
 
 ## 문서 권위와 표기
 
@@ -72,4 +73,7 @@
 
 ## 현재 산출물 경계
 
-이 문서 세트는 C1 PR Digest의 구현·검증 결과와 후속 slice의 현재 계약을 함께 보존한다. C1에서는 테스트, GitHub API 조회, 실제 `#pr-digest` 게시 1회와 재실행 관측을 완료했다. Gate resolve와 Channel notification은 실행하지 않았다.
+이 문서 세트는 C1~D3 구현과 검증 결과, 후속 slice의 현재 계약을 함께 보존한다. D3의 daemon,
+durable delivery, Task-resume evidence, existing-card projection은 hermetic failure matrix까지 구현했다.
+다만 actual Claude Code 2.1.243 development Channel과 실제 post-baseline Task resume는 아직 관찰하지
+않았으므로 `LIVE_CHANNEL_UNVERIFIED`다. live 절차는 operator 문서의 수동 경계를 따른다.

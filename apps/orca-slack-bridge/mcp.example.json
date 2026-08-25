@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "orca-slack": {
+      "command": "node",
+      "args": [
+        "<ABSOLUTE_REPOSITORY_PATH>/apps/orca-slack-bridge/dist/cli.js",
+        "channel-adapter"
+      ]
+    }
+  }
+}

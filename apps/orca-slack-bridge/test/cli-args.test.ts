@@ -150,13 +150,15 @@ describe('명령 분기', () => {
     expect(parseArgs(['snapshot', '--help']).kind).toBe('help');
   });
 
-  it('daemon 도움말은 live v11 delivery 경계를 정확히 설명한다', () => {
-    expect(CLI_USAGE).toContain('v11 durable store');
+  it('daemon 도움말은 live v12 delivery/resume 경계를 정확히 설명한다', () => {
+    expect(CLI_USAGE).toContain('v12 durable store');
     expect(CLI_USAGE).toContain('production Gate ID를 전달·receipt·consume');
-    expect(CLI_USAGE).toContain('Task를\nresume하지 않는다');
+    expect(CLI_USAGE).toContain('실제 후속 Task resume evidence를 관찰한 경우에만 기존 Slack Gate 카드를 갱신');
     expect(CLI_USAGE).not.toContain('v10 durable store');
+    expect(CLI_USAGE).not.toContain('v11 durable store');
     expect(CLI_USAGE).not.toContain('D3-1 receipt probe');
     expect(CLI_USAGE).not.toContain('production Gate를\nChannel에 보내지 않으며');
+    expect(CLI_USAGE).not.toContain('Task를\nresume하지 않는다');
   });
 
   it('알 수 없는 명령은 오류로 구분한다 — 도움말과 같은 취급을 하지 않는다', () => {

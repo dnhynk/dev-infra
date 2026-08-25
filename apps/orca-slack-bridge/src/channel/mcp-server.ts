@@ -2,9 +2,11 @@ import type { Readable, Writable } from 'node:stream';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   CallToolRequestSchema,
+  type JSONRPCMessage,
   ListToolsRequestSchema,
   type Notification,
   type Request,
@@ -70,6 +72,60 @@ function toolError(code: string): {
   readonly content: readonly [{ readonly type: 'text'; readonly text: string }];
 } {
   return { isError: true, content: [{ type: 'text', text: code }] };
+}
+
+/** The SDK's stdio transport leaves a `drain` listener behind when stdout never recovers. */
+class LifecycleStdioServerTransport extends StdioServerTransport {
+  readonly #output: Writable;
+  readonly #pendingSends = new Set<{ readonly reject: (error: Error) => void }>();
+  #transportClosed = false;
+
+  constructor(input?: Readable, output?: Writable) {
+    const targetOutput = output ?? process.stdout;
+    super(input, targetOutput, { maxBufferSize: 64 * 1024 });
+    this.#output = targetOutput;
+  }
+
+  override async send(message: JSONRPCMessage): Promise<void> {
+    if (this.#transportClosed) throw new Error('stdio_transport_closed');
+    const serialized = serializeMessage(message);
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let pending!: { readonly reject: (error: Error) => void };
+      const onDrain = (): void => finish();
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        this.#output.off('drain', onDrain);
+        this.#pendingSends.delete(pending);
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      pending = { reject: finish };
+      // Register ownership before `write()`: a custom Writable may synchronously close the MCP
+      // lifecycle from inside that call, and close must still reject and remove this exact waiter.
+      this.#pendingSends.add(pending);
+      this.#output.once('drain', onDrain);
+      let accepted: boolean;
+      try {
+        accepted = this.#output.write(serialized);
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error('stdio_transport_write_failed'));
+        return;
+      }
+      if (accepted) finish();
+      else if (this.#transportClosed) finish(new Error('stdio_transport_closed'));
+    });
+  }
+
+  override async close(): Promise<void> {
+    if (this.#transportClosed) return;
+    this.#transportClosed = true;
+    for (const pending of [...this.#pendingSends]) {
+      pending.reject(new Error('stdio_transport_closed'));
+    }
+    await super.close();
+  }
 }
 
 /** Low-level MCP server is required because `claude/channel` is an experimental capability. */
@@ -152,7 +208,7 @@ export class ChannelMcpServer {
   }
 
   async connectStdio(input?: Readable, output?: Writable): Promise<void> {
-    const transport = new StdioServerTransport(input, output, { maxBufferSize: 64 * 1024 });
+    const transport = new LifecycleStdioServerTransport(input, output);
     await this.connect(transport);
   }
 

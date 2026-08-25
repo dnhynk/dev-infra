@@ -499,6 +499,40 @@ describe('durable Channel delivery engine', () => {
     store.close();
   });
 
+  it('owner abort promptly releases a hung delivery without reporting a deadline failure', async () => {
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    resolveD2(store);
+    let started!: () => void;
+    const writeStarted = new Promise<void>((resolve) => { started = resolve; });
+    const transport: GateChannelDeliveryTransport = {
+      deliverGate: () => {
+        started();
+        return new Promise<ChannelDeliverySendResult>(() => undefined);
+      },
+    };
+    const errors: GateChannelDeliveryErrorCode[] = [];
+    const controller = new AbortController();
+    const delivery = engine(store, new FakeOrca(), transport, clock(), errors, {
+      reconcileDeadlineMs: 1_000,
+    });
+    const running = delivery.reconcile(controller.signal);
+    await writeStarted;
+    expect(store.findGateChannelDelivery(GATE)?.leaseOwner).toMatch(/^p\d+\./);
+
+    const began = Date.now();
+    controller.abort();
+    await running;
+
+    expect(Date.now() - began).toBeLessThan(500);
+    expect(errors).toEqual([]);
+    expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+      state: 'pending',
+      leaseOwner: null,
+      lastErrorCode: null,
+    });
+    store.close();
+  });
+
   it('bounds a concurrent multi-row reconcile and fences late hung-Orca completions after close', async () => {
     let store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);

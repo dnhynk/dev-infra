@@ -2344,6 +2344,10 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     expect(secondErrors).toEqual([]);
     expect(first.getResourceSnapshot()).toMatchObject({ listening: true, sockets: 0, timers: 0 });
 
+    first.quiesce();
+    expect(first.getResourceSnapshot()).toMatchObject({ listening: true, sockets: 0, timers: 0 });
+    await expect(second.start()).rejects.toThrowError('pipe_in_use');
+
     await first.stop();
     expect(first.getResourceSnapshot()).toEqual({
       listening: false,
@@ -2351,6 +2355,11 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       timers: 0,
       bindingReads: 0,
       queuedReceiptAcks: 0,
+      productionEventPermits: 0,
+      productionEventsActive: 0,
+      queuedProductionEvents: 0,
+      readyProductionConnections: 0,
+      pendingInboundMessages: 0,
       productionRouteEvaluations: 0,
       productionGateWrites: 0,
     });
@@ -2619,6 +2628,11 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       timers: 0,
       bindingReads: 0,
       queuedReceiptAcks: 0,
+      productionEventPermits: 0,
+      productionEventsActive: 0,
+      queuedProductionEvents: 0,
+      readyProductionConnections: 0,
+      pendingInboundMessages: 0,
       productionRouteEvaluations: 0,
       productionGateWrites: 0,
     });

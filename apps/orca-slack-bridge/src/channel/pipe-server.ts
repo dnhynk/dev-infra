@@ -304,6 +304,8 @@ export class ChannelPipeServer {
   #bindingRead: Promise<BindingGenerationIndex | null> | null = null;
   #productionHandlers: ChannelProductionDeliveryHandlers | null = null;
   #stopping = false;
+  #failure!: Promise<ChannelPipeErrorCode>;
+  #resolveFailure: ((code: ChannelPipeErrorCode) => void) | null = null;
   #productionRouteEvaluations = 0;
   #productionGateWrites = 0;
   #productionEventsActive = 0;
@@ -362,6 +364,21 @@ export class ChannelPipeServer {
     }
     this.#writeFrame = options.writeFrame ?? ((socket, frame) => socket.write(frame));
     this.#onError = options.onError ?? (() => undefined);
+    this.#resetFailure();
+  }
+
+  #resetFailure(): void {
+    this.#failure = new Promise<ChannelPipeErrorCode>((resolve) => {
+      this.#resolveFailure = resolve;
+    });
+  }
+
+  #reportFailure(code: ChannelPipeErrorCode): void {
+    this.#onError(code);
+    const resolve = this.#resolveFailure;
+    if (resolve === null) return;
+    this.#resolveFailure = null;
+    resolve(code);
   }
 
   setProductionDeliveryHandlers(handlers: ChannelProductionDeliveryHandlers): void {
@@ -372,6 +389,7 @@ export class ChannelPipeServer {
   async start(): Promise<void> {
     if (this.#server !== null) throw new ChannelPipeError('pipe_in_use');
     this.#stopping = false;
+    this.#resetFailure();
     const bindingAbort = new AbortController();
     this.#bindingAbort = bindingAbort;
     const server = createServer((socket) => this.#accept(socket));
@@ -399,20 +417,45 @@ export class ChannelPipeServer {
       throw error;
     }
 
-    server.on('error', () => this.#onError('pipe_runtime_error'));
+    server.on('error', () => {
+      if (!this.#stopping && this.#server === server) {
+        this.#reportFailure('pipe_runtime_error');
+      }
+    });
+    server.on('close', () => {
+      if (!this.#stopping && this.#server === server) {
+        this.#reportFailure('pipe_runtime_error');
+      }
+    });
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Reject new work and retire every accepted session while retaining the fixed listener. The
+   * daemon uses this phase to keep a contender failed closed until Slack ingress and accepted
+   * work have fully drained.
+   */
+  quiesce(): void {
     this.#stopping = true;
     const bindingAbort = this.#bindingAbort;
     this.#bindingAbort = null;
     bindingAbort?.abort();
-    const bindingRead = this.#bindingRead;
     for (const connection of this.#connections) {
       this.#clearTimer(connection);
       this.#retireProductionConnection(connection);
       connection.socket.destroy();
     }
+    this.#productionReadyConnections.length = 0;
+    this.#productionReadySet.clear();
+  }
+
+  /** Resolves once for an unexpected post-listen ownership failure. */
+  waitForFailure(): Promise<ChannelPipeErrorCode> {
+    return this.#failure;
+  }
+
+  async stop(): Promise<void> {
+    this.quiesce();
+    const bindingRead = this.#bindingRead;
 
     const server = this.#server;
     this.#server = null;
@@ -441,6 +484,9 @@ export class ChannelPipeServer {
     this.#connections.clear();
     this.#productionReadyConnections.length = 0;
     this.#productionReadySet.clear();
+    // Detach the completed lifecycle epoch. A later start creates its own independent failure
+    // latch; watchers retained by the old daemon can now be collected with the old promise.
+    this.#resetFailure();
   }
 
   getResourceSnapshot(): {
@@ -449,6 +495,11 @@ export class ChannelPipeServer {
     readonly timers: number;
     readonly bindingReads: 0 | 1;
     readonly queuedReceiptAcks: number;
+    readonly productionEventPermits: number;
+    readonly productionEventsActive: number;
+    readonly queuedProductionEvents: number;
+    readonly readyProductionConnections: number;
+    readonly pendingInboundMessages: number;
     readonly productionRouteEvaluations: number;
     readonly productionGateWrites: number;
   } {
@@ -459,6 +510,20 @@ export class ChannelPipeServer {
       bindingReads: this.#bindingRead === null ? 0 : 1,
       queuedReceiptAcks: [...this.#connections].reduce(
         (count, connection) => count + connection.pendingReceiptAcks.size,
+        0,
+      ),
+      productionEventPermits: [...this.#connections].reduce(
+        (count, connection) => count + connection.productionEventPermits.size,
+        0,
+      ),
+      productionEventsActive: this.#productionEventsActive,
+      queuedProductionEvents: [...this.#connections].reduce(
+        (count, connection) => count + connection.productionEventQueue.length,
+        0,
+      ),
+      readyProductionConnections: this.#productionReadyConnections.length,
+      pendingInboundMessages: [...this.#connections].reduce(
+        (count, connection) => count + connection.pendingInboundMessages,
         0,
       ),
       productionRouteEvaluations: this.#productionRouteEvaluations,
@@ -502,6 +567,9 @@ export class ChannelPipeServer {
   ): Promise<ChannelDeliverySendResult> {
     if (!isGateId(gateId)) throw new ChannelPipeError('invalid_gate_id');
     if (this.#productionHandlers === null) throw new ChannelPipeError('delivery_event_failed');
+    if (this.#stopping || this.#server?.listening !== true) {
+      return { kind: 'pending', code: 'no_candidate' };
+    }
     const selected = await this.#selectProductionRoute(runId, signal);
     if (selected.connection === null) return selected.decision;
     const connection = selected.connection;

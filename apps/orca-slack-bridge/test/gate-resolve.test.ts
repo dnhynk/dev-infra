@@ -415,6 +415,40 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     store.close();
   });
 
+  it('owner abort cancels a hung pre-read, releases its lease, and does not persist uncertainty', async () => {
+    const path = join(dir, 'owner-abort.db');
+    const store = seed(path);
+    let started!: () => void;
+    const readStarted = new Promise<void>((resolve) => { started = resolve; });
+    const raw: OrcaRunner = {
+      run: () => {
+        started();
+        return new Promise<string>(() => undefined);
+      },
+    };
+    const controller = new AbortController();
+    const worker = engine(store, boundedOrcaRunner(raw, 1_000), new FakeSlack());
+    const resolving = worker.resolveAndProject(GATE, controller.signal);
+    await readStarted;
+
+    controller.abort();
+    await resolving;
+
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'claimed',
+      preRead: null,
+      lastErrorCode: null,
+      leaseOwner: null,
+    });
+    const probe = new DatabaseSync(path, { readOnly: true });
+    expect(probe.prepare(
+      `SELECT outcome FROM gate_resolution_attempt
+        WHERE gate_key = ? AND phase = 'pre_read' ORDER BY id`,
+    ).all(GATE)).toEqual([{ outcome: 'started' }]);
+    probe.close();
+    store.close();
+  });
+
   it('a later equal winner remains ambiguous after a response-unknown request was observed pending', async () => {
     const store = seed(join(dir, 'response-unknown-pending-external.db'));
     const orca = new FakeOrca();

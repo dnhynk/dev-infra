@@ -292,6 +292,34 @@ describe('channel-adapter production CLI wiring', () => {
     expect(process.listenerCount('SIGTERM')).toBe(beforeSigterm);
   });
 
+  it('bounds non-cooperative Adapter and MCP cleanup phases', async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const mcp: ChannelMcpRuntime = {
+      connectStdio: () => Promise.resolve(),
+      notifyGate: () => Promise.resolve(),
+      waitClosed: never,
+      close: never,
+    };
+    const began = Date.now();
+    const code = await runChannelAdapterCommand(parsedAdapter(), {
+      env: { ...ENV_VALUES },
+      input,
+      output,
+      shutdownTimeoutMs: 10,
+      createMcp: () => mcp,
+      createAdapter: () => ({
+        start: () => undefined,
+        stop: never,
+        reportReceipt: () => Promise.resolve('accepted'),
+      }),
+      waitForStop: () => Promise.resolve(),
+    });
+
+    expect(code).toBe(0);
+    expect(Date.now() - began).toBeLessThan(500);
+  });
+
   it('does not hang when stdio had already ended before the Adapter starts waiting', async () => {
     const input = new PassThrough();
     const output = new PassThrough();

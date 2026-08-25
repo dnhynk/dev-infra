@@ -60,6 +60,7 @@ import { GateChannelDeliveryEngine } from './channel/delivery.js';
 import {
   ChannelPipeServer,
   type ChannelDeliverySendResult,
+  type ChannelPipeErrorCode,
   type ChannelProductionCommitFence,
   type ChannelProductionDeliveryEvent,
   type ChannelProductionDeliveryHandlers,
@@ -343,7 +344,7 @@ verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않
 digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 갱신한다
 runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
 gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite에 등록한다
-daemon        fixed-option Gate action을 ACK하고 durable resolution을 재조정한다
+daemon        Gate action과 verified Channel delivery/resume를 durable하게 재조정한다
 channel-adapter session별 stdio MCP Channel Adapter를 실행하고 daemon pipe에 재연결한다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
@@ -371,15 +372,16 @@ gate-register 전용:
 
 daemon 전용:
 
-  --state <path>    v11 durable store 경로 (additive migration, dry-run 없음)
+  --state <path>    v12 durable store 경로 (additive migration, dry-run 없음)
 
 snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
 runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
 하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080). gate-register는 Orca Gate를
 read-only로 재조회한 뒤 local SQLite에만 쓰고 Slack/Orca mutation을 하지 않는다. daemon은
-Bridge-owned fixed-option action과 verified Channel pipe를 실행하고, v11 delivery를 lazy seed해 exact
-production Gate ID를 전달·receipt·consume한다. D3 delivery 상태는 아직 Slack에 투영하거나 Task를
-resume하지 않는다. channel-adapter는 옵션이 없다.`;
+Bridge-owned fixed-option action과 verified Channel pipe를 실행하고, v12 delivery를 lazy seed해 exact
+production Gate ID를 전달·receipt·consume한다. 새 Task/Dispatch를 직접 만들지 않으며, receipt 뒤
+Orca에서 실제 후속 Task resume evidence를 관찰한 경우에만 기존 Slack Gate 카드를 갱신한다.
+channel-adapter는 옵션이 없다.`;
 
 /**
  * summarizer provider를 만든다.
@@ -661,7 +663,24 @@ export type ChannelAdapterCommandDependencies = {
     notificationWriter: ChannelNotificationWriter,
   ) => ChannelAdapterRuntime;
   readonly waitForStop?: (mcpClosed: Promise<void>, input: Readable) => Promise<void>;
+  /** Bounds each Adapter and MCP cleanup phase; production defaults to two seconds. */
+  readonly shutdownTimeoutMs?: number;
 };
+
+async function settleAdapterCleanup(operation: Promise<void>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = Promise.resolve(operation).then(
+    () => undefined,
+    () => undefined,
+  );
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+    timer.unref?.();
+  });
+  await Promise.race([settled, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+  void settled;
+}
 
 function waitForAdapterStop(mcpClosed: Promise<void>, input: Readable): Promise<void> {
   if (input.destroyed || input.readableEnded) return Promise.resolve();
@@ -697,6 +716,12 @@ export async function runChannelAdapterCommand(
   }
   let adapter: ChannelAdapterRuntime | null = null;
   let mcp: ChannelMcpRuntime | null = null;
+  const configuredShutdownTimeout = dependencies.shutdownTimeoutMs ?? 2_000;
+  if (!Number.isFinite(configuredShutdownTimeout) || configuredShutdownTimeout < 10) {
+    process.stderr.write('channel_adapter_failed\n');
+    return 1;
+  }
+  const shutdownTimeoutMs = Math.trunc(configuredShutdownTimeout);
   try {
     const identity = channelAdapterIdentityFromEnv(dependencies.env ?? process.env);
     const receipt: ChannelReceiptHandler = async (gateId) => {
@@ -718,14 +743,22 @@ export async function runChannelAdapterCommand(
     process.stderr.write('channel_adapter_failed\n');
     return 1;
   } finally {
-    await adapter?.stop().catch(() => undefined);
-    await mcp?.close().catch(() => undefined);
+    if (adapter !== null) {
+      await settleAdapterCleanup(Promise.resolve().then(() => adapter!.stop()), shutdownTimeoutMs);
+    }
+    if (mcp !== null) {
+      await settleAdapterCleanup(Promise.resolve().then(() => mcp!.close()), shutdownTimeoutMs);
+    }
   }
 }
 
 export type ChannelDaemonServer = {
   start(): Promise<void>;
+  /** Retains fixed-pipe ownership while rejecting/retiring all sessions and delivery work. */
+  quiesce?(): void;
   stop(): Promise<void>;
+  /** Resolves on an unexpected post-listen ownership failure. */
+  waitForFailure?(): Promise<ChannelPipeErrorCode>;
   deliverGate(
     runId: string,
     gateId: string,
@@ -735,7 +768,7 @@ export type ChannelDaemonServer = {
 };
 
 export type ChannelDeliveryRuntime = {
-  reconcile(): Promise<void>;
+  reconcile(signal?: AbortSignal): Promise<void>;
   recordAttempted(
     event: ChannelProductionDeliveryEvent,
     commitFence?: ChannelProductionCommitFence,
@@ -767,16 +800,29 @@ export type DaemonDependencies = {
   ) => ChannelDeliveryRuntime;
 };
 
-function processStop(): Promise<void> {
-  return new Promise((resolve) => {
+type ProcessStopLatch = {
+  readonly promise: Promise<void>;
+  dispose(): void;
+};
+
+function processStop(): ProcessStopLatch {
+  let dispose = (): void => undefined;
+  const promise = new Promise<void>((resolve) => {
+    let settled = false;
     const stop = (): void => {
+      if (settled) return;
+      settled = true;
+      dispose();
+      resolve();
+    };
+    dispose = (): void => {
       process.off('SIGINT', stop);
       process.off('SIGTERM', stop);
-      resolve();
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
   });
+  return { promise, dispose: () => dispose() };
 }
 
 /** Production D2+D3 path: strict v12 startup → delivery/resume reconcile → existing-card projection. */
@@ -794,16 +840,44 @@ export async function runDaemonCommand(
     process.stderr.write('daemon은 ORCA_SLACK_BRIDGE_APP_TOKEN xapp token이 필요하다\n');
     return 2;
   }
+  const processStopLatch = dependencies.waitForStop === undefined ? processStop() : null;
   let store: SqliteDigestStore | null = null;
   let transport: SlackSocketTransport | null = null;
   let channelServer: ChannelDaemonServer | null = null;
   let channelDelivery: ChannelDeliveryRuntime | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
-  let reconciliation: Promise<void> | null = null;
+  let gateReconciliation: Promise<void> | null = null;
+  let deliveryReconciliation: Promise<void> | null = null;
   const pending = new Set<Promise<void>>();
   const inbound = new Set<Promise<void>>();
   const inboundAbort = new AbortController();
+  const reconciliationAbort = new AbortController();
+  const acceptedWorkAbort = new AbortController();
+  let stopReason: 'requested' | 'pipe_failure' | null = null;
+  let resolveStop!: () => void;
+  const stopRequested = new Promise<void>((resolve) => { resolveStop = resolve; });
+  const requestStop = (reason: 'requested' | 'pipe_failure'): void => {
+    if (stopReason !== null) return;
+    stopReason = reason;
+    reconciliationAbort.abort();
+    resolveStop();
+  };
+  if (processStopLatch !== null) {
+    void processStopLatch.promise.then(() => requestStop('requested'));
+  }
   let acceptingInbound = false;
+  const drainAcceptedWork = async (): Promise<void> => {
+    await Promise.allSettled([...inbound]);
+    inboundAbort.abort();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (!acceptedWorkAbort.signal.aborted) {
+      timer = setTimeout(() => acceptedWorkAbort.abort(), 20_000);
+      timer.unref?.();
+    }
+    await Promise.allSettled([...pending]);
+    if (timer !== undefined) clearTimeout(timer);
+    acceptedWorkAbort.abort();
+  };
   try {
     store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
     const configuredOrcaTimeout = dependencies.orcaTimeoutMs ?? 15_000;
@@ -833,14 +907,18 @@ export async function runDaemonCommand(
         ? {}
         : { slackTimeoutMs: dependencies.slackTimeoutMs }),
     });
+    const daemonEngine: Pick<GateResolutionEngine, 'resolveAndProject'> = {
+      resolveAndProject: (gateKey) => engine.resolveAndProject(gateKey, acceptedWorkAbort.signal),
+    };
     const schedule = (job: () => Promise<void>): void => {
+      if (acceptedWorkAbort.signal.aborted) return;
       const task = job().catch(() => undefined).finally(() => pending.delete(task));
       pending.add(task);
     };
     const handler = new GateActionHandler({
       config: config.slack,
       store,
-      engine,
+      engine: daemonEngine,
       schedule,
       abortSignal: inboundAbort.signal,
     });
@@ -848,7 +926,7 @@ export async function runDaemonCommand(
       config: config.slack,
       store,
       opener: viewOpener,
-      engine,
+      engine: daemonEngine,
       schedule,
       abortSignal: inboundAbort.signal,
     });
@@ -866,27 +944,47 @@ export async function runDaemonCommand(
         channelDelivery?.recordReceipted(event, commitFence);
       },
     });
+    if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
     await channelServer.start();
+    const pipeFailure = channelServer.waitForFailure?.();
+    if (pipeFailure !== undefined) {
+      void pipeFailure.then(
+        () => requestStop('pipe_failure'),
+        () => requestStop('pipe_failure'),
+      );
+    }
 
     // No Slack Socket event can race schema validation or startup recovery.
-    await engine.reconcile();
-    await channelDelivery.reconcile();
+    await engine.reconcile(reconciliationAbort.signal);
+    await channelDelivery.reconcile(reconciliationAbort.signal);
+    if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
     const configuredInterval = dependencies.reconcileIntervalMs ?? 5_000;
     if (!Number.isFinite(configuredInterval) || configuredInterval < 10) {
       throw new TypeError('reconcileIntervalMs must be a finite number >= 10');
     }
     const scheduleReconciliation = (): void => {
-      if (reconciliation !== null) return;
-      const work = engine.reconcile()
-        .then(() => channelDelivery?.reconcile())
-        .then(() => undefined)
-        .catch(() => undefined);
-      reconciliation = work;
-      pending.add(work);
-      void work.finally(() => {
-        pending.delete(work);
-        if (reconciliation === work) reconciliation = null;
-      });
+      if (reconciliationAbort.signal.aborted) return;
+      if (gateReconciliation === null) {
+        // D2 dedupes by Gate. Periodic and accepted handler calls therefore share the accepted-
+        // work grace signal; the interval gate above prevents any new periodic work after stop.
+        const gateWork = engine.reconcile(acceptedWorkAbort.signal).catch(() => undefined);
+        gateReconciliation = gateWork;
+        pending.add(gateWork);
+        void gateWork.finally(() => {
+          pending.delete(gateWork);
+          if (gateReconciliation === gateWork) gateReconciliation = null;
+        });
+      }
+      if (deliveryReconciliation === null) {
+        const deliveryWork = channelDelivery!.reconcile(reconciliationAbort.signal)
+          .catch(() => undefined);
+        deliveryReconciliation = deliveryWork;
+        pending.add(deliveryWork);
+        void deliveryWork.finally(() => {
+          pending.delete(deliveryWork);
+          if (deliveryReconciliation === deliveryWork) deliveryReconciliation = null;
+        });
+      }
     };
     // Startup may see a live owner that crashes immediately afterward. Rechecking durable pending
     // work lets this daemon take over once that owner is no longer live, without stealing it early.
@@ -910,31 +1008,65 @@ export async function runDaemonCommand(
       },
     });
     acceptingInbound = true;
-    await transport.start();
-    await (dependencies.waitForStop ?? processStop)();
+    const starting = transport.start().then(
+      () => 'started' as const,
+      () => 'failed' as const,
+    );
+    const startupOutcome = await Promise.race([
+      starting,
+      stopRequested.then(() => 'stopped' as const),
+    ]);
+    if (startupOutcome === 'stopped') {
+      acceptingInbound = false;
+      if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
+      reconciliationTimer = null;
+      reconciliationAbort.abort();
+      channelServer.quiesce?.();
+      await transport.shutdown();
+      await starting;
+      transport = null;
+      await drainAcceptedWork();
+      await channelServer.stop();
+      channelServer = null;
+      return stopReason === 'pipe_failure' ? 1 : 0;
+    }
+    if (startupOutcome === 'failed') throw new Error('socket_start_failed');
+
+    if (dependencies.waitForStop !== undefined) {
+      const injectedStop = dependencies.waitForStop().then(
+        () => 'requested' as const,
+        () => 'failed' as const,
+      );
+      const waitOutcome = await Promise.race([
+        injectedStop,
+        stopRequested.then(() => 'stopped' as const),
+      ]);
+      if (waitOutcome === 'failed') throw new Error('daemon_stop_wait_failed');
+      if (waitOutcome === 'requested') requestStop('requested');
+    } else {
+      await stopRequested;
+    }
     acceptingInbound = false;
-    clearInterval(reconciliationTimer);
+    if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
     reconciliationTimer = null;
-    await channelServer.stop();
-    channelServer = null;
-    // Stop accepting new work before store close. Accepted handlers retain their existing bounded
-    // ACK deadline and are drained in finally before their local retry signal is aborted.
+    reconciliationAbort.abort();
+    channelServer.quiesce?.();
+    // Keep the fixed pipe bound until Socket ingress and all already-accepted work are quiescent.
+    // A contender therefore remains failed closed throughout the entire external-work drain.
     await transport.shutdown();
     transport = null;
-    return 0;
+    await drainAcceptedWork();
+    await channelServer.stop();
+    channelServer = null;
+    return stopReason === 'pipe_failure' ? 1 : 0;
   } catch {
     process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
     return 1;
   } finally {
     acceptingInbound = false;
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
-    if (channelServer !== null) {
-      try {
-        await channelServer.stop();
-      } catch {
-        // Pipe shutdown failure cannot authorize a second daemon or a different external write.
-      }
-    }
+    reconciliationAbort.abort();
+    channelServer?.quiesce?.();
     if (transport !== null) {
       try {
         await transport.shutdown();
@@ -942,13 +1074,18 @@ export async function runDaemonCommand(
         // Shutdown failure cannot authorize a second daemon or a different external write.
       }
     }
-    // The store remains open until both ACK/CAS handlers and already-ACKed jobs settle, even when
-    // Socket close itself rejects or times out. Only after accepted handlers have promoted or
-    // failed within their existing deadline do we abort the now-idle ingress signal.
-    await Promise.allSettled([...inbound]);
-    inboundAbort.abort();
-    await Promise.allSettled([...pending]);
+    // The store and fixed pipe remain owned until both ACK/CAS handlers and already-ACKed jobs
+    // settle, even when Socket close rejects or times out.
+    await drainAcceptedWork();
+    if (channelServer !== null) {
+      try {
+        await channelServer.stop();
+      } catch {
+        // Pipe shutdown failure cannot authorize a second daemon or a different external write.
+      }
+    }
     store?.close();
+    processStopLatch?.dispose();
   }
 }
 

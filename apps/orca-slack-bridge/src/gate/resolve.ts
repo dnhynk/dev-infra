@@ -27,6 +27,8 @@ export type GateResolutionEngineOptions = {
   readonly leaseOwner?: string;
   readonly leaseDurationMs?: number;
   readonly slackTimeoutMs?: number;
+  readonly reconcileBatchLimit?: number;
+  readonly reconcileDeadlineMs?: number;
   readonly fault?: (point: GateResolutionFault, gateKey: GateKey) => void | Promise<void>;
 };
 
@@ -86,6 +88,9 @@ export class GateResolutionEngine {
   private readonly leaseOwner: string;
   private readonly leaseDurationMs: number;
   private readonly slackTimeoutMs: number;
+  private readonly reconcileBatchLimit: number;
+  private readonly reconcileDeadlineMs: number;
+  private reconcileOffset = 0;
 
   constructor(private readonly options: GateResolutionEngineOptions) {
     this.now = options.now ?? (() => new Date());
@@ -108,12 +113,26 @@ export class GateResolutionEngine {
         `slackTimeoutMs must be <= ${DEFAULT_SLACK_UPDATE_TIMEOUT_MS} so the durable projection lease stays live`,
       );
     }
+    const reconcileBatchLimit = options.reconcileBatchLimit ?? 64;
+    if (
+      !Number.isSafeInteger(reconcileBatchLimit)
+      || reconcileBatchLimit < 1
+      || reconcileBatchLimit > 1_000
+    ) throw new TypeError('reconcileBatchLimit must be an integer between 1 and 1000');
+    this.reconcileBatchLimit = reconcileBatchLimit;
+    this.reconcileDeadlineMs = boundedDuration(
+      options.reconcileDeadlineMs,
+      20_000,
+      10,
+      'reconcileDeadlineMs',
+    );
   }
 
-  resolveAndProject(gateKey: GateKey): Promise<void> {
+  resolveAndProject(gateKey: GateKey, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.resolve();
     const running = this.active.get(gateKey);
     if (running !== undefined) return running;
-    const task = this.runAndProject(gateKey).finally(() => {
+    const task = this.runAndProject(gateKey, signal).finally(() => {
       if (this.active.get(gateKey) === task) this.active.delete(gateKey);
     });
     this.active.set(gateKey, task);
@@ -121,16 +140,45 @@ export class GateResolutionEngine {
   }
 
   /** Startup reconciliation resumes work and also checks completed cards for renderer drift. */
-  async reconcile(): Promise<void> {
-    for (const intent of this.options.store.listNonterminalGateResolutions()) {
-      await this.resolveAndProject(intent.gateKey);
-    }
-    for (const outbox of this.options.store.listAcknowledgedGateOutboxes()) {
-      await this.project(outbox.gateKey);
+  async reconcile(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
+    const deadline = new AbortController();
+    const combined = signal === undefined
+      ? deadline.signal
+      : AbortSignal.any([signal, deadline.signal]);
+    const timer = setTimeout(() => deadline.abort(), this.reconcileDeadlineMs);
+    timer.unref?.();
+    try {
+      const work = [
+        ...this.options.store.listNonterminalGateResolutions().map((intent) => ({
+          kind: 'resolve' as const,
+          gateKey: intent.gateKey,
+        })),
+        ...this.options.store.listAcknowledgedGateOutboxes().map((outbox) => ({
+          kind: 'project' as const,
+          gateKey: outbox.gateKey,
+        })),
+      ];
+      if (work.length === 0) return;
+      const start = this.reconcileOffset % work.length;
+      const count = Math.min(this.reconcileBatchLimit, work.length);
+      for (let index = 0; index < count; index += 1) {
+        if (combined.aborted) return;
+        const operation = work[(start + index) % work.length]!;
+        if (operation.kind === 'resolve') {
+          await this.resolveAndProject(operation.gateKey, combined);
+        } else {
+          await this.project(operation.gateKey, combined);
+        }
+        this.reconcileOffset = (start + index + 1) % work.length;
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
-  private async runAndProject(gateKey: GateKey): Promise<void> {
+  private async runAndProject(gateKey: GateKey, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
     let intent = this.options.store.findGateResolution(gateKey);
     if (intent === null || intent.ackState !== 'acked') return;
     if (!['resolved', 'conflict', 'degraded'].includes(intent.lifecycle)) {
@@ -143,9 +191,11 @@ export class GateResolutionEngine {
       }, Math.max(10, Math.trunc(this.leaseDurationMs / 3)));
       renewal.unref?.();
       try {
+        if (signal?.aborted) return;
         await this.options.fault?.('after_ack_before_pre_read', gateKey);
-        await this.project(gateKey);
-        await this.reconcileIntent(intent, lease);
+        if (signal?.aborted) return;
+        await this.project(gateKey, signal);
+        await this.reconcileIntent(intent, lease, signal);
       } finally {
         clearInterval(renewal);
         // A catchable JS unwind is not a process crash. Always relinquish local ownership here;
@@ -153,11 +203,18 @@ export class GateResolutionEngine {
         this.options.store.releaseGateResolutionLease(gateKey, this.leaseOwner);
       }
     }
+    if (signal?.aborted) return;
     await this.options.fault?.('after_post_read_before_projection', gateKey);
-    await this.project(gateKey);
+    if (signal?.aborted) return;
+    await this.project(gateKey, signal);
   }
 
-  private async reconcileIntent(initial: GateResolutionIntent, lease: LeaseState): Promise<void> {
+  private async reconcileIntent(
+    initial: GateResolutionIntent,
+    lease: LeaseState,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted) return;
     const metadata = this.options.store.findGateMetadata(initial.gateKey);
     if (metadata === null) {
       this.finish(initial, 'degraded', null, 'sidecar_missing');
@@ -176,14 +233,20 @@ export class GateResolutionEngine {
     if (!this.renewLease(initial.gateKey, lease)) return;
     let pre: GateSnapshot;
     try {
-      pre = await readExactGate(this.options.orca, identity);
+      pre = await readExactGate(
+        this.options.orca,
+        identity,
+        signal === undefined ? undefined : { signal },
+      );
     } catch {
+      if (signal?.aborted) return;
       this.uncertain(
         initial,
         recoveringPersistedMutation ? 'post_read_failed' : 'pre_read_failed',
       );
       return;
     }
+    if (signal?.aborted) return;
     if (recoveringPersistedMutation) {
       // A structured resolve response proves that the mutation edge was already crossed. On
       // restart this read is the missing post-read, not a new baseline: overwriting the durable
@@ -235,15 +298,23 @@ export class GateResolutionEngine {
       return;
     }
 
+    if (signal?.aborted) return;
     await this.options.fault?.('after_pre_read_before_resolve', initial.gateKey);
+    if (signal?.aborted) return;
     if (!this.renewLease(initial.gateKey, lease)) return;
     let edge: GateSnapshot;
     try {
-      edge = await readExactGate(this.options.orca, identity);
+      edge = await readExactGate(
+        this.options.orca,
+        identity,
+        signal === undefined ? undefined : { signal },
+      );
     } catch {
+      if (signal?.aborted) return;
       this.uncertain(preReadIntent, 'mutation_edge_read_failed');
       return;
     }
+    if (signal?.aborted) return;
     if (edge.status === 'resolved') {
       const ownershipAmbiguous =
         mutationOwnershipMayBeAmbiguous(preReadIntent) && expected(edge, preReadIntent);
@@ -283,6 +354,7 @@ export class GateResolutionEngine {
     // ownership lost, and this worker never starts Orca after that point. The timer keeps a normal
     // in-flight call covered; every physical retry still uses the one durable logical request ID.
     if (!this.renewLease(initial.gateKey, lease)) return;
+    if (signal?.aborted) return;
     this.options.store.recordGateAttempt(initial.gateKey, 'resolve', 'started', null, this.at());
     let result: GateResolveResult;
     try {
@@ -291,17 +363,21 @@ export class GateResolutionEngine {
         identity,
         initial.optionResolution,
         initial.retryRequestId,
+        signal === undefined ? undefined : { signal },
       );
     } catch {
+      if (signal?.aborted) return;
       this.options.store.recordGateAttempt(initial.gateKey, 'resolve', 'response_unknown', null, this.at());
-      await this.confirmAfterUnknown(resolvingIntent, identity, lease);
+      await this.confirmAfterUnknown(resolvingIntent, identity, lease, signal);
       return;
     }
+    if (signal?.aborted) return;
     if (!this.renewLease(initial.gateKey, lease)) return;
     await this.options.fault?.(
       'after_resolve_response_before_result_persist',
       initial.gateKey,
     );
+    if (signal?.aborted) return;
     const stored = this.options.store.updateGateResolution(
       initial.gateKey,
       resolvingIntent.revision,
@@ -325,14 +401,21 @@ export class GateResolutionEngine {
     );
     await this.options.fault?.('after_resolve_before_post_read', initial.gateKey);
 
+    if (signal?.aborted) return;
     if (!this.renewLease(initial.gateKey, lease)) return;
     let post: GateSnapshot;
     try {
-      post = await readExactGate(this.options.orca, identity);
+      post = await readExactGate(
+        this.options.orca,
+        identity,
+        signal === undefined ? undefined : { signal },
+      );
     } catch {
+      if (signal?.aborted) return;
       this.uncertain(resultIntent, 'post_read_failed');
       return;
     }
+    if (signal?.aborted) return;
     this.options.store.recordGateAttempt(initial.gateKey, 'post_read', 'succeeded', null, this.at());
     const confirmed = confirmedExpected(post, resultIntent);
     this.finish(
@@ -347,15 +430,23 @@ export class GateResolutionEngine {
     intent: GateResolutionIntent,
     identity: ExactGateIdentity,
     lease: LeaseState,
+    signal?: AbortSignal,
   ): Promise<void> {
+    if (signal?.aborted) return;
     if (!this.renewLease(intent.gateKey, lease)) return;
     let post: GateSnapshot;
     try {
-      post = await readExactGate(this.options.orca, identity);
+      post = await readExactGate(
+        this.options.orca,
+        identity,
+        signal === undefined ? undefined : { signal },
+      );
     } catch {
+      if (signal?.aborted) return;
       this.uncertain(intent, 'response_unknown_post_read_failed');
       return;
     }
+    if (signal?.aborted) return;
     if (expected(post, intent)) {
       // The mutation response was lost, so equal final text cannot distinguish our request from
       // an external resolver that selected the same option in the response-loss window.
@@ -392,7 +483,8 @@ export class GateResolutionEngine {
     });
   }
 
-  private async project(gateKey: GateKey): Promise<void> {
+  private async project(gateKey: GateKey, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
     await projectGateResolutionCard(
       this.options.store,
       this.options.slack,
@@ -400,6 +492,7 @@ export class GateResolutionEngine {
       this.now,
       undefined,
       this.slackTimeoutMs,
+      signal,
     );
   }
 

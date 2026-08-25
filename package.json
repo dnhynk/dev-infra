@@ -6,6 +6,7 @@
     "node": ">=26"
   },
   "scripts": {
+    "acceptance:d3-4": "node tools/d3-4-lifecycle-acceptance.mjs",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
   },

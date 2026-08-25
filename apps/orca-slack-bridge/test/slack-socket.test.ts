@@ -12,6 +12,7 @@ import {
   type SocketConnectionHooks,
   type SocketHello,
   type SocketRefreshReason,
+  type SocketSlackEvent,
 } from '../src/slack/socket.js';
 import { APP_TOKEN_VAR } from '../src/slack/verify.js';
 
@@ -40,6 +41,9 @@ class FakeConnection implements SocketConnection {
   close(): Promise<void> { this.closeCalls += 1; return this.closeResult(); }
   refresh(reason: SocketRefreshReason): void { this.hooks?.refresh(reason); }
   disconnected(): void { this.hooks?.disconnected(); }
+  event(value: SocketSlackEvent): Promise<void> {
+    return Promise.resolve(this.hooks?.event?.(value));
+  }
 }
 
 function factory(connections: readonly FakeConnection[], seen: SocketConnectionHooks[] = []): SocketConnectionFactory {
@@ -83,6 +87,54 @@ describe('Socket hello와 명시적 preflight', () => {
     await transport.start();
     expect(connection.startCalls).toBe(1);
     await transport.shutdown();
+  });
+
+  it('검증 전 candidate와 교체된 connection의 event는 ACK하지 않고 current만 전달한다', async () => {
+    const firstHello = deferred<SocketHello>();
+    const replacementHello = deferred<SocketHello>();
+    const first = new FakeConnection(() => firstHello.promise);
+    const replacement = new FakeConnection(() => replacementHello.promise);
+    let delivered = 0;
+    let acknowledged = 0;
+    const envelope: SocketSlackEvent = {
+      type: 'interactive',
+      body: {},
+      ack: () => { acknowledged += 1; },
+    };
+    const transport = new SlackSocketTransport({
+      expectedApiAppId: 'A01EXPECTED',
+      connectionFactory: factory([first, replacement]),
+      event: async (event) => {
+        delivered += 1;
+        await event.ack();
+      },
+    });
+
+    const starting = transport.start();
+    await flushMicrotasks();
+    await first.event(envelope);
+    expect([delivered, acknowledged]).toEqual([0, 0]);
+
+    firstHello.resolve({ appId: 'A01EXPECTED' });
+    await starting;
+    await first.event(envelope);
+    expect([delivered, acknowledged]).toEqual([1, 1]);
+
+    first.refresh('warning');
+    await flushMicrotasks();
+    await replacement.event(envelope);
+    await first.event(envelope);
+    expect([delivered, acknowledged]).toEqual([2, 2]);
+
+    replacementHello.resolve({ appId: 'A01EXPECTED' });
+    await vi.waitFor(() => expect(first.closeCalls).toBe(1));
+    await replacement.event(envelope);
+    await first.event(envelope);
+    expect([delivered, acknowledged]).toEqual([3, 3]);
+
+    await transport.shutdown();
+    await replacement.event(envelope);
+    expect([delivered, acknowledged]).toEqual([3, 3]);
   });
 
   it('optional apiAppId는 호환되고, exact mismatch/missing hello는 닫고 실패한다', async () => {
@@ -630,6 +682,27 @@ describe('Socket lifecycle', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled);
     }
+  });
+
+  it('즉시 close rejection도 cleanup을 한 번 재구동하고 고정 오류로 종료한다', async () => {
+    let closes = 0;
+    const connection = new FakeConnection(
+      () => hello(),
+      () => {
+        closes += 1;
+        return closes === 1
+          ? Promise.reject(new Error('wss://secret.invalid close payload'))
+          : Promise.resolve();
+      },
+    );
+    const transport = new SlackSocketTransport({ connectionFactory: factory([connection]) });
+    await transport.start();
+
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_failed' });
+    await flushMicrotasks();
+    expect(connection.closeCalls).toBe(2);
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'close_failed' });
+    expect(connection.closeCalls).toBe(2);
   });
 
   it('shutdown은 clean close하고 reconnect하지 않는다', async () => {
