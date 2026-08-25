@@ -29,14 +29,16 @@ D3 state machines and makes their acceptance evidence executable.
   surface fixed redacted errors.
 - D2 recovery now has a rotating batch and global deadline. Owner cancellation reaches exact Orca
   reads/mutation, Slack update-in-place projection, and late-result fences without manufacturing an
-  uncertain result. D3 recovery accepts the daemon owner signal and distinguishes an owner stop
-  from a real reconcile deadline.
+  uncertain result. D3 recovery accepts the daemon owner signal, distinguishes an owner stop from a
+  real reconcile deadline, and synchronously releases the exact resume-observation lease before a
+  non-cooperative Orca read is detached.
 - `ChannelPipeServer.quiesce()` retires sessions, queued production work, deadlines, and permits
   without releasing listener ownership. Its snapshot exposes every daemon-owned socket, timer,
   binding read, receipt ACK, production permit/active/queued/ready event, and inbound message count.
-- Adapter and MCP cleanup phases are independently bounded. MCP stdio shutdown rejects blocked
-  writes and removes its exact `drain` listeners, including re-entrant close during `write()`.
-  The acceptance fixtures verify exact process signal-listener restoration and zero pipe/Adapter
+- Adapter and MCP cleanup phases are independently bounded. MCP stdio stdout error, close, and
+  synchronous write failure each reject all blocked writes, wake `waitClosed()` while stdin remains
+  open, and remove only its exact `drain`/error/close listeners under re-entrant close. The
+  acceptance fixtures verify exact process signal-listener restoration and zero pipe/Adapter
   resource snapshots.
 - The checked-in MCP example has no token, state, or config value. The operator guide requires
   manual merge/trust/approval and manual every-launch development warning confirmation; the harness
@@ -44,27 +46,30 @@ D3 state machines and makes their acceptance evidence executable.
 
 ## Executable failure matrix
 
-The focused matrix is the union of a new full lifecycle composition and the existing state-machine
-fault seams. Every row runs with temporary SQLite, unique local pipes, fake tokens, and injected
-Orca/Slack/Socket boundaries only.
+The focused matrix is the union of one stateful production-path daemon composition and the existing
+component fault seams. Collectively they use temporary SQLite, isolated local-pipe fixtures
+(including explicit production fixed-pipe ownership checks), fake tokens, and injected
+Orca/Slack/Socket boundaries only; a row does not imply that every listed crash point is repeated
+through `runDaemonCommand`.
 
 | Boundary | Executable proof | Result |
 |---|---|---|
 | daemon start/stop ownership | actual `runDaemonCommand` + `ChannelPipeServer` + `ChannelAdapterClient`; pipe-before-Socket startup, quiesce-before-Socket-stop, pipe release last | pass |
+| stateful default D3 chain | real SQLite D2 resolved seed + default delivery/resume engines + real pipe/Adapter: baseline → attempted → receipted → consumed → exact post-baseline witness → same channel/ts Slack update, across owner abort/restart and generation 1→2 | pass |
 | second daemon and runtime owner loss | real fixed-pipe contender never constructs Socket; quiesced owner still rejects bind; injected post-listen fatal stops Socket and returns 1 | pass |
-| startup signal and listener cleanup | invoke only the newly installed SIGTERM listener while pipe startup is pending; Socket factory stays at zero; exact listener arrays restored | pass |
+| startup signal and listener cleanup | invoke each newly installed SIGINT/SIGTERM listener after the real pipe is owned while outer startup never settles; Socket factory stays at zero; exact listener arrays restored and the pipe rebinds | pass |
 | Socket candidate/reconnect lifecycle | pre-hello candidate, reconnect candidate, previous/retired connection, close rejection/timeout, and real `@slack/socket-mode` v3 overlap matrix | pass |
-| Adapter reconnect/epoch | daemon restart forces a new epoch; stale epoch/generation receipt is rejected; current unreceipted Gate replays | pass |
+| Adapter reconnect/epoch | Adapter-first connection and daemon restart force a new epoch; the stateful consumed Gate does not replay, while focused transport seams fence stale epoch/generation receipts | pass |
 | multi-session routing | exact binding sends once; same-binding pair is ambiguous and sends zero; retiring one leaves one eligible candidate | pass |
 | Run generation takeover | old claim is retired before routing; fresh capture/epoch is required; old receipt/ACK is fenced and new generation replays | pass |
 | no-flag and policy simulation | successful notification write without receipt and rejected notification both remain `unverified`; production writes stay zero | pass |
-| transport/receipt/consumed crash ladder | send-before-attempt, attempted-before-receipt, durable receipt-before-ACK, receipt-before-effect, exact effect-before-consumed, restart/replay | pass |
+| transport/receipt/consumed crash ladder | the stateful daemon chain proves the durable happy/restart sequence; focused delivery/store suites inject send-before-attempt, attempted-before-receipt, durable receipt-before-ACK, receipt-before-effect, exact effect-before-consumed, and restart/replay | pass |
 | duplicate and late events | duplicate exact receipt is idempotent; receipt-before-attempt and late attempted never regress; wrong Gate/epoch/generation/deadline has zero effect/ACK | pass |
 | migration/restart | fresh v12 equals populated v10→v11→v12; authentic v11 unavailable rows retain retry/consume liveness but cannot create resume evidence; future/corrupt shapes fail closed | pass |
-| Task resume evidence | immutable pre-send baseline, exact source/descendant Task-worker-Dispatch cut, ambiguous/pre-existing/unrelated/failed negatives, unique post-baseline witness only | pass |
-| Slack timeout/stale projection | timeout remains replayable; stale/late success cannot clear a newer generation; crash after Slack success converges by update-in-place to the same channel/ts | pass |
-| bounded shutdown and late work | owner-aborted Orca/Slack/delivery operations settle promptly, release leases without false deadline state, and late non-cooperative completions cannot touch closed state | pass |
-| leak freedom | repeated stop/rebind reaches zero sockets/timers/permits/queues/inbound messages, zero Adapter timers/writes, zero blocked stdio `drain` listeners, and baseline process listeners | pass |
+| Task resume evidence | the stateful chain persists one exact post-baseline Task/Dispatch witness; focused resume suites cover immutable baselines and ambiguous/pre-existing/unrelated/failed negatives | pass |
+| Slack timeout/stale projection | focused projection suites prove timeout replay, stale/late generation fencing, and post-success convergence; the stateful chain proves the existing card is updated at the same channel/ts with zero post | pass |
+| bounded shutdown and late work | owner-aborted Orca/Slack/delivery operations settle promptly, exact resume leases release immediately without a 30s wait, and late non-cooperative completions cannot overwrite a successor or touch closed state | pass |
+| leak freedom | repeated stop/rebind reaches zero sockets/timers/permits/queues/inbound messages, zero Adapter timers/writes, zero blocked stdio/output listeners, and baseline process listeners | pass |
 | harness/operator safety | static assertions reject secret/config/state-bearing MCP examples, Claude spawning, user MCP writes, and live-verification claims | pass |
 
 Focused suite routing:
@@ -86,23 +91,22 @@ other product write was performed.
 
 | Command | Result |
 |---|---|
-| `pnpm acceptance:d3-4` focused matrix | pass — 19 files, 370 tests |
+| `pnpm acceptance:d3-4` focused matrix | pass — 19 files, 379 tests |
 | `pnpm typecheck` | pass |
 | app build | pass |
-| `pnpm test` | pass — 54 files, 1172 tests |
+| `pnpm test` | pass — 54 files, 1181 tests |
 | `git diff --check` | pass |
-| independent GPT chaos/security audit | pending coordinator dispatch on pushed exact head |
-| final integrated GPT audit | pending coordinator dispatch after chaos/security approval |
-| CI | pending pushed PR |
+| independent GPT chaos/security audit | initial exact-head audit requested changes; repaired exact-head rerun pending coordinator dispatch |
+| final integrated GPT audit | initial exact-head audit requested changes; repaired exact-head rerun pending coordinator dispatch |
+| CI | initial head passed; repaired exact-head run pending push |
 
 ## Audit repair log
 
-The implementation worker's parallel read-only preflight identified and repaired candidate Socket
-event admission, post-listen pipe failure propagation, late signal installation, serial/unbounded D2
-recovery, premature pipe ownership release, post-stop route reads, incomplete resource accounting,
-immediate Socket close failure cleanup, unbounded MCP close, and false-success/re-entrant stdio
-backpressure cleanup. These preflights are not counted as the required independent Orca audits;
-the coordinator owns those exact-head reviews.
+The initial independent GPT reviews additionally identified held pipe startup after a production
+signal, stdout failure with stdin still open, abort-stranded resume leases, and the absence of one
+stateful default-engine daemon composition. The repaired tree adds exact regressions for all four.
+Approval still requires fresh reviews of the pushed repaired head; the coordinator owns those
+exact-head audits.
 
 ## Residual: `LIVE_CHANNEL_UNVERIFIED`
 

@@ -14,8 +14,13 @@ repository root에서 다음을 실행한다.
 pnpm acceptance:d3-4
 ```
 
-이 명령은 fake Orca·Slack·Socket 경계, OS 임시 DB, 호출마다 다른 local pipe만 사용해 다음 순서로
-검증한다.
+이 명령은 fake Orca·Slack·Socket 경계, OS 임시 DB, 격리된 local pipe fixture만 사용한다. 고유 pipe
+fixture 외에 production fixed-pipe ownership 자체를 확인하는 명시적 test도 있다. 실제
+`runDaemonCommand`·기본 delivery/resume engine·pipe·Adapter를 함께 구동하는 stateful same-ts 체인
+하나와, 더 넓은 crash/timeout/중복 matrix를 각 component fault seam에서 검증한다. 모든 crash row가
+daemon composition을 반복한다는 뜻은 아니다.
+
+실행 순서는 다음과 같다.
 
 1. D3-4 focused failure matrix
 2. root/app typecheck

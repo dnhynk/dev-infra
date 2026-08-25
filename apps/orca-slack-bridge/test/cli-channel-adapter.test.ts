@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +15,7 @@ import {
   type ChannelMcpRuntime,
 } from '../src/cli.js';
 import type { ChannelReceiptHandler } from '../src/channel/mcp-server.js';
+import { ChannelAdapterClient } from '../src/channel/adapter.js';
 import { ChannelPipeServer } from '../src/channel/pipe-server.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { APP_TOKEN_VAR } from '../src/slack/verify.js';
@@ -23,6 +25,8 @@ const ENV_VALUES: Readonly<Record<string, string>> = {
   ORCA_TERMINAL_HANDLE: 'term_22222222-2222-4222-8222-222222222222',
   ORCA_PANE_KEY: '33333333-3333-4333-8333-333333333333:44444444-4444-4444-8444-444444444444',
 };
+const BOUND_RUN_ID = 'run_cli_channel';
+const PRODUCTION_GATE_ID = 'gate_abcdef123456';
 
 function parsedAdapter() {
   const parsed = parseArgs(['channel-adapter']);
@@ -34,9 +38,37 @@ function never(): Promise<void> {
   return new Promise(() => undefined);
 }
 
+function pipePath(label: string): string {
+  const id = `${label}-${process.pid}-${randomUUID()}`;
+  return process.platform === 'win32'
+    ? String.raw`\\.\pipe\orca-cli-channel-${id}`
+    : join(tmpdir(), `orca-cli-channel-${id}.sock`);
+}
+
 const EMPTY_ORCA: OrcaRunner = {
   run: (args) => args.join(' ') === 'orchestration run-list --json'
     ? Promise.resolve(JSON.stringify({ id: 'fake', ok: true, result: { runs: [] } }))
+    : Promise.reject(new Error('unexpected fake Orca command')),
+};
+
+const BOUND_ORCA: OrcaRunner = {
+  run: (args) => args.join(' ') === 'orchestration run-list --json'
+    ? Promise.resolve(JSON.stringify({
+        id: 'fake',
+        ok: true,
+        result: {
+          runs: [{
+            id: BOUND_RUN_ID,
+            objective: 'stdio output lifecycle test',
+            coordinator_handle: ENV_VALUES['ORCA_TERMINAL_HANDLE'],
+            coordinator_pane_key: ENV_VALUES['ORCA_PANE_KEY'],
+            consumer_generation: 1,
+            legacy: false,
+            created_at: '2026-08-26T00:00:00.000Z',
+            updated_at: '2026-08-26T00:00:00.000Z',
+          }],
+        },
+      }))
     : Promise.reject(new Error('unexpected fake Orca command')),
 };
 
@@ -63,6 +95,40 @@ function captureJsonLines(output: PassThrough): Record<string, unknown>[] {
     }
   });
   return messages;
+}
+
+async function initializeAndReceiptProbe(
+  input: PassThrough,
+  messages: Record<string, unknown>[],
+): Promise<void> {
+  input.write(`${JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: 'production-cli-test', version: '0.0.0' },
+    },
+  })}\n`);
+  await waitFor(() => messages.some((message) => message['id'] === 1));
+  input.write(`${JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'notifications/initialized',
+    params: {},
+  })}\n`);
+  await waitFor(() => messages.some((message) => message['method'] === 'notifications/claude/channel'));
+  const notification = messages.find(
+    (message) => message['method'] === 'notifications/claude/channel',
+  )!;
+  const gateId = (notification['params'] as { meta: { gate_id: string } }).meta.gate_id;
+  input.write(`${JSON.stringify({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'orca_channel_receipt', arguments: { gate_id: gateId } },
+  })}\n`);
+  await waitFor(() => messages.some((message) => message['id'] === 2));
 }
 
 describe('channel-adapter production CLI wiring', () => {
@@ -291,6 +357,115 @@ describe('channel-adapter production CLI wiring', () => {
     expect(process.listenerCount('SIGINT')).toBe(beforeSigint);
     expect(process.listenerCount('SIGTERM')).toBe(beforeSigterm);
   });
+
+  it.each(['error', 'close', 'throw'] as const)(
+    'retires the real Adapter and pipe after a stdout %s with stdin still open',
+    async (failure) => {
+      const path = pipePath(`stdout-${failure}`);
+      const daemon = new ChannelPipeServer({
+        orca: BOUND_ORCA,
+        pipePath: path,
+        probeDelaysMs: [10],
+        helloTimeoutMs: 500,
+        shutdownTimeoutMs: 500,
+      });
+      daemon.setProductionDeliveryHandlers({
+        attempted: () => undefined,
+        receipted: () => undefined,
+      });
+      await daemon.start();
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const messages = captureJsonLines(output);
+      const foreignError = (): void => undefined;
+      const foreignClose = (): void => undefined;
+      output.on('error', foreignError);
+      output.on('close', foreignClose);
+      const inputListeners = {
+        close: input.listenerCount('close'),
+        data: input.listenerCount('data'),
+        end: input.listenerCount('end'),
+        error: input.listenerCount('error'),
+      };
+      const sigintListeners = process.listenerCount('SIGINT');
+      const sigtermListeners = process.listenerCount('SIGTERM');
+      let adapter!: ChannelAdapterClient;
+      let running: Promise<number> | null = null;
+      let delivery: ReturnType<ChannelPipeServer['deliverGate']> | null = null;
+      try {
+        running = main(['channel-adapter'], {
+          channelAdapter: {
+            env: { ...ENV_VALUES },
+            input,
+            output,
+            createAdapter: (adapterIdentity, notificationWriter) => {
+              adapter = new ChannelAdapterClient({
+                identity: adapterIdentity,
+                notificationWriter,
+                pipePath: path,
+                reconnectDelaysMs: [10, 20],
+                receiptAckTimeoutMs: 500,
+                writeTimeoutMs: 500,
+                shutdownTimeoutMs: 500,
+              });
+              return adapter;
+            },
+          },
+        });
+        await initializeAndReceiptProbe(input, messages);
+        await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+        const originalWrite = output.write.bind(output);
+        output.write = failure === 'throw'
+          ? (() => { throw new Error('raw_sync_stdout_failure_must_not_escape'); }) as typeof output.write
+          : ((...args: unknown[]) => {
+              Reflect.apply(originalWrite, output, args);
+              return false;
+            }) as typeof output.write;
+        delivery = daemon.deliverGate(BOUND_RUN_ID, PRODUCTION_GATE_ID);
+        if (failure !== 'throw') {
+          await waitFor(() => output.listenerCount('drain') === 1);
+          if (failure === 'error') output.emit('error', new Error('raw_stdout_failure_must_not_escape'));
+          else output.emit('close');
+        }
+
+        let settled = false;
+        void running.then(() => { settled = true; });
+        await waitFor(() => settled);
+        expect(await running).toBe(0);
+        await delivery;
+        await waitFor(() => daemon.getResourceSnapshot().sockets === 0);
+        expect(input.destroyed).toBe(false);
+        expect(input.readableEnded).toBe(false);
+        expect(output.listenerCount('drain')).toBe(0);
+        expect(output.listeners('error')).toEqual([foreignError]);
+        expect(output.listeners('close')).toEqual([foreignClose]);
+        expect(input.listenerCount('close')).toBe(inputListeners.close);
+        expect(input.listenerCount('data')).toBe(inputListeners.data);
+        expect(input.listenerCount('end')).toBe(inputListeners.end);
+        expect(input.listenerCount('error')).toBe(inputListeners.error);
+        expect(process.listenerCount('SIGINT')).toBe(sigintListeners);
+        expect(process.listenerCount('SIGTERM')).toBe(sigtermListeners);
+        expect(adapter.getResourceSnapshot()).toEqual({
+          socket: 0,
+          reconnectTimer: 0,
+          receiptTimers: 0,
+          writeTimer: 0,
+          queuedReceipts: 0,
+          notificationWrites: 0,
+          epoch: null,
+        });
+      } finally {
+        output.off('error', foreignError);
+        output.off('close', foreignClose);
+        input.end();
+        await running?.catch(() => undefined);
+        await delivery?.catch(() => undefined);
+        await daemon.stop();
+        output.destroy();
+      }
+    },
+  );
 
   it('bounds non-cooperative Adapter and MCP cleanup phases', async () => {
     const input = new PassThrough();

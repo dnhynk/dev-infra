@@ -78,12 +78,40 @@ function toolError(code: string): {
 class LifecycleStdioServerTransport extends StdioServerTransport {
   readonly #output: Writable;
   readonly #pendingSends = new Set<{ readonly reject: (error: Error) => void }>();
+  readonly #onOutputError = (): void => {
+    // Keep the stream's raw error inside this boundary. The fixed transport error is the only
+    // diagnostic published upward, while close wakes waitClosed() even when stdin remains open.
+    void this.#terminate(true).catch(() => undefined);
+  };
+  readonly #onOutputClose = (): void => {
+    void this.#terminate(false).catch(() => undefined);
+  };
+  #outputLifecycleOwned = false;
+  #transportErrorReported = false;
   #transportClosed = false;
+  #closeTask: Promise<void> | null = null;
 
   constructor(input?: Readable, output?: Writable) {
     const targetOutput = output ?? process.stdout;
     super(input, targetOutput, { maxBufferSize: 64 * 1024 });
     this.#output = targetOutput;
+  }
+
+  override async start(): Promise<void> {
+    // Protocol.connect installs onerror/onclose before calling start. Own stdout only inside this
+    // started lifecycle so a rejected or duplicate connect cannot leak constructor-time listeners.
+    this.#output.on('error', this.#onOutputError);
+    this.#output.on('close', this.#onOutputClose);
+    this.#outputLifecycleOwned = true;
+    try {
+      await super.start();
+    } catch (error) {
+      this.#releaseOutputLifecycle();
+      throw error;
+    }
+    if (this.#output.destroyed || this.#output.writableEnded || this.#output.writableFinished) {
+      await this.#terminate(false);
+    }
   }
 
   override async send(message: JSONRPCMessage): Promise<void> {
@@ -109,8 +137,10 @@ class LifecycleStdioServerTransport extends StdioServerTransport {
       let accepted: boolean;
       try {
         accepted = this.#output.write(serialized);
-      } catch (error) {
-        finish(error instanceof Error ? error : new Error('stdio_transport_write_failed'));
+      } catch {
+        // A synchronous Writable failure is terminal, just like its asynchronous `error` event.
+        // #terminate publishes state before callbacks so reentrant close remains idempotent.
+        void this.#terminate(true).catch(() => undefined);
         return;
       }
       if (accepted) finish();
@@ -118,13 +148,57 @@ class LifecycleStdioServerTransport extends StdioServerTransport {
     });
   }
 
-  override async close(): Promise<void> {
-    if (this.#transportClosed) return;
+  override close(): Promise<void> {
+    return this.#terminate(false);
+  }
+
+  #releaseOutputLifecycle(): void {
+    if (!this.#outputLifecycleOwned) return;
+    this.#outputLifecycleOwned = false;
+    this.#output.off('error', this.#onOutputError);
+    this.#output.off('close', this.#onOutputClose);
+  }
+
+  #reportTransportError(): void {
+    if (this.#transportErrorReported) return;
+    this.#transportErrorReported = true;
+    try {
+      this.onerror?.(new Error('stdio_transport_error'));
+    } catch {
+      // A diagnostic callback is untrusted lifecycle code and cannot prevent terminal cleanup.
+    }
+  }
+
+  #terminate(reportError: boolean): Promise<void> {
+    if (this.#closeTask !== null) {
+      if (reportError) this.#reportTransportError();
+      return this.#closeTask;
+    }
     this.#transportClosed = true;
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    this.#closeTask = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
     for (const pending of [...this.#pendingSends]) {
       pending.reject(new Error('stdio_transport_closed'));
     }
-    await super.close();
+    if (reportError) this.#reportTransportError();
+    const settle = (error?: unknown): void => {
+      this.#releaseOutputLifecycle();
+      if (error === undefined) resolveClose();
+      else rejectClose(error);
+    };
+    try {
+      void super.close().then(
+        () => settle(),
+        (error) => settle(error),
+      );
+    } catch (error) {
+      settle(error);
+    }
+    return this.#closeTask;
   }
 }
 

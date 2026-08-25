@@ -945,7 +945,22 @@ export async function runDaemonCommand(
       },
     });
     if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
-    await channelServer.start();
+    // A production signal suppresses Node's default termination, so a pending pipe startup must
+    // itself lose to the stop latch. Normalize both branches now so a late rejected start remains
+    // observed after shutdown has already continued through the single `finally` owner.
+    const channelStarting = channelServer.start().then(
+      () => 'started' as const,
+      () => 'failed' as const,
+    );
+    const channelStartOutcome = await Promise.race([
+      channelStarting,
+      stopRequested.then(() => 'stopped' as const),
+    ]);
+    if (channelStartOutcome === 'stopped') {
+      return stopReason === 'pipe_failure' ? 1 : 0;
+    }
+    if (channelStartOutcome === 'failed') throw new Error('pipe_start_failed');
+    if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
     const pipeFailure = channelServer.waitForFailure?.();
     if (pipeFailure !== undefined) {
       void pipeFailure.then(
