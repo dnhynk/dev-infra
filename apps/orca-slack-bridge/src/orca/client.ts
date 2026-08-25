@@ -566,10 +566,13 @@ function strictGateSnapshot(raw: unknown, identity: ExactGateIdentity, at: strin
 export async function readExactGate(
   runner: OrcaRunner,
   identity: ExactGateIdentity,
+  options?: OrcaRunOptions,
 ): Promise<GateSnapshot> {
-  const result = await call<unknown>(runner, [
-    'orchestration', 'gate-list', '--run', identity.runId, '--json',
-  ]);
+  const result = await call<unknown>(
+    runner,
+    ['orchestration', 'gate-list', '--run', identity.runId, '--json'],
+    options,
+  );
   if (!isRecord(result)) throw new TypeError('gate-list result가 object가 아니다');
   exactObjectKeys(result, ['runId', 'gates', 'count'], 'gate-list result');
   if (result['runId'] !== identity.runId || !Array.isArray(result['gates'])) {

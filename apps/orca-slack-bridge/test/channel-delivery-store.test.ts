@@ -212,6 +212,30 @@ describe('additive v11 Channel delivery schema', () => {
     expect(() => new SqliteDigestStore(path)).toThrow(SchemaVersionError);
   });
 
+  it('clamps a regressed seed clock to persisted D2 evidence and reopens idempotently', () => {
+    let store = new SqliteDigestStore(path);
+    resolveD2(store);
+    const rollbackAt = '2026-08-24T09:59:59.000Z';
+    expect(store.seedPendingGateChannelDeliveries(rollbackAt)).toMatchObject([{
+      gateKey: GATE,
+      state: 'pending',
+      createdAt: '2026-08-24T10:00:01.000Z',
+      updatedAt: '2026-08-24T10:00:01.000Z',
+      nextAttemptAt: '2026-08-24T10:00:01.000Z',
+    }]);
+    expect(store.seedPendingGateChannelDeliveries(rollbackAt)).toEqual([]);
+    expect(store.listDueGateChannelDeliveries(rollbackAt)).toEqual([]);
+    store.close();
+
+    store = new SqliteDigestStore(path);
+    expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+      state: 'pending', createdAt: '2026-08-24T10:00:01.000Z',
+      nextAttemptAt: '2026-08-24T10:00:01.000Z',
+    });
+    expect(store.seedPendingGateChannelDeliveries(rollbackAt)).toEqual([]);
+    store.close();
+  });
+
   it('rejects malformed lifecycle, cross-table identity, lease, and unknown objects on reopen', () => {
     const corruptions = [
       {
@@ -225,6 +249,13 @@ describe('additive v11 Channel delivery schema', () => {
       {
         name: 'lease',
         sql: "UPDATE gate_channel_delivery SET lease_owner = 't.corrupt', lease_expires_at = NULL",
+      },
+      {
+        name: 'seed-clock',
+        sql: `UPDATE gate_channel_delivery
+                SET created_at = '2026-08-24T09:59:59.000Z',
+                    updated_at = '2026-08-24T09:59:59.000Z',
+                    next_attempt_at = '2026-08-24T09:59:59.000Z'`,
       },
       {
         name: 'unknown-trigger',

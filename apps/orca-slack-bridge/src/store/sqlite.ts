@@ -1639,9 +1639,10 @@ function rearmGateOutboxForChannelTransition(
   const result = db.prepare(
     `UPDATE gate_resolution_outbox
         SET revision = revision + 1, card_pending = 1, projected_at = NULL,
-            projection_owner = NULL, projection_expires_at = NULL, updated_at = ?
+            projection_owner = NULL, projection_expires_at = NULL,
+            updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
       WHERE gate_key = ? AND notification_state = 'pending'`,
-  ).run(at, gateKey);
+  ).run(at, at, gateKey);
   if (Number(result.changes) !== 1) {
     throw new Error(`${gateKey}의 D2 outbox를 Channel transition과 함께 re-arm하지 못했다`);
   }
@@ -3309,16 +3310,26 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
         ) {
           throw new Error(`${gateKey}의 D2 pending→resolved evidence가 Channel seed와 어긋난다`);
         }
+        const deliveryAt = [
+          seededAt,
+          intent.createdAt,
+          intent.updatedAt,
+          outbox.createdAt,
+          outbox.updatedAt,
+          metadata.registeredAt,
+          intent.resolveResult.gate.resolvedAt!,
+          intent.postRead.resolvedAt!,
+        ].reduce((latest, candidate) => candidate > latest ? candidate : latest);
         this.db.prepare(INSERT_GATE_CHANNEL_DELIVERY).run(
           gateKey,
           metadata.runKey,
           metadata.taskKey,
           intent.dispatchId,
-          seededAt,
-          seededAt,
-          seededAt,
+          deliveryAt,
+          deliveryAt,
+          deliveryAt,
         );
-        rearmGateOutboxForChannelTransition(this.db, gateKey, seededAt);
+        rearmGateOutboxForChannelTransition(this.db, gateKey, deliveryAt);
         const inserted = this.db.prepare(SELECT_GATE_CHANNEL_DELIVERY).get(gateKey) as
           | GateChannelDeliveryRow
           | undefined;
@@ -4769,7 +4780,16 @@ function validateCurrentGateStore(
       delivery.runKey !== metadata.runKey || delivery.taskKey !== metadata.taskKey ||
       delivery.sourceDispatchId !== intent.dispatchId ||
       outbox.notificationState !== 'pending' ||
-      delivery.createdAt < intent.createdAt
+      delivery.createdAt < intent.createdAt ||
+      delivery.createdAt < intent.updatedAt ||
+      delivery.createdAt < outbox.createdAt ||
+      delivery.createdAt < metadata.registeredAt ||
+      (post.resolvedAt !== null && delivery.createdAt < post.resolvedAt) ||
+      (
+        intent.resolveResult?.gate.resolvedAt !== null &&
+        intent.resolveResult?.gate.resolvedAt !== undefined &&
+        delivery.createdAt < intent.resolveResult.gate.resolvedAt
+      )
     ) {
       throw new Error(`store 파일의 ${delivery.gateKey} Channel/D2 correlation이 어긋난다: ${path}`);
     }

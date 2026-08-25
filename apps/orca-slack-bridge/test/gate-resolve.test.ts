@@ -473,6 +473,53 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     store.close();
   });
 
+  it('preserves the pending baseline across a post-mutation crash and lazy D3 seed restart', async () => {
+    const dbPath = join(dir, 'post-mutation-d3-seed.db');
+    let store = seed(dbPath);
+    const orca = new FakeOrca();
+    await expect(engine(store, orca, new FakeSlack(), (point) => {
+      if (point === 'after_resolve_before_post_read') {
+        throw new Error('process died after structured result persistence');
+      }
+    }).resolveAndProject(GATE)).rejects.toThrow(/structured result persistence/);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'post_read',
+      preRead: { status: 'pending', resolution: null, resolvedAt: null },
+      postRead: null,
+      resolveResult: { gate: { status: 'resolved', resolution: '현행 유지' } },
+    });
+    store.close();
+
+    store = new SqliteDigestStore(dbPath);
+    orca.failNextLists = 1;
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'uncertain', lastErrorCode: 'post_read_failed',
+      preRead: { status: 'pending', resolution: null, resolvedAt: null },
+      resolveResult: { gate: { status: 'resolved', resolution: '현행 유지' } },
+    });
+    store.close();
+
+    store = new SqliteDigestStore(dbPath);
+    await engine(store, orca, new FakeSlack()).reconcile();
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      lifecycle: 'resolved',
+      preRead: { status: 'pending', resolution: null, resolvedAt: null },
+      postRead: { status: 'resolved', resolution: '현행 유지', resolvedAt: AT },
+    });
+    const seeded = store.seedPendingGateChannelDeliveries(new Date().toISOString());
+    expect(seeded).toHaveLength(1);
+    expect(seeded[0]).toMatchObject({ state: 'pending', gateKey: GATE });
+    store.close();
+
+    store = new SqliteDigestStore(dbPath);
+    expect(store.seedPendingGateChannelDeliveries(new Date().toISOString())).toEqual([]);
+    expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+      state: 'pending', attemptCount: 0,
+    });
+    store.close();
+  });
+
   it('restart surfaces ambiguous ownership after Orca succeeds before local result persistence', async () => {
     const store = seed(join(dir, 'after-response-before-result.db'));
     const orca = new FakeOrca();

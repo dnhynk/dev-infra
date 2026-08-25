@@ -724,14 +724,18 @@ export async function runChannelAdapterCommand(
 export type ChannelDaemonServer = {
   start(): Promise<void>;
   stop(): Promise<void>;
-  deliverGate(runId: string, gateId: string): Promise<ChannelDeliverySendResult>;
+  deliverGate(
+    runId: string,
+    gateId: string,
+    signal?: AbortSignal,
+  ): Promise<ChannelDeliverySendResult>;
   setProductionDeliveryHandlers?(handlers: ChannelProductionDeliveryHandlers): void;
 };
 
 export type ChannelDeliveryRuntime = {
   reconcile(): Promise<void>;
-  recordAttempted(gateId: string): unknown;
-  recordReceipted(gateId: string): unknown;
+  recordAttempted(event: ChannelProductionDeliveryEvent): unknown;
+  recordReceipted(event: ChannelProductionDeliveryEvent): unknown;
 };
 
 export type DaemonDependencies = {
@@ -848,10 +852,10 @@ export async function runDaemonCommand(
       new GateChannelDeliveryEngine({ store, orca, transport: channelServer });
     channelServer.setProductionDeliveryHandlers?.({
       attempted: (event: ChannelProductionDeliveryEvent) => {
-        channelDelivery?.recordAttempted(event.gateId);
+        channelDelivery?.recordAttempted(event);
       },
       receipted: (event: ChannelProductionDeliveryEvent) => {
-        channelDelivery?.recordReceipted(event.gateId);
+        channelDelivery?.recordReceipted(event);
       },
     });
     await channelServer.start();

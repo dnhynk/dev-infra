@@ -4,13 +4,22 @@ import type { GateChannelDelivery, GateChannelDeliveryStore } from '../gate/reso
 import { gateKey } from '../identity/keys.js';
 import { readExactGate, type OrcaRunner } from '../orca/client.js';
 import type { GateStore } from '../store/schema.js';
-import type { ChannelDeliverySendResult } from './pipe-server.js';
+import type {
+  ChannelDeliverySendResult,
+  ChannelProductionDeliveryEvent,
+} from './pipe-server.js';
 
 export const DEFAULT_DELIVERY_ATTEMPT_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
 export const DEFAULT_DELIVERY_RECEIPT_BACKOFF_MS = 30_000;
+export const DEFAULT_DELIVERY_RECONCILE_DEADLINE_MS = 20_000;
+export const DEFAULT_DELIVERY_CONCURRENCY = 8;
 
 export type GateChannelDeliveryTransport = {
-  deliverGate(runId: string, gateId: string): Promise<ChannelDeliverySendResult>;
+  deliverGate(
+    runId: string,
+    gateId: string,
+    signal?: AbortSignal,
+  ): Promise<ChannelDeliverySendResult>;
 };
 
 export type GateChannelDeliveryErrorCode =
@@ -18,6 +27,7 @@ export type GateChannelDeliveryErrorCode =
   | 'gate_effect_mismatch'
   | 'gate_effect_pending'
   | 'channel_send_failed'
+  | 'delivery_reconcile_deadline'
   | 'delivery_reconcile_failed'
   | `route_${Exclude<ChannelDeliverySendResult['kind'], 'sent'>}_${string}`;
 
@@ -31,6 +41,8 @@ export type GateChannelDeliveryEngineOptions = {
   readonly receiptBackoffMs?: number;
   readonly attemptDelaysMs?: readonly number[];
   readonly batchLimit?: number;
+  readonly concurrency?: number;
+  readonly reconcileDeadlineMs?: number;
   /** Bounded codes only. No downstream message or payload is exposed. */
   readonly onError?: (code: GateChannelDeliveryErrorCode) => void;
 };
@@ -63,6 +75,8 @@ export class GateChannelDeliveryEngine {
   readonly #receiptBackoffMs: number;
   readonly #attemptDelaysMs: readonly number[];
   readonly #batchLimit: number;
+  readonly #concurrency: number;
+  readonly #reconcileDeadlineMs: number;
   readonly #onError: (code: GateChannelDeliveryErrorCode) => void;
 
   constructor(options: GateChannelDeliveryEngineOptions) {
@@ -85,22 +99,76 @@ export class GateChannelDeliveryEngine {
       throw new TypeError('delivery_batch_limit_invalid');
     }
     this.#batchLimit = batchLimit;
+    const concurrency = options.concurrency ?? DEFAULT_DELIVERY_CONCURRENCY;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 64) {
+      throw new TypeError('delivery_concurrency_invalid');
+    }
+    this.#concurrency = concurrency;
+    this.#reconcileDeadlineMs = finiteMs(
+      options.reconcileDeadlineMs ?? DEFAULT_DELIVERY_RECONCILE_DEADLINE_MS,
+      'delivery_reconcile_deadline_invalid',
+    );
+    if (this.#reconcileDeadlineMs >= this.#leaseMs) {
+      throw new TypeError('delivery_reconcile_deadline_must_precede_lease_expiry');
+    }
     this.#onError = options.onError ?? (() => undefined);
   }
 
-  /** Lazy seed plus one bounded due batch. Overlap is fenced in SQLite, not process memory. */
+  /** Lazy seed plus one bounded, concurrent, deadline-limited due batch. */
   async reconcile(): Promise<void> {
     const at = this.#now().toISOString();
     this.#store.seedPendingGateChannelDeliveries(at);
     const due = this.#store.listDueGateChannelDeliveries(at, this.#batchLimit);
-    for (const delivery of due) await this.#reconcileOne(delivery);
+    if (due.length === 0) return;
+    const controller = new AbortController();
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const work = this.#runBatch(due, controller.signal);
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        expired = true;
+        this.#onError('delivery_reconcile_deadline');
+        controller.abort();
+        resolve();
+      }, this.#reconcileDeadlineMs);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([work, deadline]);
+    } catch (error) {
+      controller.abort();
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (expired) void work.catch(() => undefined);
+    }
+  }
+
+  async #runBatch(
+    due: readonly GateChannelDelivery[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    let index = 0;
+    const workers = Array.from(
+      { length: Math.min(this.#concurrency, due.length) },
+      async () => {
+        while (!signal.aborted) {
+          const candidate = due[index];
+          index += 1;
+          if (candidate === undefined) return;
+          await this.#reconcileOne(candidate, signal);
+        }
+      },
+    );
+    await Promise.all(workers);
   }
 
   /** Adapter-confirmed MCP transport write; never promoted to receipt or effect. */
-  recordAttempted(gateId: string): GateChannelDelivery {
-    const key = gateKey(gateId);
+  recordAttempted(event: ChannelProductionDeliveryEvent): GateChannelDelivery {
+    const key = gateKey(event.gateId);
     const current = this.#store.findGateChannelDelivery(key);
     if (current === null) throw new Error('delivery_not_found');
+    if (wireId(current.runKey) !== event.runId) throw new Error('delivery_token_mismatch');
     const at = this.#now().toISOString();
     const delay = this.#attemptDelaysMs[Math.min(
       current.attemptCount,
@@ -112,9 +180,13 @@ export class GateChannelDeliveryEngine {
   }
 
   /** Application receipt only. It stays due for an exact Gate effect reread. */
-  recordReceipted(gateId: string): GateChannelDelivery {
+  recordReceipted(event: ChannelProductionDeliveryEvent): GateChannelDelivery {
+    const key = gateKey(event.gateId);
+    const current = this.#store.findGateChannelDelivery(key);
+    if (current === null) throw new Error('delivery_not_found');
+    if (wireId(current.runKey) !== event.runId) throw new Error('delivery_token_mismatch');
     const receipted = this.#store.markGateChannelReceipted(
-      gateKey(gateId),
+      key,
       this.#now().toISOString(),
     );
     // The pipe withholds its ACK when this throws, so an unknown production Gate can never be
@@ -123,7 +195,11 @@ export class GateChannelDeliveryEngine {
     return receipted;
   }
 
-  async #reconcileOne(candidate: GateChannelDelivery): Promise<void> {
+  async #reconcileOne(
+    candidate: GateChannelDelivery,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) return;
     // Acquisition-specific ownership prevents a late completion from one overlapping reconcile
     // from releasing or consuming a newer lease held by this same daemon process.
     const owner = `p${process.pid}.${randomUUID()}`;
@@ -138,7 +214,38 @@ export class GateChannelDeliveryEngine {
     let current = lease.delivery;
     let released = false;
     let effectCode: GateChannelDeliveryErrorCode | null = null;
+    const abortLease = (): void => {
+      if (released) return;
+      try {
+        const latest = this.#store.findGateChannelDelivery(current.gateKey);
+        if (latest?.leaseOwner === owner) {
+          current = latest;
+          const deferred = this.#defer(
+            latest,
+            owner,
+            this.#retryDelay(latest),
+            'delivery_reconcile_deadline',
+          );
+          if (!deferred) {
+            this.#store.releaseGateChannelDeliveryLease(
+              latest.gateKey,
+              owner,
+              this.#now().toISOString(),
+            );
+          }
+        }
+      } catch {
+        // The deadline path is best-effort only after strict startup validation succeeded. The
+        // active worker will observe the aborted signal and cannot perform a later store write.
+      } finally {
+        // Late completion of an injected non-abort-aware dependency must never touch a closed DB.
+        released = true;
+      }
+    };
+    signal.addEventListener('abort', abortLease, { once: true });
+    if (signal.aborted) abortLease();
     try {
+      if (signal.aborted) return;
       if (current.state === 'receipted') {
         let fresh;
         try {
@@ -153,8 +260,9 @@ export class GateChannelDeliveryEngine {
             runId: wireId(current.runKey),
             taskId: wireId(current.taskKey),
             options: intent.preRead.options,
-          });
+          }, { signal });
         } catch {
+          if (signal.aborted) return;
           this.#onError('gate_effect_read_failed');
           released = this.#defer(
             current,
@@ -164,6 +272,7 @@ export class GateChannelDeliveryEngine {
           );
           return;
         }
+        if (signal.aborted) return;
         if (fresh.status === 'resolved') {
           const consume = this.#store.consumeGateChannelDelivery(
             current.gateKey,
@@ -198,8 +307,10 @@ export class GateChannelDeliveryEngine {
         result = await this.#transport.deliverGate(
           wireId(current.runKey),
           wireId(current.gateKey),
+          signal,
         );
       } catch {
+        if (signal.aborted) return;
         this.#onError('channel_send_failed');
         released = this.#defer(
           current,
@@ -209,12 +320,14 @@ export class GateChannelDeliveryEngine {
         );
         return;
       }
+      if (signal.aborted) return;
       const errorCode = result.kind === 'sent'
         ? effectCode
         : (`route_${result.kind}_${result.code}` as const);
       if (errorCode !== null) this.#onError(errorCode);
       released = this.#defer(current, owner, this.#retryDelay(current), errorCode);
     } catch {
+      if (signal.aborted) return;
       this.#onError('delivery_reconcile_failed');
       const latest = this.#store.findGateChannelDelivery(current.gateKey);
       if (latest?.leaseOwner === owner) {
@@ -227,6 +340,7 @@ export class GateChannelDeliveryEngine {
         );
       }
     } finally {
+      signal.removeEventListener('abort', abortLease);
       if (!released) {
         this.#store.releaseGateChannelDeliveryLease(
           current.gateKey,

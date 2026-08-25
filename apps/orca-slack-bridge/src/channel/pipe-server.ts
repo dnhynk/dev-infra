@@ -33,8 +33,10 @@ export type ChannelPipeErrorCode =
   | 'stale_epoch'
   | 'wrong_attempt'
   | 'wrong_receipt'
+  | 'stale_delivery'
   | 'delivery_event_failed'
   | 'production_delivery_limit'
+  | 'inbound_message_limit'
   | 'run_read_failed'
   | 'shutdown_timeout';
 
@@ -76,6 +78,8 @@ export type ChannelDeliverySendResult =
 
 export type ChannelProductionDeliveryEvent = {
   readonly gateId: string;
+  readonly runId: string;
+  readonly consumerGeneration: number;
   readonly connectionEpoch: string;
 };
 
@@ -98,7 +102,9 @@ type ConnectionState = {
   probeDelayIndex: number;
   writeBlocked: boolean;
   readonly pendingReceiptAcks: Set<string>;
-  readonly productionGateIds: Set<string>;
+  readonly productionDeliveries: Map<string, ChannelProductionDeliveryEvent>;
+  inbound: Promise<void>;
+  pendingInboundMessages: number;
   timer: ReturnType<typeof setTimeout> | null;
 };
 
@@ -124,6 +130,7 @@ export type ChannelPipeServerOptions = {
   readonly maxConnections?: number;
   readonly maxConnectionsPerBinding?: number;
   readonly maxProductionGateIdsPerConnection?: number;
+  readonly eventValidationTimeoutMs?: number;
   /** Test seam for deterministic backpressure; production always calls `socket.write(frame)`. */
   readonly writeFrame?: (socket: Socket, frame: Buffer) => boolean;
   /** Receives bounded codes only. Raw frames, claims, paths, and socket errors are never passed. */
@@ -189,6 +196,26 @@ async function abortableListRuns(
   }
 }
 
+function combinedSignal(...signals: readonly (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (present.length === 0) return undefined;
+  return present.length === 1 ? present[0] : AbortSignal.any(present);
+}
+
+async function abortablePromise<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return await promise;
+  if (signal.aborted) throw new Error('orca_read_aborted');
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const onAbort = (): void => rejectAbort(new Error('orca_read_aborted'));
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /**
  * Daemon-owned local Channel endpoint.
  *
@@ -206,6 +233,7 @@ export class ChannelPipeServer {
   readonly #maxConnections: number;
   readonly #maxConnectionsPerBinding: number;
   readonly #maxProductionGateIdsPerConnection: number;
+  readonly #eventValidationTimeoutMs: number;
   readonly #writeFrame: (socket: Socket, frame: Buffer) => boolean;
   readonly #onError: (code: ChannelPipeErrorCode) => void;
   readonly #connections = new Set<ConnectionState>();
@@ -249,6 +277,10 @@ export class ChannelPipeServer {
       throw new TypeError('max_production_gate_ids_invalid');
     }
     this.#maxProductionGateIdsPerConnection = maxProductionGateIds;
+    this.#eventValidationTimeoutMs = finiteMs(
+      options.eventValidationTimeoutMs ?? 2_000,
+      'event_validation_timeout',
+    );
     this.#writeFrame = options.writeFrame ?? ((socket, frame) => socket.write(frame));
     this.#onError = options.onError ?? (() => undefined);
   }
@@ -381,22 +413,45 @@ export class ChannelPipeServer {
   }
 
   /** Write only after the current Run/generation has exactly one verified Adapter candidate. */
-  async deliverGate(runId: string, gateId: string): Promise<ChannelDeliverySendResult> {
+  async deliverGate(
+    runId: string,
+    gateId: string,
+    signal?: AbortSignal,
+  ): Promise<ChannelDeliverySendResult> {
     if (!isGateId(gateId)) throw new ChannelPipeError('invalid_gate_id');
     if (this.#productionHandlers === null) throw new ChannelPipeError('delivery_event_failed');
-    const selected = await this.#selectProductionRoute(runId);
+    const selected = await this.#selectProductionRoute(runId, signal);
     if (selected.connection === null) return selected.decision;
     const connection = selected.connection;
     if (connection.writeBlocked) return { kind: 'pending', code: 'backpressure' };
     if (
-      !connection.productionGateIds.has(gateId) &&
-      connection.productionGateIds.size >= this.#maxProductionGateIdsPerConnection
+      !connection.productionDeliveries.has(gateId) &&
+      connection.productionDeliveries.size >= this.#maxProductionGateIdsPerConnection
     ) {
       this.#onError('production_delivery_limit');
       connection.socket.destroy();
       return { kind: 'pending', code: 'connection_capacity' };
     }
-    connection.productionGateIds.add(gateId);
+    const token: ChannelProductionDeliveryEvent = {
+      gateId,
+      runId,
+      consumerGeneration: selected.decision.generation,
+      connectionEpoch: selected.decision.epoch,
+    };
+    const existingToken = connection.productionDeliveries.get(gateId);
+    if (
+      existingToken !== undefined &&
+      (
+        existingToken.runId !== token.runId ||
+        existingToken.consumerGeneration !== token.consumerGeneration ||
+        existingToken.connectionEpoch !== token.connectionEpoch
+      )
+    ) {
+      this.#onError('stale_delivery');
+      connection.socket.destroy();
+      return { kind: 'pending', code: 'stale_generation' };
+    }
+    connection.productionDeliveries.set(gateId, token);
     const wrote = this.#write(connection, {
       version: CHANNEL_PROTOCOL_VERSION,
       type: 'notify',
@@ -404,7 +459,7 @@ export class ChannelPipeServer {
       gate_id: gateId,
     });
     if (!wrote && !connection.writeBlocked) {
-      connection.productionGateIds.delete(gateId);
+      connection.productionDeliveries.delete(gateId);
       return { kind: 'pending', code: 'write_failed' };
     }
     // `socket.write() === false` still means the frame was accepted into Node's bounded queue.
@@ -416,18 +471,25 @@ export class ChannelPipeServer {
     };
   }
 
-  async #selectProductionRoute(runId: string): Promise<ChannelRouteSelection> {
+  async #selectProductionRoute(
+    runId: string,
+    externalSignal?: AbortSignal,
+  ): Promise<ChannelRouteSelection> {
     this.#productionRouteEvaluations += 1;
+    const signal = combinedSignal(externalSignal, this.#bindingAbort?.signal);
     const connectionSnapshot = [...this.#connections];
     const bindings = new Map<ConnectionState, BindingGenerationIndex | null>();
-    await Promise.all(connectionSnapshot.map(async (connection) => {
-      if (connection.bindingIndex !== null) {
-        bindings.set(connection, await connection.bindingIndex);
-      }
-    }));
     let runs;
     try {
-      runs = (await listRuns(this.#orca)).filter((run) => run.id === runId);
+      await abortablePromise(Promise.all(connectionSnapshot.map(async (connection) => {
+        if (connection.bindingIndex !== null) {
+          bindings.set(connection, await connection.bindingIndex);
+        }
+      })), signal);
+      runs = (await abortablePromise(listRuns(
+        this.#orca,
+        signal === undefined ? undefined : { signal },
+      ), signal)).filter((run) => run.id === runId);
     } catch {
       this.#onError('run_read_failed');
       return { decision: { kind: 'pending', code: 'run_read_failed' }, connection: null };
@@ -531,7 +593,9 @@ export class ChannelPipeServer {
       probeDelayIndex: 0,
       writeBlocked: false,
       pendingReceiptAcks: new Set(),
-      productionGateIds: new Set(),
+      productionDeliveries: new Map(),
+      inbound: Promise.resolve(),
+      pendingInboundMessages: 0,
       timer: null,
     };
     this.#connections.add(connection);
@@ -545,8 +609,21 @@ export class ChannelPipeServer {
       try {
         const messages = connection.decoder.push(chunk);
         for (const message of messages) {
-          this.#handleMessage(connection, message);
-          if (socket.destroyed) break;
+          if (connection.pendingInboundMessages >= 256) {
+            this.#rejectConnection(connection, 'inbound_message_limit');
+            break;
+          }
+          connection.pendingInboundMessages += 1;
+          const handled = connection.inbound.then(async () => {
+            if (socket.destroyed) return;
+            await this.#handleMessage(connection, message);
+          });
+          connection.inbound = handled
+            .catch(() => {
+              this.#onError('unexpected_message');
+              socket.destroy();
+            })
+            .finally(() => { connection.pendingInboundMessages -= 1; });
         }
       } catch (error) {
         this.#onError(error instanceof ChannelProtocolError ? error.code : 'unexpected_message');
@@ -566,7 +643,10 @@ export class ChannelPipeServer {
     });
   }
 
-  #handleMessage(connection: ConnectionState, message: AdapterToDaemonMessage): void {
+  async #handleMessage(
+    connection: ConnectionState,
+    message: AdapterToDaemonMessage,
+  ): Promise<void> {
     if (message.type === 'hello') {
       if (connection.hello !== null) {
         this.#rejectConnection(connection, 'duplicate_hello');
@@ -607,18 +687,17 @@ export class ChannelPipeServer {
     if (message.type === 'attempted') {
       if (
         message.gate_id !== connection.probeGateId &&
-        !connection.productionGateIds.has(message.gate_id)
+        !connection.productionDeliveries.has(message.gate_id)
       ) {
         this.#rejectConnection(connection, 'wrong_attempt');
         return;
       }
       connection.attemptedWrites += 1;
       if (message.gate_id !== connection.probeGateId) {
+        const token = await this.#validateProductionEvent(connection, message.gate_id);
+        if (token === null) return;
         try {
-          this.#productionHandlers?.attempted({
-            gateId: message.gate_id,
-            connectionEpoch: connection.epoch,
-          });
+          this.#productionHandlers?.attempted(token);
         } catch {
           this.#onError('delivery_event_failed');
         }
@@ -627,7 +706,7 @@ export class ChannelPipeServer {
     }
     if (message.type === 'receipt') {
       const probeReceipt = message.gate_id === connection.probeGateId;
-      if (!probeReceipt && !connection.productionGateIds.has(message.gate_id)) {
+      if (!probeReceipt && !connection.productionDeliveries.has(message.gate_id)) {
         this.#rejectConnection(connection, 'wrong_receipt');
         return;
       }
@@ -636,11 +715,10 @@ export class ChannelPipeServer {
         if (!connection.writeBlocked) this.#clearTimer(connection);
       }
       if (!probeReceipt) {
+        const token = await this.#validateProductionEvent(connection, message.gate_id);
+        if (token === null) return;
         try {
-          this.#productionHandlers?.receipted({
-            gateId: message.gate_id,
-            connectionEpoch: connection.epoch,
-          });
+          this.#productionHandlers?.receipted(token);
         } catch {
           // No ACK: the Adapter's receipt tool remains retryable and cannot outrun durable state.
           this.#onError('delivery_event_failed');
@@ -649,6 +727,41 @@ export class ChannelPipeServer {
       }
       this.#ackReceipt(connection, message.gate_id);
     }
+  }
+
+  async #validateProductionEvent(
+    connection: ConnectionState,
+    gateId: string,
+  ): Promise<ChannelProductionDeliveryEvent | null> {
+    const token = connection.productionDeliveries.get(gateId);
+    if (
+      token === undefined ||
+      connection.epoch !== token.connectionEpoch ||
+      this.#stopping ||
+      connection.socket.destroyed
+    ) return null;
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), this.#eventValidationTimeoutMs);
+    timer.unref?.();
+    let selected: ChannelRouteSelection;
+    try {
+      selected = await this.#selectProductionRoute(token.runId, deadline.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (this.#stopping) return null;
+    if (
+      selected.connection === connection &&
+      selected.decision.kind === 'eligible' &&
+      selected.decision.epoch === token.connectionEpoch &&
+      selected.decision.generation === token.consumerGeneration
+    ) return token;
+    if (selected.decision.kind === 'pending' && selected.decision.code === 'run_read_failed') {
+      return null;
+    }
+    this.#onError('stale_delivery');
+    if (!connection.socket.destroyed) connection.socket.destroy();
+    return null;
   }
 
   #ackReceipt(connection: ConnectionState, gateId: string): void {

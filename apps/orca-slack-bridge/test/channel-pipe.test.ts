@@ -287,6 +287,80 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
     expect(await client.reportReceipt(productionGateId)).toBe('accepted');
   });
 
+  it('rejects an old-epoch receipt after Run takeover and replays to the new generation', async () => {
+    const path = pipePath('production-takeover-fence');
+    const orca = new FakeOrca();
+    const errors: string[] = [];
+    const daemon = server(path, orca, errors);
+    const attempted: { gateId: string; generation: number; epoch: string }[] = [];
+    const receipted: { gateId: string; generation: number; epoch: string }[] = [];
+    daemon.setProductionDeliveryHandlers({
+      attempted: (event) => attempted.push({
+        gateId: event.gateId,
+        generation: event.consumerGeneration,
+        epoch: event.connectionEpoch,
+      }),
+      receipted: (event) => receipted.push({
+        gateId: event.gateId,
+        generation: event.consumerGeneration,
+        epoch: event.connectionEpoch,
+      }),
+    });
+    await daemon.start();
+
+    const productionGateId = 'gate_ffffffffffff';
+    let productionWrites = 0;
+    let releaseOldWrite!: () => void;
+    const heldOldWrite = new Promise<void>((resolve) => { releaseOldWrite = resolve; });
+    let client!: ChannelAdapterClient;
+    client = adapter(path, {
+      notifyGate: async (gateId) => {
+        if (gateId === daemon.listConnections()[0]?.probeGateId) {
+          await client.reportReceipt(gateId);
+          return;
+        }
+        if (gateId === productionGateId) {
+          productionWrites += 1;
+          if (productionWrites === 1) await heldOldWrite;
+        }
+      },
+    });
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+    const oldEpoch = daemon.listConnections()[0]!.epoch;
+    expect(await daemon.deliverGate(RUN_ID, productionGateId)).toMatchObject({
+      kind: 'sent', generation: 1, epoch: oldEpoch,
+    });
+    await waitFor(() => productionWrites === 1);
+
+    orca.generation = 2;
+    await expect(client.reportReceipt(productionGateId)).rejects.toThrowError(
+      /receipt_disconnected|receipt_timeout/,
+    );
+    await waitFor(() => errors.includes('stale_delivery'));
+    expect(receipted).toEqual([]);
+    expect(attempted).toEqual([]);
+
+    releaseOldWrite();
+    await waitFor(() => (
+      daemon.listConnections()[0]?.verified === true &&
+      daemon.listConnections()[0]?.epoch !== oldEpoch
+    ));
+    const currentEpoch = daemon.listConnections()[0]!.epoch;
+    expect(await daemon.deliverGate(RUN_ID, productionGateId)).toMatchObject({
+      kind: 'sent', generation: 2, epoch: currentEpoch,
+    });
+    await waitFor(() => productionWrites === 2);
+    await waitFor(() => attempted.some((event) => event.epoch === currentEpoch));
+    expect(await client.reportReceipt(productionGateId)).toBe('accepted');
+    await waitFor(() => receipted.length === 1);
+    expect(receipted).toEqual([{
+      gateId: productionGateId,
+      generation: 2,
+      epoch: currentEpoch,
+    }]);
+  });
+
   it('withholds a production receipt ACK until the synchronous durable callback succeeds', async () => {
     const path = pipePath('production-receipt-fence');
     const errors: string[] = [];

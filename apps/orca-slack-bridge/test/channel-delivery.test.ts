@@ -9,7 +9,10 @@ import {
   type GateChannelDeliveryErrorCode,
   type GateChannelDeliveryTransport,
 } from '../src/channel/delivery.js';
-import type { ChannelDeliverySendResult } from '../src/channel/pipe-server.js';
+import type {
+  ChannelDeliverySendResult,
+  ChannelProductionDeliveryEvent,
+} from '../src/channel/pipe-server.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import type { GateSnapshot } from '../src/gate/resolution-types.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
@@ -137,6 +140,83 @@ function resolveD2(store: SqliteDigestStore): void {
   if (terminal?.lifecycle !== 'resolved') throw new Error('terminal resolution failed');
 }
 
+function resolveAdditionalD2(
+  store: SqliteDigestStore,
+  input: {
+    gateId: string;
+    taskId: string;
+    dispatchId: string;
+    requestId: string;
+    messageSuffix: string;
+  },
+): GateSnapshot {
+  const gate = gateKey(input.gateId);
+  const task = taskKey(input.taskId);
+  const before: GateSnapshot = {
+    ...pending, gateId: input.gateId, taskId: input.taskId,
+  };
+  const after: GateSnapshot = {
+    ...before, status: 'resolved', resolution: '현행 유지', resolvedAt: RESOLVED_AT,
+  };
+  store.insertGateMetadata({
+    gateKey: gate, runKey: RUN, taskKey: task, dispatchKey: dispatchKey(input.dispatchId),
+    askMessageId: `msg_${input.messageSuffix}`,
+    questionThreadId: `thread_${input.messageSuffix}`,
+    options: [
+      { id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' },
+      { id: 'change', label: '변경', description: '변경한다', resolution: '변경' },
+    ],
+    recommendation: { optionId: 'keep', reason: '호환성' },
+    impact: '후속 방향', registeredAt: AT,
+  });
+  store.insertGateMessage({
+    gateKey: gate, runKey: RUN, channelId: 'C0AGENTRUNS',
+    threadTs: `1787554800.100${input.messageSuffix}`,
+    messageTs: `1787554800.200${input.messageSuffix}`,
+    renderFingerprint: `fp_${input.messageSuffix}`, at: AT,
+  });
+  store.saveGateLocalObservation({
+    gateKey: gate, runKey: RUN, taskKey: task, status: 'pending', resolution: null,
+    resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+  });
+  const claim = store.claimGateResolution({
+    teamId: 'T0TEAM', ownerUserId: 'U0OWNER', apiAppId: 'A0APP', channelId: 'C0AGENTRUNS',
+    threadTs: `1787554800.100${input.messageSuffix}`,
+    messageTs: `1787554800.200${input.messageSuffix}`,
+    blockId: gateBlockId(gate), actionId: gateActionId(gate, 'keep'), actionValue: 'keep',
+    retryRequestId: input.requestId, at: AT,
+  });
+  if (claim.kind !== 'claimed') throw new Error(`additional claim failed: ${claim.kind}`);
+  const acked = store.markGateResolutionAck(gate, claim.intent.revision, 'acked', AT);
+  if (acked === null) throw new Error('additional ACK failed');
+  const owner = `t.d2-${input.messageSuffix}`;
+  const lease = store.acquireGateResolutionLease(
+    gate, owner, AT, '2026-08-24T10:01:00.000Z',
+  );
+  if (lease.kind !== 'acquired') throw new Error(`additional lease failed: ${lease.kind}`);
+  const preRead = store.updateGateResolution(gate, lease.intent.revision, owner, {
+    lifecycle: 'pre_read', preRead: before, at: AT,
+  });
+  if (preRead === null) throw new Error('additional pre-read failed');
+  const resolving = store.updateGateResolution(gate, preRead.revision, owner, {
+    lifecycle: 'resolving', at: AT,
+  });
+  if (resolving === null) throw new Error('additional resolving failed');
+  const postRead = store.updateGateResolution(gate, resolving.revision, owner, {
+    lifecycle: 'post_read',
+    resolveResult: {
+      gate: after, mutation: { requestId: input.requestId, replayed: false },
+    },
+    at: AT,
+  });
+  if (postRead === null) throw new Error('additional post-read failed');
+  const terminal = store.updateGateResolution(gate, postRead.revision, owner, {
+    lifecycle: 'resolved', postRead: after, at: AT,
+  });
+  if (terminal?.lifecycle !== 'resolved') throw new Error('additional terminal failed');
+  return after;
+}
+
 class FakeOrca implements OrcaRunner {
   snapshot: GateSnapshot = resolved;
   fail = false;
@@ -165,6 +245,42 @@ class FakeOrca implements OrcaRunner {
   }
 }
 
+class HeldGateOrca implements OrcaRunner {
+  private releaseResponse!: () => void;
+  private readonly responseReleased = new Promise<void>((resolve) => {
+    this.releaseResponse = resolve;
+  });
+
+  constructor(private readonly snapshots: readonly GateSnapshot[]) {}
+
+  release(): void {
+    this.releaseResponse();
+  }
+
+  run(_args: readonly string[]): Promise<string> {
+    // Intentionally ignores AbortSignal to prove the engine's lifecycle bound and late-write fence.
+    return this.responseReleased.then(() => JSON.stringify({
+      id: 'held',
+      ok: true,
+      result: {
+        runId: RUN_ID,
+        gates: this.snapshots.map((snapshot) => ({
+          id: snapshot.gateId,
+          run_id: snapshot.runId,
+          task_id: snapshot.taskId,
+          question: '표시용 질문',
+          options: JSON.stringify(snapshot.options),
+          status: snapshot.status,
+          resolution: snapshot.resolution,
+          created_at: '2026-08-24T09:00:00.000Z',
+          resolved_at: snapshot.resolvedAt,
+        })),
+        count: this.snapshots.length,
+      },
+    }));
+  }
+}
+
 class FakeTransport implements GateChannelDeliveryTransport {
   result: ChannelDeliverySendResult = { kind: 'sent', epoch: 'epoch_test', generation: 1 };
   fail = false;
@@ -186,12 +302,22 @@ function clock(start = START): { now: () => Date; advance: (milliseconds: number
   };
 }
 
+function callback(gateId = GATE_ID): ChannelProductionDeliveryEvent {
+  return {
+    gateId,
+    runId: RUN_ID,
+    consumerGeneration: 1,
+    connectionEpoch: 'epoch_test',
+  };
+}
+
 function engine(
   store: SqliteDigestStore,
-  orca: FakeOrca,
+  orca: OrcaRunner,
   transport: GateChannelDeliveryTransport,
   time: ReturnType<typeof clock>,
   errors: GateChannelDeliveryErrorCode[] = [],
+  bounds: { concurrency?: number; reconcileDeadlineMs?: number } = {},
 ): GateChannelDeliveryEngine {
   return new GateChannelDeliveryEngine({
     store,
@@ -201,6 +327,7 @@ function engine(
     routeRetryMs: 1_000,
     receiptBackoffMs: 3_000,
     attemptDelaysMs: [1_000, 2_000],
+    ...bounds,
     onError: (code) => errors.push(code),
   });
 }
@@ -219,13 +346,17 @@ describe('durable Channel delivery engine', () => {
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
       state: 'pending', attemptCount: 0, receiptedAt: null, consumedAt: null,
     });
+    expect(() => delivery.recordReceipted({
+      ...callback(), runId: 'run_wrong',
+    })).toThrowError('delivery_token_mismatch');
+    expect(store.findGateChannelDelivery(GATE)?.state).toBe('pending');
 
     time.advance(10);
-    expect(delivery.recordAttempted(GATE_ID)).toMatchObject({
+    expect(delivery.recordAttempted(callback())).toMatchObject({
       state: 'attempted', attemptCount: 1, receiptedAt: null,
     });
     time.advance(10);
-    expect(delivery.recordReceipted(GATE_ID)).toMatchObject({
+    expect(delivery.recordReceipted(callback())).toMatchObject({
       state: 'receipted', consumedAt: null,
     });
     expect(orca.calls).toHaveLength(0);
@@ -238,8 +369,8 @@ describe('durable Channel delivery engine', () => {
     expect(orca.calls[0]).toEqual([
       'orchestration', 'gate-list', '--run', RUN_ID, '--json',
     ]);
-    expect(delivery.recordReceipted(GATE_ID)?.state).toBe('consumed');
-    expect(delivery.recordAttempted(GATE_ID)?.state).toBe('consumed');
+    expect(delivery.recordReceipted(callback())?.state).toBe('consumed');
+    expect(delivery.recordAttempted(callback())?.state).toBe('consumed');
     store.close();
   });
 
@@ -250,9 +381,9 @@ describe('durable Channel delivery engine', () => {
     const first = engine(store, new FakeOrca(), new FakeTransport(), time);
     await first.reconcile();
     time.advance(10);
-    first.recordAttempted(GATE_ID);
+    first.recordAttempted(callback());
     time.advance(10);
-    first.recordReceipted(GATE_ID);
+    first.recordReceipted(callback());
     expect(store.findGateChannelDelivery(GATE)?.state).toBe('receipted');
     store.close();
 
@@ -300,6 +431,48 @@ describe('durable Channel delivery engine', () => {
     store.close();
   });
 
+  it('bounds a concurrent multi-row reconcile and fences late hung-Orca completions after close', async () => {
+    let store = new SqliteDigestStore(path);
+    resolveD2(store);
+    const second = resolveAdditionalD2(store, {
+      gateId: 'gate_bbbbbbbbbbbb', taskId: 'task_delivery_b', dispatchId: 'ctx_delivery_b',
+      requestId: '22222222-2222-4222-8222-222222222222', messageSuffix: '003',
+    });
+    const third = resolveAdditionalD2(store, {
+      gateId: 'gate_cccccccccccc', taskId: 'task_delivery_c', dispatchId: 'ctx_delivery_c',
+      requestId: '33333333-3333-4333-8333-333333333333', messageSuffix: '004',
+    });
+    const gateKeys = [GATE, gateKey(second.gateId), gateKey(third.gateId)];
+    expect(store.seedPendingGateChannelDeliveries(START)).toHaveLength(3);
+    for (const key of gateKeys) {
+      expect(store.markGateChannelReceipted(key, START)?.state).toBe('receipted');
+    }
+
+    const heldOrca = new HeldGateOrca([resolved, second, third]);
+    const transport = new FakeTransport();
+    const errors: GateChannelDeliveryErrorCode[] = [];
+    const startedAt = Date.now();
+    await engine(store, heldOrca, transport, clock(), errors, {
+      concurrency: 2,
+      reconcileDeadlineMs: 40,
+    }).reconcile();
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(errors).toEqual(['delivery_reconcile_deadline']);
+    expect(transport.calls).toEqual([]);
+    const beforeClose = gateKeys.map((key) => store.findGateChannelDelivery(key));
+    expect(beforeClose.every((row) => row?.state === 'receipted' && row.leaseOwner === null)).toBe(true);
+    expect(beforeClose.filter(
+      (row) => row?.lastErrorCode === 'delivery_reconcile_deadline',
+    )).toHaveLength(2);
+    store.close();
+
+    store = new SqliteDigestStore(path);
+    heldOrca.release();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(gateKeys.map((key) => store.findGateChannelDelivery(key))).toEqual(beforeClose);
+    store.close();
+  });
+
   it('does not consume a receipt while the exact Gate is pending and retries at slower pacing', async () => {
     const store = new SqliteDigestStore(path);
     resolveD2(store);
@@ -311,7 +484,7 @@ describe('durable Channel delivery engine', () => {
 
     await delivery.reconcile();
     time.advance(10);
-    expect(delivery.recordReceipted(GATE_ID)).toMatchObject({
+    expect(delivery.recordReceipted(callback())).toMatchObject({
       state: 'receipted', attemptCount: 1,
     });
     await delivery.reconcile();
@@ -339,7 +512,7 @@ describe('durable Channel delivery engine', () => {
 
     await delivery.reconcile();
     time.advance(10);
-    delivery.recordReceipted(GATE_ID);
+    delivery.recordReceipted(callback());
     orca.fail = true;
     await delivery.reconcile();
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
