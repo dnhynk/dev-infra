@@ -2,7 +2,11 @@ import type { CheckFact } from '../github/pull-request.js';
 import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import type { GateMetadata } from '../gate/types.js';
-import type { GateLocalObservation, GateResolutionStore } from '../gate/resolution-types.js';
+import type {
+  GateChannelDeliveryStore,
+  GateLocalObservation,
+  GateResolutionStore,
+} from '../gate/resolution-types.js';
 import type { GateDirectInputStore } from '../gate/direct-input-types.js';
 
 /**
@@ -64,11 +68,12 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  * D2-C는 v7 sidecar/thread mapping 위에 local Gate observation, immutable winner intent,
  * bounded evidence와 card/notification outbox를 additive v8로 덧붙인다. v9는 그 v8 행을
  * 재작성하지 않고 ordinary Slack completion을 fence하는 monotonic generation 표만 덧붙인다.
- * D3 notification transport는 여전히 구현하지 않고 notification state는 pending으로만 보존한다.
+ * D3는 v10 outbox를 재작성하지 않고 additive v11 delivery sidecar를 덧붙인다. v10의
+ * `notification_state`는 계속 `pending` 하나만 허용하며 D3 lifecycle은 별도 표가 소유한다.
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -492,6 +497,62 @@ CREATE TABLE gate_resolution_audit (
 const GATE_RESOLUTION_AUDIT_INDEX = `
 CREATE INDEX gate_resolution_audit_gate ON gate_resolution_audit (gate_key, id)`;
 
+/**
+ * Additive v11 Channel lifecycle. The referenced v10 outbox is intentionally unchanged: it stays
+ * the D2 source intent while this sidecar owns delivery retries and exact effect consumption.
+ * Session/connection claims are never durable trust inputs, so no binding or epoch column exists.
+ */
+const GATE_CHANNEL_DELIVERY_TABLE = `
+CREATE TABLE gate_channel_delivery (
+  gate_key            TEXT PRIMARY KEY REFERENCES gate_resolution_outbox(gate_key),
+  run_key             TEXT NOT NULL,
+  task_key            TEXT NOT NULL,
+  source_dispatch_id  TEXT NOT NULL CHECK (length(source_dispatch_id) BETWEEN 1 AND 500),
+  revision            INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
+  deferred_outbox_revision INTEGER NOT NULL
+    CHECK (deferred_outbox_revision BETWEEN 0 AND 9007199254740991),
+  state               TEXT NOT NULL CHECK (state IN ('pending','attempted','receipted','consumed')),
+  attempt_count       INTEGER NOT NULL CHECK (attempt_count BETWEEN 0 AND 1000000),
+  last_attempt_at     TEXT,
+  next_attempt_at     TEXT,
+  receipted_at        TEXT,
+  consumed_at         TEXT,
+  lease_owner         TEXT CHECK (lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 80),
+  lease_expires_at    TEXT,
+  last_error_code     TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL)
+      OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
+  CHECK (lease_expires_at IS NULL OR lease_expires_at > updated_at),
+  CHECK (
+    (state = 'pending' AND attempt_count = 0 AND last_attempt_at IS NULL
+      AND next_attempt_at IS NOT NULL AND receipted_at IS NULL AND consumed_at IS NULL)
+    OR (state = 'attempted' AND attempt_count >= 1 AND last_attempt_at IS NOT NULL
+      AND next_attempt_at IS NOT NULL AND receipted_at IS NULL AND consumed_at IS NULL)
+    OR (state = 'receipted' AND attempt_count >= 1 AND last_attempt_at IS NOT NULL
+      AND next_attempt_at IS NOT NULL AND receipted_at IS NOT NULL AND consumed_at IS NULL)
+    OR (state = 'consumed' AND attempt_count >= 1 AND last_attempt_at IS NOT NULL
+      AND next_attempt_at IS NULL AND receipted_at IS NOT NULL AND consumed_at IS NOT NULL
+      AND lease_owner IS NULL AND lease_expires_at IS NULL AND last_error_code IS NULL)
+  ),
+  CHECK (last_attempt_at IS NULL OR last_attempt_at >= created_at),
+  CHECK (receipted_at IS NULL OR receipted_at >= last_attempt_at),
+  CHECK (consumed_at IS NULL OR consumed_at >= receipted_at),
+  CHECK (updated_at >= created_at),
+  CHECK (last_attempt_at IS NULL OR updated_at >= last_attempt_at),
+  CHECK (receipted_at IS NULL OR updated_at >= receipted_at),
+  CHECK (consumed_at IS NULL OR updated_at >= consumed_at)
+)`;
+
+const GATE_CHANNEL_DELIVERY_DUE_INDEX = `
+CREATE INDEX gate_channel_delivery_due
+  ON gate_channel_delivery (state, next_attempt_at, gate_key)`;
+
+const GATE_CHANNEL_DELIVERY_RUN_INDEX = `
+CREATE INDEX gate_channel_delivery_run
+  ON gate_channel_delivery (run_key, state, gate_key)`;
+
 /** Exact code-owned v8 objects. Startup compares normalized sqlite_master SQL fail-closed. */
 export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_metadata: GATE_METADATA_TABLE,
@@ -518,6 +579,13 @@ export const GATE_V9_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
 export const GATE_V10_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_direct_modal: GATE_DIRECT_MODAL_TABLE,
   gate_direct_modal_gate: GATE_DIRECT_MODAL_GATE_INDEX,
+};
+
+/** v11 adds only the D3 delivery sidecar and its deterministic scheduling/routing indexes. */
+export const GATE_V11_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  gate_channel_delivery: GATE_CHANNEL_DELIVERY_TABLE,
+  gate_channel_delivery_due: GATE_CHANNEL_DELIVERY_DUE_INDEX,
+  gate_channel_delivery_run: GATE_CHANNEL_DELIVERY_RUN_INDEX,
 };
 
 /**
@@ -586,6 +654,9 @@ ${GATE_RESOLUTION_ATTEMPT_TABLE};
 ${GATE_RESOLUTION_ATTEMPT_INDEX};
 ${GATE_RESOLUTION_AUDIT_TABLE};
 ${GATE_RESOLUTION_AUDIT_INDEX};
+${GATE_CHANNEL_DELIVERY_TABLE};
+${GATE_CHANNEL_DELIVERY_DUE_INDEX};
+${GATE_CHANNEL_DELIVERY_RUN_INDEX};
 `;
 
 /**
@@ -651,6 +722,13 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // v9 → v10: durable server-owned correlation for the D2-D direct-input modal. Existing Gate
   // rows are not inferred and no trigger id or unaccepted resolution text is backfilled.
   [GATE_DIRECT_MODAL_TABLE, GATE_DIRECT_MODAL_GATE_INDEX],
+  // v10 → v11: additive D3 delivery state only. Existing v10 rows are deliberately not
+  // backfilled here; the production daemon lazily and idempotently seeds exact resolved D2 rows.
+  [
+    GATE_CHANNEL_DELIVERY_TABLE,
+    GATE_CHANNEL_DELIVERY_DUE_INDEX,
+    GATE_CHANNEL_DELIVERY_RUN_INDEX,
+  ],
 ];
 
 /**
@@ -981,7 +1059,8 @@ export type NewGateMessage = {
  * Gate metadata/card mapping plus the D2-C resolution boundary. It remains separate from PR and
  * Run-root interfaces so callers request only the effects they use.
  */
-export interface GateStore extends GateResolutionStore, GateDirectInputStore {
+export interface GateStore
+  extends GateResolutionStore, GateDirectInputStore, GateChannelDeliveryStore {
   findGateMetadata(gateKey: GateKey): GateMetadata | null;
   /** Gate key order is fixed in SQL so source-row order cannot change render fingerprints. */
   listGateMetadata(runKey: RunKey): readonly GateMetadata[];

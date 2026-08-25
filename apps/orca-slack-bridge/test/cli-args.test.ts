@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseArgs, decideEntrypoint } from '../src/cli.js';
+import { CLI_USAGE, parseArgs, decideEntrypoint } from '../src/cli.js';
 
 describe('명령 분기', () => {
   it('snapshot을 인식한다', () => {
@@ -148,6 +148,15 @@ describe('명령 분기', () => {
 
   it('--help는 명령이 있어도 도움말', () => {
     expect(parseArgs(['snapshot', '--help']).kind).toBe('help');
+  });
+
+  it('daemon 도움말은 live v11 delivery 경계를 정확히 설명한다', () => {
+    expect(CLI_USAGE).toContain('v11 durable store');
+    expect(CLI_USAGE).toContain('production Gate ID를 전달·receipt·consume');
+    expect(CLI_USAGE).toContain('Task를\nresume하지 않는다');
+    expect(CLI_USAGE).not.toContain('v10 durable store');
+    expect(CLI_USAGE).not.toContain('D3-1 receipt probe');
+    expect(CLI_USAGE).not.toContain('production Gate를\nChannel에 보내지 않으며');
   });
 
   it('알 수 없는 명령은 오류로 구분한다 — 도움말과 같은 취급을 하지 않는다', () => {

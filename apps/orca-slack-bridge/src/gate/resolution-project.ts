@@ -104,6 +104,9 @@ export async function projectGateResolutionCard(
         now().toISOString(),
       );
       if (lease === 'busy') return { kind: 'pending', card, fingerprint };
+      // D3-2 re-arms the shared card outbox atomically but deliberately leaves its exact
+      // Channel-originated generation for D3-3. Do not spin this loop or make a Slack call.
+      if (lease === 'deferred') return { kind: 'pending', card, fingerprint };
       if (lease === 'superseded') continue;
       if (lease === 'recovered') {
         ownsProjection = true;

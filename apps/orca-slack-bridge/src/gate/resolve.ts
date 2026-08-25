@@ -169,13 +169,44 @@ export class GateResolutionEngine {
       metadata.options.map((option) => option.label),
     );
     const hasStructuredMutationResult = initial.resolveResult !== null;
-    this.options.store.recordGateAttempt(initial.gateKey, 'pre_read', 'started', null, this.at());
+    const recoveringPersistedMutation =
+      hasStructuredMutationResult && initial.preRead?.status === 'pending';
+    const readPhase = recoveringPersistedMutation ? 'post_read' : 'pre_read';
+    this.options.store.recordGateAttempt(initial.gateKey, readPhase, 'started', null, this.at());
     if (!this.renewLease(initial.gateKey, lease)) return;
     let pre: GateSnapshot;
     try {
       pre = await readExactGate(this.options.orca, identity);
     } catch {
-      this.uncertain(initial, 'pre_read_failed');
+      this.uncertain(
+        initial,
+        recoveringPersistedMutation ? 'post_read_failed' : 'pre_read_failed',
+      );
+      return;
+    }
+    if (recoveringPersistedMutation) {
+      // A structured resolve response proves that the mutation edge was already crossed. On
+      // restart this read is the missing post-read, not a new baseline: overwriting the durable
+      // pending preRead with the current resolved snapshot would destroy the D2 pending→resolved
+      // evidence required by the additive D3 seed.
+      this.options.store.recordGateAttempt(
+        initial.gateKey,
+        'post_read',
+        'succeeded',
+        null,
+        this.at(),
+      );
+      const confirmed = confirmedExpected(pre, initial);
+      this.finish(
+        initial,
+        confirmed ? 'resolved' : 'conflict',
+        pre,
+        confirmed
+          ? null
+          : pre.status === 'resolved'
+            ? 'external_resolution'
+            : 'post_mutation_state_changed',
+      );
       return;
     }
     const preReadIntent = this.options.store.updateGateResolution(initial.gateKey, initial.revision, this.leaseOwner, {

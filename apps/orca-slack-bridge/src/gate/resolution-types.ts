@@ -148,7 +148,118 @@ export type GateLeaseResult =
   | { readonly kind: 'busy'; readonly expiresAt: string }
   | { readonly kind: 'unavailable' };
 
-export type GateProjectionLeaseResult = 'acquired' | 'recovered' | 'busy' | 'superseded';
+export type GateProjectionLeaseResult =
+  | 'acquired'
+  | 'recovered'
+  | 'busy'
+  | 'superseded'
+  | 'deferred';
+
+/** Exact D3-3 opt-in for the one Channel-originated card generation it is authorized to render. */
+export type GateChannelProjectionClaim = {
+  readonly expectedDeliveryRevision: number;
+  readonly expectedOutboxRevision: number;
+};
+
+/** Checked inside the SQLite transaction immediately before its durable commit. */
+export type GateChannelDeliveryCommitFence = () => boolean;
+
+export type GateChannelSeedResult =
+  | { readonly kind: 'committed'; readonly deliveries: readonly GateChannelDelivery[] }
+  | { readonly kind: 'fenced' };
+
+export type GateChannelDeliveryState = 'pending' | 'attempted' | 'receipted' | 'consumed';
+
+/**
+ * Additive D3 delivery state. The v10 Gate outbox remains the immutable D2 source row; this row is
+ * a lazy materialization that can be retried without changing `notification_state='pending'`.
+ */
+export type GateChannelDelivery = {
+  readonly gateKey: GateKey;
+  readonly runKey: RunKey;
+  readonly taskKey: TaskKey;
+  readonly sourceDispatchId: string;
+  /** Monotonic CAS/fencing generation for delivery state and lease ownership. */
+  readonly revision: number;
+  /** Exact D2 card-outbox generation re-armed by the latest D3 transition and deferred to D3-3. */
+  readonly deferredOutboxRevision: number;
+  readonly state: GateChannelDeliveryState;
+  /** Number of Adapter-confirmed MCP transport writes, not daemon pipe writes. */
+  readonly attemptCount: number;
+  readonly lastAttemptAt: string | null;
+  /** Retry/requery eligibility. `consumed` is the only state with no next attempt. */
+  readonly nextAttemptAt: string | null;
+  readonly receiptedAt: string | null;
+  readonly consumedAt: string | null;
+  readonly leaseOwner: string | null;
+  readonly leaseExpiresAt: string | null;
+  /** Bounded code only. Raw transport, Orca, Slack, or credential material is never persisted. */
+  readonly lastErrorCode: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type GateChannelDeliveryLeaseResult =
+  | { readonly kind: 'acquired'; readonly delivery: GateChannelDelivery }
+  | { readonly kind: 'busy'; readonly expiresAt: string }
+  | { readonly kind: 'unavailable' };
+
+export type GateChannelConsumeResult =
+  | { readonly kind: 'consumed'; readonly delivery: GateChannelDelivery }
+  | { readonly kind: 'duplicate'; readonly delivery: GateChannelDelivery }
+  | { readonly kind: 'mismatch' | 'superseded' };
+
+/** Durable D3 API. Every remote side effect is outside SQLite and therefore fenced by this CAS. */
+export interface GateChannelDeliveryStore {
+  /** Idempotently materialize one bounded page of eligible terminal D2 pending notifications. */
+  seedPendingGateChannelDeliveries(
+    at: string,
+    limit: number,
+    commitFence: GateChannelDeliveryCommitFence,
+  ): GateChannelSeedResult;
+  findGateChannelDelivery(gateKey: GateKey): GateChannelDelivery | null;
+  listDueGateChannelDeliveries(at: string, limit?: number): readonly GateChannelDelivery[];
+  acquireGateChannelDeliveryLease(
+    gateKey: GateKey,
+    owner: string,
+    at: string,
+    expiresAt: string,
+  ): GateChannelDeliveryLeaseResult;
+  releaseGateChannelDeliveryLease(gateKey: GateKey, owner: string, at: string): boolean;
+  /** Persist retry pacing/error and release the exact current lease without changing lifecycle. */
+  deferGateChannelDelivery(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    at: string,
+    nextAttemptAt: string,
+    errorCode: string | null,
+  ): GateChannelDelivery | null;
+  /** Adapter-reported MCP transport write. A late report cannot regress receipt/consumption. */
+  markGateChannelAttempted(
+    gateKey: GateKey,
+    at: string,
+    nextAttemptAt: string,
+    commitFence?: GateChannelDeliveryCommitFence,
+  ): GateChannelDelivery | null;
+  /** Application receipt only; it deliberately does not consume the event. */
+  markGateChannelReceipted(
+    gateKey: GateKey,
+    at: string,
+    commitFence?: GateChannelDeliveryCommitFence,
+  ): GateChannelDelivery | null;
+  /**
+   * Commit `consumed` only when the fresh exact Gate matches the stored D2 pending→resolved
+   * evidence. The state transition and D2 card-outbox re-arm are one SQLite transaction.
+   */
+  consumeGateChannelDelivery(
+    gateKey: GateKey,
+    expectedRevision: number,
+    owner: string,
+    freshGate: GateSnapshot,
+    at: string,
+  ): GateChannelConsumeResult;
+}
 
 export type GateProgressUpdate = {
   readonly lifecycle: GateResolutionLifecycle;
@@ -231,6 +342,7 @@ export interface GateResolutionStore {
     expectedRevision: number,
     owner: string,
     at: string,
+    channelClaim?: GateChannelProjectionClaim,
   ): GateProjectionLeaseResult;
   /** A completed card whose deterministic renderer changed must become a new pending generation. */
   rearmGateOutboxProjection(gateKey: GateKey, expectedRevision: number, at: string): boolean;
@@ -240,9 +352,15 @@ export interface GateResolutionStore {
     renderFingerprint: string,
     owner: string,
     at: string,
+    channelClaim?: GateChannelProjectionClaim,
   ): boolean;
   /** Release an ordinary completion and force the latest generation pending after ambiguity/failure. */
-  releaseGateOutboxProjection(gateKey: GateKey, owner: string, at: string): boolean;
+  releaseGateOutboxProjection(
+    gateKey: GateKey,
+    owner: string,
+    at: string,
+    channelClaim?: GateChannelProjectionClaim,
+  ): boolean;
   recordGateAudit(gateKey: GateKey | null, event: string, reason: string, at: string): void;
   recordGateAttempt(gateKey: GateKey, phase: string, outcome: string, detail: string | null, at: string): void;
 }

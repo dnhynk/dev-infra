@@ -21,7 +21,7 @@ const HELLO: AdapterHello = {
   connection_id: 'connection_66666666-6666-4666-8666-666666666666',
 };
 
-describe('Channel protocol v1 NDJSON codec', () => {
+describe('Channel protocol v2 NDJSON codec', () => {
   it('decodes one frame fragmented at every byte boundary', () => {
     const frame = encodeChannelFrame(HELLO);
     for (let split = 1; split < frame.length; split += 1) {
@@ -39,7 +39,12 @@ describe('Channel protocol v1 NDJSON codec', () => {
       connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
       gate_id: 'gate_1234abcdef56',
     };
-    const receipt = { ...attempted, type: 'receipt' as const };
+    const receipt = {
+      ...attempted,
+      type: 'receipt' as const,
+      ack_budget_ms: 5_000,
+      ack_deadline_ns: '123456789012345',
+    };
     const decoder = new ChannelNdjsonDecoder(decodeAdapterMessage);
     expect(decoder.push(Buffer.concat([
       encodeChannelFrame(HELLO),
@@ -54,6 +59,7 @@ describe('Channel protocol v1 NDJSON codec', () => {
       version: CHANNEL_PROTOCOL_VERSION,
       type: 'hello_ack',
       connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+      monotonic_ns: '123456789012345',
     }))).toHaveLength(1);
     expect(decoder.push(encodeChannelFrame({
       version: CHANNEL_PROTOCOL_VERSION,
@@ -63,14 +69,43 @@ describe('Channel protocol v1 NDJSON codec', () => {
     }))).toHaveLength(1);
 
     for (const value of [
-      { ...HELLO, version: 2 },
+      { ...HELLO, version: CHANNEL_PROTOCOL_VERSION + 1 },
+      { ...HELLO, version: CHANNEL_PROTOCOL_VERSION - 1 },
       { ...HELLO, extra: true },
       { ...HELLO, session_id: undefined },
-      { version: 1, type: 'surprise' },
+      { version: CHANNEL_PROTOCOL_VERSION, type: 'surprise' },
       [],
       null,
     ]) {
       expect(() => decodeAdapterMessage(value)).toThrow(ChannelProtocolError);
+    }
+    for (const ackBudget of [undefined, 0, 1.5, 60_001, '5000']) {
+      expect(() => decodeAdapterMessage({
+        version: CHANNEL_PROTOCOL_VERSION,
+        type: 'receipt',
+        connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+        gate_id: 'gate_1234abcdef56',
+        ack_budget_ms: ackBudget,
+        ack_deadline_ns: '123456789012345',
+      })).toThrow(ChannelProtocolError);
+    }
+    for (const ackDeadline of [undefined, 0, '', '0', '01', '-1', '1.5', '1'.repeat(31)]) {
+      expect(() => decodeAdapterMessage({
+        version: CHANNEL_PROTOCOL_VERSION,
+        type: 'receipt',
+        connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+        gate_id: 'gate_1234abcdef56',
+        ack_budget_ms: 5_000,
+        ack_deadline_ns: ackDeadline,
+      })).toThrow(ChannelProtocolError);
+    }
+    for (const monotonicNs of [undefined, 0, '', '0', '01', '-1', '1.5', '1'.repeat(31)]) {
+      expect(() => decodeDaemonMessage({
+        version: CHANNEL_PROTOCOL_VERSION,
+        type: 'hello_ack',
+        connection_epoch: 'epoch_77777777-7777-4777-8777-777777777777',
+        monotonic_ns: monotonicNs,
+      })).toThrow(ChannelProtocolError);
     }
   });
 
@@ -115,7 +150,9 @@ describe('Channel protocol v1 NDJSON codec', () => {
     const decoder = new ChannelNdjsonDecoder(decodeAdapterMessage);
     let caught: unknown;
     try {
-      decoder.push(Buffer.from(`{"version":1,"type":"hello","secret":"${rawSecret}"}\n`));
+      decoder.push(Buffer.from(
+        `{"version":${CHANNEL_PROTOCOL_VERSION},"type":"hello","secret":"${rawSecret}"}\n`,
+      ));
     } catch (error) {
       caught = error;
     }
