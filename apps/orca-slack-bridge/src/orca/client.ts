@@ -21,8 +21,12 @@ const execFileAsync = promisify(execFile);
  * 배치를 소비하므로 아예 쓰지 않고, 소비하지 않는 `inbox`만 쓴다(`listWorkerDone`).
  */
 export interface OrcaRunner {
-  run(args: readonly string[]): Promise<string>;
+  run(args: readonly string[], options?: OrcaRunOptions): Promise<string>;
 }
+
+export type OrcaRunOptions = {
+  readonly signal?: AbortSignal;
+};
 
 export type OrcaCliOptions = {
   /** Kills the child after this deadline. Omit only for non-daemon legacy callers. */
@@ -43,11 +47,12 @@ export class OrcaCli implements OrcaRunner {
       options.timeoutMs === undefined ? undefined : Math.trunc(options.timeoutMs);
   }
 
-  async run(args: readonly string[]): Promise<string> {
+  async run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
     const { stdout } = await execFileAsync(this.bin, [...args], {
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
       ...(this.timeoutMs === undefined ? {} : { timeout: this.timeoutMs }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
     return stdout;
   }
@@ -64,24 +69,44 @@ export function boundedOrcaRunner(runner: OrcaRunner, timeoutMs: number): OrcaRu
   }
   const deadline = Math.trunc(timeoutMs);
   return {
-    async run(args: readonly string[]): Promise<string> {
+    async run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
+      if (options.signal?.aborted === true) throw new Error('Orca command aborted');
+      const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let rejectCancellation!: (error: Error) => void;
+      const cancellation = new Promise<string>((_resolve, reject) => {
+        rejectCancellation = reject;
+      });
+      const onExternalAbort = (): void => {
+        controller.abort();
+        rejectCancellation(new Error('Orca command aborted'));
+      };
+      options.signal?.addEventListener('abort', onExternalAbort, { once: true });
       try {
         return await Promise.race([
-          runner.run(args),
+          runner.run(args, { signal: controller.signal }),
+          cancellation,
           new Promise<string>((_resolve, reject) => {
-            timer = setTimeout(() => reject(new Error('Orca command deadline exceeded')), deadline);
+            timer = setTimeout(() => {
+              controller.abort();
+              reject(new Error('Orca command deadline exceeded'));
+            }, deadline);
           }),
         ]);
       } finally {
         if (timer !== undefined) clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onExternalAbort);
       }
     },
   };
 }
 
-async function call<T>(runner: OrcaRunner, args: readonly string[]): Promise<T> {
-  const out = await runner.run(args);
+async function call<T>(
+  runner: OrcaRunner,
+  args: readonly string[],
+  options?: OrcaRunOptions,
+): Promise<T> {
+  const out = await runner.run(args, options);
   let raw: unknown;
   try {
     raw = JSON.parse(out);
@@ -238,8 +263,15 @@ function strOrNull(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
 }
 
-export async function listRuns(runner: OrcaRunner): Promise<OrcaRun[]> {
-  const r = await call<{ runs?: unknown[] }>(runner, ['orchestration', 'run-list', '--json']);
+export async function listRuns(
+  runner: OrcaRunner,
+  options?: OrcaRunOptions,
+): Promise<OrcaRun[]> {
+  const r = await call<{ runs?: unknown[] }>(
+    runner,
+    ['orchestration', 'run-list', '--json'],
+    options,
+  );
   return (r.runs ?? []).map((row) => {
     const o = row as Record<string, unknown>;
     return {

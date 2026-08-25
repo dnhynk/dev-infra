@@ -217,7 +217,62 @@ class NeverSettlingSlack implements SlackPoster {
   }
 }
 
+class FakeChannelServer {
+  readonly events: string[];
+  readonly failStart: boolean;
+
+  constructor(events: string[] = [], failStart = false) {
+    this.events = events;
+    this.failStart = failStart;
+  }
+
+  async start(): Promise<void> {
+    this.events.push('channel:start');
+    if (this.failStart) throw new Error('pipe_in_use');
+  }
+
+  async stop(): Promise<void> {
+    this.events.push('channel:stop');
+  }
+}
+
 describe('daemon production wiring', () => {
+  it('owns the Channel server before Socket ingress and releases it before Socket shutdown', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(events),
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      connectionFactory: () => ({
+        start: () => { events.push('socket:start'); return Promise.resolve({ appId: 'A0APP' }); },
+        close: () => { events.push('socket:stop'); return Promise.resolve(); },
+      }),
+      waitForStop: () => Promise.resolve(),
+    });
+    expect(code).toBe(0);
+    expect(events).toEqual(['channel:start', 'socket:start', 'channel:stop', 'socket:stop']);
+  });
+
+  it('fails closed before Socket ingress when Channel ownership cannot be acquired', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(events, true),
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      connectionFactory: () => {
+        events.push('socket:factory');
+        throw new Error('must not create Socket transport');
+      },
+      waitForStop: () => Promise.resolve(),
+    });
+    expect(code).toBe(1);
+    expect(events).toEqual(['channel:start', 'channel:stop']);
+  });
+
   it('direct button → modal errors → valid ACK → fake Orca → durable projection을 잇는다', async () => {
     seed();
     const parsed = parseArgs(['daemon', '--state', statePath]);
@@ -238,6 +293,7 @@ describe('daemon production wiring', () => {
     };
 
     const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
       orca,
       slack,
       viewOpener: opener,
@@ -342,6 +398,7 @@ describe('daemon production wiring', () => {
     };
 
     const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
       orca,
       slack,
       connectionFactory,
@@ -454,6 +511,7 @@ describe('daemon production wiring', () => {
     const began = performance.now();
     try {
       const code = await runDaemonCommand(parsed, CONFIG, {
+        channelServer: new FakeChannelServer(),
         orca,
         slack,
         connectionFactory,
@@ -517,6 +575,7 @@ describe('daemon production wiring', () => {
       };
     };
     const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
       orca,
       slack,
       connectionFactory,
@@ -559,6 +618,7 @@ describe('daemon production wiring', () => {
     let closes = 0;
     try {
       const code = await runDaemonCommand(parsed, CONFIG, {
+        channelServer: new FakeChannelServer(),
         orca,
         slack,
         reconcileIntervalMs: 10,
@@ -595,6 +655,7 @@ describe('daemon production wiring', () => {
     let starts = 0;
     const began = Date.now();
     const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
       orca,
       slack: new FakeSlack(),
       orcaTimeoutMs: 10,
@@ -625,6 +686,7 @@ describe('daemon production wiring', () => {
     let starts = 0;
     const began = Date.now();
     const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
       orca,
       slack,
       slackTimeoutMs: 10,
@@ -659,6 +721,7 @@ describe('daemon production wiring', () => {
     let acks = 0;
     const began = Date.now();
     const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
       orca,
       slack,
       orcaTimeoutMs: 10,

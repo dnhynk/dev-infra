@@ -49,8 +49,17 @@ import {
   SlackWebApiViewOpener,
   type SlackViewOpener,
 } from './slack/views.js';
+import {
+  ChannelAdapterClient,
+  channelAdapterIdentityFromEnv,
+  type ChannelAdapterIdentity,
+  type ChannelNotificationWriter,
+} from './channel/adapter.js';
+import { ChannelMcpServer, type ChannelReceiptHandler } from './channel/mcp-server.js';
+import { ChannelPipeServer } from './channel/pipe-server.js';
+import type { Readable, Writable } from 'node:stream';
 
-export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register' | 'daemon';
+export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register' | 'daemon' | 'channel-adapter';
 
 export type ParsedArgs =
   | { readonly kind: 'help' }
@@ -88,7 +97,7 @@ function arg(argv: readonly string[], name: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs', 'gate-register', 'daemon'];
+const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs', 'gate-register', 'daemon', 'channel-adapter'];
 
 function isCommand(v: string | undefined): v is Command {
   return v !== undefined && (COMMANDS as readonly string[]).includes(v);
@@ -145,6 +154,11 @@ function unknownDaemonArg(argv: readonly string[]): string | null {
     return token;
   }
   return null;
+}
+
+/** The stdio Adapter has a fixed pipe address and accepts no runtime flags or positionals. */
+function unknownChannelAdapterArg(argv: readonly string[]): string | null {
+  return argv[1] ?? null;
 }
 
 /** Socket preflight 선택이 있는 verify-slack은 문서화된 공통 옵션과 --socket만 받는다. */
@@ -284,6 +298,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       return { kind: 'error', message: `daemon이 모르는 인자다: ${unknown}` };
     }
   }
+  if (command === 'channel-adapter') {
+    const unknown = unknownChannelAdapterArg(argv);
+    if (unknown !== null) {
+      return { kind: 'error', message: `channel-adapter가 모르는 인자다: ${unknown}` };
+    }
+  }
   const prLimitRaw = arg(argv, '--pr-limit');
   const prLimit = prLimitRaw === undefined ? 50 : Number.parseInt(prLimitRaw, 10);
   if (!Number.isSafeInteger(prLimit) || prLimit <= 0) {
@@ -309,7 +329,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
-const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon>
+const USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
@@ -317,6 +337,7 @@ digest        관찰 1회로 PR digest 카드를 #pr-digest에 게시하거나 �
 runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신한다
 gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite에 등록한다
 daemon        fixed-option Gate action을 ACK하고 durable resolution을 재조정한다
+channel-adapter session별 stdio MCP Channel Adapter를 실행하고 daemon pipe에 재연결한다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
@@ -343,13 +364,14 @@ gate-register 전용:
 
 daemon 전용:
 
-  --state <path>    v8 durable store 경로 (dry-run 없음)
+  --state <path>    v10 durable store 경로 (dry-run 없음)
 
 snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
 runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
 하나와, 등록된 Run 수와 무관하게 컬렉션 카드 하나를 게시한다(OD-080). gate-register는 Orca Gate를
 read-only로 재조회한 뒤 local SQLite에만 쓰고 Slack/Orca mutation을 하지 않는다. daemon은
-Bridge-owned fixed-option action만 처리하며 D3 Coordinator notification transport는 실행하지 않는다.`;
+Bridge-owned fixed-option action과 D3-1 receipt probe pipe를 실행한다. D3-1은 production Gate를
+Channel에 보내지 않으며 schema/Slack projection을 바꾸지 않는다. channel-adapter는 옵션이 없다.`;
 
 /**
  * summarizer provider를 만든다.
@@ -609,6 +631,95 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
   }
 }
 
+export type ChannelMcpRuntime = ChannelNotificationWriter & {
+  connectStdio(input?: Readable, output?: Writable): Promise<void>;
+  waitClosed(): Promise<void>;
+  close(): Promise<void>;
+};
+
+export type ChannelAdapterRuntime = {
+  start(): void;
+  stop(): Promise<void>;
+  reportReceipt(gateId: string): Promise<'accepted' | 'duplicate'>;
+};
+
+export type ChannelAdapterCommandDependencies = {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly input?: Readable;
+  readonly output?: Writable;
+  readonly createMcp?: (receipt: ChannelReceiptHandler) => ChannelMcpRuntime;
+  readonly createAdapter?: (
+    identity: ChannelAdapterIdentity,
+    notificationWriter: ChannelNotificationWriter,
+  ) => ChannelAdapterRuntime;
+  readonly waitForStop?: (mcpClosed: Promise<void>, input: Readable) => Promise<void>;
+};
+
+function waitForAdapterStop(mcpClosed: Promise<void>, input: Readable): Promise<void> {
+  if (input.destroyed || input.readableEnded) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const stop = (): void => {
+      if (settled) return;
+      settled = true;
+      input.off('end', stop);
+      input.off('close', stop);
+      input.off('error', stop);
+      process.off('SIGINT', stop);
+      process.off('SIGTERM', stop);
+      resolve();
+    };
+    input.once('end', stop);
+    input.once('close', stop);
+    input.once('error', stop);
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+    void mcpClosed.then(stop, stop);
+  });
+}
+
+/** Production stdio Adapter path. It does not load Bridge config or read Slack credentials. */
+export async function runChannelAdapterCommand(
+  parsed: RunArgs,
+  dependencies: ChannelAdapterCommandDependencies = {},
+): Promise<number> {
+  if (parsed.command !== 'channel-adapter') {
+    process.stderr.write('channel_adapter_wrong_command\n');
+    return 2;
+  }
+  let adapter: ChannelAdapterRuntime | null = null;
+  let mcp: ChannelMcpRuntime | null = null;
+  try {
+    const identity = channelAdapterIdentityFromEnv(dependencies.env ?? process.env);
+    const receipt: ChannelReceiptHandler = async (gateId) => {
+      if (adapter === null) throw new Error('adapter_not_ready');
+      return await adapter.reportReceipt(gateId);
+    };
+    mcp = dependencies.createMcp?.(receipt) ?? new ChannelMcpServer({ receipt });
+    adapter = dependencies.createAdapter?.(identity, mcp) ?? new ChannelAdapterClient({
+      identity,
+      notificationWriter: mcp,
+    });
+    const input = dependencies.input ?? process.stdin;
+    await mcp.connectStdio(input, dependencies.output ?? process.stdout);
+    adapter.start();
+    await (dependencies.waitForStop ?? waitForAdapterStop)(mcp.waitClosed(), input);
+    return 0;
+  } catch {
+    // stdout is reserved for MCP frames; stderr gets one code and never a frame/claim/env value.
+    process.stderr.write('channel_adapter_failed\n');
+    return 1;
+  } finally {
+    await adapter?.stop().catch(() => undefined);
+    await mcp?.close().catch(() => undefined);
+  }
+}
+
+export type ChannelDaemonServer = {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+};
+
 export type DaemonDependencies = {
   readonly orca?: OrcaRunner;
   readonly slack?: SlackPoster;
@@ -622,6 +733,7 @@ export type DaemonDependencies = {
   /** Production defaults to five seconds; tests may shorten the durable retry cadence. */
   readonly reconcileIntervalMs?: number;
   readonly waitForStop?: () => Promise<void>;
+  readonly channelServer?: ChannelDaemonServer;
 };
 
 function processStop(): Promise<void> {
@@ -653,6 +765,7 @@ export async function runDaemonCommand(
   }
   let store: SqliteDigestStore | null = null;
   let transport: SlackSocketTransport | null = null;
+  let channelServer: ChannelDaemonServer | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let reconciliation: Promise<void> | null = null;
   const pending = new Set<Promise<void>>();
@@ -708,7 +821,12 @@ export async function runDaemonCommand(
       abortSignal: inboundAbort.signal,
     });
 
-    // No Socket event can race schema validation or startup recovery.
+    // Acquire the single fixed pipe before recovery or Slack ingress. A second daemon fails closed
+    // here and cannot become either the Channel owner or an interactive consumer.
+    channelServer = dependencies.channelServer ?? new ChannelPipeServer({ orca });
+    await channelServer.start();
+
+    // No Slack Socket event can race schema validation or startup recovery.
     await engine.reconcile();
     const configuredInterval = dependencies.reconcileIntervalMs ?? 5_000;
     if (!Number.isFinite(configuredInterval) || configuredInterval < 10) {
@@ -751,6 +869,8 @@ export async function runDaemonCommand(
     acceptingInbound = false;
     clearInterval(reconciliationTimer);
     reconciliationTimer = null;
+    await channelServer.stop();
+    channelServer = null;
     // Stop accepting new work before store close. Accepted handlers retain their existing bounded
     // ACK deadline and are drained in finally before their local retry signal is aborted.
     await transport.shutdown();
@@ -762,6 +882,13 @@ export async function runDaemonCommand(
   } finally {
     acceptingInbound = false;
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
+    if (channelServer !== null) {
+      try {
+        await channelServer.stop();
+      } catch {
+        // Pipe shutdown failure cannot authorize a second daemon or a different external write.
+      }
+    }
     if (transport !== null) {
       try {
         await transport.shutdown();
@@ -779,8 +906,16 @@ export async function runDaemonCommand(
   }
 }
 
-async function main(): Promise<number> {
-  const parsed = parseArgs(process.argv.slice(2));
+export type CliMainDependencies = {
+  readonly channelAdapter?: ChannelAdapterCommandDependencies;
+  readonly daemon?: DaemonDependencies;
+};
+
+export async function main(
+  argv: readonly string[] = process.argv.slice(2),
+  dependencies: CliMainDependencies = {},
+): Promise<number> {
+  const parsed = parseArgs(argv);
   if (parsed.kind === 'help') {
     process.stdout.write(USAGE + '\n');
     return 0;
@@ -792,6 +927,10 @@ async function main(): Promise<number> {
 
   if (parsed.command === 'gate-register') {
     return await runGateRegisterCommand(parsed);
+  }
+
+  if (parsed.command === 'channel-adapter') {
+    return await runChannelAdapterCommand(parsed, dependencies.channelAdapter);
   }
 
   const config = await loadConfig(parsed.configPath ?? defaultConfigPath());
@@ -818,7 +957,7 @@ async function main(): Promise<number> {
   }
 
   if (parsed.command === 'daemon') {
-    return await runDaemonCommand(parsed, config);
+    return await runDaemonCommand(parsed, config, dependencies.daemon);
   }
 
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
