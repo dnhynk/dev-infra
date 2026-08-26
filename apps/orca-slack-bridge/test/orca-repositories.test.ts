@@ -30,6 +30,12 @@ function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
+function rowWithoutRepoIcon(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const value = row(overrides);
+  delete value['repoIcon'];
+  return value;
+}
+
 function envelope(repos: readonly unknown[] = [row()]): Record<string, unknown> {
   return {
     id: 'request_synthetic',
@@ -71,6 +77,19 @@ describe('parseOrcaRepositoryList', () => {
     expect(JSON.stringify(got)).not.toContain('C:/REDACTED');
     expect(JSON.stringify(got)).not.toContain('remoteUrl');
     expect(JSON.stringify(got)).not.toContain('displayName');
+  });
+
+  it('accepts the exact installed row variant that omits repoIcon', () => {
+    const got = parseOrcaRepositoryList(envelope([rowWithoutRepoIcon()]));
+    expect(got.rows).toEqual([{
+      status: 'valid',
+      orcaRepositoryId: 'repo_synthetic_1',
+      rowIndex: 0,
+      identity: {
+        canonicalKey: 'github.com/example/project',
+        nameWithOwner: 'example/project',
+      },
+    }]);
   });
 
   it('represents null remote as a row-local no_remote diagnostic', () => {
@@ -171,7 +190,7 @@ describe('parseOrcaRepositoryList', () => {
       .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
   });
 
-  const rowKeys = Object.keys(row());
+  const rowKeys = Object.keys(row()).filter((key) => key !== 'repoIcon');
   it.each(rowKeys)('rejects a missing top-level row key: %s', (key) => {
     const value = row();
     delete value[key];
@@ -184,6 +203,19 @@ describe('parseOrcaRepositoryList', () => {
       .toBe('ORCA_REPOSITORY_ROW_INVALID');
   });
 
+  it('rejects every other missing or extra key in the repoIcon-omitted row variant', () => {
+    for (const key of Object.keys(rowWithoutRepoIcon())) {
+      const value = rowWithoutRepoIcon();
+      delete value[key];
+      expect(contractCode(() => parseOrcaRepositoryList(envelope([value]))))
+        .toBe('ORCA_REPOSITORY_ROW_INVALID');
+    }
+    expect(contractCode(() => parseOrcaRepositoryList(envelope([{
+      ...rowWithoutRepoIcon(),
+      unexpected: true,
+    }])))).toBe('ORCA_REPOSITORY_ROW_INVALID');
+  });
+
   const wrongTypes: readonly [string, unknown][] = [
     ['id', 1], ['path', null], ['displayName', false], ['badgeColor', 1], ['addedAt', 1.5],
     ['kind', null], ['externalWorktreeVisibilityLegacy', 0], ['gitUsername', []],
@@ -193,6 +225,11 @@ describe('parseOrcaRepositoryList', () => {
   it.each(wrongTypes)('rejects wrong top-level row type: %s', (key, value) => {
     expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ [key]: value })]))))
       .toBe('ORCA_REPOSITORY_ROW_INVALID');
+    if (key !== 'repoIcon') {
+      expect(contractCode(() => parseOrcaRepositoryList(envelope([
+        rowWithoutRepoIcon({ [key]: value }),
+      ])))).toBe('ORCA_REPOSITORY_ROW_INVALID');
+    }
   });
 
   it('requires the exact three remote identity fields and string types', () => {
@@ -237,5 +274,34 @@ describe('listRepositories', () => {
     const got = await listRepositories(runner, { signal: controller.signal });
     expect(got.rows).toHaveLength(1);
     expect(calls).toEqual([[['repo', 'list', '--json'], controller.signal]]);
+  });
+
+  it('replaces runner failures with a static contract error that cannot leak cause fields', async () => {
+    const sentinel = 'SYNTHETIC_PRIVATE_REMOTE_MARKER';
+    const failure = Object.assign(new Error(sentinel), {
+      stdout: sentinel,
+      stderr: sentinel,
+      command: sentinel,
+      path: sentinel,
+      url: sentinel,
+      repositoryId: sentinel,
+    });
+    const runner: OrcaRunner = {
+      async run(): Promise<string> {
+        throw failure;
+      },
+    };
+
+    try {
+      await listRepositories(runner);
+      expect.unreachable('runner failure should be replaced');
+    } catch (error) {
+      expect(error).toBeInstanceOf(OrcaRepositoryContractError);
+      expect((error as OrcaRepositoryContractError).code)
+        .toBe('ORCA_REPOSITORY_COMMAND_FAILED');
+      expect(error).not.toBe(failure);
+      expect('cause' in (error as object)).toBe(false);
+      expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain(sentinel);
+    }
   });
 });

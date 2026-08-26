@@ -10,7 +10,10 @@ import {
 } from './coerce.js';
 import type { FindingFacts } from '../summarize/contract.js';
 import type { GateResolveResult, GateSnapshot } from '../gate/resolution-types.js';
-import { parseOrcaRepositoryListJson } from '../discovery/orca-repositories.js';
+import {
+  OrcaRepositoryContractError,
+  parseOrcaRepositoryListJson,
+} from '../discovery/orca-repositories.js';
 import type { RepositoryDiscoverySnapshot } from '../discovery/types.js';
 
 const execFileAsync = promisify(execFile);
@@ -138,7 +141,12 @@ export async function listRepositories(
   runner: OrcaRunner,
   options?: OrcaRunOptions,
 ): Promise<RepositoryDiscoverySnapshot> {
-  const out = await runner.run(['repo', 'list', '--json'], options);
+  let out: string;
+  try {
+    out = await runner.run(['repo', 'list', '--json'], options);
+  } catch {
+    throw new OrcaRepositoryContractError('ORCA_REPOSITORY_COMMAND_FAILED');
+  }
   return parseOrcaRepositoryListJson(out);
 }
 

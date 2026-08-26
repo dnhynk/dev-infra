@@ -68,6 +68,7 @@ export function normalizeGithubNameWithOwner(value: string): CanonicalGithubRepo
   if (value.includes('\\')) reject('backslash');
   if (value.includes('%')) reject('percent_encoding');
   if (value.includes('?') || value.includes('#')) reject('query_or_fragment');
+  if (value.startsWith('/')) reject('invalid_path');
   const repository = value.split('/')[1];
   if (repository !== undefined && /\.git$/i.test(repository)) reject('invalid_repository');
   return parsePath(value, false);
@@ -91,6 +92,7 @@ export function normalizeGithubRemote(value: string): CanonicalGithubRepository 
     if (scp === null) reject('invalid_syntax');
     if (scp[1] !== 'git') reject('invalid_user');
     if (scp[2]!.toLowerCase() !== 'github.com') reject('unsupported_host');
+    if (scp[3]!.startsWith('/')) reject('invalid_path');
     return parsePath(scp[3]!, false);
   }
   const schemeLower = scheme[1]!.toLowerCase();
@@ -106,6 +108,7 @@ export function normalizeGithubRemote(value: string): CanonicalGithubRepository 
   const pathStart = value.indexOf('/', authorityStart);
   const authority = pathStart === -1 ? value.slice(authorityStart) : value.slice(authorityStart, pathStart);
   const rawPath = pathStart === -1 ? '' : value.slice(pathStart);
+  if (authority.endsWith(':')) reject('invalid_syntax');
   if (/(?:^|\/)\.{1,2}(?:\/|$)/.test(rawPath)) reject('invalid_path');
   if (parsed.hostname.toLowerCase() !== 'github.com') reject('unsupported_host');
 

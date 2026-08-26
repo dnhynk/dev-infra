@@ -40,6 +40,9 @@ describe('normalizeGithubRemote', () => {
     ['root@github.com:o/r', 'invalid_user'],
     ['https://github.com:444/o/r', 'non_default_port'],
     ['ssh://git@github.com:2222/o/r', 'non_default_port'],
+    ['git@github.com:/owner/repository', 'invalid_path'],
+    ['https://github.com:/owner/repository', 'invalid_syntax'],
+    ['ssh://git@github.com:/owner/repository', 'invalid_syntax'],
     ['git@github.com:o/r.git/', 'invalid_path'],
     ['https://github.com/o/r?x=1', 'query_or_fragment'],
     ['https://github.com/o/r#fragment', 'query_or_fragment'],
@@ -114,5 +117,12 @@ describe('normalizeGithubNameWithOwner', () => {
       nameWithOwner: 'owner/repo',
     });
     expect(() => normalizeGithubNameWithOwner('https://github.com/o/r')).toThrow(GithubRemoteError);
+    try {
+      normalizeGithubNameWithOwner('/owner/repository');
+      expect.unreachable('leading slash should be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(GithubRemoteError);
+      expect((error as GithubRemoteError).code).toBe('invalid_path');
+    }
   });
 });

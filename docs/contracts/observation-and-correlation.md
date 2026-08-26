@@ -182,10 +182,11 @@ worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree i
 ### O1 repository discovery 입력 계약
 
 O1 discovery는 설치된 `orca repo list --json`의 success envelope key를 정확히 `id`, `ok`, `result`,
-`_meta`, result key를 정확히 `repos`로 읽는다. repository row는 설치 버전에서 관측한 14개 top-level
-key와 type을 exact 검증하며 `gitRemoteIdentity`는 `null` 또는 `canonicalKey`, `remoteName`, `remoteUrl`
-string 세 필드의 exact object다. `repoIcon`은 null/object, `hookSettings`는 object까지만 검사하고 내부 raw
-field를 export하지 않는다. envelope/result/row schema drift는 pass 전체 실패다.
+`_meta`, result key를 정확히 `repos`로 읽는다. repository row는 설치 버전에서 관측한 `repoIcon` 포함
+14-key 형태 또는 그 key만 생략한 13-key 형태의 explicit union과 각 type을 exact 검증하며
+`gitRemoteIdentity`는 `null` 또는 `canonicalKey`, `remoteName`, `remoteUrl` string 세 필드의 exact
+object다. 존재하는 `repoIcon`은 null/object, `hookSettings`는 object까지만 검사하고 내부 raw field를
+export하지 않는다. envelope/result/row schema drift는 pass 전체 실패다.
 
 정상 row의 remote URL은 위 독립 GitHub normalizer를 거친다. 계산한 key와 Orca `canonicalKey`가 다르면
 그 row는 `canonical_conflict`로 봉쇄하며 어느 쪽도 binding으로 추측하지 않는다. remote가 없거나 지원하지

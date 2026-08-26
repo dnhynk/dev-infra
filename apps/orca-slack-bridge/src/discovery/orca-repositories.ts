@@ -8,7 +8,7 @@ import type {
 const ENVELOPE_KEYS = ['_meta', 'id', 'ok', 'result'] as const;
 const RESULT_KEYS = ['repos'] as const;
 const META_KEYS = ['runtimeId'] as const;
-const ROW_KEYS = [
+const ROW_KEYS_WITH_REPO_ICON = [
   'addedAt',
   'badgeColor',
   'displayName',
@@ -22,6 +22,21 @@ const ROW_KEYS = [
   'path',
   'projectHostSetupMethod',
   'repoIcon',
+  'upstream',
+] as const;
+const ROW_KEYS_WITHOUT_REPO_ICON = [
+  'addedAt',
+  'badgeColor',
+  'displayName',
+  'externalWorktreeVisibility',
+  'externalWorktreeVisibilityLegacy',
+  'gitRemoteIdentity',
+  'gitUsername',
+  'hookSettings',
+  'id',
+  'kind',
+  'path',
+  'projectHostSetupMethod',
   'upstream',
 ] as const;
 const REMOTE_KEYS = ['canonicalKey', 'remoteName', 'remoteUrl'] as const;
@@ -67,7 +82,13 @@ function requireString(row: Record<string, unknown>, key: string): void {
 }
 
 function validateRowShape(value: unknown): Record<string, unknown> {
-  if (!isRecord(value) || !hasExactKeys(value, ROW_KEYS)) fail('ORCA_REPOSITORY_ROW_INVALID');
+  if (
+    !isRecord(value) ||
+    (!hasExactKeys(value, ROW_KEYS_WITH_REPO_ICON) &&
+      !hasExactKeys(value, ROW_KEYS_WITHOUT_REPO_ICON))
+  ) {
+    fail('ORCA_REPOSITORY_ROW_INVALID');
+  }
   for (const key of [
     'id',
     'path',
@@ -85,7 +106,7 @@ function validateRowShape(value: unknown): Record<string, unknown> {
     fail('ORCA_REPOSITORY_ROW_INVALID');
   }
   if (value['upstream'] !== null) fail('ORCA_REPOSITORY_ROW_INVALID');
-  if (value['repoIcon'] !== null && !isRecord(value['repoIcon'])) {
+  if ('repoIcon' in value && value['repoIcon'] !== null && !isRecord(value['repoIcon'])) {
     fail('ORCA_REPOSITORY_ROW_INVALID');
   }
   if (!isRecord(value['hookSettings'])) fail('ORCA_REPOSITORY_ROW_INVALID');
