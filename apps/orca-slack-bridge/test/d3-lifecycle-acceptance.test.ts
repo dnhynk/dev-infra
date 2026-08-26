@@ -928,6 +928,10 @@ describe('D3-4 offline lifecycle acceptance', () => {
 
     const current = server.listConnections()[0];
     if (current === undefined) throw new Error('current Adapter missing');
+    // Server verification proves the automatic receipt was sent, but its ACK can still be queued
+    // on the Adapter. Joining that exact pending promise may therefore observe its one `accepted`;
+    // every subsequent report in the same epoch must be the deterministic duplicate.
+    await expect(first.reportReceipt(current.probeGateId)).resolves.toMatch(/^(?:accepted|duplicate)$/u);
     await expect(first.reportReceipt(current.probeGateId)).resolves.toBe('duplicate');
     expect(server.getResourceSnapshot().productionGateWrites).toBe(0);
 
