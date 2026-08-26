@@ -66,8 +66,29 @@ import {
   type ChannelProductionDeliveryHandlers,
 } from './channel/pipe-server.js';
 import type { Readable, Writable } from 'node:stream';
+import type { DaemonJobName } from './store/operational-types.js';
+import {
+  formatOperationalStatus,
+  inspectOperationalStatus,
+  type InspectOperationalStatusOptions,
+} from './operational/status.js';
+import {
+  followOperationalLogs,
+  formatOperationalLogRecord,
+  readOperationalLogTail,
+} from './operational/logs.js';
+import { OPERATIONAL_JOB_NAMES, resolveOperationalLogDir } from './operational/logger.js';
 
-export type Command = 'snapshot' | 'verify-slack' | 'digest' | 'runs' | 'gate-register' | 'daemon' | 'channel-adapter';
+export type Command =
+  | 'snapshot'
+  | 'verify-slack'
+  | 'digest'
+  | 'runs'
+  | 'gate-register'
+  | 'daemon'
+  | 'channel-adapter'
+  | 'status'
+  | 'logs';
 
 export type ParsedArgs =
   | { readonly kind: 'help' }
@@ -89,6 +110,14 @@ export type ParsedArgs =
       readonly dryRun: boolean;
       /** `verify-slack`에서만 실제 Socket hello를 확인한다. */
       readonly socket: boolean;
+      /** status/logs가 참조하는 bounded operational log directory. */
+      readonly logDir: string | null;
+      /** logs가 출력할 마지막 safe record 수. */
+      readonly tail: number;
+      /** logs가 rotation/truncation을 따라갈지 여부. */
+      readonly follow: boolean;
+      /** logs가 parsed allowlisted job field로 거를 이름. */
+      readonly job: DaemonJobName | null;
     };
 
 type RunArgs = Extract<ParsedArgs, { readonly kind: 'run' }>;
@@ -105,7 +134,10 @@ function arg(argv: readonly string[], name: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-const COMMANDS: readonly Command[] = ['snapshot', 'verify-slack', 'digest', 'runs', 'gate-register', 'daemon', 'channel-adapter'];
+const COMMANDS: readonly Command[] = [
+  'snapshot', 'verify-slack', 'digest', 'runs', 'gate-register', 'daemon', 'channel-adapter',
+  'status', 'logs',
+];
 
 function isCommand(v: string | undefined): v is Command {
   return v !== undefined && (COMMANDS as readonly string[]).includes(v);
@@ -121,6 +153,7 @@ const VALUE_FLAGS: readonly string[] = [
   '--input',
 ];
 const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run', '--socket'];
+const ALL_VALUE_FLAGS: readonly string[] = [...VALUE_FLAGS, '--log-dir', '--tail', '--job'];
 
 /**
  * 되돌릴 수 없는 외부 write를 하는 명령.
@@ -187,6 +220,34 @@ function unknownVerifySlackArg(argv: readonly string[]): string | null {
   return null;
 }
 
+function unknownExactArg(
+  argv: readonly string[],
+  valueFlags: readonly string[],
+  boolFlags: readonly string[],
+): string | null {
+  const values = new Set(valueFlags);
+  const booleans = new Set(boolFlags);
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (values.has(token)) {
+      const value = argv[i + 1];
+      if (value !== undefined && !value.startsWith('--')) i += 1;
+      continue;
+    }
+    if (booleans.has(token)) continue;
+    return token;
+  }
+  return null;
+}
+
+function repeatedExactArg(argv: readonly string[], flags: readonly string[]): string | null {
+  for (const flag of flags) {
+    if (argv.filter((token) => token === flag).length > 1) return flag;
+  }
+  return null;
+}
+
 /**
  * 값 플래그가 값을 실제로 받았는지 본다. 위반이 없으면 null.
  *
@@ -209,7 +270,7 @@ function unknownVerifySlackArg(argv: readonly string[]): string | null {
 function missingFlagValue(argv: readonly string[]): string | null {
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
-    if (token === undefined || !VALUE_FLAGS.includes(token)) continue;
+    if (token === undefined || !ALL_VALUE_FLAGS.includes(token)) continue;
     const value = argv[i + 1];
     if (value === undefined) return `${token}은 값을 요구하는데 값이 없다`;
     if (value.startsWith('--')) return `${token}은 값을 요구하는데 플래그가 왔다: ${value}`;
@@ -274,6 +335,20 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   }
   const missing = missingFlagValue(argv);
   if (missing !== null) return { kind: 'error', message: missing };
+  if (command === 'status') {
+    const flags = ['--config', '--state', '--log-dir', '--json'];
+    const unknown = unknownExactArg(argv, ['--config', '--state', '--log-dir'], ['--json']);
+    if (unknown !== null) return { kind: 'error', message: 'status가 모르는 인자다' };
+    const repeated = repeatedExactArg(argv, flags);
+    if (repeated !== null) return { kind: 'error', message: `status는 ${repeated}을 한 번만 받는다` };
+  }
+  if (command === 'logs') {
+    const flags = ['--tail', '--follow', '--job', '--log-dir'];
+    const unknown = unknownExactArg(argv, ['--tail', '--job', '--log-dir'], ['--follow']);
+    if (unknown !== null) return { kind: 'error', message: 'logs가 모르는 인자다' };
+    const repeated = repeatedExactArg(argv, flags);
+    if (repeated !== null) return { kind: 'error', message: `logs는 ${repeated}을 한 번만 받는다` };
+  }
   if ((WRITE_COMMANDS as readonly string[]).includes(command)) {
     const unknown = unknownWriteFlag(argv);
     if (unknown !== null) {
@@ -322,6 +397,17 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if (pr !== null && (!Number.isSafeInteger(pr) || pr <= 0)) {
     return { kind: 'error', message: `--pr이 양의 정수가 아니다: ${String(prRaw)}` };
   }
+  const tailRaw = arg(argv, '--tail');
+  const tail = tailRaw === undefined ? 200 : Number(tailRaw);
+  if (command === 'logs' && tailRaw !== undefined &&
+      (!/^[1-9][0-9]*$/u.test(tailRaw) || !Number.isSafeInteger(tail) || tail > 5_000)) {
+    return { kind: 'error', message: '--tail은 1..5000 정수여야 한다' };
+  }
+  const jobRaw = arg(argv, '--job');
+  if (command === 'logs' && jobRaw !== undefined &&
+      !(OPERATIONAL_JOB_NAMES as readonly string[]).includes(jobRaw)) {
+    return { kind: 'error', message: '--job이 알려진 daemon job 이름이 아니다' };
+  }
   return {
     kind: 'run',
     command,
@@ -334,10 +420,14 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     pr,
     dryRun: argv.includes('--dry-run'),
     socket: command === 'verify-slack' && argv.includes('--socket'),
+    logDir: arg(argv, '--log-dir') ?? null,
+    tail,
+    follow: command === 'logs' && argv.includes('--follow'),
+    job: command === 'logs' && jobRaw !== undefined ? jobRaw as DaemonJobName : null,
   };
 }
 
-export const CLI_USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter>
+export const CLI_USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter|status|logs>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
@@ -346,6 +436,8 @@ runs          관찰 1회로 Run 카드를 #agent-runs에 게시하거나 갱신
 gate-register coordinator가 만든 Gate sidecar JSON을 검증해 local SQLite에 등록한다
 daemon        Gate action과 verified Channel delivery/resume를 durable하게 재조정한다
 channel-adapter session별 stdio MCP Channel Adapter를 실행하고 daemon pipe에 재연결한다
+status        local operational state를 read-only로 진단한다
+logs          redacted rotating NDJSON history를 read-only로 읽는다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
@@ -372,7 +464,21 @@ gate-register 전용:
 
 daemon 전용:
 
-  --state <path>    v12 durable store 경로 (additive migration, dry-run 없음)
+  --state <path>    v13 durable store 경로 (additive migration, dry-run 없음)
+
+status 전용:
+
+  --config <path>   비교할 strict config
+  --state <path>    읽을 durable store (source migration/create 없음)
+  --log-dir <path>  operational log directory
+  --json            aggregate/static-code report를 JSON으로 출력
+
+logs 전용:
+
+  --tail <n>        마지막 safe record 수 (기본 200, 범위 1..5000)
+  --follow          rotation/truncation을 따라가며 signal까지 대기
+  --job <name>      parsed allowlisted daemon job field로 필터
+  --log-dir <path>  operational log directory
 
 snapshot과 verify-slack은 외부 write를 하지 않는다. digest는 설정의 slack.channels.prDigest에만,
 runs는 slack.channels.agentRuns에만 게시하며 채널을 코드에서 만들지 않는다. runs는 Run마다 카드
@@ -1107,7 +1213,92 @@ export async function runDaemonCommand(
 export type CliMainDependencies = {
   readonly channelAdapter?: ChannelAdapterCommandDependencies;
   readonly daemon?: DaemonDependencies;
+  readonly status?: InspectOperationalStatusOptions;
+  readonly logs?: {
+    readonly signal?: AbortSignal;
+    readonly pollMilliseconds?: number;
+    readonly clock?: () => Date;
+  };
 };
+
+type ProcessAbortLatch = { readonly signal: AbortSignal; readonly dispose: () => void };
+
+function processAbortLatch(): ProcessAbortLatch {
+  const controller = new AbortController();
+  const stop = (): void => { controller.abort(); };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      process.off('SIGINT', stop);
+      process.off('SIGTERM', stop);
+    },
+  };
+}
+
+async function runStatusCli(
+  parsed: RunArgs,
+  dependencies: InspectOperationalStatusOptions | undefined,
+): Promise<number> {
+  const report = await inspectOperationalStatus({
+    ...dependencies,
+    ...(parsed.configPath === null ? {} : { configPath: parsed.configPath }),
+    ...(parsed.statePath === null ? {} : { statePath: parsed.statePath }),
+    ...(parsed.logDir === null ? {} : { logDir: parsed.logDir }),
+  });
+  process.stdout.write((parsed.json ? JSON.stringify(report, null, 2) : formatOperationalStatus(report)) + '\n');
+  return report.exitCode;
+}
+
+async function runLogsCli(
+  parsed: RunArgs,
+  dependencies: CliMainDependencies['logs'],
+): Promise<number> {
+  let logDir: string;
+  try {
+    logDir = resolveOperationalLogDir(parsed.logDir);
+  } catch {
+    process.stderr.write('logs.path_unavailable\n');
+    return 1;
+  }
+  const common = {
+    logDir,
+    tail: parsed.tail,
+    job: parsed.job,
+    ...(dependencies?.clock === undefined ? {} : { clock: dependencies.clock }),
+  };
+  try {
+    if (!parsed.follow) {
+      const records = await readOperationalLogTail(common);
+      if (records.length > 0) {
+        process.stdout.write(records.map((record) => formatOperationalLogRecord(record)).join('\n') + '\n');
+      }
+      return 0;
+    }
+
+    const ownedLatch = dependencies?.signal === undefined ? processAbortLatch() : null;
+    try {
+      const signal = dependencies?.signal ?? ownedLatch?.signal;
+      if (signal === undefined) throw new Error('logs.signal_unavailable');
+      for await (const record of followOperationalLogs({
+        ...common,
+        signal,
+        ...(dependencies?.pollMilliseconds === undefined
+          ? {}
+          : { pollMilliseconds: dependencies.pollMilliseconds }),
+      })) {
+        process.stdout.write(formatOperationalLogRecord(record) + '\n');
+      }
+      return 0;
+    } finally {
+      ownedLatch?.dispose();
+    }
+  } catch {
+    process.stderr.write('logs.read_failed\n');
+    return 1;
+  }
+}
 
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
@@ -1121,6 +1312,14 @@ export async function main(
   if (parsed.kind === 'error') {
     process.stderr.write(parsed.message + '\n\n' + CLI_USAGE + '\n');
     return 2;
+  }
+
+  if (parsed.command === 'status') {
+    return await runStatusCli(parsed, dependencies.status);
+  }
+
+  if (parsed.command === 'logs') {
+    return await runLogsCli(parsed, dependencies.logs);
   }
 
   if (parsed.command === 'gate-register') {

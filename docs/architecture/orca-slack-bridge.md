@@ -284,8 +284,9 @@ metadata를 Orca/Git branch/dispatch 관계와 어느 수준까지 대조할지�
 - 마지막 오류와 재시도 여부
 - 현재 관리 중인 repository/Run/PR 수
 
-O1-1은 아래 config/default/bound만 확정한다. health/log 구현과 자동 재시작 수단은 후속 O1 PR에서 이
-계약을 소비하며 이 문서의 현재 상태만으로 구현 완료나 운영 설치를 주장하지 않는다.
+O1-1은 아래 config/default/bound를 확정했다. O1-4는 그중 health projection과 bounded log/조회 CLI를
+구현하지만 daemon scheduler 연결은 O1-5, Windows Task ownership은 O1-6/7이 소유한다. 따라서 O1-4만으로
+daemon 자동 시작이나 운영 설치 완료를 주장하지 않는다.
 
 ### O1 automation config contract (O1-1)
 
@@ -320,3 +321,36 @@ repository uniqueness와 exact Orca ID uniqueness를 preflight에서 검증한�
 fallback은 그대로 유효하며 같은 Project 안의 duplicate도 deterministic error로 거부한다. configured
 repository는 lowercase canonical `owner/name`으로 저장하고 `.git` suffix는 config에서 거부한다. 이 config contract는
 scheduler, logger, schema v13, Slack write를 이 PR에서 활성화하지 않는다.
+
+### O1-4 operational telemetry/status/log boundary
+
+latest operational state의 권위는 v13 SQLite이고, 시간순 history는
+`operational.ndjson` current + numbered backups다. writer는 한 줄에 JSON object 하나만 쓰며 LF 포함
+16 KiB를 넘기지 않는다. top-level field는 다음 allowlist뿐이다.
+
+`ts`, `level`, `service`, `schemaVersion`, `build`, `event`, `job`, `outcome`, `attempt`,
+`durationMs`, `nextRunAt`, `errorCode`, `retryable`, bounded numeric `counts`, `entityRef`
+
+event/outcome/job/error/count key는 finite catalog이고 build와 entity identity는 writer 진입 전에 SHA-256으로
+바뀐다. `entityRef`는 앞 12 hex만 남긴다. Error, free-form detail, token/authorization/cookie/secret/password,
+Slack/Gate/GitHub/Orca payload·body·options, raw ID, remote URL, full path를 받을 field는 없다. runtime에서
+unknown key/value나 getter/Proxy 실패를 만나면 입력을 문자열화하지 않고 static `telemetry.rejected`로 바꾼다.
+
+rotation 기본은 5 MiB current + 5 backups이고 config bound는 1..100 MiB, 1..20 backups다. Windows rename
+전에 writer handle을 닫고, sharing violation rename만 bounded retry한 다음 exclusive new current를 연다.
+logger failure는 `logger.write_failed` 한 줄만 stderr와 daemon-facing failure callback으로 보낸다. 원 payload를
+fallback print하지 않는다.
+
+`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 source DB와 WAL을 scratch directory에
+복사하고 source schema version을 먼저 확인한다. v13일 때만 scratch copy를 O1-2 strict store API로 읽으므로
+source file create/migration/checkpoint가 없다. task ownership은 O1-6이 주입할 facet이며 현재 기본
+`unavailable`은 중립이다. exit은 healthy 0, degraded/stale 1, absent/stopped/schema/config mismatch 2다.
+output에는 fingerprint 값, instance/repository/Slack/Orca ID, source path가 없고 match state, static code,
+timestamp와 aggregate count만 있다. O1-2가 diagnostic으로 보존하는 legacy `notification_state` count는
+표시하되 actionable pending total에서 제외한다.
+
+`logs --tail N [--follow] [--job NAME] [--log-dir ...]`는 current와 최대 configured bound의 numbered chain을
+read-only로 역순 scan해 마지막 1..5,000 safe record만 고른 뒤 시간순으로 출력한다. job filter는 JSON을
+strict parse한 뒤 allowlisted `job` field에만 적용한다. corrupt/invalid UTF-8/oversize/unknown-field line은
+원문 대신 static diagnostic record가 된다. follow는 polling 동안 file handle을 붙잡지 않아 Windows rotation을
+막지 않고 inode 교체, truncate-and-rewrite, partial line과 SIGINT/SIGTERM 종료를 처리한다.

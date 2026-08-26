@@ -237,6 +237,10 @@ post-baseline Task/Dispatch resume, 같은 Slack message update, duplicate/resta
 
 OD-068로 위 자동 발견·Git remote 기반 등록·자동 발견된 다중 repository routing이 D1이 아니라 O1 범위임을 확인했다.
 
+O1-4는 daemon scheduling이나 Windows Task를 활성화하지 않고 redacted NDJSON writer, read-only `status`,
+rotation-aware `logs`, O1-5용 heartbeat/job telemetry adapter까지만 제공한다. 운영 daemon 연결과 설치 성공
+판정은 각각 O1-5와 O1-6/7 출구 조건에 남는다.
+
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
 ## 11. 별도 후속 workstream
