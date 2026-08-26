@@ -9,6 +9,7 @@ import {
   normalizeGateResumeSnapshot,
   parseGateResumeSnapshotJson,
 } from '../channel/resume.js';
+import { normalizeGithubNameWithOwner } from '../discovery/github-remote.js';
 import { parseGateOptionMetadataArray } from '../gate/register.js';
 import type { GateMetadata } from '../gate/types.js';
 import {
@@ -1811,11 +1812,18 @@ function canonicalRepository(value: unknown, input = false): {
   readonly nameWithOwner: `${string}/${string}`;
 } {
   const text = input ? operationalInputText(value, 250) : operationalText(value, 250);
-  const match = /^github\.com\/([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\/([a-z0-9._-]{1,100})$/.exec(text);
-  if (match === null || match[2] === '.' || match[2] === '..') {
+  if (!text.startsWith('github.com/')) {
     operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
   }
-  return { canonicalKey: text as `github.com/${string}/${string}`, nameWithOwner: `${match[1]}/${match[2]}` };
+  try {
+    const identity = normalizeGithubNameWithOwner(text.slice('github.com/'.length));
+    if (identity.canonicalKey !== text) {
+      operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+    }
+    return identity;
+  } catch {
+    operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  }
 }
 
 function validateProjectKey(value: unknown, input = false): string {
@@ -2000,7 +2008,14 @@ function toDaemonJobOutcome(row: DaemonJobOutcomeRow): DaemonJobOutcomeRecord {
 function checkedSlackRootEntity(kind: unknown, key: unknown, input = false): SlackRootEntity {
   const fail = (): never => operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
   const text = input ? operationalInputText(key, 500) : operationalText(key, 500);
-  if (kind === 'pr' && text.startsWith('pr:')) return { kind, key: text as PullRequestKey };
+  if (kind === 'pr') {
+    const match = /^pr:([1-9][0-9]*)#([1-9][0-9]*)$/.exec(text);
+    if (match !== null && Number.isSafeInteger(Number(match[1])) &&
+        Number.isSafeInteger(Number(match[2]))) {
+      return { kind, key: text as PullRequestKey };
+    }
+    return fail();
+  }
   if (kind === 'run' && text.startsWith('run:')) return { kind, key: text as RunKey };
   if (kind === 'run_collection' && text === 'run_collection') return { kind, key: text };
   return fail();

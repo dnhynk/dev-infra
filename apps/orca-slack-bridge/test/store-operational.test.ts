@@ -10,7 +10,7 @@ import {
   SqliteDigestStore,
 } from '../src/store/sqlite.js';
 import type { SlackRootClaim } from '../src/store/operational-types.js';
-import type { PullRequestKey } from '../src/identity/keys.js';
+import { pullRequestKey, type PullRequestKey } from '../src/identity/keys.js';
 
 let dir: string;
 let path: string;
@@ -91,7 +91,7 @@ describe('additive v13 operational schema', () => {
   it('makes fresh v13 structurally identical to v12→v13 and preserves existing mapping rows', () => {
     const migrated = join(dir, 'migrated.db');
     const before = new SqliteDigestStore(migrated);
-    const prKey = 'pr:github.com/acme/widget#7' as PullRequestKey;
+    const prKey = pullRequestKey(101, 7);
     before.insertPrMessage({
       prKey, channelId: 'C1', messageTs: '100.1', renderFingerprint: 'render.old',
       factsFingerprint: 'facts.old', summaryJson: null, at: AT0,
@@ -201,6 +201,97 @@ describe('additive v13 operational schema', () => {
       expect(() => new SqliteDigestStore(candidate)).toThrowError(
         new OperationalStoreError('OPERATIONAL_STORE_CORRUPT'),
       );
+    }
+  });
+
+  it('rejects noncanonical repository and PR identities without exposing rejected values', () => {
+    const invalidCanonicalKey = 'github.com/acme/private-sentinel.git';
+    const invalidPrKeys = [
+      'pr:github.com/acme/private-sentinel#7',
+      'pr:0#7',
+      'pr:101#0',
+      'pr:-1#7',
+      'pr:101#-7',
+      'pr:01#7',
+      'pr:101#07',
+      'pr:101#7.0',
+      'pr:101',
+      'pr:101#7#8',
+      'pr:9007199254740992#7',
+      'pr:101#9007199254740992',
+    ] as const;
+    const inputStore = new SqliteDigestStore(path);
+    for (const key of invalidPrKeys) {
+      try {
+        inputStore.prepareSlackRootIntent({
+          kind: 'pr', key: key as PullRequestKey, channelId: 'C1',
+          renderFingerprint: 'render.1', at: AT0,
+        });
+        throw new Error('expected invalid PR identity to be rejected');
+      } catch (error) {
+        expect(error).toBeInstanceOf(OperationalStoreError);
+        expect((error as Error).message).toBe('Operational store input is invalid');
+        expect((error as Error).message).not.toContain(key);
+      }
+    }
+    try {
+      inputStore.replaceDiscoverySnapshot({
+        repositories: [{
+          ...repository,
+          canonicalKey: invalidCanonicalKey as `github.com/${string}/${string}`,
+          nameWithOwner: 'acme/private-sentinel.git',
+        }],
+        bindings: [], issues: [], at: AT0,
+      });
+      throw new Error('expected noncanonical repository identity to be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(OperationalStoreError);
+      expect((error as Error).message).toBe('Operational store input is invalid');
+      expect((error as Error).message).not.toContain('private-sentinel');
+    }
+    inputStore.close();
+
+    const corruptRepositories = join(dir, 'corrupt-canonical.db');
+    const repositoryStore = new SqliteDigestStore(corruptRepositories);
+    repositoryStore.replaceDiscoverySnapshot({
+      repositories: [repository], bindings: [binding], issues: [], at: AT0,
+    });
+    repositoryStore.close();
+    const repositoryDb = new DatabaseSync(corruptRepositories);
+    repositoryDb.exec('PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON');
+    repositoryDb.prepare(`UPDATE repository_registry
+      SET canonical_key = ?, name_with_owner = ?`).run(
+      invalidCanonicalKey, 'acme/private-sentinel.git',
+    );
+    repositoryDb.close();
+    try {
+      new SqliteDigestStore(corruptRepositories);
+      throw new Error('expected corrupt repository identity to be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(OperationalStoreError);
+      expect((error as Error).message).toBe('Operational store state is malformed or corrupt');
+      expect((error as Error).message).not.toContain('private-sentinel');
+    }
+
+    const corruptIntentPath = join(dir, 'corrupt-pr-identity.db');
+    const intentStore = new SqliteDigestStore(corruptIntentPath);
+    intentStore.prepareSlackRootIntent({
+      kind: 'pr', key: pullRequestKey(101, 7), channelId: 'C1',
+      renderFingerprint: 'render.1', at: AT0,
+    });
+    intentStore.close();
+    const intentDb = new DatabaseSync(corruptIntentPath);
+    intentDb.exec('PRAGMA ignore_check_constraints = ON');
+    const invalidCorruptPrKey = 'pr:9007199254740992#7';
+    intentDb.prepare('UPDATE slack_root_intent SET entity_key = ?').run(invalidCorruptPrKey);
+    intentDb.close();
+    try {
+      new SqliteDigestStore(corruptIntentPath);
+      throw new Error('expected corrupt PR identity to be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(OperationalStoreError);
+      expect((error as Error).message).toBe('Operational store state is malformed or corrupt');
+      expect((error as Error).message).not.toContain(invalidCorruptPrKey);
     }
   });
 });
@@ -435,7 +526,7 @@ describe('at-most-once Slack root intents', () => {
   });
 
   it('commits mapping+posted atomically and leaves a rolled-back possible effect unauthorized', () => {
-    const entity = { kind: 'pr', key: 'pr:github.com/acme/widget#8' as PullRequestKey } as const;
+    const entity = { kind: 'pr', key: pullRequestKey(101, 8) } as const;
     const faulty = new SqliteDigestStore(path, {
       operationalFault: (point) => {
         if (point === 'after_root_mapping') throw new Error('injected');
