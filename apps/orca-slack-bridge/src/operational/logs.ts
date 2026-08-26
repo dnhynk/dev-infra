@@ -30,6 +30,11 @@ export type ReadOperationalLogsOptions = {
   readonly signal?: AbortSignal;
   /** Deterministic test seam invoked before each captured name epoch is validated. */
   readonly afterLogChainCapture?: (attempt: number) => void | Promise<void>;
+  /** Deterministic identity-only seam; production always uses the native bigint identity. */
+  readonly fileIdentity?: (
+    path: string,
+    native: Pick<BigIntStats, 'dev' | 'ino'>,
+  ) => Pick<BigIntStats, 'dev' | 'ino'>;
 };
 
 export type FollowOperationalLogsOptions = ReadOperationalLogsOptions & {
@@ -146,6 +151,14 @@ function safeFileSize(info: Pick<BigIntStats, 'size'>): number {
   return Number(info.size);
 }
 
+function fileIdentity(
+  path: string,
+  info: Pick<BigIntStats, 'dev' | 'ino'>,
+  override?: ReadOperationalLogsOptions['fileIdentity'],
+): string {
+  return serializeOperationalLogFileIdentity(override?.(path, info) ?? info);
+}
+
 async function statIfPresent(path: string): Promise<BigIntStats | null> {
   try {
     return await stat(path, { bigint: true });
@@ -170,7 +183,11 @@ async function closeSnapshot(snapshot: LogChainSnapshot): Promise<void> {
   if (results.some((result) => result.status === 'rejected')) throw new Error('logs.read_failed');
 }
 
-async function captureLogChainOnce(current: string, backupLimit: number): Promise<LogChainSnapshot> {
+async function captureLogChainOnce(
+  current: string,
+  backupLimit: number,
+  identityOverride?: ReadOperationalLogsOptions['fileIdentity'],
+): Promise<LogChainSnapshot> {
   const entries: OpenLogGeneration[] = [];
   try {
     for (let generation = 0; generation <= backupLimit; generation += 1) {
@@ -183,7 +200,7 @@ async function captureLogChainOnce(current: string, backupLimit: number): Promis
           generation,
           path,
           handle,
-          identity: serializeOperationalLogFileIdentity(info),
+          identity: fileIdentity(path, info, identityOverride),
           size: safeFileSize(info),
         });
       } catch (error) {
@@ -202,11 +219,14 @@ async function snapshotStillNamesSameFiles(
   current: string,
   backupLimit: number,
   snapshot: LogChainSnapshot,
+  identityOverride?: ReadOperationalLogsOptions['fileIdentity'],
 ): Promise<boolean> {
   const identities = new Map(snapshot.entries.map((entry) => [entry.generation, entry.identity]));
   for (let generation = 0; generation <= backupLimit; generation += 1) {
     const info = await statIfPresent(generationPath(current, generation));
-    if ((info === null ? null : serializeOperationalLogFileIdentity(info)) !==
+    if ((info === null ? null : fileIdentity(
+      generationPath(current, generation), info, identityOverride,
+    )) !==
         (identities.get(generation) ?? null)) return false;
   }
   return true;
@@ -220,12 +240,15 @@ async function captureLogChain(
   current: string,
   backupLimit: number,
   afterCapture?: (attempt: number) => void | Promise<void>,
+  identityOverride?: ReadOperationalLogsOptions['fileIdentity'],
 ): Promise<LogChainSnapshot> {
   for (let attempt = 0; attempt < SNAPSHOT_ATTEMPTS; attempt += 1) {
-    const snapshot = await captureLogChainOnce(current, backupLimit);
+    const snapshot = await captureLogChainOnce(current, backupLimit, identityOverride);
     try {
       await afterCapture?.(attempt);
-      if (await snapshotStillNamesSameFiles(current, backupLimit, snapshot)) return snapshot;
+      if (await snapshotStillNamesSameFiles(
+        current, backupLimit, snapshot, identityOverride,
+      )) return snapshot;
     } catch (error) {
       await closeSnapshot(snapshot);
       throw error;
@@ -343,6 +366,7 @@ export async function readOperationalLogTail(
     operationalLogPath(options.logDir),
     validated.backupLimit,
     options.afterLogChainCapture,
+    options.fileIdentity,
   );
   try {
     return await readTailFromSnapshot(snapshot, validated, options.signal);
@@ -595,6 +619,7 @@ export async function* followOperationalLogs(
     path,
     validated.backupLimit,
     options.afterLogChainCapture,
+    options.fileIdentity,
   );
   let initial: readonly OperationalLogRecord[];
   let cursor: FollowCursor | null = null;
@@ -632,6 +657,7 @@ export async function* followOperationalLogs(
       path,
       validated.backupLimit,
       options.afterLogChainCapture,
+      options.fileIdentity,
     );
     let drained: Awaited<ReturnType<typeof drainFollowSnapshot>>;
     try {

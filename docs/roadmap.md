@@ -244,7 +244,11 @@ live WAL은 daemon/store owner의 strict aggregate cache와 bounded private loca
 source DB/WAL/SHM을 열지 않는다. RPC는 current-user-only rotating capability와 HMAC으로 owner를 attestation하고,
 Windows에서는 protected artifact에 기록된 OS-assigned `127.0.0.1` endpoint, 비-Windows에서는 private local pipe를
 쓴다. 두 방향 모두 bounded length prefix 하나와 EOF를 요구해 split/coalesced/partial/trailing/replay frame을
-fail closed한다. disabled observer job은 opt-out으로 분류하며, logs follow는 exact bigint file
+fail closed한다. per-state current-user owner claim은 listener와 capability의 complete lifecycle을 직렬화하고,
+실제 owner/DACL 재검증과 handle-pinned identity를 포함한 atomic quarantine/no-replace 교체가 permission
+drift와 identical-content raced cleanup을 봉쇄한다.
+server는 idle timeout과 별도의 absolute request deadline을 적용하고 authenticated nonce를 generation별 bounded
+set에서 reserve한다. disabled observer job은 opt-out으로 분류하며, logs follow는 exact bigint file
 identity·verified chain epoch·initial append/unterminated handoff·retained multi-rotation drain·
 content-witness truncate detection을 보장한다.
 

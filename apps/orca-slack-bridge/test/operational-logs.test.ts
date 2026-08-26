@@ -263,33 +263,39 @@ describe('rotated read-only tail', () => {
     );
   });
 
+  it('keeps a complete log chain whose injected bigint identities collide after Number coercion', async () => {
+    const first = 9_007_199_255_392_568n;
+    const second = first + 1n;
+    const device = 1_315_120_574n;
+    expect(Number(first)).toBe(Number(second));
+    writeFileSync(`${current}.1`, lines(record(0)));
+    writeFileSync(current, lines(record(1)));
+
+    const result = await readOperationalLogTail({
+      logDir: dir,
+      tail: 2,
+      backupLimit: 1,
+      fileIdentity: (path) => ({
+        dev: device,
+        ino: path === current ? second : first,
+      }),
+    });
+
+    expect(result.map((value) => value.attempt)).toEqual([1, 2]);
+  });
+
   it.runIf(process.platform === 'win32')(
-    'keeps two live NTFS generations whose ordinary numeric identities collide',
+    'keeps two live NTFS generations with distinct exact identities',
     async () => {
-      const numeric = new Map<string, { readonly path: string; readonly identity: string }>();
-      let collision: {
-        readonly first: { readonly path: string; readonly identity: string };
-        readonly second: { readonly path: string; readonly identity: string };
-      } | null = null;
-      for (let index = 0; index < 8_192 && collision === null; index += 1) {
-        const path = join(dir, `identity-candidate-${index}`);
-        writeFileSync(path, lines(record(index % 10)));
-        const info = statSync(path, { bigint: true });
-        const numericKey = `${String(Number(info.dev))}:${String(Number(info.ino))}`;
-        const exact = serializeOperationalLogFileIdentity(info);
-        const prior = numeric.get(numericKey);
-        if (prior !== undefined && prior.identity !== exact) {
-          collision = { first: prior, second: { path, identity: exact } };
-        } else {
-          numeric.set(numericKey, { path, identity: exact });
-        }
-      }
-      expect(collision).not.toBeNull();
-      const found = collision!;
-      writeFileSync(found.first.path, lines(record(0)));
-      writeFileSync(found.second.path, lines(record(1)));
-      renameSync(found.first.path, `${current}.1`);
-      renameSync(found.second.path, current);
+      const first = join(dir, 'identity-generation-first');
+      const second = join(dir, 'identity-generation-second');
+      writeFileSync(first, lines(record(0)));
+      writeFileSync(second, lines(record(1)));
+      expect(serializeOperationalLogFileIdentity(statSync(first, { bigint: true }))).not.toBe(
+        serializeOperationalLogFileIdentity(statSync(second, { bigint: true })),
+      );
+      renameSync(first, `${current}.1`);
+      renameSync(second, current);
       expect((await readOperationalLogTail({ logDir: dir, tail: 2, backupLimit: 1 }))
         .map((value) => value.attempt)).toEqual([1, 2]);
     },

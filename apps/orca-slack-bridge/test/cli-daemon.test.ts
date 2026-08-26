@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { parseArgs, runDaemonCommand } from '../src/cli.js';
+import { parseArgs, runDaemonCommand as runDaemonCommandWithNativeStatus } from '../src/cli.js';
 import type {
   ChannelPipeErrorCode,
   ChannelProductionDeliveryHandlers,
@@ -44,6 +44,22 @@ const CONFIG: BridgeConfig = {
   projects: [],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
+
+const TEST_STATUS_OWNER_SERVER = {
+  start: () => Promise.resolve(),
+  refresh: () => undefined,
+  stop: () => Promise.resolve(),
+};
+
+async function runDaemonCommand(
+  ...args: Parameters<typeof runDaemonCommandWithNativeStatus>
+): Promise<number> {
+  const [parsed, config, dependencies] = args;
+  return await runDaemonCommandWithNativeStatus(parsed, config, {
+    ...(dependencies ?? {}),
+    statusOwnerServer: dependencies?.statusOwnerServer ?? TEST_STATUS_OWNER_SERVER,
+  });
+}
 
 let dir: string;
 let statePath: string;

@@ -8,7 +8,7 @@ import { runInNewContext } from 'node:vm';
 import { SocketModeClient } from '@slack/socket-mode';
 import { Response as UndiciResponse } from 'undici';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parseArgs, runDaemonCommand } from '../src/cli.js';
+import { parseArgs, runDaemonCommand as runDaemonCommandWithNativeStatus } from '../src/cli.js';
 import {
   gateDirectActionId,
   gateDirectActionValue,
@@ -32,6 +32,22 @@ import {
 import { SlackWebApiViewOpener } from '../src/slack/views.js';
 import { APP_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
+
+const TEST_STATUS_OWNER_SERVER = {
+  start: () => Promise.resolve(),
+  refresh: () => undefined,
+  stop: () => Promise.resolve(),
+};
+
+async function runDaemonCommand(
+  ...args: Parameters<typeof runDaemonCommandWithNativeStatus>
+): Promise<number> {
+  const [parsed, config, dependencies] = args;
+  return await runDaemonCommandWithNativeStatus(parsed, config, {
+    ...(dependencies ?? {}),
+    statusOwnerServer: dependencies?.statusOwnerServer ?? TEST_STATUS_OWNER_SERVER,
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

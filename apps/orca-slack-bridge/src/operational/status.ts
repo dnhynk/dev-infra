@@ -37,6 +37,7 @@ import {
   STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS,
   type ActiveOperationalStatusCapability,
   type OperationalStatusCapabilityStore,
+  type OperationalStatusOwnerClaim,
   type OperationalStatusTransportEndpoint,
   type RetiredOperationalStatusCapability,
 } from './status-capability.js';
@@ -391,8 +392,10 @@ const STATUS_OWNER_MAX_REQUEST_BYTES = 1_024;
 const STATUS_OWNER_MAX_RESPONSE_BYTES = 64 * 1024;
 const STATUS_OWNER_MAX_CONNECTIONS = 8;
 const STATUS_OWNER_DEFAULT_TIMEOUT_MS = 1_000;
+const STATUS_OWNER_DEFAULT_ABSOLUTE_REQUEST_DEADLINE_MS = 2_000;
 const STATUS_OWNER_DEFAULT_REFRESH_MS = 1_000;
 const STATUS_OWNER_MESSAGE_MAX_AGE_MS = 5_000;
+const STATUS_OWNER_MAX_ACCEPTED_NONCES = 2_048;
 const FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
 const NONCE_PATTERN = /^[0-9a-f]{32}$/;
 const FAILURE_CODE_SET = new Set<string>(OPERATIONAL_FAILURE_CODES);
@@ -652,6 +655,10 @@ export type OperationalStatusOwnerServerOptions = {
   readonly platform?: NodeJS.Platform;
   readonly clock?: () => Date;
   readonly refreshMilliseconds?: number | null;
+  /** Test seam for the refreshing inactivity timeout. */
+  readonly requestIdleTimeoutMilliseconds?: number;
+  /** Test seam for the non-refreshing wall-clock request deadline. */
+  readonly requestAbsoluteDeadlineMilliseconds?: number;
   readonly beforeRefresh?: () => void;
   readonly afterDaemonCapture?: () => void;
 };
@@ -668,10 +675,15 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
   private readonly capabilityStore: OperationalStatusCapabilityStore;
   private readonly clock: () => Date;
   private readonly refreshMilliseconds: number | null;
+  private readonly requestIdleTimeoutMilliseconds: number;
+  private readonly requestAbsoluteDeadlineMilliseconds: number;
   private server: Server | null = null;
+  private ownerClaim: OperationalStatusOwnerClaim | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private generation: OwnerGeneration | null = null;
   private readonly sockets = new Set<Socket>();
+  private acceptedNonceCapabilityId: string | null = null;
+  private readonly acceptedNonces = new Map<string, number>();
 
   constructor(private readonly options: OperationalStatusOwnerServerOptions) {
     const platform = options.platform ?? process.platform;
@@ -696,12 +708,26 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       throw new TypeError('status.owner_refresh_invalid');
     }
     this.refreshMilliseconds = refreshMilliseconds;
+    const idleTimeout = options.requestIdleTimeoutMilliseconds ?? STATUS_OWNER_DEFAULT_TIMEOUT_MS;
+    const absoluteDeadline = options.requestAbsoluteDeadlineMilliseconds ??
+      STATUS_OWNER_DEFAULT_ABSOLUTE_REQUEST_DEADLINE_MS;
+    if (!Number.isSafeInteger(idleTimeout) || idleTimeout < 10 || idleTimeout > 5_000 ||
+        !Number.isSafeInteger(absoluteDeadline) || absoluteDeadline < 20 ||
+        absoluteDeadline > 10_000 || absoluteDeadline <= idleTimeout) {
+      throw new TypeError('status.owner_timeout_invalid');
+    }
+    this.requestIdleTimeoutMilliseconds = idleTimeout;
+    this.requestAbsoluteDeadlineMilliseconds = absoluteDeadline;
   }
 
   refresh(): void {
     try {
       const previous = this.generation;
-      if (this.server === null || previous === null) throw new Error('status.snapshot_unavailable');
+      const claim = this.ownerClaim;
+      if (this.server === null || previous === null || claim === null) {
+        throw new Error('status.snapshot_unavailable');
+      }
+      claim.assertHeld();
       this.options.beforeRefresh?.();
       const captured = captureOperationalStore(this.options.store, this.options.afterDaemonCapture);
       const now = transportNow(this.clock);
@@ -721,12 +747,19 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         capability,
       };
       if (capability !== previous.capability) {
-        this.capabilityStore.publish(this.capabilityPath, generation.capability);
+        this.capabilityStore.publish(
+          this.capabilityPath,
+          generation.capability,
+          previous.capability,
+          claim,
+        );
         const confirmed = this.capabilityStore.read(this.capabilityPath);
         if (confirmed.kind !== 'ready' || confirmed.value.status !== 'active' ||
             !sameCanonical(confirmed.value, generation.capability)) {
           throw new Error('status.snapshot_unavailable');
         }
+        this.acceptedNonces.clear();
+        this.acceptedNonceCapabilityId = capability.capabilityId;
       }
       this.generation = generation;
     } catch {
@@ -735,7 +768,17 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
   }
 
   async start(): Promise<void> {
-    if (this.server !== null) throw new Error('status.owner_start_failed');
+    if (this.server !== null || this.ownerClaim !== null) {
+      throw new Error('status.owner_start_failed');
+    }
+    let claim: OperationalStatusOwnerClaim;
+    try {
+      claim = await this.capabilityStore.acquireOwnerClaim(this.capabilityPath, this.stateIdentity);
+      claim.assertHeld();
+    } catch {
+      throw new Error('status.owner_start_failed');
+    }
+    this.ownerClaim = claim;
     const server = createServer({ allowHalfOpen: true }, (socket) => this.accept(socket));
     this.server = server;
     let published: ActiveOperationalStatusCapability | null = null;
@@ -779,13 +822,20 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         throw new Error('status.owner_start_failed');
       }
       published = generation.capability;
-      this.capabilityStore.publish(this.capabilityPath, generation.capability);
+      this.capabilityStore.publish(
+        this.capabilityPath,
+        generation.capability,
+        existing.kind === 'ready' ? existing.value : null,
+        claim,
+      );
       const confirmed = this.capabilityStore.read(this.capabilityPath);
       if (confirmed.kind !== 'ready' || confirmed.value.status !== 'active' ||
           !sameCanonical(confirmed.value, generation.capability)) {
         throw new Error('status.owner_start_failed');
       }
       this.generation = generation;
+      this.acceptedNonces.clear();
+      this.acceptedNonceCapabilityId = generation.capability.capabilityId;
     } catch {
       this.server = null;
       for (const socket of this.sockets) socket.destroy();
@@ -798,14 +848,18 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
           const now = transportNow(this.clock);
           const current = this.capabilityStore.read(this.capabilityPath);
           if (now !== null && current.kind === 'ready' && current.value.status === 'active' &&
-              sameCanonical(current.value, published)) {
+            sameCanonical(current.value, published)) {
             const retired = retiredOperationalStatusCapability(published, now.toISOString());
-            this.capabilityStore.publish(this.capabilityPath, retired);
-            this.capabilityStore.remove(this.capabilityPath, retired);
+            this.capabilityStore.publish(this.capabilityPath, retired, published, claim);
+            this.capabilityStore.remove(this.capabilityPath, retired, claim);
           }
         } catch { /* stale protected metadata fails closed */ }
       }
       this.generation = null;
+      this.acceptedNonces.clear();
+      this.acceptedNonceCapabilityId = null;
+      this.ownerClaim = null;
+      try { await claim.release(); } catch { /* claim loss remains a failed start */ }
       throw new Error('status.owner_start_failed');
     }
     if (this.refreshMilliseconds !== null) {
@@ -833,12 +887,18 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     this.timer = null;
     const server = this.server;
     this.server = null;
+    const claim = this.ownerClaim;
+    this.ownerClaim = null;
     const active = this.generation?.capability ?? null;
     this.generation = null;
+    this.acceptedNonces.clear();
+    this.acceptedNonceCapabilityId = null;
     let retired: RetiredOperationalStatusCapability | null = null;
     let failed = false;
     if (active !== null) {
       try {
+        if (claim === null) throw new Error('status.owner_stop_failed');
+        claim.assertHeld();
         const now = transportNow(this.clock);
         const current = this.capabilityStore.read(this.capabilityPath);
         if (now === null || current.kind !== 'ready' || current.value.status !== 'active' ||
@@ -846,7 +906,7 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
           throw new Error('status.owner_stop_failed');
         }
         retired = retiredOperationalStatusCapability(active, now.toISOString());
-        this.capabilityStore.publish(this.capabilityPath, retired);
+        this.capabilityStore.publish(this.capabilityPath, retired, active, claim);
       } catch {
         failed = true;
       }
@@ -859,7 +919,13 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       });
     }
     if (retired !== null) {
-      try { this.capabilityStore.remove(this.capabilityPath, retired); } catch { failed = true; }
+      try {
+        if (claim === null) throw new Error('status.owner_stop_failed');
+        this.capabilityStore.remove(this.capabilityPath, retired, claim);
+      } catch { failed = true; }
+    }
+    if (claim !== null) {
+      try { await claim.release(); } catch { failed = true; }
     }
     if (failed) throw new Error('status.owner_stop_failed');
   }
@@ -871,9 +937,22 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       return;
     }
     this.sockets.add(socket);
-    socket.setTimeout(STATUS_OWNER_DEFAULT_TIMEOUT_MS, () => socket.destroy());
+    const acceptedAt = process.hrtime.bigint();
+    const absoluteDeadlineNanoseconds =
+      BigInt(this.requestAbsoluteDeadlineMilliseconds) * 1_000_000n;
+    const absoluteDeadlinePassed = (): boolean =>
+      process.hrtime.bigint() - acceptedAt >= absoluteDeadlineNanoseconds;
+    const absoluteTimer = setTimeout(
+      () => socket.destroy(),
+      this.requestAbsoluteDeadlineMilliseconds,
+    );
+    absoluteTimer.unref?.();
+    socket.setTimeout(this.requestIdleTimeoutMilliseconds, () => socket.destroy());
     socket.on('error', () => undefined);
-    socket.on('close', () => this.sockets.delete(socket));
+    socket.on('close', () => {
+      clearTimeout(absoluteTimer);
+      this.sockets.delete(socket);
+    });
     let input = Buffer.alloc(0);
     let rejected = false;
     socket.on('data', (chunk: Buffer) => {
@@ -891,11 +970,14 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       }
     });
     socket.on('end', () => {
-      if (rejected) return;
+      if (rejected || absoluteDeadlinePassed()) {
+        socket.destroy();
+        return;
+      }
       const generation = this.generation;
       const now = transportNow(this.clock);
       const persisted = this.capabilityStore.read(this.capabilityPath);
-      if (generation === null || now === null ||
+      if (absoluteDeadlinePassed() || generation === null || now === null ||
           !operationalStatusCapabilityIsFresh(generation.capability, now) ||
           persisted.kind !== 'ready' || persisted.value.status !== 'active' ||
           !sameCanonical(persisted.value, generation.capability)) {
@@ -908,6 +990,10 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         now,
       );
       if (request === null) {
+        socket.destroy();
+        return;
+      }
+      if (!this.reserveAcceptedNonce(request.capabilityId, request.nonce, now)) {
         socket.destroy();
         return;
       }
@@ -941,12 +1027,24 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
           response: unsignedResponse,
         }),
       }, STATUS_OWNER_MAX_RESPONSE_BYTES);
-      if (response === null) {
+      if (response === null || absoluteDeadlinePassed()) {
         socket.destroy();
         return;
       }
       socket.end(response);
     });
+  }
+
+  private reserveAcceptedNonce(capabilityId: string, nonce: string, now: Date): boolean {
+    if (this.acceptedNonceCapabilityId !== capabilityId) return false;
+    const expiresBefore = now.getTime() - STATUS_OWNER_MESSAGE_MAX_AGE_MS;
+    for (const [acceptedNonce, acceptedAt] of this.acceptedNonces) {
+      if (acceptedAt <= expiresBefore) this.acceptedNonces.delete(acceptedNonce);
+    }
+    if (this.acceptedNonces.has(nonce) ||
+        this.acceptedNonces.size >= STATUS_OWNER_MAX_ACCEPTED_NONCES) return false;
+    this.acceptedNonces.set(nonce, now.getTime());
+    return true;
   }
 }
 
