@@ -651,6 +651,8 @@ function projectedSnapshot(
 }
 
 describe('read-only operational status classification', () => {
+  // This one integration owns schema creation, WAL checkpoint, online backup, and strict reopen.
+  // Keep its CI contention budget local; transport deadlines and the global test timeout stay tight.
   it('reports a fully matched daemon as healthy with static aggregate-only output', async () => {
     healthyStore().close();
     const report = await inspect();
@@ -667,7 +669,7 @@ describe('read-only operational status classification', () => {
     for (const privateValue of [INSTANCE, 'Project Sentinel', 'private-owner', statePath, dir, BUILD]) {
       expect(rendered).not.toContain(privateValue);
     }
-  });
+  }, 15_000);
 
   it('reads the daemon-owner projection without changing main, WAL, SHM, or directory entries', async () => {
     const store = healthyStore();
