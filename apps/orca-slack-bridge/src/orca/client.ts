@@ -231,6 +231,8 @@ export type OrcaTask = {
    * Git remote를 읽지 않는다 — 자동 발견은 O1 범위다(OD-068).
    */
   readonly repositoryId: string | null;
+  /** Distinguishes an absent binding from a non-empty binding whose identity grammar changed. */
+  readonly repositoryIdReadability?: 'absent' | 'readable' | 'unreadable';
   /**
    * 이 Task를 만든 binding. Run row의 현재 소유자와 대조해 live/stale을 가른다(OD-020).
    *
@@ -295,16 +297,26 @@ function strOrNull(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
 }
 
+function repositoryIdReadability(
+  source: string,
+): 'absent' | 'readable' | 'unreadable' {
+  if (source === '') return 'absent';
+  return repositoryIdFromWorktreeId(source) === null ? 'unreadable' : 'readable';
+}
+
 export async function listRuns(
   runner: OrcaRunner,
   options?: OrcaRunOptions,
 ): Promise<OrcaRun[]> {
-  const r = await call<{ runs?: unknown[] }>(
+  const r = await call<{ runs?: unknown }>(
     runner,
     ['orchestration', 'run-list', '--json'],
     options,
   );
-  return (r.runs ?? []).map((row) => {
+  if (!Array.isArray(r.runs)) {
+    throw new TypeError('Orca Run list does not contain a runs array');
+  }
+  return r.runs.map((row) => {
     const o = row as Record<string, unknown>;
     return {
       id: str(o['id']),
@@ -470,6 +482,7 @@ export async function listTaskPage(
       result: read(() => parseJsonField<unknown>(o['result'], null)),
       worktreePath: inc === '' ? null : worktreePathFromIncarnation(inc),
       repositoryId: inc === '' ? null : repositoryIdFromWorktreeId(inc),
+      repositoryIdReadability: repositoryIdReadability(inc),
       createdBy: read(() => ({
         handle: strOrNull(o['created_by_terminal_handle']),
         paneKey: strOrNull(o['created_by_pane_key']),
@@ -815,6 +828,8 @@ export type OrcaWorker = {
   readonly dispatchStatus: string;
   /** `resource.worktreeId`의 `::` 앞부분. 형식이 다르거나 resource가 없으면 null. */
   readonly repositoryId: string | null;
+  /** Distinguishes a missing resource from a present but unreadable worktree identity. */
+  readonly repositoryIdReadability?: 'absent' | 'readable' | 'unreadable';
 };
 
 /**
@@ -838,6 +853,7 @@ export async function listWorkers(runner: OrcaRunner, runId: string): Promise<Or
       runId: str(o['runId']),
       dispatchStatus: str(o['dispatchStatus']),
       repositoryId: worktreeId === '' ? null : repositoryIdFromWorktreeId(worktreeId),
+      repositoryIdReadability: repositoryIdReadability(worktreeId),
     };
   });
 }

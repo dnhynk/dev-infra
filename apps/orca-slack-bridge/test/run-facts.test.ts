@@ -602,13 +602,13 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
     // ENTRY_CAP(5)보다 많아야 "상위 몇 건"이 순서에 따라 갈린다.
     // id 오름차순과 created_at 내림차순이 정반대가 되게 둔다 — 두 키를 구분하지 못하면 실패한다.
     const rows = [
-      { ...RUN_ROW, id: 'run_1', created_at: '2026-08-23T01:00:00Z' },
-      { ...RUN_ROW, id: 'run_2', created_at: '2026-08-23T02:00:00Z' },
-      { ...RUN_ROW, id: 'run_3', created_at: '2026-08-23T03:00:00Z' },
-      { ...RUN_ROW, id: 'run_4', created_at: '2026-08-23T04:00:00Z' },
-      { ...RUN_ROW, id: 'run_5', created_at: '2026-08-23T05:00:00Z' },
-      { ...RUN_ROW, id: 'run_6', created_at: '2026-08-23T06:00:00Z' },
-      { ...RUN_ROW, id: 'run_7', created_at: '2026-08-23T07:00:00Z' },
+      { ...RUN_ROW, id: 'run_1', created_at: '2026-08-23T01:00:00Z', updated_at: '2026-08-23T01:00:00Z' },
+      { ...RUN_ROW, id: 'run_2', created_at: '2026-08-23T02:00:00Z', updated_at: '2026-08-23T02:00:00Z' },
+      { ...RUN_ROW, id: 'run_3', created_at: '2026-08-23T03:00:00Z', updated_at: '2026-08-23T03:00:00Z' },
+      { ...RUN_ROW, id: 'run_4', created_at: '2026-08-23T04:00:00Z', updated_at: '2026-08-23T04:00:00Z' },
+      { ...RUN_ROW, id: 'run_5', created_at: '2026-08-23T05:00:00Z', updated_at: '2026-08-23T05:00:00Z' },
+      { ...RUN_ROW, id: 'run_6', created_at: '2026-08-23T06:00:00Z', updated_at: '2026-08-23T06:00:00Z' },
+      { ...RUN_ROW, id: 'run_7', created_at: '2026-08-23T07:00:00Z', updated_at: '2026-08-23T07:00:00Z' },
     ];
     const newestFirst = ['run_7', 'run_6', 'run_5', 'run_4', 'run_3', 'run_2', 'run_1'];
 
@@ -653,23 +653,15 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
    * 사실이 그대로여도 지문이 흔들린다. **맨 뒤**에 두고 버리지 않는다 — 읽지 못한 시각은
    * 최신성을 주장할 근거가 아니지만, 그 Run이 미등록이라는 사실은 사라지면 안 된다.
    */
-  it('created_at이 범위 밖인 Run은 버려지지 않고 맨 뒤로 간다', async () => {
+  it('정렬 시각이 범위 밖인 Run은 working set을 증명할 수 없어 pass를 실패시킨다', async () => {
     const rows = [
       { ...RUN_ROW, id: 'run_bad', created_at: '2026-13-45 99:99:99' },
       { ...RUN_ROW, id: 'run_old', created_at: '2026-08-21T00:00:00Z' },
       { ...RUN_ROW, id: 'run_new', created_at: '2026-08-23T00:00:00Z' },
     ];
 
-    const forward = await collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY });
-    const reversed = await collect({
-      'run-list': { runs: [...rows].reverse() },
-      ...UNREGISTERED_ONLY,
-    });
-
-    expect(forward.unregistered.count).toBe(3);
-    expect(forward.unregistered.runs.map((u) => u.runId)).toEqual(['run_new', 'run_old', 'run_bad']);
-    expect(reversed.unregistered.runs.map((u) => u.runId)).toEqual(['run_new', 'run_old', 'run_bad']);
-    expect(collectionFingerprint(reversed)).toBe(collectionFingerprint(forward));
+    await expect(collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY }))
+      .rejects.toMatchObject({ code: 'RUN_ORDERING_UNRELIABLE' });
   });
 
   /*
@@ -680,9 +672,8 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
    */
   it('created_at이 없는 Run은 조용히 사라지지 않고 관찰을 실패시킨다', async () => {
     const rows = [{ ...RUN_ROW, id: 'run_1', created_at: undefined }];
-    await expect(collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY })).rejects.toThrow(
-      RangeError,
-    );
+    await expect(collect({ 'run-list': { runs: rows }, ...UNREGISTERED_ONLY }))
+      .rejects.toMatchObject({ code: 'RUN_ORDERING_UNRELIABLE' });
   });
 
   it('repository id를 exact 비교한다. 경로가 아니라 id다', async () => {
@@ -817,10 +808,10 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
         ],
       },
     );
-    expect(c.runs[0]?.project).toBe('alpha');
-    const multi = c.runs[0]?.degraded.find((d) => d.kind === 'multiple_project_match');
-    expect(multi?.detail).toContain('alpha, beta');
-    expect(multi?.detail).toContain('나머지 Project의 카드에서 이 Run이 빠진다');
+    expect(c.runs).toEqual([]);
+    expect(c.unregistered.count).toBe(1);
+    const multi = c.unregistered.runs[0]?.degraded.find((d) => d.kind === 'multiple_project_match');
+    expect(multi?.counts).toMatchObject({ resolvedProjects: 2 });
   });
 
   /**

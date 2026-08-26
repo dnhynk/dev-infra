@@ -1,5 +1,15 @@
 import { repositoryIdentity, type RepositoryIdentity } from '../identity/repository.js';
+import { normalizeGithubNameWithOwner } from '../discovery/github-remote.js';
 import { ghJson, type GhRunner } from './runner.js';
+
+/** Injectable seam used by discovery; tests never need a live GitHub process or network. */
+export interface RepositoryIdentityConfirmer {
+  confirm(nameWithOwner: string): Promise<RepositoryIdentity>;
+}
+
+export function repositoryIdentityConfirmer(runner: GhRunner): RepositoryIdentityConfirmer {
+  return { confirm: (nameWithOwner) => fetchRepositoryIdentity(runner, nameWithOwner) };
+}
 
 /**
  * repository identity를 조회한다.
@@ -23,5 +33,8 @@ export async function fetchRepositoryIdentity(
   if (typeof raw.full_name !== 'string') {
     throw new TypeError(`repos/${nameWithOwner} 응답에 full_name이 없다`);
   }
-  return repositoryIdentity(raw.id, raw.full_name);
+  // REST is authoritative for rename/owner-transfer spelling, but it still crosses the same
+  // strict owner/name grammar as configured and Orca-derived identities.
+  const authoritative = normalizeGithubNameWithOwner(raw.full_name);
+  return repositoryIdentity(raw.id, authoritative.nameWithOwner);
 }

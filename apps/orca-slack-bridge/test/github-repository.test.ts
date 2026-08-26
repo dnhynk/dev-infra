@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { fetchRepositoryIdentity } from '../src/github/repository.js';
+import {
+  fetchRepositoryIdentity,
+  repositoryIdentityConfirmer,
+} from '../src/github/repository.js';
 import { ghJson, type GhRunner } from '../src/github/runner.js';
 
 class FakeGh implements GhRunner {
@@ -37,6 +40,16 @@ describe('fetchRepositoryIdentity', () => {
   it('full_name이 없으면 거부한다', async () => {
     const gh = new FakeGh('{"id":1}');
     await expect(fetchRepositoryIdentity(gh, 'x/y')).rejects.toThrow(TypeError);
+  });
+
+  it('authoritative full_name도 strict canonical grammar를 통과하고 lowercase로 저장한다', async () => {
+    const gh = new FakeGh('{"id":7,"full_name":"Acme/Widget"}');
+    await expect(repositoryIdentityConfirmer(gh).confirm('acme/widget')).resolves.toMatchObject({
+      githubId: 7, nameWithOwner: 'acme/widget',
+    });
+
+    const malformed = new FakeGh('{"id":7,"full_name":"acme/widget/extra"}');
+    await expect(fetchRepositoryIdentity(malformed, 'acme/widget')).rejects.toThrow(TypeError);
   });
 });
 
