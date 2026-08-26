@@ -69,6 +69,7 @@ import {
   GATE_V11_SCHEMA_OBJECTS,
   GATE_V12_SCHEMA_OBJECTS,
   MIGRATIONS,
+  OPERATIONAL_V13_SCHEMA_OBJECTS,
   SCHEMA_DDL,
   SCHEMA_VERSION,
   STATE_PATH_VAR,
@@ -92,6 +93,29 @@ import {
   type RunPullRequestRecord,
   type RunStore,
 } from './schema.js';
+import type {
+  DaemonDesiredState,
+  DaemonHealthRecord,
+  DaemonStartInput,
+  DaemonJobClaim,
+  DaemonJobCompletion,
+  DaemonJobName,
+  DaemonJobOutcomeRecord,
+  EffectiveDiscoverySnapshot,
+  OperationalAggregateCounts,
+  OperationalStore,
+  OrcaRepositoryBindingRecord,
+  PrepareSlackRootIntentInput,
+  ReplaceDiscoverySnapshotInput,
+  RepositoryDiscoveryIssueCategory,
+  RepositoryDiscoveryIssueRecord,
+  RepositoryRegistryRecord,
+  SlackRootClaim,
+  SlackRootClaimResult,
+  SlackRootEntity,
+  SlackRootIntentRecord,
+  SlackRootPostedInput,
+} from './operational-types.js';
 
 /**
  * `node:sqlite` 기반 `DigestStore` 구현(OD-043).
@@ -230,6 +254,31 @@ export class SchemaVersionError extends Error {
     );
     this.name = 'SchemaVersionError';
   }
+}
+
+export type OperationalStoreErrorCode =
+  | 'OPERATIONAL_INPUT_INVALID'
+  | 'OPERATIONAL_CONFLICT'
+  | 'OPERATIONAL_STALE_TRANSITION'
+  | 'OPERATIONAL_STORE_CORRUPT';
+
+const OPERATIONAL_ERROR_MESSAGES: Readonly<Record<OperationalStoreErrorCode, string>> = {
+  OPERATIONAL_INPUT_INVALID: 'Operational store input is invalid',
+  OPERATIONAL_CONFLICT: 'Operational store input conflicts with durable state',
+  OPERATIONAL_STALE_TRANSITION: 'Operational store transition is stale',
+  OPERATIONAL_STORE_CORRUPT: 'Operational store state is malformed or corrupt',
+};
+
+/** Static/redacted public error. Exact repository, daemon, job, and Slack keys stay in typed data. */
+export class OperationalStoreError extends Error {
+  constructor(readonly code: OperationalStoreErrorCode) {
+    super(OPERATIONAL_ERROR_MESSAGES[code]);
+    this.name = 'OperationalStoreError';
+  }
+}
+
+function operationalFail(code: OperationalStoreErrorCode): never {
+  throw new OperationalStoreError(code);
 }
 
 const SELECT_ROW = `
@@ -694,6 +743,50 @@ SELECT t.pr_key AS pr_key,
  GROUP BY t.pr_key
  ORDER BY t.pr_key`;
 
+const SELECT_REPOSITORY_REGISTRY = `
+SELECT canonical_key, github_repository_id, name_with_owner, project_key, project_origin, active,
+       first_seen_at, last_seen_at, last_good_at, updated_at
+  FROM repository_registry ORDER BY canonical_key`;
+
+const SELECT_ORCA_REPOSITORY_BINDINGS = `
+SELECT orca_repository_id, canonical_key, project_key, origin, active,
+       first_seen_at, last_seen_at, last_good_at, updated_at
+  FROM orca_repository_binding ORDER BY orca_repository_id`;
+
+const SELECT_REPOSITORY_DISCOVERY_ISSUES = `
+SELECT issue_hash, category, active, occurrence_count, first_seen_at, last_seen_at,
+       resolved_at, updated_at
+  FROM repository_discovery_issue ORDER BY issue_hash`;
+
+const SELECT_DAEMON_HEALTH = `
+SELECT revision, instance_id, build_fingerprint, config_fingerprint, desired_state, state,
+       started_at, heartbeat_at, clean_stopped_at, last_error_code, updated_at
+  FROM daemon_health WHERE id = 1`;
+
+const SELECT_DAEMON_JOB_OUTCOME = `
+SELECT job_name, revision, state, attempt, consecutive_failures, started_at, completed_at,
+       last_success_at, last_failure_at, duration_ms, next_run_at, error_code,
+       processed_count, deferred_count, checkpoint, updated_at
+  FROM daemon_job_outcome WHERE job_name = ?`;
+
+const SELECT_ALL_DAEMON_JOB_OUTCOMES = `
+SELECT job_name, revision, state, attempt, consecutive_failures, started_at, completed_at,
+       last_success_at, last_failure_at, duration_ms, next_run_at, error_code,
+       processed_count, deferred_count, checkpoint, updated_at
+  FROM daemon_job_outcome ORDER BY job_name`;
+
+const SELECT_SLACK_ROOT_INTENT = `
+SELECT entity_kind, entity_key, revision, channel_id, render_fingerprint, state, attempt_count,
+       sending_instance_id, message_ts, prepared_at, last_attempt_at, posted_at, uncertain_at,
+       last_error_code, updated_at
+  FROM slack_root_intent WHERE entity_kind = ? AND entity_key = ?`;
+
+const SELECT_ALL_SLACK_ROOT_INTENTS = `
+SELECT entity_kind, entity_key, revision, channel_id, render_fingerprint, state, attempt_count,
+       sending_instance_id, message_ts, prepared_at, last_attempt_at, posted_at, uncertain_at,
+       last_error_code, updated_at
+  FROM slack_root_intent ORDER BY entity_kind, entity_key`;
+
 /** sqlite가 돌려주는 run_message 한 행. 컬럼명 그대로다. */
 type RunMessageRow = {
   readonly run_key: string;
@@ -879,6 +972,93 @@ type GateResumeObservationRow = {
   readonly lease_expires_at: string | null;
   readonly last_error_code: string | null;
   readonly created_at: string;
+  readonly updated_at: string;
+};
+
+type RepositoryRegistryRow = {
+  readonly canonical_key: string;
+  readonly github_repository_id: number | null;
+  readonly name_with_owner: string;
+  readonly project_key: string;
+  readonly project_origin: string;
+  readonly active: number;
+  readonly first_seen_at: string;
+  readonly last_seen_at: string;
+  readonly last_good_at: string;
+  readonly updated_at: string;
+};
+
+type OrcaRepositoryBindingRow = {
+  readonly orca_repository_id: string;
+  readonly canonical_key: string | null;
+  readonly project_key: string;
+  readonly origin: string;
+  readonly active: number;
+  readonly first_seen_at: string;
+  readonly last_seen_at: string;
+  readonly last_good_at: string;
+  readonly updated_at: string;
+};
+
+type RepositoryDiscoveryIssueRow = {
+  readonly issue_hash: string;
+  readonly category: string;
+  readonly active: number;
+  readonly occurrence_count: number;
+  readonly first_seen_at: string;
+  readonly last_seen_at: string;
+  readonly resolved_at: string | null;
+  readonly updated_at: string;
+};
+
+type DaemonHealthRow = {
+  readonly revision: number;
+  readonly instance_id: string;
+  readonly build_fingerprint: string;
+  readonly config_fingerprint: string;
+  readonly desired_state: string;
+  readonly state: string;
+  readonly started_at: string;
+  readonly heartbeat_at: string;
+  readonly clean_stopped_at: string | null;
+  readonly last_error_code: string | null;
+  readonly updated_at: string;
+};
+
+type DaemonJobOutcomeRow = {
+  readonly job_name: string;
+  readonly revision: number;
+  readonly state: string;
+  readonly attempt: number;
+  readonly consecutive_failures: number;
+  readonly started_at: string;
+  readonly completed_at: string | null;
+  readonly last_success_at: string | null;
+  readonly last_failure_at: string | null;
+  readonly duration_ms: number | null;
+  readonly next_run_at: string | null;
+  readonly error_code: string | null;
+  readonly processed_count: number;
+  readonly deferred_count: number;
+  readonly checkpoint: number;
+  readonly updated_at: string;
+};
+
+type SlackRootIntentRow = {
+  readonly entity_kind: string;
+  readonly entity_key: string;
+  readonly revision: number;
+  readonly channel_id: string;
+  readonly render_fingerprint: string;
+  readonly state: string;
+  readonly attempt_count: number;
+  readonly sending_instance_id: string | null;
+  readonly message_ts: string | null;
+  readonly prepared_at: string;
+  readonly last_attempt_at: string | null;
+  readonly posted_at: string | null;
+  readonly uncertain_at: string | null;
+  readonly last_error_code: string | null;
   readonly updated_at: string;
 };
 
@@ -1567,6 +1747,329 @@ function toGateResumeObservation(row: GateResumeObservationRow): GateResumeObser
   };
 }
 
+const OPERATIONAL_ISSUE_CATEGORIES = new Set<RepositoryDiscoveryIssueCategory>([
+  'no_remote', 'unsupported_remote', 'invalid_remote', 'canonical_conflict',
+  'duplicate_orca_id', 'manual_remote_conflict', 'capacity_conflict', 'schema_drift',
+  'project_conflict', 'query_failed', 'github_identity_unverified', 'capacity_deferred',
+]);
+
+const OPERATIONAL_JOB_NAMES = new Set<DaemonJobName>([
+  'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
+]);
+
+function operationalText(value: unknown, max: number): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > max) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return value;
+}
+
+function operationalInputText(value: unknown, max: number): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > max) {
+    operationalFail('OPERATIONAL_INPUT_INVALID');
+  }
+  return value;
+}
+
+function operationalIso(value: unknown, input = false): string {
+  const fail = (): never => operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) fail();
+  const text = value as string;
+  const time = new Date(text).valueOf();
+  if (!Number.isFinite(time) || new Date(time).toISOString() !== value) fail();
+  return text;
+}
+
+function operationalInteger(value: unknown, input = false, min = 0): number {
+  if (!Number.isSafeInteger(value) || (value as number) < min) {
+    operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  }
+  return value as number;
+}
+
+function operationalBoolean(value: unknown): boolean {
+  if (value !== 0 && value !== 1) operationalFail('OPERATIONAL_STORE_CORRUPT');
+  return value === 1;
+}
+
+function operationalCode(value: unknown, input = false): string {
+  const code = input ? operationalInputText(value, 80) : operationalText(value, 80);
+  if (!/^[a-z0-9_.-]+$/.test(code)) {
+    operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  }
+  return code;
+}
+
+function canonicalRepository(value: unknown, input = false): {
+  readonly canonicalKey: `github.com/${string}/${string}`;
+  readonly nameWithOwner: `${string}/${string}`;
+} {
+  const text = input ? operationalInputText(value, 250) : operationalText(value, 250);
+  const match = /^github\.com\/([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\/([a-z0-9._-]{1,100})$/.exec(text);
+  if (match === null || match[2] === '.' || match[2] === '..') {
+    operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  }
+  return { canonicalKey: text as `github.com/${string}/${string}`, nameWithOwner: `${match[1]}/${match[2]}` };
+}
+
+function validateProjectKey(value: unknown, input = false): string {
+  return input ? operationalInputText(value, 200) : operationalText(value, 200);
+}
+
+function validateFingerprint(value: unknown, input = false): string {
+  const result = input ? operationalInputText(value, 128) : operationalText(value, 128);
+  if (!/^[A-Za-z0-9_.:-]+$/.test(result)) {
+    operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  }
+  return result;
+}
+
+function toRepositoryRegistry(row: RepositoryRegistryRow): RepositoryRegistryRecord {
+  const identity = canonicalRepository(row.canonical_key);
+  if (row.name_with_owner !== identity.nameWithOwner) operationalFail('OPERATIONAL_STORE_CORRUPT');
+  const githubRepositoryId = row.github_repository_id === null
+    ? null
+    : operationalInteger(row.github_repository_id, false, 1);
+  if (row.project_origin !== 'explicit' && row.project_origin !== 'auto') {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  const firstSeenAt = operationalIso(row.first_seen_at);
+  const lastSeenAt = operationalIso(row.last_seen_at);
+  const lastGoodAt = operationalIso(row.last_good_at);
+  const updatedAt = operationalIso(row.updated_at);
+  if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt || updatedAt < firstSeenAt) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return {
+    ...identity,
+    githubRepositoryId,
+    projectKey: validateProjectKey(row.project_key),
+    projectOrigin: row.project_origin,
+    active: operationalBoolean(row.active),
+    firstSeenAt,
+    lastSeenAt,
+    lastGoodAt,
+    updatedAt,
+  };
+}
+
+function toOrcaRepositoryBinding(row: OrcaRepositoryBindingRow): OrcaRepositoryBindingRecord {
+  if (row.origin !== 'manual' && row.origin !== 'discovered') operationalFail('OPERATIONAL_STORE_CORRUPT');
+  const canonicalKey = row.canonical_key === null ? null : canonicalRepository(row.canonical_key).canonicalKey;
+  if (canonicalKey === null && row.origin !== 'manual') operationalFail('OPERATIONAL_STORE_CORRUPT');
+  const firstSeenAt = operationalIso(row.first_seen_at);
+  const lastSeenAt = operationalIso(row.last_seen_at);
+  const lastGoodAt = operationalIso(row.last_good_at);
+  const updatedAt = operationalIso(row.updated_at);
+  if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt || updatedAt < firstSeenAt) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return {
+    orcaRepositoryId: operationalText(row.orca_repository_id, 500),
+    canonicalKey,
+    projectKey: validateProjectKey(row.project_key),
+    origin: row.origin,
+    active: operationalBoolean(row.active),
+    firstSeenAt,
+    lastSeenAt,
+    lastGoodAt,
+    updatedAt,
+  };
+}
+
+function toRepositoryDiscoveryIssue(row: RepositoryDiscoveryIssueRow): RepositoryDiscoveryIssueRecord {
+  if (!/^[0-9a-f]{64}$/.test(row.issue_hash) || !OPERATIONAL_ISSUE_CATEGORIES.has(row.category as RepositoryDiscoveryIssueCategory)) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  const active = operationalBoolean(row.active);
+  const firstSeenAt = operationalIso(row.first_seen_at);
+  const lastSeenAt = operationalIso(row.last_seen_at);
+  const resolvedAt = row.resolved_at === null ? null : operationalIso(row.resolved_at);
+  const updatedAt = operationalIso(row.updated_at);
+  if (lastSeenAt < firstSeenAt || updatedAt < firstSeenAt || active === (resolvedAt !== null)) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return {
+    issueHash: row.issue_hash,
+    category: row.category as RepositoryDiscoveryIssueCategory,
+    active,
+    occurrenceCount: operationalInteger(row.occurrence_count, false, 1),
+    firstSeenAt,
+    lastSeenAt,
+    resolvedAt,
+    updatedAt,
+  };
+}
+
+function toDaemonHealth(row: DaemonHealthRow): DaemonHealthRecord {
+  if ((row.desired_state !== 'running' && row.desired_state !== 'stopped') ||
+      (row.state !== 'running' && row.state !== 'stopped')) operationalFail('OPERATIONAL_STORE_CORRUPT');
+  const startedAt = operationalIso(row.started_at);
+  const heartbeatAt = operationalIso(row.heartbeat_at);
+  const cleanStoppedAt = row.clean_stopped_at === null ? null : operationalIso(row.clean_stopped_at);
+  const updatedAt = operationalIso(row.updated_at);
+  if (heartbeatAt < startedAt || updatedAt < heartbeatAt ||
+      (row.state === 'running') !== (cleanStoppedAt === null) ||
+      (cleanStoppedAt !== null && (cleanStoppedAt < heartbeatAt || updatedAt < cleanStoppedAt))) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return {
+    revision: operationalInteger(row.revision),
+    instanceId: operationalText(row.instance_id, 200),
+    buildFingerprint: validateFingerprint(row.build_fingerprint),
+    configFingerprint: validateFingerprint(row.config_fingerprint),
+    desiredState: row.desired_state,
+    state: row.state,
+    startedAt,
+    heartbeatAt,
+    cleanStoppedAt,
+    lastErrorCode: row.last_error_code === null ? null : operationalCode(row.last_error_code),
+    updatedAt,
+  };
+}
+
+function toDaemonJobOutcome(row: DaemonJobOutcomeRow): DaemonJobOutcomeRecord {
+  if (!OPERATIONAL_JOB_NAMES.has(row.job_name as DaemonJobName) ||
+      !['running', 'succeeded', 'failed', 'backoff'].includes(row.state)) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  const startedAt = operationalIso(row.started_at);
+  const completedAt = row.completed_at === null ? null : operationalIso(row.completed_at);
+  const lastSuccessAt = row.last_success_at === null ? null : operationalIso(row.last_success_at);
+  const lastFailureAt = row.last_failure_at === null ? null : operationalIso(row.last_failure_at);
+  const nextRunAt = row.next_run_at === null ? null : operationalIso(row.next_run_at);
+  const updatedAt = operationalIso(row.updated_at);
+  const durationMs = row.duration_ms === null ? null : operationalInteger(row.duration_ms);
+  const consecutiveFailures = operationalInteger(row.consecutive_failures);
+  const errorCode = row.error_code === null ? null : operationalCode(row.error_code);
+  const validState =
+    (row.state === 'running' && completedAt === null && durationMs === null &&
+      nextRunAt === null && errorCode === null) ||
+    (row.state === 'succeeded' && completedAt !== null && durationMs !== null &&
+      lastSuccessAt === completedAt && nextRunAt === null && errorCode === null &&
+      consecutiveFailures === 0) ||
+    (row.state === 'failed' && completedAt !== null && durationMs !== null &&
+      lastFailureAt === completedAt && nextRunAt === null && errorCode !== null &&
+      consecutiveFailures >= 1) ||
+    (row.state === 'backoff' && completedAt !== null && durationMs !== null &&
+      lastFailureAt === completedAt && nextRunAt !== null && nextRunAt >= updatedAt &&
+      errorCode !== null && consecutiveFailures >= 1);
+  if (updatedAt < startedAt || (completedAt !== null && completedAt < startedAt) ||
+      (lastSuccessAt !== null && updatedAt < lastSuccessAt) ||
+      (lastFailureAt !== null && updatedAt < lastFailureAt) || !validState) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return {
+    jobName: row.job_name as DaemonJobName,
+    revision: operationalInteger(row.revision),
+    state: row.state as DaemonJobOutcomeRecord['state'],
+    attempt: operationalInteger(row.attempt, false, 1),
+    consecutiveFailures,
+    startedAt,
+    completedAt,
+    lastSuccessAt,
+    lastFailureAt,
+    durationMs,
+    nextRunAt,
+    errorCode,
+    processedCount: operationalInteger(row.processed_count),
+    deferredCount: operationalInteger(row.deferred_count),
+    checkpoint: operationalInteger(row.checkpoint),
+    updatedAt,
+  };
+}
+
+function checkedSlackRootEntity(kind: unknown, key: unknown, input = false): SlackRootEntity {
+  const fail = (): never => operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  const text = input ? operationalInputText(key, 500) : operationalText(key, 500);
+  if (kind === 'pr' && text.startsWith('pr:')) return { kind, key: text as PullRequestKey };
+  if (kind === 'run' && text.startsWith('run:')) return { kind, key: text as RunKey };
+  if (kind === 'run_collection' && text === 'run_collection') return { kind, key: text };
+  return fail();
+}
+
+function toSlackRootIntent(row: SlackRootIntentRow): SlackRootIntentRecord {
+  const entity = checkedSlackRootEntity(row.entity_kind, row.entity_key);
+  if (!['pending', 'sending', 'posted', 'uncertain'].includes(row.state)) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  const preparedAt = operationalIso(row.prepared_at);
+  const lastAttemptAt = row.last_attempt_at === null ? null : operationalIso(row.last_attempt_at);
+  const postedAt = row.posted_at === null ? null : operationalIso(row.posted_at);
+  const uncertainAt = row.uncertain_at === null ? null : operationalIso(row.uncertain_at);
+  const updatedAt = operationalIso(row.updated_at);
+  const attemptCount = operationalInteger(row.attempt_count);
+  const sendingInstanceId = row.sending_instance_id === null
+    ? null
+    : operationalText(row.sending_instance_id, 200);
+  const messageTs = row.message_ts === null ? null : operationalText(row.message_ts, 100);
+  const lastErrorCode = row.last_error_code === null ? null : operationalCode(row.last_error_code);
+  const validState =
+    (row.state === 'pending' && sendingInstanceId === null && messageTs === null &&
+      postedAt === null && uncertainAt === null &&
+      ((attemptCount === 0 && lastAttemptAt === null && lastErrorCode === null) ||
+       (attemptCount >= 1 && lastAttemptAt !== null && lastErrorCode !== null))) ||
+    (row.state === 'sending' && attemptCount >= 1 && sendingInstanceId !== null &&
+      messageTs === null && lastAttemptAt !== null && postedAt === null &&
+      uncertainAt === null && lastErrorCode === null) ||
+    (row.state === 'posted' && attemptCount >= 1 && sendingInstanceId === null &&
+      messageTs !== null && lastAttemptAt !== null && postedAt !== null &&
+      uncertainAt === null && lastErrorCode === null && updatedAt >= postedAt) ||
+    (row.state === 'uncertain' && attemptCount >= 1 && sendingInstanceId === null &&
+      messageTs === null && lastAttemptAt !== null && postedAt === null &&
+      uncertainAt !== null && lastErrorCode !== null && updatedAt >= uncertainAt);
+  if (updatedAt < preparedAt ||
+      (lastAttemptAt !== null && (lastAttemptAt < preparedAt || updatedAt < lastAttemptAt)) ||
+      !validState) {
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+  return {
+    ...entity,
+    revision: operationalInteger(row.revision),
+    channelId: operationalText(row.channel_id, 200),
+    renderFingerprint: validateFingerprint(row.render_fingerprint),
+    state: row.state as SlackRootIntentRecord['state'],
+    attemptCount,
+    sendingInstanceId,
+    messageTs,
+    preparedAt,
+    lastAttemptAt,
+    postedAt,
+    uncertainAt,
+    lastErrorCode,
+    updatedAt,
+  };
+}
+
+function operationalEntity(entity: SlackRootEntity, input = true): SlackRootEntity {
+  return checkedSlackRootEntity(entity.kind, entity.key, input);
+}
+
+function operationalJobName(value: unknown, input = true): DaemonJobName {
+  if (!OPERATIONAL_JOB_NAMES.has(value as DaemonJobName)) {
+    operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
+  }
+  return value as DaemonJobName;
+}
+
+function readDiscoverySnapshot(db: DatabaseSync, activeOnly: boolean): EffectiveDiscoverySnapshot {
+  const suffix = activeOnly ? ' WHERE active = 1' : '';
+  const registry = db.prepare(SELECT_REPOSITORY_REGISTRY.replace(
+    ' ORDER BY canonical_key', `${suffix} ORDER BY canonical_key`,
+  )).all() as RepositoryRegistryRow[];
+  const bindings = db.prepare(SELECT_ORCA_REPOSITORY_BINDINGS.replace(
+    ' ORDER BY orca_repository_id', `${suffix} ORDER BY orca_repository_id`,
+  )).all() as OrcaRepositoryBindingRow[];
+  const issues = db.prepare(SELECT_REPOSITORY_DISCOVERY_ISSUES.replace(
+    ' ORDER BY issue_hash', `${suffix} ORDER BY issue_hash`,
+  )).all() as RepositoryDiscoveryIssueRow[];
+  return {
+    repositories: registry.map(toRepositoryRegistry),
+    bindings: bindings.map(toOrcaRepositoryBinding),
+    issues: issues.map(toRepositoryDiscoveryIssue),
+  };
+}
+
 function toGateMetadata(row: GateMetadataRow): GateMetadata {
   storedText(row.options_json, `${row.gate_key}.options_json`, 200_000);
   let parsed: unknown;
@@ -1844,7 +2347,7 @@ function rearmGateOutboxForChannelTransition(
   return storedRevision(row.revision, `${gateKey}.Channel deferred outbox revision`);
 }
 
-export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
+export class SqliteDigestStore implements DigestStore, RunStore, GateStore, OperationalStore {
   private readonly db: DatabaseSync;
   private readonly observationWriteOwner: string;
   private readonly isObservationOwnerAlive: (owner: string) => boolean;
@@ -1853,6 +2356,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
   private readonly ownedProjectionWrites = new Set<string>();
   private channelClockMonotonicMs: number;
   private channelClockLogicalMs: number | null = null;
+  private readonly operationalFault: ((
+    point: 'after_discovery_registry' | 'after_discovery_bindings' | 'after_root_mapping',
+  ) => void) | undefined;
 
   /** 파일을 열고 스키마를 준비한다. 부모 디렉터리가 없으면 만든다. */
   constructor(
@@ -1864,6 +2370,12 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
       readonly observationOwnerAlive?: (owner: string) => boolean;
       /** Test seam for rollback-safe delivery scheduling; production uses the process clock. */
       readonly monotonicNow?: () => number;
+      /** Test-only rollback seam for multi-statement operational transactions. */
+      readonly operationalFault?: (
+        point: 'after_discovery_registry' | 'after_discovery_bindings' | 'after_root_mapping',
+      ) => void;
+      /** Test-only migration statement fault injection. */
+      readonly migrationFault?: (fromVersion: number, statementIndex: number) => void;
     } = {},
   ) {
     this.observationWriteOwner = storedLeaseOwner(
@@ -1873,6 +2385,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     this.isObservationOwnerAlive = options.observationOwnerAlive ?? observationOwnerAlive;
     this.channelMonotonicNow = options.monotonicNow ??
       (() => Number(process.hrtime.bigint()) / 1_000_000);
+    this.operationalFault = options.operationalFault;
     this.channelClockMonotonicMs = this.channelMonotonicNow();
     if (!Number.isFinite(this.channelClockMonotonicMs)) {
       throw new TypeError('Channel delivery monotonic clock이 유한하지 않다');
@@ -1881,7 +2394,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     this.db = new DatabaseSync(path);
     try {
       enableWal(this.db, path);
-      prepareSchema(this.db, path, options.validationFault);
+      enableForeignKeys(this.db);
+      prepareSchema(this.db, path, options.validationFault, options.migrationFault);
       const clockFloor = this.db.prepare(SELECT_GATE_CHANNEL_CLOCK_FLOOR).get() as
         | { readonly updated_at: string | null }
         | undefined;
@@ -4966,6 +5480,666 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore {
     return Number(result.changes) === 1;
   }
 
+  replaceDiscoverySnapshot(input: ReplaceDiscoverySnapshotInput): EffectiveDiscoverySnapshot {
+    const at = operationalIso(input.at, true);
+    const canonicalKeys = new Set<string>();
+    const githubIds = new Set<number>();
+    const repositoryProjects = new Map<string, string>();
+    for (const repository of input.repositories) {
+      const canonical = canonicalRepository(repository.canonicalKey, true);
+      if (repository.nameWithOwner !== canonical.nameWithOwner || canonicalKeys.has(canonical.canonicalKey)) {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
+      canonicalKeys.add(canonical.canonicalKey);
+      repositoryProjects.set(canonical.canonicalKey, validateProjectKey(repository.projectKey, true));
+      if (repository.projectOrigin !== 'explicit' && repository.projectOrigin !== 'auto') {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
+      if (repository.githubRepositoryId !== null) {
+        const id = operationalInteger(repository.githubRepositoryId, true, 1);
+        if (githubIds.has(id)) operationalFail('OPERATIONAL_INPUT_INVALID');
+        githubIds.add(id);
+      }
+    }
+    const bindingIds = new Set<string>();
+    for (const binding of input.bindings) {
+      const orcaId = operationalInputText(binding.orcaRepositoryId, 500);
+      if (bindingIds.has(orcaId)) operationalFail('OPERATIONAL_INPUT_INVALID');
+      bindingIds.add(orcaId);
+      if (binding.origin !== 'manual' && binding.origin !== 'discovered') {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
+      const projectKey = validateProjectKey(binding.projectKey, true);
+      if (binding.canonicalKey === null) {
+        if (binding.origin !== 'manual') operationalFail('OPERATIONAL_INPUT_INVALID');
+      } else {
+        const canonical = canonicalRepository(binding.canonicalKey, true).canonicalKey;
+        if (!canonicalKeys.has(canonical) || repositoryProjects.get(canonical) !== projectKey) {
+          operationalFail('OPERATIONAL_INPUT_INVALID');
+        }
+      }
+    }
+    const issueHashes = new Set<string>();
+    for (const issue of input.issues) {
+      if (!/^[0-9a-f]{64}$/.test(issue.issueHash) ||
+          !OPERATIONAL_ISSUE_CATEGORIES.has(issue.category) || issueHashes.has(issue.issueHash)) {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
+      issueHashes.add(issue.issueHash);
+    }
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE repository_registry SET active = 0, updated_at = ? WHERE active = 1')
+        .run(at);
+      const upsertRepository = this.db.prepare(`
+        INSERT INTO repository_registry
+          (canonical_key, github_repository_id, name_with_owner, project_key, project_origin,
+           active, first_seen_at, last_seen_at, last_good_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT (canonical_key) DO UPDATE SET
+          github_repository_id = excluded.github_repository_id,
+          name_with_owner = excluded.name_with_owner,
+          project_key = excluded.project_key,
+          project_origin = excluded.project_origin,
+          active = 1,
+          last_seen_at = excluded.last_seen_at,
+          last_good_at = excluded.last_good_at,
+          updated_at = excluded.updated_at`);
+      for (const repository of input.repositories) {
+        upsertRepository.run(
+          repository.canonicalKey, repository.githubRepositoryId, repository.nameWithOwner,
+          repository.projectKey, repository.projectOrigin, at, at, at, at,
+        );
+      }
+      this.operationalFault?.('after_discovery_registry');
+
+      this.db.prepare('UPDATE orca_repository_binding SET active = 0, updated_at = ? WHERE active = 1')
+        .run(at);
+      const upsertBinding = this.db.prepare(`
+        INSERT INTO orca_repository_binding
+          (orca_repository_id, canonical_key, project_key, origin, active,
+           first_seen_at, last_seen_at, last_good_at, updated_at)
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT (orca_repository_id) DO UPDATE SET
+          canonical_key = excluded.canonical_key,
+          project_key = excluded.project_key,
+          origin = excluded.origin,
+          active = 1,
+          last_seen_at = excluded.last_seen_at,
+          last_good_at = excluded.last_good_at,
+          updated_at = excluded.updated_at`);
+      for (const binding of input.bindings) {
+        upsertBinding.run(
+          binding.orcaRepositoryId, binding.canonicalKey, binding.projectKey, binding.origin,
+          at, at, at, at,
+        );
+      }
+      this.operationalFault?.('after_discovery_bindings');
+
+      this.db.prepare(`
+        UPDATE repository_discovery_issue
+           SET active = 0, resolved_at = ?, updated_at = ?
+         WHERE active = 1`).run(at, at);
+      const upsertIssue = this.db.prepare(`
+        INSERT INTO repository_discovery_issue
+          (issue_hash, category, active, occurrence_count, first_seen_at, last_seen_at,
+           resolved_at, updated_at)
+        VALUES (?, ?, 1, 1, ?, ?, NULL, ?)
+        ON CONFLICT (issue_hash) DO UPDATE SET
+          active = 1,
+          occurrence_count = repository_discovery_issue.occurrence_count + 1,
+          last_seen_at = excluded.last_seen_at,
+          resolved_at = NULL,
+          updated_at = excluded.updated_at
+        WHERE repository_discovery_issue.category = excluded.category`);
+      for (const issue of input.issues) {
+        if (Number(upsertIssue.run(issue.issueHash, issue.category, at, at, at).changes) !== 1) {
+          operationalFail('OPERATIONAL_CONFLICT');
+        }
+      }
+      const snapshot = readDiscoverySnapshot(this.db, true);
+      this.db.exec('COMMIT');
+      return snapshot;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  readEffectiveDiscoverySnapshot(): EffectiveDiscoverySnapshot {
+    this.db.exec('BEGIN');
+    try {
+      const snapshot = readDiscoverySnapshot(this.db, true);
+      this.db.exec('COMMIT');
+      return snapshot;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_STORE_CORRUPT');
+    }
+  }
+
+  recordDaemonStart(input: DaemonStartInput): DaemonHealthRecord {
+    const instanceId = operationalInputText(input.instanceId, 200);
+    const buildFingerprint = validateFingerprint(input.buildFingerprint, true);
+    const configFingerprint = validateFingerprint(input.configFingerprint, true);
+    const at = operationalIso(input.at, true);
+    const record = this.transitionDaemonHealth(() => Number(this.db.prepare(`
+        INSERT INTO daemon_health
+          (id, revision, instance_id, build_fingerprint, config_fingerprint, desired_state,
+           state, started_at, heartbeat_at, clean_stopped_at, last_error_code, updated_at)
+        VALUES (1, 0, ?, ?, ?, 'running', 'running', ?, ?, NULL, NULL, ?)
+        ON CONFLICT (id) DO UPDATE SET
+          revision = daemon_health.revision + 1,
+          instance_id = excluded.instance_id,
+          build_fingerprint = excluded.build_fingerprint,
+          config_fingerprint = excluded.config_fingerprint,
+          desired_state = 'running', state = 'running',
+          started_at = excluded.started_at, heartbeat_at = excluded.heartbeat_at,
+          clean_stopped_at = NULL, last_error_code = NULL, updated_at = excluded.updated_at
+        WHERE excluded.updated_at >= daemon_health.updated_at`)
+        .run(instanceId, buildFingerprint, configFingerprint, at, at, at).changes));
+    if (record === null) operationalFail('OPERATIONAL_STALE_TRANSITION');
+    if (record.instanceId !== instanceId || record.startedAt !== at) {
+      operationalFail('OPERATIONAL_STORE_CORRUPT');
+    }
+    return record;
+  }
+
+  recordDaemonHeartbeat(instanceId: string, at: string): DaemonHealthRecord | null {
+    const safeInstance = operationalInputText(instanceId, 200);
+    const safeAt = operationalIso(at, true);
+    return this.transitionDaemonHealth(() => Number(this.db.prepare(`
+      UPDATE daemon_health
+         SET revision = revision + 1, heartbeat_at = ?, updated_at = ?
+       WHERE id = 1 AND instance_id = ? AND state = 'running' AND updated_at <= ?`)
+      .run(safeAt, safeAt, safeInstance, safeAt).changes));
+  }
+
+  recordDaemonCleanStop(instanceId: string, at: string): DaemonHealthRecord | null {
+    const safeInstance = operationalInputText(instanceId, 200);
+    const safeAt = operationalIso(at, true);
+    return this.transitionDaemonHealth(() => Number(this.db.prepare(`
+      UPDATE daemon_health
+         SET revision = revision + 1, state = 'stopped',
+             heartbeat_at = ?, clean_stopped_at = ?, last_error_code = NULL, updated_at = ?
+       WHERE id = 1 AND instance_id = ? AND state = 'running' AND updated_at <= ?`)
+      .run(safeAt, safeAt, safeAt, safeInstance, safeAt).changes));
+  }
+
+  setDaemonDesiredState(state: DaemonDesiredState, at: string): DaemonHealthRecord | null {
+    if (state !== 'running' && state !== 'stopped') operationalFail('OPERATIONAL_INPUT_INVALID');
+    const safeAt = operationalIso(at, true);
+    return this.transitionDaemonHealth(() => Number(this.db.prepare(`
+      UPDATE daemon_health
+         SET revision = revision + 1, desired_state = ?, updated_at = ?
+       WHERE id = 1 AND updated_at <= ?`).run(state, safeAt, safeAt).changes));
+  }
+
+  readDaemonHealth(): DaemonHealthRecord | null {
+    const row = this.db.prepare(SELECT_DAEMON_HEALTH).get() as DaemonHealthRow | undefined;
+    return row === undefined ? null : toDaemonHealth(row);
+  }
+
+  private transitionDaemonHealth(write: () => number): DaemonHealthRecord | null {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (write() !== 1) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const record = this.readDaemonHealth();
+      if (record === null) operationalFail('OPERATIONAL_STORE_CORRUPT');
+      this.db.exec('COMMIT');
+      return record;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  startDaemonJob(jobName: DaemonJobName, at: string): DaemonJobClaim | null {
+    const safeJob = operationalJobName(jobName);
+    const safeAt = operationalIso(at, true);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existingRow = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(safeJob) as
+        | DaemonJobOutcomeRow | undefined;
+      if (existingRow !== undefined) {
+        const existing = toDaemonJobOutcome(existingRow);
+        if (existing.state === 'running' || existing.updatedAt > safeAt ||
+            (existing.state === 'backoff' && existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
+          this.db.exec('COMMIT');
+          return null;
+        }
+        const result = this.db.prepare(`
+          UPDATE daemon_job_outcome
+             SET revision = revision + 1, state = 'running', attempt = attempt + 1,
+                 started_at = ?, completed_at = NULL, duration_ms = NULL, next_run_at = NULL,
+                 error_code = NULL, processed_count = 0, deferred_count = 0, updated_at = ?
+           WHERE job_name = ? AND revision = ? AND state <> 'running' AND updated_at <= ?`)
+          .run(safeAt, safeAt, safeJob, existing.revision, safeAt);
+        if (Number(result.changes) !== 1) {
+          this.db.exec('ROLLBACK');
+          return null;
+        }
+      } else {
+        this.db.prepare(`
+          INSERT INTO daemon_job_outcome
+            (job_name, revision, state, attempt, consecutive_failures, started_at, completed_at,
+             last_success_at, last_failure_at, duration_ms, next_run_at, error_code,
+             processed_count, deferred_count, checkpoint, updated_at)
+          VALUES (?, 0, 'running', 1, 0, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, ?)`)
+          .run(safeJob, safeAt, safeAt);
+      }
+      const row = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(safeJob) as DaemonJobOutcomeRow;
+      const current = toDaemonJobOutcome(row);
+      this.db.exec('COMMIT');
+      return { jobName: current.jobName, revision: current.revision, startedAt: current.startedAt };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  completeDaemonJobSuccess(input: DaemonJobCompletion): DaemonJobOutcomeRecord | null {
+    return this.completeDaemonJob(input, null);
+  }
+
+  completeDaemonJobFailure(
+    input: DaemonJobCompletion & { readonly errorCode: string },
+  ): DaemonJobOutcomeRecord | null {
+    return this.completeDaemonJob(input, operationalCode(input.errorCode, true));
+  }
+
+  private completeDaemonJob(
+    input: DaemonJobCompletion,
+    errorCode: string | null,
+  ): DaemonJobOutcomeRecord | null {
+    const jobName = operationalJobName(input.claim.jobName);
+    const revision = operationalInteger(input.claim.revision, true);
+    const startedAt = operationalIso(input.claim.startedAt, true);
+    const at = operationalIso(input.at, true);
+    const durationMs = operationalInteger(input.durationMs, true);
+    const processedCount = operationalInteger(input.processedCount ?? 0, true);
+    const deferredCount = operationalInteger(input.deferredCount ?? 0, true);
+    const checkpoint = input.checkpoint === undefined
+      ? null
+      : operationalInteger(input.checkpoint, true);
+    if (at < startedAt) operationalFail('OPERATIONAL_INPUT_INVALID');
+    const state = errorCode === null ? 'succeeded' : 'failed';
+    return this.transitionDaemonJob(jobName, () => Number(this.db.prepare(`
+      UPDATE daemon_job_outcome
+         SET revision = revision + 1, state = ?, completed_at = ?,
+             last_success_at = CASE WHEN ? = 'succeeded' THEN ? ELSE last_success_at END,
+             last_failure_at = CASE WHEN ? = 'failed' THEN ? ELSE last_failure_at END,
+             duration_ms = ?, next_run_at = NULL, error_code = ?,
+             consecutive_failures = CASE WHEN ? = 'succeeded' THEN 0 ELSE consecutive_failures + 1 END,
+             processed_count = ?, deferred_count = ?,
+             checkpoint = CASE WHEN ? IS NULL THEN checkpoint ELSE ? END,
+             updated_at = ?
+       WHERE job_name = ? AND revision = ? AND state = 'running' AND started_at = ?
+         AND updated_at <= ? AND (? IS NULL OR checkpoint <= ?)`)
+      .run(
+        state, at, state, at, state, at, durationMs, errorCode, state,
+        processedCount, deferredCount, checkpoint, checkpoint, at,
+        jobName, revision, startedAt, at, checkpoint, checkpoint,
+      ).changes));
+  }
+
+  scheduleDaemonJobBackoff(
+    jobName: DaemonJobName,
+    expectedRevision: number,
+    nextRunAt: string,
+    at: string,
+  ): DaemonJobOutcomeRecord | null {
+    const safeJob = operationalJobName(jobName);
+    const revision = operationalInteger(expectedRevision, true);
+    const safeNext = operationalIso(nextRunAt, true);
+    const safeAt = operationalIso(at, true);
+    if (safeNext < safeAt) operationalFail('OPERATIONAL_INPUT_INVALID');
+    return this.transitionDaemonJob(safeJob, () => Number(this.db.prepare(`
+      UPDATE daemon_job_outcome
+         SET revision = revision + 1, state = 'backoff', next_run_at = ?, updated_at = ?
+       WHERE job_name = ? AND revision = ? AND state = 'failed' AND updated_at <= ?`)
+      .run(safeNext, safeAt, safeJob, revision, safeAt).changes));
+  }
+
+  advanceDaemonJobCheckpoint(
+    jobName: DaemonJobName,
+    expectedCheckpoint: number,
+    checkpoint: number,
+    at: string,
+  ): DaemonJobOutcomeRecord | null {
+    const safeJob = operationalJobName(jobName);
+    const expected = operationalInteger(expectedCheckpoint, true);
+    const next = operationalInteger(checkpoint, true);
+    const safeAt = operationalIso(at, true);
+    if (next < expected) operationalFail('OPERATIONAL_INPUT_INVALID');
+    return this.transitionDaemonJob(safeJob, () => Number(this.db.prepare(`
+      UPDATE daemon_job_outcome
+         SET revision = revision + 1, checkpoint = ?, updated_at = ?
+       WHERE job_name = ? AND checkpoint = ? AND updated_at <= ?`)
+      .run(next, safeAt, safeJob, expected, safeAt).changes));
+  }
+
+  findDaemonJobOutcome(jobName: DaemonJobName): DaemonJobOutcomeRecord | null {
+    const safeJob = operationalJobName(jobName);
+    const row = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(safeJob) as
+      | DaemonJobOutcomeRow | undefined;
+    return row === undefined ? null : toDaemonJobOutcome(row);
+  }
+
+  private transitionDaemonJob(jobName: DaemonJobName, write: () => number): DaemonJobOutcomeRecord | null {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (write() !== 1) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const row = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(jobName) as
+        | DaemonJobOutcomeRow | undefined;
+      if (row === undefined) operationalFail('OPERATIONAL_STORE_CORRUPT');
+      const outcome = toDaemonJobOutcome(row);
+      this.db.exec('COMMIT');
+      return outcome;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  readOperationalAggregateCounts(): OperationalAggregateCounts {
+    const row = this.db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM gate_resolution_outbox WHERE card_pending = 1) AS gate_cards,
+        (SELECT COUNT(*) FROM gate_channel_delivery
+          WHERE state IN ('pending','attempted','receipted')
+            AND resume_baseline_state <> 'unavailable') AS channel_deliveries,
+        (SELECT COUNT(*) FROM gate_channel_delivery
+          WHERE state <> 'consumed' AND resume_baseline_state = 'required') AS resume_baselines,
+        (SELECT COUNT(*) FROM gate_resolution_outbox o
+          WHERE o.notification_state = 'pending'
+            AND NOT EXISTS (SELECT 1 FROM gate_channel_delivery d WHERE d.gate_key = o.gate_key))
+          AS legacy_notifications,
+        (SELECT COUNT(*) FROM slack_root_intent WHERE state IN ('pending','sending'))
+          AS slack_root_pending,
+        (SELECT COUNT(*) FROM slack_root_intent WHERE state = 'uncertain') AS slack_root_uncertain,
+        (SELECT COUNT(*) FROM gate_channel_delivery
+          WHERE state <> 'consumed' AND resume_baseline_state = 'unavailable') AS unavailable_resume`)
+      .get() as Record<string, unknown>;
+    const gateCards = operationalInteger(row['gate_cards']);
+    const channelDeliveries = operationalInteger(row['channel_deliveries']);
+    const resumeBaselines = operationalInteger(row['resume_baselines']);
+    const legacyNotifications = operationalInteger(row['legacy_notifications']);
+    const slackRootIntents = operationalInteger(row['slack_root_pending']);
+    const uncertain = operationalInteger(row['slack_root_uncertain']);
+    const dead = operationalInteger(row['unavailable_resume']);
+    return {
+      pending: {
+        gateCards, channelDeliveries, resumeBaselines, legacyNotifications, slackRootIntents,
+        total: gateCards + channelDeliveries + resumeBaselines + legacyNotifications + slackRootIntents,
+      },
+      uncertain: { slackRootIntents: uncertain, total: uncertain },
+      dead: { unavailableResumeBaselines: dead, total: dead },
+    };
+  }
+
+  prepareSlackRootIntent(input: PrepareSlackRootIntentInput): SlackRootIntentRecord {
+    const entity = operationalEntity(input);
+    const channelId = operationalInputText(input.channelId, 200);
+    const renderFingerprint = validateFingerprint(input.renderFingerprint, true);
+    const at = operationalIso(input.at, true);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existingRow = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
+      if (existingRow !== undefined) {
+        const existing = toSlackRootIntent(existingRow);
+        if (existing.channelId !== channelId || existing.renderFingerprint !== renderFingerprint) {
+          this.db.exec('ROLLBACK');
+          operationalFail('OPERATIONAL_CONFLICT');
+        }
+        this.db.exec('COMMIT');
+        return existing;
+      }
+      const mappingExists = entity.kind === 'pr'
+        ? this.db.prepare(SELECT_ROW).get(entity.key) !== undefined
+        : entity.kind === 'run'
+          ? this.db.prepare(SELECT_RUN_ROW).get(entity.key) !== undefined
+          : this.db.prepare(SELECT_RUN_COLLECTION_ROW).get() !== undefined;
+      if (mappingExists) {
+        this.db.exec('ROLLBACK');
+        operationalFail('OPERATIONAL_CONFLICT');
+      }
+      this.db.prepare(`
+        INSERT INTO slack_root_intent
+          (entity_kind, entity_key, revision, channel_id, render_fingerprint, state,
+           attempt_count, sending_instance_id, message_ts, prepared_at, last_attempt_at,
+           posted_at, uncertain_at, last_error_code, updated_at)
+        VALUES (?, ?, 0, ?, ?, 'pending', 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?)`)
+        .run(entity.kind, entity.key, channelId, renderFingerprint, at, at);
+      const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow;
+      this.db.exec('COMMIT');
+      return toSlackRootIntent(row);
+    } catch (error) {
+      // Explicit branches may have rolled back immediately before throwing.
+      try { this.db.exec('ROLLBACK'); } catch { /* transaction already closed */ }
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  claimSlackRootIntent(
+    entityInput: SlackRootEntity,
+    instanceId: string,
+    at: string,
+  ): SlackRootClaimResult | null {
+    const entity = operationalEntity(entityInput);
+    const safeInstance = operationalInputText(instanceId, 200);
+    const safeAt = operationalIso(at, true);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
+      if (row === undefined) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const intent = toSlackRootIntent(row);
+      if (intent.state !== 'pending' || intent.updatedAt > safeAt) {
+        this.db.exec('COMMIT');
+        return { kind: 'not_claimed', intent };
+      }
+      const result = this.db.prepare(`
+        UPDATE slack_root_intent
+           SET revision = revision + 1, state = 'sending', attempt_count = attempt_count + 1,
+               sending_instance_id = ?, last_attempt_at = ?, last_error_code = NULL,
+               updated_at = ?
+         WHERE entity_kind = ? AND entity_key = ? AND revision = ? AND state = 'pending'`)
+        .run(safeInstance, safeAt, safeAt, entity.kind, entity.key, intent.revision);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
+      const claimedRow = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow;
+      const claimed = toSlackRootIntent(claimedRow);
+      this.db.exec('COMMIT');
+      return {
+        kind: 'claimed',
+        claim: {
+          ...entity,
+          revision: claimed.revision,
+          instanceId: safeInstance,
+          claimedAt: safeAt,
+        },
+        intent: claimed,
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  markSlackRootIntentSafeRetry(
+    claim: SlackRootClaim,
+    errorCode: string,
+    at: string,
+  ): SlackRootIntentRecord | null {
+    return this.finishSlackRootClaim(claim, 'pending', errorCode, at);
+  }
+
+  markSlackRootIntentUncertain(
+    claim: SlackRootClaim,
+    errorCode: string,
+    at: string,
+  ): SlackRootIntentRecord | null {
+    return this.finishSlackRootClaim(claim, 'uncertain', errorCode, at);
+  }
+
+  private finishSlackRootClaim(
+    claim: SlackRootClaim,
+    state: 'pending' | 'uncertain',
+    errorCode: string,
+    at: string,
+  ): SlackRootIntentRecord | null {
+    const entity = operationalEntity(claim);
+    const revision = operationalInteger(claim.revision, true);
+    const instanceId = operationalInputText(claim.instanceId, 200);
+    const claimedAt = operationalIso(claim.claimedAt, true);
+    const safeAt = operationalIso(at, true);
+    const safeError = operationalCode(errorCode, true);
+    if (safeAt < claimedAt) operationalFail('OPERATIONAL_INPUT_INVALID');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare(`
+        UPDATE slack_root_intent
+           SET revision = revision + 1, state = ?, sending_instance_id = NULL,
+               uncertain_at = CASE WHEN ? = 'uncertain' THEN ? ELSE NULL END,
+               last_error_code = ?, updated_at = ?
+         WHERE entity_kind = ? AND entity_key = ? AND revision = ? AND state = 'sending'
+           AND sending_instance_id = ? AND last_attempt_at = ? AND updated_at <= ?`)
+        .run(
+          state, state, safeAt, safeError, safeAt,
+          entity.kind, entity.key, revision, instanceId, claimedAt, safeAt,
+        );
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
+      if (row === undefined) operationalFail('OPERATIONAL_STORE_CORRUPT');
+      const intent = toSlackRootIntent(row);
+      this.db.exec('COMMIT');
+      return intent;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  markSlackRootIntentPosted(input: SlackRootPostedInput): SlackRootIntentRecord | null {
+    const entity = operationalEntity(input.claim);
+    const revision = operationalInteger(input.claim.revision, true);
+    const instanceId = operationalInputText(input.claim.instanceId, 200);
+    const claimedAt = operationalIso(input.claim.claimedAt, true);
+    const messageTs = operationalInputText(input.messageTs, 100);
+    const at = operationalIso(input.at, true);
+    if (at < claimedAt || input.mapping.kind !== entity.kind) {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
+      if (row === undefined) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const intent = toSlackRootIntent(row);
+      if (intent.state !== 'sending' || intent.revision !== revision ||
+          intent.sendingInstanceId !== instanceId || intent.lastAttemptAt !== claimedAt ||
+          intent.updatedAt > at) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      if (entity.kind === 'pr' && input.mapping.kind === 'pr') {
+        const facts = validateFingerprint(input.mapping.factsFingerprint, true);
+        if (input.mapping.summaryJson !== null &&
+            (typeof input.mapping.summaryJson !== 'string' || input.mapping.summaryJson.length > 200_000)) {
+          operationalFail('OPERATIONAL_INPUT_INVALID');
+        }
+        this.db.prepare(INSERT_ROW).run(
+          entity.key, intent.channelId, messageTs, intent.renderFingerprint, facts,
+          input.mapping.summaryJson, at, at,
+        );
+      } else if (entity.kind === 'run' && input.mapping.kind === 'run') {
+        this.db.prepare(INSERT_RUN_ROW).run(
+          entity.key, intent.channelId, messageTs, intent.renderFingerprint, at, at,
+        );
+      } else if (entity.kind === 'run_collection' && input.mapping.kind === 'run_collection') {
+        this.db.prepare(INSERT_RUN_COLLECTION_ROW).run(
+          intent.channelId, messageTs, intent.renderFingerprint, at, at,
+        );
+      } else {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
+      this.operationalFault?.('after_root_mapping');
+      const result = this.db.prepare(`
+        UPDATE slack_root_intent
+           SET revision = revision + 1, state = 'posted', sending_instance_id = NULL,
+               message_ts = ?, posted_at = ?, last_error_code = NULL, updated_at = ?
+         WHERE entity_kind = ? AND entity_key = ? AND revision = ? AND state = 'sending'
+           AND sending_instance_id = ? AND last_attempt_at = ?`)
+        .run(messageTs, at, at, entity.kind, entity.key, revision, instanceId, claimedAt);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
+      const postedRow = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow;
+      this.db.exec('COMMIT');
+      return toSlackRootIntent(postedRow);
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* transaction already closed */ }
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  recoverSlackRootIntents(instanceId: string, at: string): number {
+    const safeInstance = operationalInputText(instanceId, 200);
+    const safeAt = operationalIso(at, true);
+    try {
+      const result = this.db.prepare(`
+        UPDATE slack_root_intent
+           SET revision = revision + 1, state = 'uncertain', sending_instance_id = NULL,
+               uncertain_at = ?, last_error_code = 'startup_recovery', updated_at = ?
+         WHERE state = 'sending' AND sending_instance_id <> ? AND updated_at <= ?`)
+        .run(safeAt, safeAt, safeInstance, safeAt);
+      return Number(result.changes);
+    } catch {
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  findSlackRootIntent(entityInput: SlackRootEntity): SlackRootIntentRecord | null {
+    const entity = operationalEntity(entityInput);
+    const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+      .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
+    return row === undefined ? null : toSlackRootIntent(row);
+  }
+
   close(): void {
     try {
       // WAL과 shm을 본 파일에 접고 지운다. 다음 실행이 남은 조각을 복구하지 않아도 되게 한다.
@@ -5421,6 +6595,7 @@ function openCopy(path: string): OpenedCopy {
     copyFileSync(path, copy);
     if (pathExists(`${path}-wal`)) copyFileSync(`${path}-wal`, `${copy}-wal`);
     db = new DatabaseSync(copy);
+    enableForeignKeys(db);
     // 버전 판정과 migration은 실제 실행과 같은 함수를 쓴다. 모르는 버전이면 여기서도 던진다.
     // 올리는 대상은 **복사본**이다. 원본은 v1인 채로 남고, 다음 실제 실행이 원본을 올린다.
     // 복사본을 올리지 않으면 dry-run이 v2 컬럼을 읽지 못해 실제 실행과 다른 판정을 낸다.
@@ -5456,6 +6631,12 @@ function enableWal(db: DatabaseSync, path: string): void {
       `store 파일을 WAL로 열지 못했다. 실제 journal mode는 ${mode ?? '알 수 없음'}이다: ${path}`,
     );
   }
+}
+
+function enableForeignKeys(db: DatabaseSync): void {
+  db.exec('PRAGMA foreign_keys = ON');
+  const row = db.prepare('PRAGMA foreign_keys').get() as { readonly foreign_keys: number } | undefined;
+  if (row?.foreign_keys !== 1) operationalFail('OPERATIONAL_STORE_CORRUPT');
 }
 
 const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
@@ -5510,6 +6691,122 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   ],
 };
 
+const CURRENT_OPERATIONAL_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  repository_registry: [
+    'canonical_key', 'github_repository_id', 'name_with_owner', 'project_key', 'project_origin',
+    'active', 'first_seen_at', 'last_seen_at', 'last_good_at', 'updated_at',
+  ],
+  orca_repository_binding: [
+    'orca_repository_id', 'canonical_key', 'project_key', 'origin', 'active',
+    'first_seen_at', 'last_seen_at', 'last_good_at', 'updated_at',
+  ],
+  repository_discovery_issue: [
+    'issue_hash', 'category', 'active', 'occurrence_count', 'first_seen_at', 'last_seen_at',
+    'resolved_at', 'updated_at',
+  ],
+  daemon_health: [
+    'id', 'revision', 'instance_id', 'build_fingerprint', 'config_fingerprint', 'desired_state',
+    'state', 'started_at', 'heartbeat_at', 'clean_stopped_at', 'last_error_code', 'updated_at',
+  ],
+  daemon_job_outcome: [
+    'job_name', 'revision', 'state', 'attempt', 'consecutive_failures', 'started_at',
+    'completed_at', 'last_success_at', 'last_failure_at', 'duration_ms', 'next_run_at',
+    'error_code', 'processed_count', 'deferred_count', 'checkpoint', 'updated_at',
+  ],
+  slack_root_intent: [
+    'entity_kind', 'entity_key', 'revision', 'channel_id', 'render_fingerprint', 'state',
+    'attempt_count', 'sending_instance_id', 'message_ts', 'prepared_at', 'last_attempt_at',
+    'posted_at', 'uncertain_at', 'last_error_code', 'updated_at',
+  ],
+};
+
+function validateCurrentOperationalStore(db: DatabaseSync): void {
+  try {
+    const normalize = (sql: string): string => sql.replace(/\s+/g, ' ').trim().replace(/;$/, '');
+    for (const [table, expected] of Object.entries(CURRENT_OPERATIONAL_COLUMNS)) {
+      const actual = (db.prepare(`PRAGMA table_info(${table})`).all() as { readonly name: string }[])
+        .map((row) => row.name);
+      if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
+        operationalFail('OPERATIONAL_STORE_CORRUPT');
+      }
+    }
+    for (const [name, expected] of Object.entries(OPERATIONAL_V13_SCHEMA_OBJECTS)) {
+      const row = db.prepare(
+        `SELECT sql FROM sqlite_master WHERE name = ? AND type IN ('table','index')`,
+      ).get(name) as { readonly sql: string | null } | undefined;
+      if (row?.sql === null || row === undefined || normalize(row.sql) !== normalize(expected)) {
+        operationalFail('OPERATIONAL_STORE_CORRUPT');
+      }
+    }
+    const tableNames = Object.keys(CURRENT_OPERATIONAL_COLUMNS);
+    const placeholders = tableNames.map(() => '?').join(',');
+    const expectedNames = new Set(Object.keys(OPERATIONAL_V13_SCHEMA_OBJECTS));
+    const unexpected = (db.prepare(
+      `SELECT type, name FROM sqlite_master
+        WHERE (type IN ('index','trigger') AND tbl_name IN (${placeholders}))
+           OR (type = 'table' AND
+              (name LIKE 'repository_registry%' OR name LIKE 'orca_repository_binding%' OR
+               name LIKE 'repository_discovery_issue%' OR name LIKE 'daemon_health%' OR
+               name LIKE 'daemon_job_outcome%' OR name LIKE 'slack_root_intent%'))`,
+    ).all(...tableNames) as { readonly type: string; readonly name: string }[])
+      .filter((row) => !row.name.startsWith('sqlite_autoindex_') && !expectedNames.has(row.name));
+    if (unexpected.length > 0) operationalFail('OPERATIONAL_STORE_CORRUPT');
+
+    const snapshot = readDiscoverySnapshot(db, false);
+    const registryByKey = new Map(snapshot.repositories.map((record) => [record.canonicalKey, record]));
+    for (const binding of snapshot.bindings) {
+      if (binding.canonicalKey === null) continue;
+      const repository = registryByKey.get(binding.canonicalKey);
+      if (repository === undefined || repository.projectKey !== binding.projectKey ||
+          (binding.active && !repository.active)) operationalFail('OPERATIONAL_STORE_CORRUPT');
+    }
+    const healthRows = db.prepare(SELECT_DAEMON_HEALTH.replace(' WHERE id = 1', ''))
+      .all() as DaemonHealthRow[];
+    if (healthRows.length > 1) operationalFail('OPERATIONAL_STORE_CORRUPT');
+    healthRows.map(toDaemonHealth);
+    (db.prepare(SELECT_ALL_DAEMON_JOB_OUTCOMES).all() as DaemonJobOutcomeRow[])
+      .map(toDaemonJobOutcome);
+    const intents = (db.prepare(SELECT_ALL_SLACK_ROOT_INTENTS).all() as SlackRootIntentRow[])
+      .map(toSlackRootIntent);
+    for (const intent of intents) {
+      const mapping = intent.kind === 'pr'
+        ? convertOptionalMapping(db.prepare(SELECT_ROW).get(intent.key) as PrMessageRow | undefined, toRecord)
+        : intent.kind === 'run'
+          ? convertOptionalMapping(db.prepare(SELECT_RUN_ROW).get(intent.key) as RunMessageRow | undefined, toRunMessageRecord)
+          : convertOptionalMapping(db.prepare(SELECT_RUN_COLLECTION_ROW).get() as RunCollectionMessageRow | undefined, toRunCollectionMessageRecord);
+      if (intent.state === 'posted') {
+        if (mapping === null || mapping.channelId !== intent.channelId ||
+            mapping.messageTs !== intent.messageTs || mapping.renderFingerprint !== intent.renderFingerprint) {
+          operationalFail('OPERATIONAL_STORE_CORRUPT');
+        }
+      } else if (mapping !== null) {
+        operationalFail('OPERATIONAL_STORE_CORRUPT');
+      }
+    }
+    const foreignKeys = db.prepare('PRAGMA foreign_key_check').all() as { readonly table: string }[];
+    if (foreignKeys.some((row) => tableNames.includes(row.table))) {
+      operationalFail('OPERATIONAL_STORE_CORRUPT');
+    }
+  } catch (error) {
+    if (error instanceof OperationalStoreError) throw error;
+    operationalFail('OPERATIONAL_STORE_CORRUPT');
+  }
+}
+
+function convertOptionalMapping<
+  Row,
+  RecordType extends {
+    readonly channelId: string;
+    readonly messageTs: string;
+    readonly renderFingerprint: string;
+  },
+>(
+  row: Row | undefined,
+  convert: (row: Row) => RecordType,
+): RecordType | null {
+  return row === undefined ? null : convert(row);
+}
+
 /** Current Gate schema is a fail-closed boundary: exact shape, SQLite integrity, and every row. */
 function validateCurrentGateStore(
   db: DatabaseSync,
@@ -5521,6 +6818,9 @@ function validateCurrentGateStore(
   // reject an internally consistent store as corrupt.
   db.exec('BEGIN');
   try {
+  // Operational rows use a static/redacted failure surface even when SQLite quick_check would
+  // otherwise expose only a generic integrity failure first.
+  validateCurrentOperationalStore(db);
   const integrity = db.prepare('PRAGMA quick_check').all() as Record<string, unknown>[];
   if (integrity.length !== 1 || Object.values(integrity[0] ?? {})[0] !== 'ok') {
     throw new Error(`store 파일의 SQLite integrity check가 실패했다: ${path}`);
@@ -5573,7 +6873,6 @@ function validateCurrentGateStore(
   if (unexpectedD2Objects.length > 0) {
     throw new Error(`store 파일에 current code-owned Gate shape 밖의 schema object가 있다: ${path}`);
   }
-
   const metadatas = (db.prepare(
     `SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
             options_json, recommendation_option_id, recommendation_reason, impact, registered_at
@@ -5927,6 +7226,7 @@ function prepareSchema(
   db: DatabaseSync,
   path: string,
   validationFault?: (point: 'after_resolution_rows') => void,
+  migrationFault?: (fromVersion: number, statementIndex: number) => void,
 ): void {
   const version = readSchemaVersion(db, path);
 
@@ -5947,7 +7247,7 @@ function prepareSchema(
     return;
   }
 
-  applyMigrations(db, path, version);
+  applyMigrations(db, path, version, migrationFault);
   validateCurrentGateStore(db, path, validationFault);
 }
 
@@ -5966,7 +7266,12 @@ function prepareSchema(
  * 되돌아간 파일은 적용 전과 같은 v1이므로 옛 코드로도 그대로 열린다. 이것이 `MIGRATIONS`를
  * 덧붙이기로 제한한 이유이기도 하다(`schema.ts`).
  */
-function applyMigrations(db: DatabaseSync, path: string, from: number): void {
+function applyMigrations(
+  db: DatabaseSync,
+  path: string,
+  from: number,
+  migrationFault?: (fromVersion: number, statementIndex: number) => void,
+): void {
   if (from === SCHEMA_VERSION) return;
   if (from > SCHEMA_VERSION || from < 1) {
     throw new SchemaVersionError(path, from, SCHEMA_VERSION);
@@ -5978,7 +7283,10 @@ function applyMigrations(db: DatabaseSync, path: string, from: number): void {
       const step = MIGRATIONS[v - 1];
       // SCHEMA_VERSION과 MIGRATIONS.length가 어긋나면 여기서 드러난다. 건너뛰지 않는다.
       if (step === undefined) throw new SchemaVersionError(path, from, SCHEMA_VERSION);
-      for (const statement of step) db.exec(statement);
+      for (const [statementIndex, statement] of step.entries()) {
+        db.exec(statement);
+        migrationFault?.(v, statementIndex);
+      }
     }
     db.prepare('UPDATE schema_version SET version = ?, applied_at = ? WHERE id = 1').run(
       SCHEMA_VERSION,

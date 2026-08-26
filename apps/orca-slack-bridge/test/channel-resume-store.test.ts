@@ -451,7 +451,10 @@ function downgradeDeliveryDatabaseToV11(): string {
   const legacyRow = raw.prepare(
     `SELECT ${legacyColumns.join(', ')} FROM gate_channel_delivery WHERE gate_key = ?`,
   ).get(GATE) as Record<(typeof legacyColumns)[number], unknown>;
-  raw.exec('DROP TABLE gate_resume_observation');
+  raw.exec(`DROP TABLE gate_resume_observation;
+    DROP TABLE slack_root_intent; DROP TABLE daemon_job_outcome; DROP TABLE daemon_health;
+    DROP TABLE repository_discovery_issue; DROP TABLE orca_repository_binding;
+    DROP TABLE repository_registry`);
   raw.exec('DROP TABLE gate_channel_delivery');
   for (const ddl of Object.values(GATE_V11_SCHEMA_OBJECTS)) raw.exec(ddl);
   raw.prepare(
@@ -1230,7 +1233,7 @@ describe('v12 durable resume evidence and existing-card projection', () => {
 
     const nowAt = '2026-08-24T11:00:00.000Z';
     store = new SqliteDigestStore(path);
-    expect(SCHEMA_VERSION).toBe(12);
+    expect(SCHEMA_VERSION).toBe(13);
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
       resumeBaselineState: 'unavailable',
       state: legacyState,

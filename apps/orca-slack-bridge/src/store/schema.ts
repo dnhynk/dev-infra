@@ -74,7 +74,7 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -603,6 +603,202 @@ const GATE_RESUME_OBSERVATION_DUE_INDEX = `
 CREATE INDEX gate_resume_observation_due
   ON gate_resume_observation (next_observation_at, gate_key)`;
 
+/** O1 v13 stores only canonical/redacted discovery facts. Raw remotes and paths have no column. */
+const REPOSITORY_REGISTRY_TABLE = `
+CREATE TABLE repository_registry (
+  canonical_key        TEXT PRIMARY KEY CHECK (length(canonical_key) BETWEEN 1 AND 250),
+  github_repository_id INTEGER UNIQUE CHECK (github_repository_id IS NULL OR github_repository_id > 0),
+  name_with_owner      TEXT NOT NULL CHECK (length(name_with_owner) BETWEEN 3 AND 201),
+  project_key          TEXT NOT NULL CHECK (length(project_key) BETWEEN 1 AND 200),
+  project_origin       TEXT NOT NULL CHECK (project_origin IN ('explicit','auto')),
+  active               INTEGER NOT NULL CHECK (active IN (0, 1)),
+  first_seen_at        TEXT NOT NULL,
+  last_seen_at         TEXT NOT NULL,
+  last_good_at         TEXT NOT NULL,
+  updated_at           TEXT NOT NULL,
+  CHECK (last_seen_at >= first_seen_at),
+  CHECK (last_good_at >= first_seen_at),
+  CHECK (updated_at >= first_seen_at)
+)`;
+
+const REPOSITORY_REGISTRY_PROJECT_INDEX = `
+CREATE INDEX repository_registry_project
+  ON repository_registry (project_key, active, canonical_key)`;
+
+const ORCA_REPOSITORY_BINDING_TABLE = `
+CREATE TABLE orca_repository_binding (
+  orca_repository_id TEXT PRIMARY KEY CHECK (length(orca_repository_id) BETWEEN 1 AND 500),
+  canonical_key      TEXT REFERENCES repository_registry(canonical_key),
+  project_key        TEXT NOT NULL CHECK (length(project_key) BETWEEN 1 AND 200),
+  origin             TEXT NOT NULL CHECK (origin IN ('manual','discovered')),
+  active             INTEGER NOT NULL CHECK (active IN (0, 1)),
+  first_seen_at      TEXT NOT NULL,
+  last_seen_at       TEXT NOT NULL,
+  last_good_at       TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  CHECK (canonical_key IS NOT NULL OR origin = 'manual'),
+  CHECK (last_seen_at >= first_seen_at),
+  CHECK (last_good_at >= first_seen_at),
+  CHECK (updated_at >= first_seen_at)
+)`;
+
+const ORCA_REPOSITORY_BINDING_CANONICAL_INDEX = `
+CREATE INDEX orca_repository_binding_canonical
+  ON orca_repository_binding (canonical_key, active, orca_repository_id)`;
+
+const ORCA_REPOSITORY_BINDING_PROJECT_INDEX = `
+CREATE INDEX orca_repository_binding_project
+  ON orca_repository_binding (project_key, active, orca_repository_id)`;
+
+const REPOSITORY_DISCOVERY_ISSUE_TABLE = `
+CREATE TABLE repository_discovery_issue (
+  issue_hash       TEXT PRIMARY KEY CHECK (length(issue_hash) = 64 AND issue_hash NOT GLOB '*[^0-9a-f]*'),
+  category         TEXT NOT NULL CHECK (category IN
+    ('no_remote','unsupported_remote','invalid_remote','canonical_conflict','duplicate_orca_id',
+     'manual_remote_conflict','capacity_conflict','schema_drift','project_conflict','query_failed',
+     'github_identity_unverified','capacity_deferred')),
+  active           INTEGER NOT NULL CHECK (active IN (0, 1)),
+  occurrence_count INTEGER NOT NULL CHECK (occurrence_count BETWEEN 1 AND 9007199254740991),
+  first_seen_at    TEXT NOT NULL,
+  last_seen_at     TEXT NOT NULL,
+  resolved_at      TEXT,
+  updated_at       TEXT NOT NULL,
+  CHECK (last_seen_at >= first_seen_at),
+  CHECK (updated_at >= first_seen_at),
+  CHECK ((active = 1 AND resolved_at IS NULL) OR (active = 0 AND resolved_at IS NOT NULL))
+)`;
+
+const REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX = `
+CREATE INDEX repository_discovery_issue_active
+  ON repository_discovery_issue (active, category, issue_hash)`;
+
+const DAEMON_HEALTH_TABLE = `
+CREATE TABLE daemon_health (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  revision           INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
+  instance_id        TEXT NOT NULL CHECK (length(instance_id) BETWEEN 1 AND 200),
+  build_fingerprint  TEXT NOT NULL CHECK (length(build_fingerprint) BETWEEN 1 AND 128),
+  config_fingerprint TEXT NOT NULL CHECK (length(config_fingerprint) BETWEEN 1 AND 128),
+  desired_state      TEXT NOT NULL CHECK (desired_state IN ('running','stopped')),
+  state              TEXT NOT NULL CHECK (state IN ('running','stopped')),
+  started_at         TEXT NOT NULL,
+  heartbeat_at       TEXT NOT NULL,
+  clean_stopped_at   TEXT,
+  last_error_code    TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
+  updated_at         TEXT NOT NULL,
+  CHECK (heartbeat_at >= started_at),
+  CHECK (updated_at >= heartbeat_at),
+  CHECK ((state = 'running' AND clean_stopped_at IS NULL)
+      OR (state = 'stopped' AND clean_stopped_at IS NOT NULL AND clean_stopped_at >= heartbeat_at
+          AND updated_at >= clean_stopped_at))
+)`;
+
+const DAEMON_JOB_OUTCOME_TABLE = `
+CREATE TABLE daemon_job_outcome (
+  job_name             TEXT PRIMARY KEY CHECK (job_name IN
+    ('repository-discovery','run-observer','pr-digest','gate-reconcile','channel-delivery')),
+  revision             INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
+  state                TEXT NOT NULL CHECK (state IN ('running','succeeded','failed','backoff')),
+  attempt              INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 9007199254740991),
+  consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures BETWEEN 0 AND 1000000),
+  started_at           TEXT NOT NULL,
+  completed_at         TEXT,
+  last_success_at      TEXT,
+  last_failure_at      TEXT,
+  duration_ms          INTEGER CHECK (duration_ms IS NULL OR duration_ms BETWEEN 0 AND 9007199254740991),
+  next_run_at          TEXT,
+  error_code           TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 80),
+  processed_count      INTEGER NOT NULL CHECK (processed_count BETWEEN 0 AND 9007199254740991),
+  deferred_count       INTEGER NOT NULL CHECK (deferred_count BETWEEN 0 AND 9007199254740991),
+  checkpoint           INTEGER NOT NULL CHECK (checkpoint BETWEEN 0 AND 9007199254740991),
+  updated_at           TEXT NOT NULL,
+  CHECK (updated_at >= started_at),
+  CHECK (last_success_at IS NULL OR updated_at >= last_success_at),
+  CHECK (last_failure_at IS NULL OR updated_at >= last_failure_at),
+  CHECK (
+    (state = 'running' AND completed_at IS NULL AND duration_ms IS NULL
+      AND next_run_at IS NULL AND error_code IS NULL)
+    OR (state = 'succeeded' AND completed_at IS NOT NULL AND duration_ms IS NOT NULL
+      AND last_success_at = completed_at AND next_run_at IS NULL AND error_code IS NULL
+      AND consecutive_failures = 0)
+    OR (state = 'failed' AND completed_at IS NOT NULL AND duration_ms IS NOT NULL
+      AND last_failure_at = completed_at AND next_run_at IS NULL AND error_code IS NOT NULL
+      AND consecutive_failures >= 1)
+    OR (state = 'backoff' AND completed_at IS NOT NULL AND duration_ms IS NOT NULL
+      AND last_failure_at = completed_at AND next_run_at IS NOT NULL AND error_code IS NOT NULL
+      AND consecutive_failures >= 1 AND next_run_at >= updated_at)
+  )
+)`;
+
+const DAEMON_JOB_OUTCOME_STATE_INDEX = `
+CREATE INDEX daemon_job_outcome_state
+  ON daemon_job_outcome (state, next_run_at, job_name)`;
+
+const SLACK_ROOT_INTENT_TABLE = `
+CREATE TABLE slack_root_intent (
+  entity_kind          TEXT NOT NULL CHECK (entity_kind IN ('pr','run','run_collection')),
+  entity_key           TEXT NOT NULL CHECK (length(entity_key) BETWEEN 1 AND 500),
+  revision             INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
+  channel_id           TEXT NOT NULL CHECK (length(channel_id) BETWEEN 1 AND 200),
+  render_fingerprint   TEXT NOT NULL CHECK (length(render_fingerprint) BETWEEN 1 AND 128),
+  state                TEXT NOT NULL CHECK (state IN ('pending','sending','posted','uncertain')),
+  attempt_count        INTEGER NOT NULL CHECK (attempt_count BETWEEN 0 AND 1000000),
+  sending_instance_id  TEXT CHECK (sending_instance_id IS NULL OR length(sending_instance_id) BETWEEN 1 AND 200),
+  message_ts           TEXT CHECK (message_ts IS NULL OR length(message_ts) BETWEEN 1 AND 100),
+  prepared_at          TEXT NOT NULL,
+  last_attempt_at      TEXT,
+  posted_at            TEXT,
+  uncertain_at         TEXT,
+  last_error_code      TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
+  updated_at           TEXT NOT NULL,
+  PRIMARY KEY (entity_kind, entity_key),
+  CHECK ((entity_kind = 'pr' AND entity_key LIKE 'pr:%')
+      OR (entity_kind = 'run' AND entity_key LIKE 'run:%')
+      OR (entity_kind = 'run_collection' AND entity_key = 'run_collection')),
+  CHECK (updated_at >= prepared_at),
+  CHECK (last_attempt_at IS NULL OR (last_attempt_at >= prepared_at AND updated_at >= last_attempt_at)),
+  CHECK (
+    (state = 'pending' AND sending_instance_id IS NULL AND message_ts IS NULL
+      AND posted_at IS NULL AND uncertain_at IS NULL
+      AND ((attempt_count = 0 AND last_attempt_at IS NULL AND last_error_code IS NULL)
+        OR (attempt_count >= 1 AND last_attempt_at IS NOT NULL AND last_error_code IS NOT NULL)))
+    OR (state = 'sending' AND attempt_count >= 1 AND sending_instance_id IS NOT NULL
+      AND message_ts IS NULL AND last_attempt_at IS NOT NULL AND posted_at IS NULL
+      AND uncertain_at IS NULL AND last_error_code IS NULL)
+    OR (state = 'posted' AND attempt_count >= 1 AND sending_instance_id IS NULL
+      AND message_ts IS NOT NULL AND last_attempt_at IS NOT NULL AND posted_at IS NOT NULL
+      AND uncertain_at IS NULL AND last_error_code IS NULL AND updated_at >= posted_at)
+    OR (state = 'uncertain' AND attempt_count >= 1 AND sending_instance_id IS NULL
+      AND message_ts IS NULL AND last_attempt_at IS NOT NULL AND posted_at IS NULL
+      AND uncertain_at IS NOT NULL AND last_error_code IS NOT NULL AND updated_at >= uncertain_at)
+  )
+)`;
+
+const SLACK_ROOT_INTENT_STATE_INDEX = `
+CREATE INDEX slack_root_intent_state
+  ON slack_root_intent (state, updated_at, entity_kind, entity_key)`;
+
+const SLACK_ROOT_INTENT_SLACK_INDEX = `
+CREATE UNIQUE INDEX slack_root_intent_slack_identity
+  ON slack_root_intent (channel_id, message_ts) WHERE message_ts IS NOT NULL`;
+
+/** Exact code-owned O1 schema objects. Fresh DDL and migration share these same strings. */
+export const OPERATIONAL_V13_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  repository_registry: REPOSITORY_REGISTRY_TABLE,
+  repository_registry_project: REPOSITORY_REGISTRY_PROJECT_INDEX,
+  orca_repository_binding: ORCA_REPOSITORY_BINDING_TABLE,
+  orca_repository_binding_canonical: ORCA_REPOSITORY_BINDING_CANONICAL_INDEX,
+  orca_repository_binding_project: ORCA_REPOSITORY_BINDING_PROJECT_INDEX,
+  repository_discovery_issue: REPOSITORY_DISCOVERY_ISSUE_TABLE,
+  repository_discovery_issue_active: REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX,
+  daemon_health: DAEMON_HEALTH_TABLE,
+  daemon_job_outcome: DAEMON_JOB_OUTCOME_TABLE,
+  daemon_job_outcome_state: DAEMON_JOB_OUTCOME_STATE_INDEX,
+  slack_root_intent: SLACK_ROOT_INTENT_TABLE,
+  slack_root_intent_state: SLACK_ROOT_INTENT_STATE_INDEX,
+  slack_root_intent_slack_identity: SLACK_ROOT_INTENT_SLACK_INDEX,
+};
+
 /** Exact code-owned v8 objects. Startup compares normalized sqlite_master SQL fail-closed. */
 export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_metadata: GATE_METADATA_TABLE,
@@ -717,6 +913,19 @@ ${GATE_CHANNEL_DELIVERY_DUE_INDEX};
 ${GATE_CHANNEL_DELIVERY_RUN_INDEX};
 ${GATE_RESUME_OBSERVATION_TABLE};
 ${GATE_RESUME_OBSERVATION_DUE_INDEX};
+${REPOSITORY_REGISTRY_TABLE};
+${REPOSITORY_REGISTRY_PROJECT_INDEX};
+${ORCA_REPOSITORY_BINDING_TABLE};
+${ORCA_REPOSITORY_BINDING_CANONICAL_INDEX};
+${ORCA_REPOSITORY_BINDING_PROJECT_INDEX};
+${REPOSITORY_DISCOVERY_ISSUE_TABLE};
+${REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX};
+${DAEMON_HEALTH_TABLE};
+${DAEMON_JOB_OUTCOME_TABLE};
+${DAEMON_JOB_OUTCOME_STATE_INDEX};
+${SLACK_ROOT_INTENT_TABLE};
+${SLACK_ROOT_INTENT_STATE_INDEX};
+${SLACK_ROOT_INTENT_SLACK_INDEX};
 `;
 
 /**
@@ -795,6 +1004,22 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     "ALTER TABLE gate_channel_delivery ADD COLUMN resume_baseline_state TEXT NOT NULL DEFAULT 'unavailable' CHECK (resume_baseline_state IN ('unavailable','required','recorded'))",
     GATE_RESUME_OBSERVATION_TABLE,
     GATE_RESUME_OBSERVATION_DUE_INDEX,
+  ],
+  // v12 → v13: O1 operational state only. Existing 19 tables and every identity row remain intact.
+  [
+    REPOSITORY_REGISTRY_TABLE,
+    REPOSITORY_REGISTRY_PROJECT_INDEX,
+    ORCA_REPOSITORY_BINDING_TABLE,
+    ORCA_REPOSITORY_BINDING_CANONICAL_INDEX,
+    ORCA_REPOSITORY_BINDING_PROJECT_INDEX,
+    REPOSITORY_DISCOVERY_ISSUE_TABLE,
+    REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX,
+    DAEMON_HEALTH_TABLE,
+    DAEMON_JOB_OUTCOME_TABLE,
+    DAEMON_JOB_OUTCOME_STATE_INDEX,
+    SLACK_ROOT_INTENT_TABLE,
+    SLACK_ROOT_INTENT_STATE_INDEX,
+    SLACK_ROOT_INTENT_SLACK_INDEX,
   ],
 ];
 
