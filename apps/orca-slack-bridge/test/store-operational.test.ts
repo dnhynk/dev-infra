@@ -9,8 +9,8 @@ import {
   SchemaVersionError,
   SqliteDigestStore,
 } from '../src/store/sqlite.js';
-import type { SlackRootClaim } from '../src/store/operational-types.js';
-import { pullRequestKey, type PullRequestKey } from '../src/identity/keys.js';
+import type { OperationalFailureCode, SlackRootClaim } from '../src/store/operational-types.js';
+import { pullRequestKey, runKey, type PullRequestKey, type RunKey } from '../src/identity/keys.js';
 
 let dir: string;
 let path: string;
@@ -70,6 +70,7 @@ const repository = {
   githubRepositoryId: 101,
   projectKey: 'project-one',
   projectOrigin: 'explicit' as const,
+  evidence: 'verified' as const,
 };
 
 const binding = {
@@ -77,6 +78,7 @@ const binding = {
   canonicalKey: repository.canonicalKey,
   projectKey: repository.projectKey,
   origin: 'discovered' as const,
+  evidence: 'verified' as const,
 };
 
 const issue = { issueHash: 'a'.repeat(64), category: 'no_remote' as const };
@@ -184,6 +186,7 @@ describe('additive v13 operational schema', () => {
       const candidate = join(dir, `corrupt-${index}.db`);
       const store = new SqliteDigestStore(candidate);
       store.replaceDiscoverySnapshot({
+        passOutcome: 'succeeded',
         repositories: [repository], bindings: [binding], issues: [issue], at: AT0,
       });
       store.recordDaemonStart({
@@ -204,7 +207,7 @@ describe('additive v13 operational schema', () => {
     }
   });
 
-  it('rejects noncanonical repository and PR identities without exposing rejected values', () => {
+  it('rejects noncanonical repository, PR, and Run identities without exposing rejected values', () => {
     const invalidCanonicalKey = 'github.com/acme/private-sentinel.git';
     const invalidPrKeys = [
       'pr:github.com/acme/private-sentinel#7',
@@ -234,8 +237,31 @@ describe('additive v13 operational schema', () => {
         expect((error as Error).message).not.toContain(key);
       }
     }
+    const invalidRunKeys = [
+      'run:', 'run: ', 'run:\t', 'run: private', 'run:private ',
+      'run:\nprivate', 'run:private\n', 'private-run-key',
+    ] as const;
+    for (const key of invalidRunKeys) {
+      try {
+        inputStore.prepareSlackRootIntent({
+          kind: 'run', key: key as RunKey, channelId: 'C1',
+          renderFingerprint: 'render.1', at: AT0,
+        });
+        throw new Error('expected invalid Run identity to be rejected');
+      } catch (error) {
+        expect(error).toBeInstanceOf(OperationalStoreError);
+        expect((error as Error).message).toBe('Operational store input is invalid');
+        expect((error as Error).message).not.toContain('private');
+      }
+    }
+    const validInternalRun = runKey('internal run/key');
+    expect(inputStore.prepareSlackRootIntent({
+      kind: 'run', key: validInternalRun, channelId: 'C1',
+      renderFingerprint: 'render.1', at: AT0,
+    })).toMatchObject({ key: validInternalRun, state: 'pending' });
     try {
       inputStore.replaceDiscoverySnapshot({
+        passOutcome: 'succeeded',
         repositories: [{
           ...repository,
           canonicalKey: invalidCanonicalKey as `github.com/${string}/${string}`,
@@ -254,6 +280,7 @@ describe('additive v13 operational schema', () => {
     const corruptRepositories = join(dir, 'corrupt-canonical.db');
     const repositoryStore = new SqliteDigestStore(corruptRepositories);
     repositoryStore.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [repository], bindings: [binding], issues: [], at: AT0,
     });
     repositoryStore.close();
@@ -293,6 +320,26 @@ describe('additive v13 operational schema', () => {
       expect((error as Error).message).toBe('Operational store state is malformed or corrupt');
       expect((error as Error).message).not.toContain(invalidCorruptPrKey);
     }
+
+    const corruptRunPath = join(dir, 'corrupt-run-identity.db');
+    const runStore = new SqliteDigestStore(corruptRunPath);
+    runStore.prepareSlackRootIntent({
+      kind: 'run', key: runKey('valid-run'), channelId: 'C1',
+      renderFingerprint: 'render.1', at: AT0,
+    });
+    runStore.close();
+    const runDb = new DatabaseSync(corruptRunPath);
+    runDb.exec('PRAGMA ignore_check_constraints = ON');
+    runDb.prepare(`UPDATE slack_root_intent SET entity_key = 'run: private-sentinel'`).run();
+    runDb.close();
+    try {
+      new SqliteDigestStore(corruptRunPath);
+      throw new Error('expected corrupt Run identity to be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(OperationalStoreError);
+      expect((error as Error).message).toBe('Operational store state is malformed or corrupt');
+      expect((error as Error).message).not.toContain('private-sentinel');
+    }
   });
 });
 
@@ -300,6 +347,7 @@ describe('discovery registry transactions', () => {
   it('replaces one effective snapshot, aggregates issues, and preserves LKG across rollback', () => {
     const store = new SqliteDigestStore(path);
     expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [repository], bindings: [binding], issues: [issue], at: AT0,
     })).toMatchObject({
       repositories: [{ canonicalKey: repository.canonicalKey, active: true }],
@@ -307,10 +355,11 @@ describe('discovery registry transactions', () => {
       issues: [{ issueHash: issue.issueHash, occurrenceCount: 1, active: true }],
     });
     store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [repository],
       bindings: [binding, {
         orcaRepositoryId: 'manual-no-remote', canonicalKey: null,
-        projectKey: 'project-one', origin: 'manual',
+        projectKey: 'project-one', origin: 'manual', evidence: 'verified',
       }],
       issues: [issue], at: AT1,
     });
@@ -323,6 +372,7 @@ describe('discovery registry transactions', () => {
       },
     });
     expect(() => faulty.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [{ ...repository, projectKey: 'changed' }],
       bindings: [{ ...binding, projectKey: 'changed' }], issues: [], at: AT2,
     })).toThrow(OperationalStoreError);
@@ -340,9 +390,9 @@ describe('discovery registry transactions', () => {
   it('rejects duplicate identities, project mismatch, and non-manual null bindings', () => {
     const store = new SqliteDigestStore(path);
     for (const input of [
-      { repositories: [repository, repository], bindings: [], issues: [], at: AT0 },
-      { repositories: [repository], bindings: [{ ...binding, projectKey: 'wrong' }], issues: [], at: AT0 },
-      { repositories: [repository], bindings: [{ ...binding, canonicalKey: null }], issues: [], at: AT0 },
+      { passOutcome: 'succeeded' as const, repositories: [repository, repository], bindings: [], issues: [], at: AT0 },
+      { passOutcome: 'succeeded' as const, repositories: [repository], bindings: [{ ...binding, projectKey: 'wrong' }], issues: [], at: AT0 },
+      { passOutcome: 'succeeded' as const, repositories: [repository], bindings: [{ ...binding, canonicalKey: null }], issues: [], at: AT0 },
     ]) {
       expect(() => store.replaceDiscoverySnapshot(input)).toThrow(OperationalStoreError);
     }
@@ -352,6 +402,7 @@ describe('discovery registry transactions', () => {
   it('renames by numeric identity through the FK and applies consecutive-pass plus 24h grace', () => {
     let store = new SqliteDigestStore(path);
     store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [repository], bindings: [binding], issues: [], at: AT0,
     });
     const renamed = {
@@ -361,6 +412,7 @@ describe('discovery registry transactions', () => {
     };
     const renamedBinding = { ...binding, canonicalKey: renamed.canonicalKey };
     expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [renamed], bindings: [renamedBinding], issues: [], at: AT1,
     })).toMatchObject({
       repositories: [{
@@ -374,6 +426,7 @@ describe('discovery registry transactions', () => {
     });
 
     expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [], bindings: [], issues: [], at: AT2,
     })).toMatchObject({
       repositories: [{
@@ -389,17 +442,20 @@ describe('discovery registry transactions', () => {
     store = new SqliteDigestStore(path);
     // Reappearance resets only the miss counter; durable first-seen identity is retained.
     expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [renamed], bindings: [renamedBinding], issues: [], at: AT3,
     }).repositories[0]).toMatchObject({
       firstSeenAt: AT0, lastSeenAt: AT3, consecutiveMissingPasses: 0,
     });
     expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [], bindings: [], issues: [], at: AT4,
     }).repositories[0]).toMatchObject({
       firstSeenAt: AT0, lastSeenAt: AT3, active: true, consecutiveMissingPasses: 1,
     });
     const afterGrace = '2026-08-27T00:00:04.000Z';
     expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
       repositories: [], bindings: [], issues: [], at: afterGrace,
     })).toEqual({ repositories: [], bindings: [], issues: [] });
     store.close();
@@ -425,6 +481,144 @@ describe('discovery registry transactions', () => {
       repositories: [], bindings: [], issues: [],
     });
     reopened.close();
+  });
+
+  it('propagates a changed parent project to grace-retained bindings without refreshing evidence', () => {
+    let store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [repository], bindings: [binding], issues: [], at: AT0,
+    });
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
+      repositories: [{ ...repository, projectKey: 'project-two' }],
+      bindings: [], issues: [], at: AT1,
+    })).toMatchObject({
+      repositories: [{ projectKey: 'project-two', lastSeenAt: AT1, lastGoodAt: AT1 }],
+      bindings: [{
+        projectKey: 'project-two', lastSeenAt: AT0, lastGoodAt: AT0,
+        consecutiveMissingPasses: 1, active: true,
+      }],
+    });
+    store.close();
+    store = new SqliteDigestStore(path);
+    expect(store.readEffectiveDiscoverySnapshot().bindings[0]).toMatchObject({
+      projectKey: 'project-two', lastSeenAt: AT0, lastGoodAt: AT0,
+      consecutiveMissingPasses: 1,
+    });
+    store.close();
+  });
+
+  it('absorbs a tentative rename target into the verified numeric identity and retains both bindings', () => {
+    let store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [repository], bindings: [binding], issues: [], at: AT0,
+    });
+    const target = {
+      ...repository,
+      canonicalKey: 'github.com/acme/widget-next' as const,
+      nameWithOwner: 'acme/widget-next' as const,
+      githubRepositoryId: null,
+    };
+    const targetBinding = {
+      ...binding, orcaRepositoryId: 'tentative-orca-key', canonicalKey: target.canonicalKey,
+    };
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [target], bindings: [targetBinding], issues: [], at: AT1,
+    });
+    const converged = { ...target, githubRepositoryId: repository.githubRepositoryId };
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [converged],
+      bindings: [{ ...binding, canonicalKey: target.canonicalKey }], issues: [], at: AT2,
+    })).toMatchObject({
+      repositories: [{
+        canonicalKey: target.canonicalKey, githubRepositoryId: repository.githubRepositoryId,
+        firstSeenAt: AT0, lastSeenAt: AT2,
+      }],
+      bindings: expect.arrayContaining([
+        expect.objectContaining({
+          orcaRepositoryId: binding.orcaRepositoryId, canonicalKey: target.canonicalKey,
+        }),
+        expect.objectContaining({
+          orcaRepositoryId: targetBinding.orcaRepositoryId, canonicalKey: target.canonicalKey,
+        }),
+      ]),
+    });
+    store.close();
+    store = new SqliteDigestStore(path);
+    const reopened = store.readEffectiveDiscoverySnapshot();
+    expect(reopened.repositories).toHaveLength(1);
+    expect(reopened.bindings).toHaveLength(2);
+    expect(reopened.bindings.every((row) => row.canonicalKey === target.canonicalKey)).toBe(true);
+    store.close();
+  });
+
+  it('fails closed when a tentative rename target has a conflicting project or numeric identity', () => {
+    for (const conflict of ['project', 'numeric'] as const) {
+      const candidate = join(dir, `identity-${conflict}.db`);
+      const store = new SqliteDigestStore(candidate);
+      const target = {
+        ...repository,
+        canonicalKey: `github.com/acme/widget-${conflict}` as const,
+        nameWithOwner: `acme/widget-${conflict}` as const,
+        githubRepositoryId: conflict === 'numeric' ? 202 : null,
+        projectKey: conflict === 'project' ? 'project-two' : repository.projectKey,
+      };
+      store.replaceDiscoverySnapshot({
+        passOutcome: 'succeeded', repositories: [repository, target], bindings: [], issues: [], at: AT0,
+      });
+      expect(() => store.replaceDiscoverySnapshot({
+        passOutcome: 'succeeded',
+        repositories: [{ ...target, githubRepositoryId: repository.githubRepositoryId }],
+        bindings: [], issues: [], at: AT1,
+      })).toThrowError(new OperationalStoreError('OPERATIONAL_CONFLICT'));
+      const unchanged = store.readEffectiveDiscoverySnapshot();
+      expect(unchanged.repositories).toHaveLength(2);
+      expect(unchanged.repositories.find((row) => row.canonicalKey === repository.canonicalKey))
+        .toMatchObject({ githubRepositoryId: repository.githubRepositoryId, projectKey: 'project-one' });
+      store.close();
+    }
+  });
+
+  it('preserves numeric LKG and grace evidence through failed and carried-forward observations', () => {
+    let store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [repository], bindings: [binding], issues: [], at: AT0,
+    });
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'failed', repositories: [{
+        canonicalKey: 'github.com/acme/unverified' as const,
+        nameWithOwner: 'acme/unverified' as const,
+        githubRepositoryId: null,
+        projectKey: 'project-one',
+        projectOrigin: 'auto',
+        evidence: 'carried_forward',
+      }], bindings: [],
+      issues: [{ issueHash: 'b'.repeat(64), category: 'query_failed' }], at: AT1,
+    })).toMatchObject({
+      repositories: [{
+        canonicalKey: repository.canonicalKey, githubRepositoryId: repository.githubRepositoryId,
+        lastSeenAt: AT0, lastGoodAt: AT0, consecutiveMissingPasses: 0,
+      }],
+      bindings: [{ lastSeenAt: AT0, lastGoodAt: AT0, consecutiveMissingPasses: 0 }],
+      issues: [{ category: 'query_failed', occurrenceCount: 1, active: true }],
+    });
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
+      repositories: [{ ...repository, githubRepositoryId: null, evidence: 'carried_forward' }],
+      bindings: [{ ...binding, evidence: 'carried_forward' }], issues: [], at: AT2,
+    })).toMatchObject({
+      repositories: [{
+        githubRepositoryId: repository.githubRepositoryId, lastSeenAt: AT0,
+        lastGoodAt: AT0, consecutiveMissingPasses: 0,
+      }],
+      bindings: [{ lastSeenAt: AT0, lastGoodAt: AT0, consecutiveMissingPasses: 0 }],
+    });
+    store.close();
+    store = new SqliteDigestStore(path);
+    expect(store.readEffectiveDiscoverySnapshot().repositories[0]).toMatchObject({
+      githubRepositoryId: repository.githubRepositoryId, lastSeenAt: AT0, lastGoodAt: AT0,
+    });
+    store.close();
   });
 });
 
@@ -487,6 +681,116 @@ describe('daemon health and monotonic job outcomes', () => {
     )).toMatchObject({ state: 'backoff', nextRunAt: '2026-08-26T00:01:00.000Z' });
     expect(store.startDaemonJob('repository-discovery', AT3)).toBeNull();
     store.close();
+  });
+
+  it('accepts only the finite redacted failure-code catalog in every operational writer and row', () => {
+    const store = new SqliteDigestStore(path);
+    const job = store.startDaemonJob('repository-discovery', AT0)!;
+    const root = { kind: 'run', key: runKey('error-catalog') } as const;
+    store.prepareSlackRootIntent({ ...root, channelId: 'C1', renderFingerprint: 'r.1', at: AT0 });
+    const claim = expectClaim(store.claimSlackRootIntent(root, 'instance-a', AT1));
+    const arbitrary = 'private.token-123' as OperationalFailureCode;
+    for (const write of [
+      () => store.completeDaemonJobFailure({
+        claim: job, at: AT2, durationMs: 1, errorCode: arbitrary,
+      }),
+      () => store.markSlackRootIntentSafeRetry(claim, arbitrary, AT2),
+      () => store.markSlackRootIntentUncertain(claim, arbitrary, AT2),
+    ]) {
+      try {
+        write();
+        throw new Error('expected arbitrary operational error code to be rejected');
+      } catch (error) {
+        expect(error).toBeInstanceOf(OperationalStoreError);
+        expect((error as Error).message).toBe('Operational store input is invalid');
+        expect((error as Error).message).not.toContain('private');
+      }
+    }
+    store.close();
+
+    for (const table of ['daemon_health', 'daemon_job_outcome', 'slack_root_intent'] as const) {
+      const candidate = join(dir, `error-code-${table}.db`);
+      const candidateStore = new SqliteDigestStore(candidate);
+      if (table === 'daemon_health') {
+        candidateStore.recordDaemonStart({
+          instanceId: 'instance-a', buildFingerprint: 'b.1', configFingerprint: 'c.1', at: AT0,
+        });
+      } else if (table === 'daemon_job_outcome') {
+        const candidateJob = candidateStore.startDaemonJob('repository-discovery', AT0)!;
+        candidateStore.completeDaemonJobFailure({
+          claim: candidateJob, at: AT1, durationMs: 1, errorCode: 'github.unavailable',
+        });
+      } else {
+        const candidateRoot = { kind: 'run', key: runKey('corrupt-error-code') } as const;
+        candidateStore.prepareSlackRootIntent({
+          ...candidateRoot, channelId: 'C1', renderFingerprint: 'r.1', at: AT0,
+        });
+        const candidateClaim = expectClaim(
+          candidateStore.claimSlackRootIntent(candidateRoot, 'instance-a', AT1),
+        );
+        candidateStore.markSlackRootIntentUncertain(
+          candidateClaim, 'transport.unknown', AT2,
+        );
+      }
+      candidateStore.close();
+      const raw = new DatabaseSync(candidate);
+      raw.exec('PRAGMA ignore_check_constraints = ON');
+      const column = table === 'daemon_job_outcome' ? 'error_code' : 'last_error_code';
+      raw.prepare(`UPDATE ${table} SET ${column} = ?`).run('private.token-123');
+      raw.close();
+      try {
+        new SqliteDigestStore(candidate);
+        throw new Error('expected arbitrary stored operational error code to be rejected');
+      } catch (error) {
+        expect(error).toBeInstanceOf(OperationalStoreError);
+        expect((error as Error).message).toBe('Operational store state is malformed or corrupt');
+        expect((error as Error).message).not.toContain('private');
+      }
+    }
+  });
+
+  it('redacts raw SQLite causes from every operational read surface', () => {
+    const cases = [
+      {
+        name: 'discovery', drop: 'repository_registry',
+        read: (store: SqliteDigestStore) => store.readEffectiveDiscoverySnapshot(),
+      },
+      {
+        name: 'health', drop: 'daemon_health',
+        read: (store: SqliteDigestStore) => store.readDaemonHealth(),
+      },
+      {
+        name: 'job', drop: 'daemon_job_outcome',
+        read: (store: SqliteDigestStore) => store.findDaemonJobOutcome('repository-discovery'),
+      },
+      {
+        name: 'aggregate', drop: 'gate_resolution_outbox',
+        read: (store: SqliteDigestStore) => store.readOperationalAggregateCounts(),
+      },
+      {
+        name: 'root', drop: 'slack_root_intent',
+        read: (store: SqliteDigestStore) => store.findSlackRootIntent({
+          kind: 'run', key: runKey('redacted-read'),
+        }),
+      },
+    ] as const;
+    for (const candidate of cases) {
+      const candidatePath = join(dir, `redacted-${candidate.name}.db`);
+      const store = new SqliteDigestStore(candidatePath);
+      const raw = new DatabaseSync(candidatePath);
+      raw.exec(`DROP TABLE ${candidate.drop}`);
+      raw.close();
+      try {
+        candidate.read(store);
+        throw new Error('expected missing operational table to fail closed');
+      } catch (error) {
+        expect(error).toBeInstanceOf(OperationalStoreError);
+        expect((error as Error).message).toBe('Operational store state is malformed or corrupt');
+        expect((error as Error).message).not.toContain(candidate.drop);
+        expect((error as Error).message).not.toContain('no such table');
+      }
+      store.close();
+    }
   });
 });
 

@@ -59,7 +59,7 @@ import {
   type GateResolveResult,
   type GateSnapshot,
 } from '../gate/resolution-types.js';
-import { pullRequestNumber } from '../identity/keys.js';
+import { pullRequestKey, pullRequestNumber, runKey } from '../identity/keys.js';
 import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
@@ -105,6 +105,7 @@ import type {
   DaemonJobSuccessCompletion,
   EffectiveDiscoverySnapshot,
   OperationalAggregateCounts,
+  OperationalFailureCode,
   OperationalStore,
   OrcaRepositoryBindingRecord,
   PrepareSlackRootIntentInput,
@@ -118,6 +119,7 @@ import type {
   SlackRootIntentRecord,
   SlackRootPostedInput,
 } from './operational-types.js';
+import { OPERATIONAL_FAILURE_CODES } from './operational-types.js';
 
 /**
  * `node:sqlite` 기반 `DigestStore` 구현(OD-043).
@@ -1761,6 +1763,8 @@ const OPERATIONAL_JOB_NAMES = new Set<DaemonJobName>([
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
 ]);
 
+const OPERATIONAL_FAILURE_CODE_SET = new Set<OperationalFailureCode>(OPERATIONAL_FAILURE_CODES);
+
 const DISCOVERY_MISSING_PASS_LIMIT = 1_000_000;
 const DISCOVERY_REMOVAL_GRACE_MS = 24 * 60 * 60 * 1_000;
 
@@ -1799,12 +1803,12 @@ function operationalBoolean(value: unknown): boolean {
   return value === 1;
 }
 
-function operationalCode(value: unknown, input = false): string {
+function operationalCode(value: unknown, input = false): OperationalFailureCode {
   const code = input ? operationalInputText(value, 80) : operationalText(value, 80);
-  if (!/^[a-z0-9_.-]+$/.test(code)) {
+  if (!OPERATIONAL_FAILURE_CODE_SET.has(code as OperationalFailureCode)) {
     operationalFail(input ? 'OPERATIONAL_INPUT_INVALID' : 'OPERATIONAL_STORE_CORRUPT');
   }
-  return code;
+  return code as OperationalFailureCode;
 }
 
 function canonicalRepository(value: unknown, input = false): {
@@ -1855,6 +1859,7 @@ function toRepositoryRegistry(row: RepositoryRegistryRow): RepositoryRegistryRec
   const active = operationalBoolean(row.active);
   if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt ||
       updatedAt < lastSeenAt || updatedAt < lastGoodAt ||
+      (row.project_origin === 'auto' && githubRepositoryId === null) ||
       (!active && (consecutiveMissingPasses < 2 ||
         new Date(updatedAt).valueOf() - new Date(lastSeenAt).valueOf() < DISCOVERY_REMOVAL_GRACE_MS))) {
     operationalFail('OPERATIONAL_STORE_CORRUPT');
@@ -2010,13 +2015,27 @@ function checkedSlackRootEntity(kind: unknown, key: unknown, input = false): Sla
   const text = input ? operationalInputText(key, 500) : operationalText(key, 500);
   if (kind === 'pr') {
     const match = /^pr:([1-9][0-9]*)#([1-9][0-9]*)$/.exec(text);
-    if (match !== null && Number.isSafeInteger(Number(match[1])) &&
-        Number.isSafeInteger(Number(match[2]))) {
-      return { kind, key: text as PullRequestKey };
+    if (match !== null) {
+      try {
+        const repositoryId = Number(match[1]);
+        const number = Number(match[2]);
+        if (pullRequestKey(repositoryId, number) === text) {
+          return { kind, key: text as PullRequestKey };
+        }
+      } catch {
+        return fail();
+      }
     }
     return fail();
   }
-  if (kind === 'run' && text.startsWith('run:')) return { kind, key: text as RunKey };
+  if (kind === 'run') {
+    try {
+      if (runKey(text.slice('run:'.length)) === text) return { kind, key: text as RunKey };
+    } catch {
+      return fail();
+    }
+    return fail();
+  }
   if (kind === 'run_collection' && text === 'run_collection') return { kind, key: text };
   return fail();
 }
@@ -5515,6 +5534,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   replaceDiscoverySnapshot(input: ReplaceDiscoverySnapshotInput): EffectiveDiscoverySnapshot {
     const at = operationalIso(input.at, true);
+    if (input.passOutcome !== 'succeeded' && input.passOutcome !== 'failed') {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
     const canonicalKeys = new Set<string>();
     const githubIds = new Set<number>();
     const repositoryProjects = new Map<string, string>();
@@ -5528,10 +5550,17 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (repository.projectOrigin !== 'explicit' && repository.projectOrigin !== 'auto') {
         operationalFail('OPERATIONAL_INPUT_INVALID');
       }
+      if (repository.evidence !== 'verified' && repository.evidence !== 'carried_forward') {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
       if (repository.githubRepositoryId !== null) {
         const id = operationalInteger(repository.githubRepositoryId, true, 1);
         if (githubIds.has(id)) operationalFail('OPERATIONAL_INPUT_INVALID');
         githubIds.add(id);
+      } else if (repository.projectOrigin === 'auto' && repository.evidence === 'verified') {
+        // Automatically discovered candidates are not strong evidence until GitHub confirms
+        // the durable numeric identity.
+        operationalFail('OPERATIONAL_INPUT_INVALID');
       }
     }
     const bindingIds = new Set<string>();
@@ -5542,12 +5571,17 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (binding.origin !== 'manual' && binding.origin !== 'discovered') {
         operationalFail('OPERATIONAL_INPUT_INVALID');
       }
+      if (binding.evidence !== 'verified' && binding.evidence !== 'carried_forward') {
+        operationalFail('OPERATIONAL_INPUT_INVALID');
+      }
       const projectKey = validateProjectKey(binding.projectKey, true);
       if (binding.canonicalKey === null) {
         if (binding.origin !== 'manual') operationalFail('OPERATIONAL_INPUT_INVALID');
       } else {
         const canonical = canonicalRepository(binding.canonicalKey, true).canonicalKey;
-        if (!canonicalKeys.has(canonical) || repositoryProjects.get(canonical) !== projectKey) {
+        const submittedProject = repositoryProjects.get(canonical);
+        if ((binding.evidence === 'verified' && submittedProject === undefined) ||
+            (binding.evidence === 'verified' && submittedProject !== projectKey)) {
           operationalFail('OPERATIONAL_INPUT_INVALID');
         }
       }
@@ -5561,8 +5595,10 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       issueHashes.add(issue.issueHash);
     }
 
-    this.db.exec('BEGIN IMMEDIATE');
+    let transactionOpen = false;
     try {
+      this.db.exec('BEGIN IMMEDIATE');
+      transactionOpen = true;
       const discoveryFloor = this.db.prepare(`
         SELECT MAX(updated_at) AS updated_at FROM (
           SELECT updated_at FROM repository_registry
@@ -5576,23 +5612,55 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
       // GitHub's numeric repository identity survives owner/name changes. Rename the durable PK
       // before upsert; ON UPDATE CASCADE moves every exact Orca binding in this same transaction.
+      // If the new canonical spelling already has a tentative null-ID row, merge it into the
+      // numeric row first so the verified identity converges instead of deadlocking on two keys.
       const findByGithubId = this.db.prepare(`
-        SELECT canonical_key FROM repository_registry WHERE github_repository_id = ?`);
+        SELECT canonical_key, github_repository_id, project_key, first_seen_at
+          FROM repository_registry WHERE github_repository_id = ?`);
       const findCanonical = this.db.prepare(`
-        SELECT canonical_key FROM repository_registry WHERE canonical_key = ?`);
+        SELECT canonical_key, github_repository_id, project_key, first_seen_at
+          FROM repository_registry WHERE canonical_key = ?`);
+      const preserveEarliestEvidence = this.db.prepare(`
+        UPDATE repository_registry
+           SET first_seen_at = CASE WHEN first_seen_at <= ? THEN first_seen_at ELSE ? END
+         WHERE canonical_key = ?`);
+      const repointTentativeBindings = this.db.prepare(`
+        UPDATE orca_repository_binding SET canonical_key = ? WHERE canonical_key = ?`);
+      const deleteTentativeCanonical = this.db.prepare(`
+        DELETE FROM repository_registry
+         WHERE canonical_key = ? AND github_repository_id IS NULL`);
       const renameCanonical = this.db.prepare(`
         UPDATE repository_registry SET canonical_key = ?, updated_at = ?
          WHERE canonical_key = ? AND github_repository_id = ?`);
       for (const repository of input.repositories) {
-        if (repository.githubRepositoryId === null) continue;
+        if (input.passOutcome !== 'succeeded' || repository.evidence !== 'verified' ||
+            repository.githubRepositoryId === null) continue;
         const existing = findByGithubId.get(repository.githubRepositoryId) as
-          | { readonly canonical_key: string } | undefined;
+          | { readonly canonical_key: string; readonly github_repository_id: number;
+              readonly project_key: string; readonly first_seen_at: string } | undefined;
         if (existing === undefined || existing.canonical_key === repository.canonicalKey) continue;
-        if (canonicalKeys.has(existing.canonical_key) ||
-            findCanonical.get(repository.canonicalKey) !== undefined ||
-            Number(renameCanonical.run(
-              repository.canonicalKey, at, existing.canonical_key, repository.githubRepositoryId,
-            ).changes) !== 1) {
+        if (canonicalKeys.has(existing.canonical_key)) {
+          operationalFail('OPERATIONAL_CONFLICT');
+        }
+        const tentative = findCanonical.get(repository.canonicalKey) as
+          | { readonly canonical_key: string; readonly github_repository_id: number | null;
+              readonly project_key: string; readonly first_seen_at: string } | undefined;
+        if (tentative !== undefined) {
+          if (tentative.github_repository_id !== null ||
+              tentative.project_key !== existing.project_key) {
+            operationalFail('OPERATIONAL_CONFLICT');
+          }
+          preserveEarliestEvidence.run(
+            tentative.first_seen_at, tentative.first_seen_at, existing.canonical_key,
+          );
+          repointTentativeBindings.run(existing.canonical_key, tentative.canonical_key);
+          if (Number(deleteTentativeCanonical.run(tentative.canonical_key).changes) !== 1) {
+            operationalFail('OPERATIONAL_CONFLICT');
+          }
+        }
+        if (Number(renameCanonical.run(
+          repository.canonicalKey, at, existing.canonical_key, repository.githubRepositoryId,
+        ).changes) !== 1) {
           operationalFail('OPERATIONAL_CONFLICT');
         }
       }
@@ -5600,15 +5668,22 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       const inactiveCutoff = new Date(
         new Date(at).valueOf() - DISCOVERY_REMOVAL_GRACE_MS,
       ).toISOString();
-      this.db.prepare(`
-        UPDATE repository_registry
-           SET active = CASE
-                 WHEN active = 1 AND consecutive_missing_passes >= 1 AND last_seen_at <= ?
-                   THEN 0 ELSE active END,
-               consecutive_missing_passes = CASE
-                 WHEN consecutive_missing_passes < ? THEN consecutive_missing_passes + 1
-                 ELSE consecutive_missing_passes END,
-               updated_at = ?`).run(inactiveCutoff, DISCOVERY_MISSING_PASS_LIMIT, at);
+      if (input.passOutcome === 'succeeded') {
+        const retained = input.repositories.map((repository) => repository.canonicalKey);
+        const retainedClause = retained.length === 0
+          ? ''
+          : ` WHERE canonical_key NOT IN (${retained.map(() => '?').join(',')})`;
+        this.db.prepare(`
+          UPDATE repository_registry
+             SET active = CASE
+                   WHEN active = 1 AND consecutive_missing_passes >= 1 AND last_seen_at <= ?
+                     THEN 0 ELSE active END,
+                 consecutive_missing_passes = CASE
+                   WHEN consecutive_missing_passes < ? THEN consecutive_missing_passes + 1
+                   ELSE consecutive_missing_passes END,
+                 updated_at = ?${retainedClause}`)
+          .run(inactiveCutoff, DISCOVERY_MISSING_PASS_LIMIT, at, ...retained);
+      }
       const upsertRepository = this.db.prepare(`
         INSERT INTO repository_registry
           (canonical_key, github_repository_id, name_with_owner, project_key, project_origin,
@@ -5616,16 +5691,29 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
            first_seen_at, last_seen_at, last_good_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)
         ON CONFLICT (canonical_key) DO UPDATE SET
-          github_repository_id = excluded.github_repository_id,
+          github_repository_id = COALESCE(
+            excluded.github_repository_id, repository_registry.github_repository_id),
           name_with_owner = excluded.name_with_owner,
           project_key = excluded.project_key,
           project_origin = excluded.project_origin,
           active = 1,
           consecutive_missing_passes = 0,
           last_seen_at = excluded.last_seen_at,
-          last_good_at = excluded.last_good_at,
+          last_good_at = CASE
+            WHEN excluded.github_repository_id IS NULL AND
+                 repository_registry.github_repository_id IS NOT NULL
+              THEN repository_registry.last_good_at
+            ELSE excluded.last_good_at END,
           updated_at = excluded.updated_at`);
       for (const repository of input.repositories) {
+        const existing = findCanonical.get(repository.canonicalKey);
+        if (repository.evidence === 'carried_forward') {
+          if (input.passOutcome === 'succeeded' && existing === undefined) {
+            operationalFail('OPERATIONAL_CONFLICT');
+          }
+          continue;
+        }
+        if (input.passOutcome !== 'succeeded') continue;
         upsertRepository.run(
           repository.canonicalKey, repository.githubRepositoryId, repository.nameWithOwner,
           repository.projectKey, repository.projectOrigin, at, at, at, at,
@@ -5633,15 +5721,22 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       }
       this.operationalFault?.('after_discovery_registry');
 
-      this.db.prepare(`
-        UPDATE orca_repository_binding
-           SET active = CASE
-                 WHEN active = 1 AND consecutive_missing_passes >= 1 AND last_seen_at <= ?
-                   THEN 0 ELSE active END,
-               consecutive_missing_passes = CASE
-                 WHEN consecutive_missing_passes < ? THEN consecutive_missing_passes + 1
-                 ELSE consecutive_missing_passes END,
-               updated_at = ?`).run(inactiveCutoff, DISCOVERY_MISSING_PASS_LIMIT, at);
+      if (input.passOutcome === 'succeeded') {
+        const retained = input.bindings.map((binding) => binding.orcaRepositoryId);
+        const retainedClause = retained.length === 0
+          ? ''
+          : ` WHERE orca_repository_id NOT IN (${retained.map(() => '?').join(',')})`;
+        this.db.prepare(`
+          UPDATE orca_repository_binding
+             SET active = CASE
+                   WHEN active = 1 AND consecutive_missing_passes >= 1 AND last_seen_at <= ?
+                     THEN 0 ELSE active END,
+                 consecutive_missing_passes = CASE
+                   WHEN consecutive_missing_passes < ? THEN consecutive_missing_passes + 1
+                   ELSE consecutive_missing_passes END,
+                 updated_at = ?${retainedClause}`)
+          .run(inactiveCutoff, DISCOVERY_MISSING_PASS_LIMIT, at, ...retained);
+      }
       const upsertBinding = this.db.prepare(`
         INSERT INTO orca_repository_binding
           (orca_repository_id, canonical_key, project_key, origin, active, consecutive_missing_passes,
@@ -5657,17 +5752,42 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           last_good_at = excluded.last_good_at,
           updated_at = excluded.updated_at`);
       for (const binding of input.bindings) {
+        if (binding.evidence === 'carried_forward') {
+          const existing = this.db.prepare(`
+            SELECT orca_repository_id FROM orca_repository_binding WHERE orca_repository_id = ?`)
+            .get(binding.orcaRepositoryId);
+          if (input.passOutcome === 'succeeded' && existing === undefined) {
+            operationalFail('OPERATIONAL_CONFLICT');
+          }
+          continue;
+        }
+        if (input.passOutcome !== 'succeeded') continue;
         upsertBinding.run(
           binding.orcaRepositoryId, binding.canonicalKey, binding.projectKey, binding.origin,
           at, at, at, at,
         );
       }
+      // Project changes are parent facts. Grace-retained bindings follow the parent without
+      // pretending that the binding itself was seen or strongly verified in this pass.
+      this.db.prepare(`
+        UPDATE orca_repository_binding
+           SET project_key = (
+                 SELECT project_key FROM repository_registry
+                  WHERE canonical_key = orca_repository_binding.canonical_key),
+               updated_at = ?
+         WHERE canonical_key IS NOT NULL
+           AND project_key <> (
+                 SELECT project_key FROM repository_registry
+                  WHERE canonical_key = orca_repository_binding.canonical_key)`)
+        .run(at);
       this.operationalFault?.('after_discovery_bindings');
 
-      this.db.prepare(`
-        UPDATE repository_discovery_issue
-           SET active = 0, resolved_at = ?, updated_at = ?
-         WHERE active = 1`).run(at, at);
+      if (input.passOutcome === 'succeeded') {
+        this.db.prepare(`
+          UPDATE repository_discovery_issue
+             SET active = 0, resolved_at = ?, updated_at = ?
+           WHERE active = 1`).run(at, at);
+      }
       const upsertIssue = this.db.prepare(`
         INSERT INTO repository_discovery_issue
           (issue_hash, category, active, occurrence_count, first_seen_at, last_seen_at,
@@ -5685,24 +5805,41 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           operationalFail('OPERATIONAL_CONFLICT');
         }
       }
+      const invalidBinding = this.db.prepare(`
+        SELECT 1
+          FROM orca_repository_binding b
+          LEFT JOIN repository_registry r ON r.canonical_key = b.canonical_key
+         WHERE b.canonical_key IS NOT NULL
+           AND (r.canonical_key IS NULL OR b.project_key <> r.project_key OR
+                (b.active = 1 AND r.active <> 1))
+         LIMIT 1`).get();
+      if (invalidBinding !== undefined) operationalFail('OPERATIONAL_CONFLICT');
       const snapshot = readDiscoverySnapshot(this.db, true);
       this.db.exec('COMMIT');
+      transactionOpen = false;
       return snapshot;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if (transactionOpen) {
+        try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
+      }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
     }
   }
 
   readEffectiveDiscoverySnapshot(): EffectiveDiscoverySnapshot {
-    this.db.exec('BEGIN');
+    let transactionOpen = false;
     try {
+      this.db.exec('BEGIN');
+      transactionOpen = true;
       const snapshot = readDiscoverySnapshot(this.db, true);
       this.db.exec('COMMIT');
+      transactionOpen = false;
       return snapshot;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if (transactionOpen) {
+        try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
+      }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_STORE_CORRUPT');
     }
@@ -5766,13 +5903,15 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   }
 
   readDaemonHealth(): DaemonHealthRecord | null {
-    const row = this.db.prepare(SELECT_DAEMON_HEALTH).get() as DaemonHealthRow | undefined;
-    return row === undefined ? null : toDaemonHealth(row);
+    return this.readOperationally(() => {
+      const row = this.db.prepare(SELECT_DAEMON_HEALTH).get() as DaemonHealthRow | undefined;
+      return row === undefined ? null : toDaemonHealth(row);
+    });
   }
 
   private transitionDaemonHealth(write: () => number): DaemonHealthRecord | null {
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       if (write() !== 1) {
         this.db.exec('COMMIT');
         return null;
@@ -5782,7 +5921,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       this.db.exec('COMMIT');
       return record;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
     }
@@ -5791,8 +5930,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   startDaemonJob(jobName: DaemonJobName, at: string): DaemonJobClaim | null {
     const safeJob = operationalJobName(jobName);
     const safeAt = operationalIso(at, true);
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       const existingRow = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(safeJob) as
         | DaemonJobOutcomeRow | undefined;
       if (existingRow !== undefined) {
@@ -5827,7 +5966,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       this.db.exec('COMMIT');
       return { jobName: current.jobName, revision: current.revision, startedAt: current.startedAt };
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
     }
@@ -5838,14 +5977,14 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   }
 
   completeDaemonJobFailure(
-    input: DaemonJobCompletion & { readonly errorCode: string },
+    input: DaemonJobCompletion & { readonly errorCode: OperationalFailureCode },
   ): DaemonJobOutcomeRecord | null {
     return this.completeDaemonJob(input, operationalCode(input.errorCode, true), null);
   }
 
   private completeDaemonJob(
     input: DaemonJobCompletion,
-    errorCode: string | null,
+    errorCode: OperationalFailureCode | null,
     nextRunAt: string | null,
   ): DaemonJobOutcomeRecord | null {
     const jobName = operationalJobName(input.claim.jobName);
@@ -5923,14 +6062,16 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   findDaemonJobOutcome(jobName: DaemonJobName): DaemonJobOutcomeRecord | null {
     const safeJob = operationalJobName(jobName);
-    const row = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(safeJob) as
-      | DaemonJobOutcomeRow | undefined;
-    return row === undefined ? null : toDaemonJobOutcome(row);
+    return this.readOperationally(() => {
+      const row = this.db.prepare(SELECT_DAEMON_JOB_OUTCOME).get(safeJob) as
+        | DaemonJobOutcomeRow | undefined;
+      return row === undefined ? null : toDaemonJobOutcome(row);
+    });
   }
 
   private transitionDaemonJob(jobName: DaemonJobName, write: () => number): DaemonJobOutcomeRecord | null {
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       if (write() !== 1) {
         this.db.exec('COMMIT');
         return null;
@@ -5942,14 +6083,15 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       this.db.exec('COMMIT');
       return outcome;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
     }
   }
 
   readOperationalAggregateCounts(): OperationalAggregateCounts {
-    const row = this.db.prepare(`
+    return this.readOperationally(() => {
+      const row = this.db.prepare(`
       SELECT
         (SELECT COUNT(*) FROM gate_resolution_outbox o
           WHERE o.card_pending = 1
@@ -5969,22 +6111,23 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         (SELECT COUNT(*) FROM slack_root_intent WHERE state = 'uncertain') AS slack_root_uncertain,
         (SELECT COUNT(*) FROM gate_channel_delivery
           WHERE state <> 'consumed' AND resume_baseline_state = 'unavailable') AS unavailable_resume`)
-      .get() as Record<string, unknown>;
-    const gateCards = operationalInteger(row['gate_cards']);
-    const channelDeliveries = operationalInteger(row['channel_deliveries']);
-    const resumeBaselines = operationalInteger(row['resume_baselines']);
-    const legacyNotifications = operationalInteger(row['legacy_notifications']);
-    const slackRootIntents = operationalInteger(row['slack_root_pending']);
-    const uncertain = operationalInteger(row['slack_root_uncertain']);
-    const dead = operationalInteger(row['unavailable_resume']);
-    return {
-      pending: {
-        gateCards, channelDeliveries, resumeBaselines, legacyNotifications, slackRootIntents,
-        total: gateCards + channelDeliveries + resumeBaselines + legacyNotifications + slackRootIntents,
-      },
-      uncertain: { slackRootIntents: uncertain, total: uncertain },
-      dead: { unavailableResumeBaselines: dead, total: dead },
-    };
+        .get() as Record<string, unknown>;
+      const gateCards = operationalInteger(row['gate_cards']);
+      const channelDeliveries = operationalInteger(row['channel_deliveries']);
+      const resumeBaselines = operationalInteger(row['resume_baselines']);
+      const legacyNotifications = operationalInteger(row['legacy_notifications']);
+      const slackRootIntents = operationalInteger(row['slack_root_pending']);
+      const uncertain = operationalInteger(row['slack_root_uncertain']);
+      const dead = operationalInteger(row['unavailable_resume']);
+      return {
+        pending: {
+          gateCards, channelDeliveries, resumeBaselines, legacyNotifications, slackRootIntents,
+          total: gateCards + channelDeliveries + resumeBaselines + legacyNotifications + slackRootIntents,
+        },
+        uncertain: { slackRootIntents: uncertain, total: uncertain },
+        dead: { unavailableResumeBaselines: dead, total: dead },
+      };
+    });
   }
 
   prepareSlackRootIntent(input: PrepareSlackRootIntentInput): SlackRootIntentRecord {
@@ -5992,8 +6135,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     const channelId = operationalInputText(input.channelId, 200);
     const renderFingerprint = validateFingerprint(input.renderFingerprint, true);
     const at = operationalIso(input.at, true);
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       const existingRow = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
         .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
       if (existingRow !== undefined) {
@@ -6055,8 +6198,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     const entity = operationalEntity(entityInput);
     const safeInstance = operationalInputText(instanceId, 200);
     const safeAt = operationalIso(at, true);
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
         .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
       if (row === undefined) {
@@ -6094,7 +6237,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         intent: claimed,
       };
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
     }
@@ -6102,7 +6245,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   markSlackRootIntentSafeRetry(
     claim: SlackRootClaim,
-    errorCode: string,
+    errorCode: OperationalFailureCode,
     at: string,
   ): SlackRootIntentRecord | null {
     return this.finishSlackRootClaim(claim, 'pending', errorCode, at);
@@ -6110,7 +6253,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   markSlackRootIntentUncertain(
     claim: SlackRootClaim,
-    errorCode: string,
+    errorCode: OperationalFailureCode,
     at: string,
   ): SlackRootIntentRecord | null {
     return this.finishSlackRootClaim(claim, 'uncertain', errorCode, at);
@@ -6119,7 +6262,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   private finishSlackRootClaim(
     claim: SlackRootClaim,
     state: 'pending' | 'uncertain',
-    errorCode: string,
+    errorCode: OperationalFailureCode,
     at: string,
   ): SlackRootIntentRecord | null {
     const entity = operationalEntity(claim);
@@ -6129,8 +6272,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     const safeAt = operationalIso(at, true);
     const safeError = operationalCode(errorCode, true);
     if (safeAt < claimedAt) operationalFail('OPERATIONAL_INPUT_INVALID');
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       const result = this.db.prepare(`
         UPDATE slack_root_intent
            SET revision = revision + 1, state = ?, sending_instance_id = NULL,
@@ -6153,7 +6296,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       this.db.exec('COMMIT');
       return intent;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
     }
@@ -6169,8 +6312,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     if (at < claimedAt || input.mapping.kind !== entity.kind) {
       operationalFail('OPERATIONAL_INPUT_INVALID');
     }
-    this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('BEGIN IMMEDIATE');
       const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
         .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
       if (row === undefined) {
@@ -6246,9 +6389,20 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   findSlackRootIntent(entityInput: SlackRootEntity): SlackRootIntentRecord | null {
     const entity = operationalEntity(entityInput);
-    const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
-      .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
-    return row === undefined ? null : toSlackRootIntent(row);
+    return this.readOperationally(() => {
+      const row = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+        .get(entity.kind, entity.key) as SlackRootIntentRow | undefined;
+      return row === undefined ? null : toSlackRootIntent(row);
+    });
+  }
+
+  private readOperationally<T>(read: () => T): T {
+    try {
+      return read();
+    } catch (error) {
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_STORE_CORRUPT');
+    }
   }
 
   close(): void {

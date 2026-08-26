@@ -5,6 +5,8 @@ export type RepositoryRegistryInput = CanonicalGithubRepository & {
   readonly githubRepositoryId: number | null;
   readonly projectKey: string;
   readonly projectOrigin: EffectiveProjectOrigin;
+  /** Only verified observations may replace last-known-good identity facts. */
+  readonly evidence: DiscoveryObservationEvidence;
 };
 
 export type OrcaRepositoryBindingInput = {
@@ -13,7 +15,12 @@ export type OrcaRepositoryBindingInput = {
   readonly projectKey: string;
   /** A null canonical key is valid only for the explicit manual-ID fallback. */
   readonly origin: 'manual' | 'discovered';
+  /** Carried-forward rows retain their durable evidence timestamps unchanged. */
+  readonly evidence: DiscoveryObservationEvidence;
 };
+
+export type DiscoveryPassOutcome = 'succeeded' | 'failed';
+export type DiscoveryObservationEvidence = 'verified' | 'carried_forward';
 
 export type RepositoryDiscoveryIssueCategory =
   | 'no_remote'
@@ -36,13 +43,15 @@ export type RepositoryDiscoveryIssueInput = {
 };
 
 export type ReplaceDiscoverySnapshotInput = {
+  /** Failed whole passes record diagnostics but never consume grace or replace LKG. */
+  readonly passOutcome: DiscoveryPassOutcome;
   readonly repositories: readonly RepositoryRegistryInput[];
   readonly bindings: readonly OrcaRepositoryBindingInput[];
   readonly issues: readonly RepositoryDiscoveryIssueInput[];
   readonly at: string;
 };
 
-export type RepositoryRegistryRecord = RepositoryRegistryInput & {
+export type RepositoryRegistryRecord = Omit<RepositoryRegistryInput, 'evidence'> & {
   readonly active: boolean;
   /** Consecutive successful discovery passes in which this identity was absent. */
   readonly consecutiveMissingPasses: number;
@@ -52,7 +61,7 @@ export type RepositoryRegistryRecord = RepositoryRegistryInput & {
   readonly updatedAt: string;
 };
 
-export type OrcaRepositoryBindingRecord = OrcaRepositoryBindingInput & {
+export type OrcaRepositoryBindingRecord = Omit<OrcaRepositoryBindingInput, 'evidence'> & {
   readonly active: boolean;
   /** Consecutive successful discovery passes in which this exact Orca ID was absent. */
   readonly consecutiveMissingPasses: number;
@@ -80,6 +89,51 @@ export type EffectiveDiscoverySnapshot = {
 export type DaemonDesiredState = 'running' | 'stopped';
 export type DaemonRuntimeState = 'running' | 'stopped';
 
+/** Finite redacted catalog. Operational tables never accept free-form errors. */
+export const OPERATIONAL_FAILURE_CODES = [
+  'startup_recovery',
+  'validation.failed',
+  'transport.unknown',
+  'commit.unknown',
+  'github.unavailable',
+  'config.invalid',
+  'config.drift',
+  'schema.drift',
+  'daemon.startup_failed',
+  'daemon.heartbeat_failed',
+  'logger.write_failed',
+  'discovery.no_remote',
+  'discovery.unsupported_remote',
+  'discovery.invalid_remote',
+  'discovery.canonical_conflict',
+  'discovery.duplicate_orca_id',
+  'discovery.manual_remote_conflict',
+  'discovery.capacity_conflict',
+  'discovery.schema_drift',
+  'discovery.project_conflict',
+  'discovery.query_failed',
+  'discovery.github_unavailable',
+  'discovery.github_identity_unverified',
+  'discovery.capacity_deferred',
+  'run.query_failed',
+  'run.schema_drift',
+  'run.timeout',
+  'run.capacity_deferred',
+  'digest.query_failed',
+  'digest.github_unavailable',
+  'digest.timeout',
+  'digest.capacity_deferred',
+  'gate.reconcile_failed',
+  'channel.delivery_failed',
+  'scheduler.timeout',
+  'scheduler.aborted',
+  'slack.validation_failed',
+  'slack.transport_unknown',
+  'slack.commit_unknown',
+] as const;
+
+export type OperationalFailureCode = typeof OPERATIONAL_FAILURE_CODES[number];
+
 export type DaemonHealthRecord = {
   readonly revision: number;
   readonly instanceId: string;
@@ -90,7 +144,7 @@ export type DaemonHealthRecord = {
   readonly startedAt: string;
   readonly heartbeatAt: string;
   readonly cleanStoppedAt: string | null;
-  readonly lastErrorCode: string | null;
+  readonly lastErrorCode: OperationalFailureCode | null;
   readonly updatedAt: string;
 };
 
@@ -122,7 +176,7 @@ export type DaemonJobOutcomeRecord = {
   readonly lastFailureAt: string | null;
   readonly durationMs: number | null;
   readonly nextRunAt: string | null;
-  readonly errorCode: string | null;
+  readonly errorCode: OperationalFailureCode | null;
   readonly processedCount: number;
   readonly deferredCount: number;
   readonly checkpoint: number;
@@ -189,7 +243,7 @@ export type SlackRootIntentRecord = SlackRootEntity & {
   readonly lastAttemptAt: string | null;
   readonly postedAt: string | null;
   readonly uncertainAt: string | null;
-  readonly lastErrorCode: string | null;
+  readonly lastErrorCode: OperationalFailureCode | null;
   readonly updatedAt: string;
 };
 
@@ -237,7 +291,7 @@ export interface OperationalStore {
 
   startDaemonJob(jobName: DaemonJobName, at: string): DaemonJobClaim | null;
   completeDaemonJobSuccess(input: DaemonJobSuccessCompletion): DaemonJobOutcomeRecord | null;
-  completeDaemonJobFailure(input: DaemonJobCompletion & { readonly errorCode: string }): DaemonJobOutcomeRecord | null;
+  completeDaemonJobFailure(input: DaemonJobCompletion & { readonly errorCode: OperationalFailureCode }): DaemonJobOutcomeRecord | null;
   scheduleDaemonJobBackoff(jobName: DaemonJobName, expectedRevision: number, nextRunAt: string, at: string): DaemonJobOutcomeRecord | null;
   advanceDaemonJobCheckpoint(claim: DaemonJobClaim, expectedCheckpoint: number, checkpoint: number, at: string): DaemonJobOutcomeRecord | null;
   findDaemonJobOutcome(jobName: DaemonJobName): DaemonJobOutcomeRecord | null;
@@ -246,8 +300,8 @@ export interface OperationalStore {
 
   prepareSlackRootIntent(input: PrepareSlackRootIntentInput): SlackRootIntentRecord;
   claimSlackRootIntent(entity: SlackRootEntity, instanceId: string, at: string): SlackRootClaimResult | null;
-  markSlackRootIntentSafeRetry(claim: SlackRootClaim, errorCode: string, at: string): SlackRootIntentRecord | null;
-  markSlackRootIntentUncertain(claim: SlackRootClaim, errorCode: string, at: string): SlackRootIntentRecord | null;
+  markSlackRootIntentSafeRetry(claim: SlackRootClaim, errorCode: OperationalFailureCode, at: string): SlackRootIntentRecord | null;
+  markSlackRootIntentUncertain(claim: SlackRootClaim, errorCode: OperationalFailureCode, at: string): SlackRootIntentRecord | null;
   markSlackRootIntentPosted(input: SlackRootPostedInput): SlackRootIntentRecord | null;
   recoverSlackRootIntents(instanceId: string, at: string): number;
   findSlackRootIntent(entity: SlackRootEntity): SlackRootIntentRecord | null;
