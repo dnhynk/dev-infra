@@ -1,6 +1,6 @@
 # Channel Adapter 운영·live acceptance 절차
 
-상태: **offline acceptance 구현됨 · `LIVE_CHANNEL_UNVERIFIED`**
+상태: **offline acceptance 완료·사람 승인 live 경로 관찰 · exact-build 재수용 대기 · `LIVE_CHANNEL_UNVERIFIED`**
 
 이 문서는 D3 daemon/Channel Adapter를 사람이 검토한 뒤 제한된 live smoke로 확인하는 절차다.
 자동 하니스는 Claude Code를 실행하지 않고, 사용자 `.mcp.json`·Bridge 설정·persistent 환경변수를
@@ -119,6 +119,12 @@ shape와 commit SHA, 시각, pass/fail로 남긴다.
 
 - interactive Claude Code 2.1.243 development-channel smoke가 사람이 직접 경고를 승인한 세션에서 통과
 - 그 세션의 receipt 뒤 실제 post-baseline Orca Task/Dispatch resume와 기존 Slack card 갱신이 관찰됨
+
+2026-08-26 사람이 승인한 session에서 두 기능 경로와 duplicate/late receipt, daemon restart,
+Adapter reconnect를 실제로 관찰했다. 그러나 session Adapter는 authority repair 전 build에서 시작됐고
+daemon만 repair 후 build로 바뀌어 위의 **같은 reviewed build** 조건을 충족하지 못했다. 따라서
+`LIVE_CHANNEL_UNVERIFIED`를 유지한다. 실제 ID를 제거한 관찰 기록과 최종 재수용 조건은
+[D3 live Channel acceptance evidence](../evidence/d3-live-channel-acceptance.md)에 있다.
 
 종료할 때는 먼저 interactive Claude session을 정상 종료해 Adapter stdio를 닫고, daemon에
 SIGINT/SIGTERM을 한 번 보내 bounded drain을 기다린다. 하니스나 operator 절차는 자신이 만들지 않은

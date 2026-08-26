@@ -134,7 +134,7 @@ The final staged diff contains 15 files, 4,368 insertions, and 20 deletions: pro
 code is 1,807 additions and 18 deletions; tests are 1,663 additions and 2 deletions; evidence is
 144 additions; and the exact dependency lock update is 754 additions.
 
-## Residual: `LIVE_CHANNEL_UNVERIFIED`
+## Historical D3-1 residual
 
 The official surface and installed dependency were verified, but an actual Claude Code 2.1.243
 interactive Channel was deliberately not registered or opted in. The development warning was not
@@ -142,3 +142,7 @@ confirmed, no user `.mcp.json` was written, and no live receipt callback or Gate
 performed. Therefore this evidence does **not** claim a 2.1.243 Channel E2E, silent-drop behavior,
 or any production Gate delivery/resume result; production Gate sends remain impossible and zero in
 D3-1.
+
+The combined D3 exercise later observed this path in a human-approved live session, but did not
+close the release residual because the Adapter and repaired daemon were not launched from one exact
+immutable build. See [D3 live Channel acceptance evidence](d3-live-channel-acceptance.md).

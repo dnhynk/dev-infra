@@ -42,7 +42,7 @@
 | ask/reply와 사람용 Gate correlation | sidecar의 message/thread/dispatch/task/gate mapping이 권위 (OD-019) | [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
 | 버튼 클릭 시 owner/open/duplicate 검증 후 `gate-resolve` | Gate별 직렬화·retry replay·전후 재조회·durable outbox 확정 (OD-051) | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
 | Slack 결정을 Claude prompt로 바로 보내지 않고 Orca Gate에 먼저 기록 | 확정 | [처리 순서](specs/orca-slack-bridge.md#72-처리-순서) |
-| 기존 로컬 coordinator를 Channel로 깨움 | D3 offline 구현·failure matrix 완료, actual 2.1.243 smoke는 `LIVE_CHANNEL_UNVERIFIED` (OD-056) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter), [운영 acceptance](ops/channel-adapter-acceptance.md) |
+| 기존 로컬 coordinator를 Channel로 깨움 | D3 offline failure matrix 완료, 사람 승인 actual 2.1.243 경로 관찰; exact-build 재수용 전 `LIVE_CHANNEL_UNVERIFIED` (OD-056) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter), [운영 acceptance](ops/channel-adapter-acceptance.md), [live evidence](evidence/d3-live-channel-acceptance.md) |
 | `@Claude`의 새 cloud session/clone과 기존 coordinator push를 구분 | 확정 | [플랫폼 비교](platform-capabilities.md#35-claude와의-차이) |
 | Standard Slack MCP는 외부→현재 session push 해결책이 아님 | 확정 일반 원리, 특정 plugin 명령 미검증 | [Channels 검증](platform-capabilities.md#33-channels-계약) |
 | Slack Socket Mode로 공개 endpoint 없이 개인 PC 연결 | `@slack/socket-mode`, reconnect/ACK 계약 확정 (OD-041) | [시스템 컨텍스트](architecture/orca-slack-bridge.md#1-시스템-컨텍스트) |

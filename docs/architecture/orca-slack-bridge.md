@@ -1,6 +1,6 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · C1~D3 offline 구현·검증 반영, D3 live acceptance 미검증**
+상태: **Draft · C1~D3 구현·offline 검증 및 D3 split-build live 관찰 반영 · exact-build 재수용 대기**
 
 이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 

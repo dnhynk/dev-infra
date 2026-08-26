@@ -33,6 +33,18 @@ export type OrcaCliOptions = {
   readonly timeoutMs?: number;
 };
 
+/**
+ * The daemon is an external control-plane client, not the Orca terminal that happened to launch
+ * it.  Forwarding that terminal's launch attestation fences an explicit `--from` coordinator
+ * authority as impersonation.  Keep ordinary runtime discovery variables, but deliberately drop
+ * the one credential that turns a child CLI into the launching terminal.
+ */
+export function orcaServiceEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const child = { ...env };
+  delete child['ORCA_AGENT_LAUNCH_TOKEN'];
+  return child;
+}
+
 export class OrcaCli implements OrcaRunner {
   private readonly timeoutMs: number | undefined;
 
@@ -51,6 +63,7 @@ export class OrcaCli implements OrcaRunner {
     const { stdout } = await execFileAsync(this.bin, [...args], {
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
+      env: orcaServiceEnvironment(process.env),
       ...(this.timeoutMs === undefined ? {} : { timeout: this.timeoutMs }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
@@ -596,6 +609,44 @@ function exactObjectKeys(
   }
 }
 
+/** Read the current coordinator immediately before a write; `run-use` can replace it at any time. */
+export async function readExactRunCoordinatorHandle(
+  runner: OrcaRunner,
+  runId: string,
+  options?: OrcaRunOptions,
+): Promise<string> {
+  const result = await call<unknown>(
+    runner,
+    ['orchestration', 'run-show', '--id', runId, '--json'],
+    options,
+  );
+  if (!isRecord(result)) throw new TypeError('run-show result가 object가 아니다');
+  exactObjectKeys(result, ['run'], 'run-show result');
+  const run = result['run'];
+  if (!isRecord(run)) throw new TypeError('run-show run이 object가 아니다');
+  exactObjectKeys(
+    run,
+    [
+      'id',
+      'objective',
+      'home_database',
+      'coordinator_handle',
+      'coordinator_pane_key',
+      'consumer_generation',
+      'legacy',
+      'created_at',
+      'updated_at',
+    ],
+    'run-show run',
+  );
+  if (run['id'] !== runId) throw new TypeError('run-show run id가 요청과 어긋난다');
+  const handle = run['coordinator_handle'];
+  if (typeof handle !== 'string' || handle.trim() === '') {
+    throw new TypeError('run-show run에 현재 coordinator handle이 없다');
+  }
+  return handle;
+}
+
 function strictGateSnapshot(raw: unknown, identity: ExactGateIdentity, at: string): GateSnapshot {
   if (!isRecord(raw)) throw new TypeError(`${at}이(가) object가 아니다`);
   exactObjectKeys(
@@ -693,8 +744,10 @@ export async function resolveExactGate(
 ): Promise<GateResolveResult> {
   let result: unknown;
   try {
+    const coordinatorHandle = await readExactRunCoordinatorHandle(runner, identity.runId, options);
     result = await call<unknown>(runner, [
       'orchestration', 'gate-resolve',
+      '--from', coordinatorHandle,
       '--id', identity.gateId,
       '--resolution', resolution,
       '--retry-request', retryRequestId,

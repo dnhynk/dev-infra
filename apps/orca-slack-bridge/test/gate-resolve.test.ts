@@ -114,6 +114,24 @@ class FakeOrca implements OrcaRunner {
 
   run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
+    if (args[1] === 'run-show') {
+      return Promise.resolve(JSON.stringify({
+        id: 'run', ok: true,
+        result: {
+          run: {
+            id: RUN_ID,
+            objective: 'test',
+            home_database: 'this_database',
+            coordinator_handle: 'term_current_coordinator',
+            coordinator_pane_key: 'tab:pane',
+            consumer_generation: 2,
+            legacy: 0,
+            created_at: '2026-08-24T09:00:00.000Z',
+            updated_at: '2026-08-24T10:00:00.000Z',
+          },
+        },
+      }));
+    }
     if (args[1] === 'gate-list') {
       this.listCount += 1;
       if (this.resolveExternallyOnListCall === this.listCount) {
@@ -264,11 +282,13 @@ function engine(
   slack: FakeSlack,
   fault?: (point: GateResolutionFault) => void | Promise<void>,
   leaseDurationMs = 30_000,
+  leaseNow?: () => Date,
 ): GateResolutionEngine {
   return new GateResolutionEngine({
     store, orca, slack, now: () => new Date(AT), leaseDurationMs,
     leaseOwner: `t.engine-${++engineSequence}`,
     ...(fault ? { fault } : {}),
+    ...(leaseNow ? { leaseNow } : {}),
   });
 }
 
@@ -279,7 +299,9 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     const slack = new FakeSlack();
     const worker = engine(store, orca, slack);
     await Promise.all([worker.resolveAndProject(GATE), worker.resolveAndProject(GATE)]);
-    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list', 'gate-list', 'gate-resolve', 'gate-list']);
+    expect(orca.calls.map((call) => call[1])).toEqual([
+      'gate-list', 'gate-list', 'run-show', 'gate-resolve', 'gate-list',
+    ]);
     expect(orca.retryRequests).toEqual([REQUEST]);
     expect(store.findGateResolution(GATE)).toMatchObject({
       lifecycle: 'resolved',
@@ -1557,19 +1579,38 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     const secondStore = new SqliteDigestStore(path);
     const orca = new FakeOrca();
     orca.blockResolveResponse = true;
-    const first = engine(firstStore, orca, new FakeSlack(), undefined, 100);
+    const leaseBase = new Date(AT).valueOf();
+    let leaseClock = leaseBase;
+    const leaseNow = (): Date => new Date(leaseClock);
+    const first = engine(firstStore, orca, new FakeSlack(), undefined, 100, leaseNow);
     const secondSlack = new FakeSlack();
-    const second = engine(secondStore, orca, secondSlack);
+    const second = engine(secondStore, orca, secondSlack, undefined, 100, leaseNow);
     const firstRun = first.resolveAndProject(GATE);
     await orca.resolveStarted;
+
+    const initialExpiry = firstStore.findGateResolution(GATE)?.leaseExpiresAt;
+    if (initialExpiry === null || initialExpiry === undefined) throw new Error('initial lease missing');
+    leaseClock = leaseBase + 80;
+    // Wait for an observed renewal, not an elapsed wall-clock guess. Under a loaded CI worker the
+    // event loop may not run a 33 ms interval before a fixed 180 ms assertion, which correctly
+    // fences the owner but makes this renewable-lease test nondeterministic.
+    let renewedExpiry = initialExpiry;
+    for (let attempt = 0; attempt < 200 && renewedExpiry === initialExpiry; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      renewedExpiry = firstStore.findGateResolution(GATE)?.leaseExpiresAt ?? initialExpiry;
+    }
+    expect(renewedExpiry > initialExpiry).toBe(true);
+    leaseClock = leaseBase + 150; // past the original lease, still inside the observed renewal
+
     const secondRun = second.reconcile();
     expect(await Promise.race([
       secondRun.then(() => 'settled' as const),
       new Promise<'timed_out'>((resolve) => setTimeout(() => resolve('timed_out'), 50)),
     ])).toBe('settled');
     expect(secondSlack.updates.some((update) => update.ts === laterMessageTs)).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 180)); // longer than the initial 100 ms lease
-    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list', 'gate-list', 'gate-resolve']);
+    expect(orca.calls.map((call) => call[1])).toEqual([
+      'gate-list', 'gate-list', 'run-show', 'gate-resolve',
+    ]);
     orca.releaseResolve();
     await firstRun;
     expect(orca.retryRequests).toEqual([REQUEST]);

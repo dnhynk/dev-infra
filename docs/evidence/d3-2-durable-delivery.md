@@ -226,10 +226,14 @@ per-connection commit chain remains ordered, stale late work is fenced to zero e
 `attempted` permits only non-authorizing current-Run route validation—not Gate/effect authority,
 ACK, authority-revision advance, token consumption, or retry/replay suppression.
 
-## Residual: `LIVE_CHANNEL_UNVERIFIED`
+## Historical D3-2 residual
 
 No actual Claude Code Channel was registered, no development warning was confirmed, no user MCP
 configuration was changed, and no live Slack or Orca resource was mutated. This evidence therefore
 does not claim live Channel acceptance, actual coordinator processing, or Task resume. D3-3 remains
 responsible for distinct Task-resume evidence and existing-message Slack projection; this PR adds no
 `작업 재개` UI or Task-resume write.
+
+That later D3 exercise observed the live delivery boundary, but exact-build acceptance remains
+unverified because the session Adapter and repaired daemon were not one immutable build. See
+[D3 live Channel acceptance evidence](d3-live-channel-acceptance.md).

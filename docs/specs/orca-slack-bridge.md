@@ -1,6 +1,6 @@
 # `orca-slack-bridge` Umbrella 스펙
 
-상태: **Draft · C1~D3 offline 구현됨, D3 live acceptance 미검증**
+상태: **Draft · C1~D3 구현·offline 검증 완료, D3 exact-build live acceptance 미검증**
 해결 대상: **C + D**  
 예정 위치: `dev-infra/apps/orca-slack-bridge`
 
@@ -330,7 +330,10 @@ Adapter reply tool 왕복이며 유일한 로컬 반환 경로라고 규정하�
 delivery/receipt/consume, post-baseline Task/Dispatch evidence, existing-card projection으로 구현됐다.
 구현은 새 Task/Dispatch를 만들지 않고 실제 Orca 상태를 관찰한다. development flag의 매 기동 확인과
 research-preview 변동성은 자동화하지 않으며 allowlist plugin 등재도 범위가 아니다(OD-056).
-actual Claude Code 2.1.243 opt-in과 실제 Task resume는 `LIVE_CHANNEL_UNVERIFIED`로 남는다.
+actual Claude Code 2.1.243 opt-in과 실제 Task resume 경로는 2026-08-26 사람 승인 session에서
+관찰됐다. 다만 session Adapter와 authority-repaired daemon이 하나의 exact build가 아니었으므로
+release 상태는 `LIVE_CHANNEL_UNVERIFIED`다. 구체 ID를 제거한 근거와 잔여 조건은
+[D3 live Channel acceptance evidence](../evidence/d3-live-channel-acceptance.md)에 있다.
 
 ## 9. Durability와 멱등성
 

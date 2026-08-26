@@ -482,3 +482,25 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 루트 재사용·재시작·채널 불일치 판정은 `run_message`와 같고, 닫지 않는 두 창(crash, delivery
   unknown)도 같다. D1은 그 둘을 없앴다고 주장하지 않는다(스펙 §9, OD-051).
 - 상세 근거와 기각한 대안은 [미결정 사항](open-decisions.md#확정-기록)의 OD-080 확정 기록에 있다.
+
+## 2026-08-26 · D3 live authority repair와 split-build 관찰
+
+### DL-055 · daemon은 ambient terminal attestation이 아니라 현재 Run coordinator authority를 쓴다
+
+- 별도 프로세스로 실행되는 daemon은 자신을 시작한 terminal의 `ORCA_AGENT_LAUNCH_TOKEN`을 Orca CLI
+  child에 전달하지 않는다. 그 token은 daemon identity가 아니라 launching terminal의 attestation이다.
+- Gate write 직전에 target Run을 `run-show`로 엄격하게 다시 읽고, 그 시점의
+  `coordinator_handle`을 `gate-resolve --from`에 명시한다. `run-use` takeover가 일어날 수 있으므로
+  startup 때 잡아 둔 handle을 재사용하지 않는다.
+- Run shape가 어긋나거나 current coordinator가 없으면 mutation 전에 fail closed한다. 환경변수
+  `ORCA_TERMINAL_HANDLE`은 진단 단서일 뿐 authority가 아니다(DL-050 유지).
+- 근거: 사람 승인 live Slack action에서 daemon이 launching terminal attestation을 상속한 채
+  `gate-resolve`를 호출하자 authority 충돌이 재현됐다. attestation만 제거하고 current Run handle을
+  명시한 동일 retry request는 structured replay로 수렴했으며 중복 mutation을 만들지 않았다.
+- 사람이 승인한 Claude Code 2.1.243 interactive session에서 probe receipt, 실제 post-baseline
+  Dispatch, 기존 Slack message의 `작업 재개` update, duplicate receipt no-op, daemon restart와
+  Adapter reconnect를 관찰했다. 다만 session Adapter는 repair 전 build에서 시작됐고 daemon만 repair
+  후 build로 바뀌었으므로 exact immutable build 조건은 충족하지 못했다. 상태는
+  `LIVE_CHANNEL_UNVERIFIED`를 유지하고 최종 merged build에서 재수용한다.
+- 실제 ID와 payload를 제거한 근거는
+  [D3 live Channel acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다.
