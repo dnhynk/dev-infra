@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { GithubRemoteError, normalizeGithubNameWithOwner } from '../discovery/github-remote.js';
 
 /**
  * Bridge 설정.
@@ -13,7 +14,75 @@ export type BridgeConfig = {
   readonly projects: readonly ProjectConfig[];
   /** PR body에서 correlation ID를 읽을 때 쓸 key 이름. 형식 확정 전까지 주입받는다(OD-021). */
   readonly correlationKeys: CorrelationKeys;
+  /** Parsed configs always contain this; optional keeps legacy hand-built test/caller fixtures valid. */
+  readonly automation?: AutomationConfig;
 };
+
+export type ParsedBridgeConfig = BridgeConfig & { readonly automation: AutomationConfig };
+
+export type AutomationConfig = {
+  /** Controls only O1 discovery/Run/digest observer jobs. D2/D3 Gate/Channel jobs are independent. */
+  readonly enabled: boolean;
+  readonly repositoryDiscovery: {
+    readonly intervalSeconds: number;
+    readonly timeoutSeconds: number;
+  };
+  readonly runObserver: {
+    readonly intervalSeconds: number;
+    readonly timeoutSeconds: number;
+  };
+  readonly prDigest: {
+    readonly intervalSeconds: number;
+    readonly timeoutSeconds: number;
+    /** Daemon-only limit. The existing one-shot digest default remains 50. */
+    readonly prLimit: number;
+    readonly globalPrBudget: number;
+  };
+  readonly github: {
+    readonly commandBudgetPerHour: number;
+    readonly rateLimitFloor: number;
+  };
+  readonly scheduler: { readonly jitterRatio: number };
+  readonly health: {
+    readonly heartbeatSeconds: number;
+    readonly staleAfterSeconds: number;
+  };
+  readonly capacity: {
+    readonly repositories: number;
+    readonly runsPerPass: number;
+    readonly orcaIdsPerCanonicalRepository: number;
+  };
+  readonly logging: {
+    readonly maxFileMiB: number;
+    readonly backupCount: number;
+  };
+  /** O1 daemon scheduling/routing must never consult an LLM. */
+  readonly deterministicNoLlm: true;
+};
+
+export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = Object.freeze({
+  enabled: true,
+  repositoryDiscovery: Object.freeze({ intervalSeconds: 300, timeoutSeconds: 30 }),
+  runObserver: Object.freeze({ intervalSeconds: 120, timeoutSeconds: 90 }),
+  prDigest: Object.freeze({
+    intervalSeconds: 900,
+    timeoutSeconds: 300,
+    prLimit: 10,
+    globalPrBudget: 100,
+  }),
+  github: Object.freeze({ commandBudgetPerHour: 2_000, rateLimitFloor: 1_000 }),
+  scheduler: Object.freeze({ jitterRatio: 0.1 }),
+  health: Object.freeze({ heartbeatSeconds: 15, staleAfterSeconds: 90 }),
+  capacity: Object.freeze({
+    repositories: 16,
+    runsPerPass: 64,
+    orcaIdsPerCanonicalRepository: 16,
+  }),
+  logging: Object.freeze({ maxFileMiB: 5, backupCount: 5 }),
+  deterministicNoLlm: true,
+});
+
+export const MAX_EXPLICIT_REPOSITORIES_PER_PROJECT = 16;
 
 /**
  * Slack 식별자. **토큰은 여기 두지 않는다.**
@@ -46,8 +115,8 @@ export type ProjectConfig = {
    *
    * D1이 Orca Run을 이 Project에 연결하는 유일한 열쇠다(OD-078). Run row에는 repository 필드가
    * 없고, Task의 `created_by_process_incarnation`과 worker의 `resource.worktreeId`에 있는
-   * `<repositoryId>::<path>` 앞부분만이 관측 가능한 연결점이다. Git remote는 읽지 않는다 —
-   * 자동 발견·자동 등록은 O1 범위다(OD-068).
+   * `<repositoryId>::<path>` 앞부분만이 관측 가능한 연결점이다. 현재 D1 route는 Git remote를 읽지
+   * 않는다. O1 strict discovery는 별도 adapter이며 이 manual fallback을 제거하지 않는다(OD-068).
    *
    * 값을 얻는 방법: `orca worktree list --json`의 `repoId`(= worktree `id`의 `::` 앞부분).
    * 대조는 **exact 문자열 비교**다. 경로가 아니라 id로 등록하므로 정규화도 prefix 매칭도 없다.
@@ -89,6 +158,244 @@ export function defaultConfigPath(env: NodeJS.ProcessEnv = process.env): string 
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Locale-independent compatibility fold for Project identity comparisons. */
+function caseFold(value: string): string {
+  return value.normalize('NFKC').toUpperCase().toLowerCase();
+}
+
+function assertOnlyKeys(raw: Record<string, unknown>, allowed: readonly string[], at: string): void {
+  const unknown = Object.keys(raw).filter((key) => !allowed.includes(key)).sort();
+  if (unknown.length > 0) throw new TypeError(`${at}에 허용되지 않은 설정 key가 있다`);
+}
+
+function boundedNumber(
+  value: unknown,
+  fallback: number,
+  at: string,
+  min: number,
+  max: number,
+  integer = true,
+): number {
+  if (value === undefined) return fallback;
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    (integer && !Number.isSafeInteger(value)) ||
+    value < min ||
+    value > max
+  ) {
+    throw new TypeError(`${at}가 허용 범위 ${min}..${max} 안의 ${integer ? '정수' : '수'}가 아니다`);
+  }
+  return value;
+}
+
+function section(
+  raw: Record<string, unknown>,
+  key: string,
+  allowed: readonly string[],
+): Record<string, unknown> {
+  const value = raw[key];
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new TypeError(`automation.${key}가 객체가 아니다`);
+  assertOnlyKeys(value, allowed, `automation.${key}`);
+  return value;
+}
+
+function parseAutomation(value: unknown): AutomationConfig {
+  if (value === undefined) return DEFAULT_AUTOMATION_CONFIG;
+  if (!isRecord(value)) throw new TypeError('automation이 객체가 아니다');
+  assertOnlyKeys(
+    value,
+    [
+      'enabled',
+      'repositoryDiscovery',
+      'runObserver',
+      'prDigest',
+      'github',
+      'scheduler',
+      'health',
+      'capacity',
+      'logging',
+    ],
+    'automation',
+  );
+  if (value['enabled'] !== undefined && typeof value['enabled'] !== 'boolean') {
+    throw new TypeError('automation.enabled가 boolean이 아니다');
+  }
+
+  const repositoryDiscovery = section(value, 'repositoryDiscovery', [
+    'intervalSeconds',
+    'timeoutSeconds',
+  ]);
+  const runObserver = section(value, 'runObserver', ['intervalSeconds', 'timeoutSeconds']);
+  const prDigest = section(value, 'prDigest', [
+    'intervalSeconds',
+    'timeoutSeconds',
+    'prLimit',
+    'globalPrBudget',
+  ]);
+  const github = section(value, 'github', ['commandBudgetPerHour', 'rateLimitFloor']);
+  const scheduler = section(value, 'scheduler', ['jitterRatio']);
+  const health = section(value, 'health', ['heartbeatSeconds', 'staleAfterSeconds']);
+  const capacity = section(value, 'capacity', [
+    'repositories',
+    'runsPerPass',
+    'orcaIdsPerCanonicalRepository',
+  ]);
+  const logging = section(value, 'logging', ['maxFileMiB', 'backupCount']);
+
+  const heartbeatSeconds = boundedNumber(
+    health['heartbeatSeconds'],
+    DEFAULT_AUTOMATION_CONFIG.health.heartbeatSeconds,
+    'automation.health.heartbeatSeconds',
+    5,
+    60,
+  );
+  const staleAfterSeconds = boundedNumber(
+    health['staleAfterSeconds'],
+    Math.max(
+      DEFAULT_AUTOMATION_CONFIG.health.staleAfterSeconds,
+      Math.max(3 * heartbeatSeconds, 30),
+    ),
+    'automation.health.staleAfterSeconds',
+    Math.max(3 * heartbeatSeconds, 30),
+    600,
+  );
+
+  return {
+    enabled: value['enabled'] ?? DEFAULT_AUTOMATION_CONFIG.enabled,
+    repositoryDiscovery: {
+      intervalSeconds: boundedNumber(
+        repositoryDiscovery['intervalSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.repositoryDiscovery.intervalSeconds,
+        'automation.repositoryDiscovery.intervalSeconds',
+        60,
+        3_600,
+      ),
+      timeoutSeconds: boundedNumber(
+        repositoryDiscovery['timeoutSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.repositoryDiscovery.timeoutSeconds,
+        'automation.repositoryDiscovery.timeoutSeconds',
+        10,
+        120,
+      ),
+    },
+    runObserver: {
+      intervalSeconds: boundedNumber(
+        runObserver['intervalSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.runObserver.intervalSeconds,
+        'automation.runObserver.intervalSeconds',
+        30,
+        900,
+      ),
+      timeoutSeconds: boundedNumber(
+        runObserver['timeoutSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.runObserver.timeoutSeconds,
+        'automation.runObserver.timeoutSeconds',
+        15,
+        300,
+      ),
+    },
+    prDigest: {
+      intervalSeconds: boundedNumber(
+        prDigest['intervalSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.prDigest.intervalSeconds,
+        'automation.prDigest.intervalSeconds',
+        300,
+        7_200,
+      ),
+      timeoutSeconds: boundedNumber(
+        prDigest['timeoutSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.prDigest.timeoutSeconds,
+        'automation.prDigest.timeoutSeconds',
+        60,
+        900,
+      ),
+      prLimit: boundedNumber(
+        prDigest['prLimit'],
+        DEFAULT_AUTOMATION_CONFIG.prDigest.prLimit,
+        'automation.prDigest.prLimit',
+        1,
+        50,
+      ),
+      globalPrBudget: boundedNumber(
+        prDigest['globalPrBudget'],
+        DEFAULT_AUTOMATION_CONFIG.prDigest.globalPrBudget,
+        'automation.prDigest.globalPrBudget',
+        1,
+        1_000,
+      ),
+    },
+    github: {
+      commandBudgetPerHour: boundedNumber(
+        github['commandBudgetPerHour'],
+        DEFAULT_AUTOMATION_CONFIG.github.commandBudgetPerHour,
+        'automation.github.commandBudgetPerHour',
+        200,
+        4_000,
+      ),
+      rateLimitFloor: boundedNumber(
+        github['rateLimitFloor'],
+        DEFAULT_AUTOMATION_CONFIG.github.rateLimitFloor,
+        'automation.github.rateLimitFloor',
+        100,
+        4_000,
+      ),
+    },
+    scheduler: {
+      jitterRatio: boundedNumber(
+        scheduler['jitterRatio'],
+        DEFAULT_AUTOMATION_CONFIG.scheduler.jitterRatio,
+        'automation.scheduler.jitterRatio',
+        0,
+        0.25,
+        false,
+      ),
+    },
+    health: { heartbeatSeconds, staleAfterSeconds },
+    capacity: {
+      repositories: boundedNumber(
+        capacity['repositories'],
+        DEFAULT_AUTOMATION_CONFIG.capacity.repositories,
+        'automation.capacity.repositories',
+        1,
+        64,
+      ),
+      runsPerPass: boundedNumber(
+        capacity['runsPerPass'],
+        DEFAULT_AUTOMATION_CONFIG.capacity.runsPerPass,
+        'automation.capacity.runsPerPass',
+        1,
+        256,
+      ),
+      orcaIdsPerCanonicalRepository: boundedNumber(
+        capacity['orcaIdsPerCanonicalRepository'],
+        DEFAULT_AUTOMATION_CONFIG.capacity.orcaIdsPerCanonicalRepository,
+        'automation.capacity.orcaIdsPerCanonicalRepository',
+        1,
+        64,
+      ),
+    },
+    logging: {
+      maxFileMiB: boundedNumber(
+        logging['maxFileMiB'],
+        DEFAULT_AUTOMATION_CONFIG.logging.maxFileMiB,
+        'automation.logging.maxFileMiB',
+        1,
+        100,
+      ),
+      backupCount: boundedNumber(
+        logging['backupCount'],
+        DEFAULT_AUTOMATION_CONFIG.logging.backupCount,
+        'automation.logging.backupCount',
+        1,
+        20,
+      ),
+    },
+    deterministicNoLlm: true,
+  };
 }
 
 /** 설정을 검증한다. 빠진 값을 추측으로 채우지 않는다. */
@@ -153,14 +460,15 @@ function parseSlack(raw: unknown): SlackConfig | null {
   };
 }
 
-export function parseConfig(raw: unknown): BridgeConfig {
+export function parseConfig(raw: unknown): ParsedBridgeConfig {
   if (!isRecord(raw)) throw new TypeError('설정이 객체가 아니다');
   assertNoTokens(raw);
   const projectsRaw = raw['projects'];
   if (!Array.isArray(projectsRaw)) throw new TypeError('설정에 projects 배열이 없다');
 
-  const seen = new Map<string, string>();
-  const seenOrcaIds = new Map<string, string>();
+  const seenNames = new Map<string, number>();
+  const seen = new Map<string, { readonly project: number; readonly item: number }>();
+  const seenOrcaIds = new Map<string, { readonly project: number; readonly item: number }>();
   const projects = projectsRaw.map((p, i) => {
     if (!isRecord(p)) throw new TypeError(`projects[${i}]가 객체가 아니다`);
     const name = p['name'];
@@ -168,21 +476,47 @@ export function parseConfig(raw: unknown): BridgeConfig {
     if (typeof name !== 'string' || name.trim() === '') {
       throw new TypeError(`projects[${i}].name이 비어 있다`);
     }
+    const projectName = name.trim();
+    const nameKey = caseFold(projectName);
+    const previousName = seenNames.get(nameKey);
+    if (previousName !== undefined) {
+      throw new TypeError(`projects[${i}].name이 projects[${previousName}].name과 case-fold 중복이다`);
+    }
+    seenNames.set(nameKey, i);
     if (!Array.isArray(repos) || repos.length === 0) {
       throw new TypeError(`projects[${i}].repositories가 비어 있다`);
     }
+    if (repos.length > MAX_EXPLICIT_REPOSITORIES_PER_PROJECT) {
+      throw new TypeError(
+        `projects[${i}].repositories가 상한 ${MAX_EXPLICIT_REPOSITORIES_PER_PROJECT}을 넘는다`,
+      );
+    }
     const repositories = repos.map((r, j) => {
-      if (typeof r !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(r.trim())) {
-        throw new TypeError(`projects[${i}].repositories[${j}]가 owner/name 형식이 아니다: ${String(r)}`);
+      if (typeof r !== 'string') {
+        throw new TypeError(`projects[${i}].repositories[${j}]가 owner/name 형식이 아니다`);
       }
-      const key = r.trim().toLowerCase();
+      const repository = r.trim();
+      let canonicalRepository: ReturnType<typeof normalizeGithubNameWithOwner>;
+      try {
+        canonicalRepository = normalizeGithubNameWithOwner(repository);
+      } catch (error) {
+        if (error instanceof GithubRemoteError) {
+          throw new TypeError(
+            `projects[${i}].repositories[${j}]가 owner/name 계약을 위반했다: ${error.code}`,
+          );
+        }
+        throw error;
+      }
+      const key = canonicalRepository.nameWithOwner;
       const prev = seen.get(key);
-      if (prev !== undefined && prev !== name.trim()) {
-        // 한 repository가 두 Project에 속하면 Slack routing이 모호해진다.
-        throw new TypeError(`repository ${r.trim()}가 여러 Project에 등록됐다: ${prev}, ${name.trim()}`);
+      if (prev !== undefined) {
+        const scope = prev.project === i ? '같은 Project 안에 중복 등록됐다' : '여러 Project에 등록됐다';
+        throw new TypeError(
+          `projects[${i}].repositories[${j}]가 projects[${prev.project}].repositories[${prev.item}]와 ${scope}`,
+        );
       }
-      seen.set(key, name.trim());
-      return r.trim();
+      seen.set(key, { project: i, item: j });
+      return canonicalRepository.nameWithOwner;
     });
     const idsRaw = p['orcaRepositoryIds'];
     if (idsRaw !== undefined && !Array.isArray(idsRaw)) {
@@ -190,29 +524,28 @@ export function parseConfig(raw: unknown): BridgeConfig {
     }
     const orcaRepositoryIds = (idsRaw ?? []).map((v, j) => {
       if (typeof v !== 'string' || v.trim() === '') {
-        throw new TypeError(
-          `projects[${i}].orcaRepositoryIds[${j}]가 비어 있지 않은 문자열이 아니다: ${String(v)}`,
-        );
+        throw new TypeError(`projects[${i}].orcaRepositoryIds[${j}]가 비어 있지 않은 문자열이 아니다`);
       }
       // `::`가 들어오면 worktree id를 통째로 붙여넣은 것이다. id만 등록해야 exact 비교가 성립한다.
       if (v.includes('::')) {
         throw new TypeError(
           `projects[${i}].orcaRepositoryIds[${j}]에 '::'가 있다. ` +
-            `worktree id 전체가 아니라 '::' 앞의 repository id만 등록한다: ${v}`,
+            `worktree id 전체가 아니라 '::' 앞의 repository id만 등록한다`,
         );
       }
       const id = v.trim();
       const prevProject = seenOrcaIds.get(id);
-      if (prevProject !== undefined && prevProject !== name.trim()) {
-        // 한 repository id가 두 Project에 속하면 Run routing이 모호해진다.
+      if (prevProject !== undefined) {
+        const scope = prevProject.project === i ? '같은 Project 안에 중복 등록됐다' : '여러 Project에 등록됐다';
         throw new TypeError(
-          `Orca repository id ${id}가 여러 Project에 등록됐다: ${prevProject}, ${name.trim()}`,
+          `projects[${i}].orcaRepositoryIds[${j}]가 ` +
+            `projects[${prevProject.project}].orcaRepositoryIds[${prevProject.item}]와 ${scope}`,
         );
       }
-      seenOrcaIds.set(id, name.trim());
+      seenOrcaIds.set(id, { project: i, item: j });
       return id;
     });
-    return { name: name.trim(), repositories, orcaRepositoryIds };
+    return { name: projectName, repositories, orcaRepositoryIds };
   });
 
   const keysRaw = raw['correlationKeys'];
@@ -227,10 +560,15 @@ export function parseConfig(raw: unknown): BridgeConfig {
       }
     : DEFAULT_CORRELATION_KEYS;
 
-  return { slack: parseSlack(raw['slack']), projects, correlationKeys };
+  return {
+    slack: parseSlack(raw['slack']),
+    projects,
+    correlationKeys,
+    automation: parseAutomation(raw['automation']),
+  };
 }
 
-export async function loadConfig(path: string): Promise<BridgeConfig> {
+export async function loadConfig(path: string): Promise<ParsedBridgeConfig> {
   let text: string;
   try {
     text = await readFile(path, 'utf8');

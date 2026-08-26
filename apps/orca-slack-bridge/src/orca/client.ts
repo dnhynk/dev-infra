@@ -10,6 +10,11 @@ import {
 } from './coerce.js';
 import type { FindingFacts } from '../summarize/contract.js';
 import type { GateResolveResult, GateSnapshot } from '../gate/resolution-types.js';
+import {
+  OrcaRepositoryContractError,
+  parseOrcaRepositoryListJson,
+} from '../discovery/orca-repositories.js';
+import type { RepositoryDiscoverySnapshot } from '../discovery/types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -129,6 +134,20 @@ async function call<T>(
     throw new SyntaxError('orca command 출력이 JSON이 아니다');
   }
   return unwrap<T>(raw);
+}
+
+/** Strict `orca repo list --json` boundary used by O1 discovery. */
+export async function listRepositories(
+  runner: OrcaRunner,
+  options?: OrcaRunOptions,
+): Promise<RepositoryDiscoverySnapshot> {
+  let out: string;
+  try {
+    out = await runner.run(['repo', 'list', '--json'], options);
+  } catch {
+    throw new OrcaRepositoryContractError('ORCA_REPOSITORY_COMMAND_FAILED');
+  }
+  return parseOrcaRepositoryListJson(out);
 }
 
 export type OrcaRun = {
