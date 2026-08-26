@@ -40,6 +40,7 @@ export type RepositoryDiscoveryFailure =
   | 'schema_drift'
   | 'capacity_conflict'
   | 'config_drift'
+  | 'github_unavailable'
   | 'store_failed';
 
 export type RepositoryDiscoveryPassResult = {
@@ -65,8 +66,12 @@ export type RepositoryDiscoveryPassOptions = {
   readonly now?: () => Date;
   /** The daemon may supply its canonical config fingerprint; otherwise it is derived here. */
   readonly configFingerprint?: string;
-  /** Fences a process-local LKG snapshot captured under a different explicit configuration. */
-  readonly lastKnownGoodConfigFingerprint?: string;
+  /** Required proof for consuming durable LKG. Null explicitly declares that no LKG is trusted. */
+  readonly lastKnownGoodConfigFingerprint: string | null;
+  /** Cancels GitHub confirmation and makes the whole pass fail without a store write. */
+  readonly signal?: AbortSignal;
+  /** Optional earlier absolute epoch deadline; config still supplies the hard upper bound. */
+  readonly deadlineAt?: number;
 };
 
 type RowCandidate = {
@@ -93,6 +98,18 @@ type ResolvedRepository = {
   readonly rowIndex: number;
   readonly orcaRepositoryIds: Set<string>;
 };
+
+type ConfirmedCandidate = CanonicalCandidate & {
+  readonly authoritative: CanonicalGithubRepository;
+  readonly githubRepositoryId: number;
+};
+
+class RepositoryConfirmationDeadlineError extends Error {
+  constructor() {
+    super('GitHub repository confirmation deadline exceeded');
+    this.name = 'RepositoryConfirmationDeadlineError';
+  }
+}
 
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -146,10 +163,6 @@ function uniqueIssues(issues: readonly RepositoryDiscoveryIssueInput[]): Reposit
     .sort((a, b) => compareText(a.issueHash, b.issueHash));
 }
 
-function failedIssue(category: RepositoryDiscoveryIssueCategory): RepositoryDiscoveryIssueInput {
-  return { issueHash: discoveryIssueHash(category, 'whole-pass'), category };
-}
-
 function repositoryInput(
   identity: CanonicalGithubRepository,
   githubRepositoryId: number | null,
@@ -160,6 +173,62 @@ function repositoryInput(
   return {
     ...identity, githubRepositoryId, projectKey, projectOrigin, evidence,
   };
+}
+
+function autoProjectKey(identity: CanonicalGithubRepository): string {
+  return `auto:${identity.canonicalKey}`;
+}
+
+async function confirmBeforeDeadline(
+  confirmer: RepositoryIdentityConfirmer,
+  candidate: CanonicalCandidate,
+  deadlineAt: number,
+  externalSignal: AbortSignal | undefined,
+): Promise<ConfirmedCandidate> {
+  const remaining = Math.trunc(deadlineAt - Date.now());
+  if (externalSignal?.aborted === true || remaining <= 0) {
+    throw new RepositoryConfirmationDeadlineError();
+  }
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectCancellation!: (error: RepositoryConfirmationDeadlineError) => void;
+  const cancellation = new Promise<never>((_resolve, reject) => {
+    rejectCancellation = reject;
+  });
+  const cancel = (): void => {
+    controller.abort();
+    rejectCancellation(new RepositoryConfirmationDeadlineError());
+  };
+  externalSignal?.addEventListener('abort', cancel, { once: true });
+  timer = setTimeout(cancel, remaining);
+  try {
+    const confirmed = await Promise.race([
+      confirmer.confirm(candidate.observed.nameWithOwner, {
+        signal: controller.signal,
+        deadlineAt,
+      }),
+      cancellation,
+    ]);
+    if (controller.signal.aborted || Boolean(externalSignal?.aborted) || Date.now() >= deadlineAt) {
+      throw new RepositoryConfirmationDeadlineError();
+    }
+    if (!Number.isSafeInteger(confirmed.githubId) || confirmed.githubId <= 0) {
+      throw new TypeError('GitHub repository identity is invalid');
+    }
+    return {
+      ...candidate,
+      authoritative: normalizeGithubNameWithOwner(confirmed.nameWithOwner),
+      githubRepositoryId: confirmed.githubId,
+    };
+  } catch (error) {
+    if (controller.signal.aborted || Boolean(externalSignal?.aborted) || Date.now() >= deadlineAt) {
+      throw new RepositoryConfirmationDeadlineError();
+    }
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', cancel);
+  }
 }
 
 function resultCounts(
@@ -183,39 +252,53 @@ export async function runRepositoryDiscoveryPass(
 ): Promise<RepositoryDiscoveryPassResult> {
   const at = (options.now ?? (() => new Date()))().toISOString();
   const fingerprint = options.configFingerprint ?? bridgeConfigFingerprint(options.config);
-  const lkgCompatible = options.lastKnownGoodConfigFingerprint === undefined ||
-    options.lastKnownGoodConfigFingerprint === fingerprint;
+  const lkgProof = options.lastKnownGoodConfigFingerprint as string | null | undefined;
+  const lkgCompatible = typeof lkgProof === 'string' && lkgProof === fingerprint;
   const previous = options.store.readEffectiveDiscoverySnapshot();
+  const hasDurableLkg = previous.repositories.length > 0 || previous.bindings.length > 0;
+  const lkgProofFailed = lkgProof === undefined || (hasDurableLkg && !lkgCompatible);
+
+  const failedFromPrevious = (
+    requestedFailure: RepositoryDiscoveryFailure,
+    sourceRows: number,
+    blocks: readonly EffectiveBindingBlock[] = [],
+    diagnostics: readonly RepositoryDiscoveryDiagnostic[] = [],
+    deferredRepositories = 0,
+    routingBlock?: 'capacity_conflict',
+  ): RepositoryDiscoveryPassResult => {
+    const failure = lkgProofFailed ? 'config_drift' : requestedFailure;
+    const usable = lkgCompatible ? previous : EMPTY_SNAPSHOT;
+    const effectiveConfig = buildEffectiveBridgeConfig(options.config, usable, {
+      configFingerprint: fingerprint,
+      blockedBindings: blocks,
+      diagnostics,
+      ...(lkgProofFailed
+        ? { routingBlock: 'config_drift' as const }
+        : routingBlock === undefined ? {} : { routingBlock }),
+    });
+    return {
+      status: 'failed',
+      failure,
+      configFingerprint: fingerprint,
+      snapshot: previous,
+      effectiveConfig,
+      counts: resultCounts(sourceRows, usable, blocks, deferredRepositories),
+    };
+  };
 
   let source: RepositoryDiscoverySnapshot;
   try {
-    source = await listRepositories(options.orca);
+    source = await listRepositories(options.orca,
+      options.signal === undefined ? undefined : { signal: options.signal });
   } catch (error) {
     const failure: RepositoryDiscoveryFailure = error instanceof OrcaRepositoryContractError &&
       error.code !== 'ORCA_REPOSITORY_COMMAND_FAILED' ? 'schema_drift' : 'query_failed';
-    const category: RepositoryDiscoveryIssueCategory = failure === 'schema_drift'
-      ? 'schema_drift' : 'query_failed';
-    let retained = previous;
-    try {
-      retained = options.store.replaceDiscoverySnapshot({
-        passOutcome: 'failed', repositories: [], bindings: [], issues: [failedIssue(category)], at,
-      });
-    } catch {
-      // The old snapshot was read before the transaction and is the only safe fallback.
-    }
-    const usable = lkgCompatible ? retained : EMPTY_SNAPSHOT;
-    const effectiveConfig = buildEffectiveBridgeConfig(options.config, usable, {
-      configFingerprint: fingerprint,
-      ...(lkgCompatible ? {} : { routingBlock: 'config_drift' as const }),
-    });
-    return {
-      status: 'failed', failure: lkgCompatible ? failure : 'config_drift',
-      configFingerprint: fingerprint, snapshot: retained, effectiveConfig,
-      counts: resultCounts(0, usable, [], 0),
-    };
+    // An envelope that was not accepted has no authority to mutate registry, bindings, or issues.
+    return failedFromPrevious(failure, 0);
   }
 
   const repositoryLimit = options.config.automation.capacity.repositories;
+  const idLimit = options.config.automation.capacity.orcaIdsPerCanonicalRepository;
   const explicitByCanonical = new Map<string, string>();
   const manualById = new Map<string, string>();
   for (const project of options.config.projects) {
@@ -223,29 +306,6 @@ export async function runRepositoryDiscoveryPass(
       explicitByCanonical.set(normalizeGithubNameWithOwner(name).canonicalKey, project.name);
     }
     for (const id of project.orcaRepositoryIds) manualById.set(id, project.name);
-  }
-
-  const activeCanonical = new Set((lkgCompatible ? previous.repositories : [])
-    .filter((row) => row.githubRepositoryId !== null)
-    .map((row) => row.canonicalKey));
-  const capacityFloor = new Set([...explicitByCanonical.keys(), ...activeCanonical]).size;
-  if (explicitByCanonical.size > repositoryLimit || capacityFloor > repositoryLimit) {
-    let retained = previous;
-    try {
-      retained = options.store.replaceDiscoverySnapshot({
-        passOutcome: 'failed', repositories: [], bindings: [],
-        issues: [failedIssue('capacity_conflict')], at,
-      });
-    } catch { /* return the pre-read LKG */ }
-    const effectiveConfig = buildEffectiveBridgeConfig(
-      options.config, lkgCompatible ? retained : EMPTY_SNAPSHOT,
-      { configFingerprint: fingerprint, routingBlock: 'capacity_conflict' },
-    );
-    return {
-      status: 'failed', failure: 'capacity_conflict', configFingerprint: fingerprint,
-      snapshot: retained, effectiveConfig,
-      counts: resultCounts(source.rows.length, lkgCompatible ? retained : EMPTY_SNAPSHOT, [], 0),
-    };
   }
 
   const previousByCanonical = new Map(previous.repositories.map((row) => [row.canonicalKey, row]));
@@ -266,6 +326,53 @@ export async function runRepositoryDiscoveryPass(
     ...extra,
     ...(previousBindingsByCanonical.get(canonicalKey) ?? []).map((row) => row.orcaRepositoryId),
   ])].sort();
+  const idsForNumeric = (numeric: number, extra: readonly string[] = []): string[] => {
+    const repository = previousByNumeric.get(numeric);
+    return repository === undefined ? [...new Set(extra)].sort() :
+      idsForCanonical(repository.canonicalKey, extra);
+  };
+
+  const configuredByProject = new Map(
+    options.config.projects.map((project) => [project.name, project.repositories.length]),
+  );
+  const priorExplicitByProject = new Map<string, Set<number>>();
+  for (const repository of previous.repositories) {
+    if (repository.projectOrigin !== 'explicit' || repository.githubRepositoryId === null) continue;
+    const ids = priorExplicitByProject.get(repository.projectKey) ?? new Set<number>();
+    ids.add(repository.githubRepositoryId);
+    priorExplicitByProject.set(repository.projectKey, ids);
+  }
+  let explicitCapacityFloor = 0;
+  for (const projectKey of new Set([
+    ...configuredByProject.keys(), ...priorExplicitByProject.keys(),
+  ])) {
+    explicitCapacityFloor += Math.max(
+      configuredByProject.get(projectKey) ?? 0,
+      priorExplicitByProject.get(projectKey)?.size ?? 0,
+    );
+  }
+  const activeAutoNumeric = new Set<number>();
+  for (const repository of previous.repositories) {
+    if (repository.projectOrigin !== 'auto' || repository.githubRepositoryId === null) continue;
+    const stableAlias = repository.projectKey.startsWith('auto:')
+      ? repository.projectKey.slice('auto:'.length) : '';
+    if (explicitByCanonical.has(repository.canonicalKey) || explicitByCanonical.has(stableAlias)) {
+      continue;
+    }
+    activeAutoNumeric.add(repository.githubRepositoryId);
+  }
+  const capacityFloor = explicitCapacityFloor + activeAutoNumeric.size;
+  if (explicitByCanonical.size > repositoryLimit || capacityFloor > repositoryLimit) {
+    const diagnostics: RepositoryDiscoveryDiagnostic[] = [{
+      rowIndex: -1,
+      code: 'capacity_conflict',
+      effect: 'group_blocked',
+      entityRef: redactedEntityRef('repository-capacity', String(capacityFloor)),
+    }];
+    return failedFromPrevious(
+      'capacity_conflict', source.rows.length, [], diagnostics, 0, 'capacity_conflict',
+    );
+  }
 
   const diagnostics: RepositoryDiscoveryDiagnostic[] = [...source.diagnostics];
   const issues: RepositoryDiscoveryIssueInput[] = [];
@@ -328,6 +435,10 @@ export async function runRepositoryDiscoveryPass(
         });
       }
     }
+  };
+  const carryNumeric = (numeric: number): void => {
+    const repository = previousByNumeric.get(numeric);
+    if (repository !== undefined) carryCanonical(repository.canonicalKey);
   };
   const carryId = (id: string): void => {
     if (!lkgCompatible) return;
@@ -406,13 +517,11 @@ export async function runRepositoryDiscoveryPass(
     }
   }
 
-  const selected: CanonicalCandidate[] = [];
-  const autoSlots = repositoryLimit - capacityFloor;
-  let selectedNewAuto = 0;
+  const eligible: CanonicalCandidate[] = [];
   for (const group of [...canonical.values()].sort((a, b) =>
     compareText(a.identity.canonicalKey, b.identity.canonicalKey))) {
     const ids = [...new Set(group.ids)].sort();
-    if (ids.length > options.config.automation.capacity.orcaIdsPerCanonicalRepository) {
+    if (ids.length > idLimit) {
       addBlock(idsForCanonical(group.identity.canonicalKey, ids),
         'capacity_conflict', group.rowIndex, group.identity);
       carryCanonical(group.identity.canonicalKey);
@@ -428,30 +537,12 @@ export async function runRepositoryDiscoveryPass(
       carryCanonical(group.identity.canonicalKey);
       continue;
     }
-    const isNewAuto = explicitProject === undefined && !activeCanonical.has(group.identity.canonicalKey);
-    if (isNewAuto && selectedNewAuto >= autoSlots) {
-      deferredRepositories += 1;
-      addBlock(ids, 'capacity_deferred', group.rowIndex, group.identity, 'group_deferred');
-      continue;
-    }
-    if (isNewAuto) selectedNewAuto += 1;
-    selected.push({
+    eligible.push({
       observed: group.identity, rowIndex: group.rowIndex, orcaRepositoryIds: ids,
     });
   }
 
-  const resolvedByNumeric = new Map<number, ResolvedRepository>();
-  const conflictedNumeric = new Set<number>();
-  for (const candidate of selected) {
-    let confirmed: { readonly githubId: number; readonly nameWithOwner: string };
-    let authoritative: CanonicalGithubRepository;
-    try {
-      confirmed = await options.github.confirm(candidate.observed.nameWithOwner);
-      if (!Number.isSafeInteger(confirmed.githubId) || confirmed.githubId <= 0) {
-        throw new TypeError('GitHub repository identity is invalid');
-      }
-      authoritative = normalizeGithubNameWithOwner(confirmed.nameWithOwner);
-    } catch {
+  const handleGithubFailure = (candidate: CanonicalCandidate): void => {
       const priorCanonicals = new Set(candidate.orcaRepositoryIds
         .map((id) => previousBindingById.get(id)?.canonicalKey)
         .filter((key): key is CanonicalGithubRepository['canonicalKey'] => key !== null && key !== undefined));
@@ -459,33 +550,62 @@ export async function runRepositoryDiscoveryPass(
         (priorCanonicals.size === 1 ? previousByCanonical.get([...priorCanonicals][0]!) : undefined);
       if (lkgCompatible && existing?.githubRepositoryId !== null &&
           existing?.githubRepositoryId !== undefined) {
+        if (priorCanonicals.size > 1 ||
+            (priorCanonicals.size === 1 && !priorCanonicals.has(existing.canonicalKey))) {
+          const ids = [
+            ...candidate.orcaRepositoryIds,
+            ...[...priorCanonicals].flatMap((key) => idsForCanonical(key)),
+          ];
+          addBlock(ids, 'canonical_conflict', candidate.rowIndex, candidate.observed);
+          for (const key of priorCanonicals) carryCanonical(key);
+          return;
+        }
         const observedProject = explicitByCanonical.get(candidate.observed.canonicalKey);
-        const durableProject = explicitByCanonical.get(existing.canonicalKey);
+        const durableProject = existing.projectOrigin === 'explicit'
+          ? existing.projectKey : explicitByCanonical.get(existing.canonicalKey);
         const canonicalChanged = existing.canonicalKey !== candidate.observed.canonicalKey;
-        if ((observedProject !== undefined && durableProject !== undefined &&
-             observedProject !== durableProject) ||
-            (canonicalChanged && observedProject === undefined && durableProject === undefined)) {
+        const autoAliasProven = existing.projectOrigin === 'auto' &&
+          existing.projectKey === autoProjectKey(candidate.observed);
+        const explicitAliasProven = observedProject !== undefined &&
+          durableProject === observedProject;
+        if (observedProject !== undefined && durableProject !== undefined &&
+            observedProject !== durableProject) {
           addBlock(
             idsForCanonical(existing.canonicalKey, candidate.orcaRepositoryIds),
-            observedProject !== undefined && durableProject !== undefined
-              ? 'project_conflict' : 'canonical_conflict',
+            'project_conflict',
             candidate.rowIndex,
             candidate.observed,
           );
           carryCanonical(existing.canonicalKey);
-          continue;
+          return;
+        }
+        if (canonicalChanged && !autoAliasProven && !explicitAliasProven) {
+          addBlock(
+            idsForCanonical(existing.canonicalKey, candidate.orcaRepositoryIds),
+            'canonical_conflict', candidate.rowIndex, candidate.observed,
+          );
+          carryCanonical(existing.canonicalKey);
+          return;
+        }
+        const allIds = idsForNumeric(existing.githubRepositoryId, candidate.orcaRepositoryIds);
+        if (allIds.length > idLimit) {
+          addBlock(allIds, 'capacity_conflict', candidate.rowIndex, candidate.observed);
+          carryCanonical(existing.canonicalKey);
+          return;
         }
         carryCanonical(existing.canonicalKey);
+        const projectKey = observedProject ?? existing.projectKey;
+        const projectOrigin: EffectiveProjectOrigin = observedProject === undefined
+          ? existing.projectOrigin : 'explicit';
         projectOverrides.set(existing.canonicalKey, {
-          projectKey: observedProject ?? durableProject ?? existing.projectKey,
-          projectOrigin: observedProject !== undefined || durableProject !== undefined
-            ? 'explicit' : existing.projectOrigin,
+          projectKey,
+          projectOrigin,
         });
         for (const id of candidate.orcaRepositoryIds) {
           bindingInputs.set(id, {
             orcaRepositoryId: id,
             canonicalKey: existing.canonicalKey,
-            projectKey: existing.projectKey,
+            projectKey,
             origin: 'discovered',
             evidence: 'verified',
           });
@@ -501,103 +621,215 @@ export async function runRepositoryDiscoveryPass(
         addBlock(candidate.orcaRepositoryIds, 'github_identity_unverified', candidate.rowIndex,
           candidate.observed);
       }
-      continue;
-    }
-    const priorCanonicalKeys = new Set(candidate.orcaRepositoryIds
-      .map((id) => previousBindingById.get(id)?.canonicalKey)
-      .filter((key): key is CanonicalGithubRepository['canonicalKey'] => key !== null && key !== undefined));
-    const priorRepositories = [...priorCanonicalKeys]
-      .map((key) => previousByCanonical.get(key))
-      .filter((row): row is NonNullable<typeof row> => row !== undefined && row.githubRepositoryId !== null);
-    if (priorRepositories.some((row) => row.githubRepositoryId !== confirmed.githubId)) {
-      addBlock([
-        ...candidate.orcaRepositoryIds,
-        ...priorRepositories.flatMap((row) => idsForCanonical(row.canonicalKey)),
-      ], 'canonical_conflict', candidate.rowIndex, candidate.observed);
-      for (const row of priorRepositories) carryCanonical(row.canonicalKey);
-      continue;
-    }
-    const existingCanonical = previousByCanonical.get(candidate.observed.canonicalKey);
-    const existingAuthoritative = previousByCanonical.get(authoritative.canonicalKey);
-    const contradictoryExisting = [existingCanonical, existingAuthoritative].find((row) =>
-      row?.githubRepositoryId !== null && row?.githubRepositoryId !== undefined &&
-      row.githubRepositoryId !== confirmed.githubId);
-    if (contradictoryExisting !== undefined) {
-      addBlock([
-        ...idsForCanonical(candidate.observed.canonicalKey, candidate.orcaRepositoryIds),
-        ...idsForCanonical(contradictoryExisting.canonicalKey),
-      ],
-        'canonical_conflict', candidate.rowIndex, candidate.observed);
-      carryCanonical(candidate.observed.canonicalKey);
-      carryCanonical(contradictoryExisting.canonicalKey);
-      continue;
-    }
+  };
 
-    const observedProject = explicitByCanonical.get(candidate.observed.canonicalKey);
-    const authoritativeProject = explicitByCanonical.get(authoritative.canonicalKey);
-    const numericLkg = previousByNumeric.get(confirmed.githubId);
-    const priorExplicitProject = numericLkg === undefined
-      ? undefined : explicitByCanonical.get(numericLkg.canonicalKey);
-    const explicitProjects = new Set(
-      [observedProject, authoritativeProject, priorExplicitProject]
-        .filter((value): value is string => value !== undefined),
-    );
-    if (explicitProjects.size > 1) {
-      addBlock([
-        ...candidate.orcaRepositoryIds,
-        ...(numericLkg === undefined ? [] : idsForCanonical(numericLkg.canonicalKey)),
-      ], 'project_conflict', candidate.rowIndex, authoritative);
-      if (numericLkg !== undefined) carryCanonical(numericLkg.canonicalKey);
-      continue;
-    }
-    const current = resolvedByNumeric.get(confirmed.githubId);
-    const projectKey = [...explicitProjects][0] ??
-      (current?.identity.canonicalKey === authoritative.canonicalKey
-        ? current.projectKey
-        : `auto:${authoritative.canonicalKey}`);
-    const projectOrigin: EffectiveProjectOrigin = explicitProjects.size === 0
-      ? (current?.identity.canonicalKey === authoritative.canonicalKey
-          ? current.projectOrigin : 'auto')
-      : 'explicit';
-    if (conflictedNumeric.has(confirmed.githubId)) {
-      addBlock(candidate.orcaRepositoryIds, 'canonical_conflict', candidate.rowIndex, authoritative);
-      continue;
-    }
-    if (current !== undefined &&
-        (current.identity.canonicalKey !== authoritative.canonicalKey ||
-         current.projectKey !== projectKey)) {
-      const old = previousByNumeric.get(confirmed.githubId);
-      const ids = [
-        ...current.orcaRepositoryIds,
-        ...candidate.orcaRepositoryIds,
-        ...(old === undefined ? [] : idsForCanonical(old.canonicalKey)),
-      ];
-      resolvedByNumeric.delete(confirmed.githubId);
-      conflictedNumeric.add(confirmed.githubId);
-      addBlock(ids,
-        current.identity.canonicalKey !== authoritative.canonicalKey
-          ? 'canonical_conflict' : 'project_conflict',
-        Math.min(current.rowIndex, candidate.rowIndex), authoritative);
-      if (old !== undefined) carryCanonical(old.canonicalKey);
-      continue;
-    }
-    if (current === undefined) {
-      resolvedByNumeric.set(confirmed.githubId, {
-        observedCanonicalKeys: new Set([candidate.observed.canonicalKey]),
-        identity: authoritative,
-        githubRepositoryId: confirmed.githubId,
-        projectKey,
-        projectOrigin,
-        rowIndex: candidate.rowIndex,
-        orcaRepositoryIds: new Set(candidate.orcaRepositoryIds),
-      });
+  const configuredDeadline = Date.now() +
+    options.config.automation.repositoryDiscovery.timeoutSeconds * 1_000;
+  const deadlineAt = options.deadlineAt === undefined
+    ? configuredDeadline
+    : Number.isFinite(options.deadlineAt)
+      ? Math.min(configuredDeadline, Math.trunc(options.deadlineAt))
+      : Date.now() - 1;
+  const related: CanonicalCandidate[] = [];
+  const newAuto: CanonicalCandidate[] = [];
+  for (const candidate of eligible) {
+    const prior = candidate.orcaRepositoryIds.some((id) => {
+      const canonicalKey = previousBindingById.get(id)?.canonicalKey;
+      if (canonicalKey === null || canonicalKey === undefined) return false;
+      return previousByCanonical.get(canonicalKey)?.githubRepositoryId != null;
+    });
+    const observedLkg = previousByCanonical.get(candidate.observed.canonicalKey);
+    if (explicitByCanonical.has(candidate.observed.canonicalKey) ||
+        observedLkg?.githubRepositoryId != null ||
+        prior) {
+      related.push(candidate);
     } else {
-      current.observedCanonicalKeys.add(candidate.observed.canonicalKey);
-      for (const id of candidate.orcaRepositoryIds) current.orcaRepositoryIds.add(id);
+      newAuto.push(candidate);
     }
   }
 
+  const confirmed: ConfirmedCandidate[] = [];
+  const newAutoNumerics = new Set<number>();
+  const attempt = async (candidate: CanonicalCandidate): Promise<void> => {
+    try {
+      const row = await confirmBeforeDeadline(
+        options.github, candidate, deadlineAt, options.signal,
+      );
+      confirmed.push(row);
+      const explicit = explicitByCanonical.has(row.observed.canonicalKey) ||
+        explicitByCanonical.has(row.authoritative.canonicalKey);
+      if (!explicit && !previousByNumeric.has(row.githubRepositoryId)) {
+        newAutoNumerics.add(row.githubRepositoryId);
+      }
+    } catch (error) {
+      if (error instanceof RepositoryConfirmationDeadlineError) throw error;
+      handleGithubFailure(candidate);
+    }
+  };
+
+  try {
+    for (const candidate of related) await attempt(candidate);
+    const autoSlots = repositoryLimit - capacityFloor;
+    for (const candidate of newAuto) {
+      if (newAutoNumerics.size >= autoSlots) {
+        deferredRepositories += 1;
+        addBlock(
+          candidate.orcaRepositoryIds, 'capacity_deferred', candidate.rowIndex,
+          candidate.observed, 'group_deferred',
+        );
+        continue;
+      }
+      await attempt(candidate);
+    }
+  } catch (error) {
+    if (!(error instanceof RepositoryConfirmationDeadlineError)) throw error;
+    // A deadline makes all GitHub evidence from this pass unusable. Overlay every current group on
+    // the unchanged LKG so no already-confirmed prefix can leak as a partial identity snapshot.
+    for (const candidate of eligible) {
+      addBlock(
+        idsForCanonical(candidate.observed.canonicalKey, candidate.orcaRepositoryIds),
+        'github_identity_unverified', candidate.rowIndex, candidate.observed,
+      );
+    }
+    return failedFromPrevious(
+      'github_unavailable', source.rows.length, blocks, diagnostics, deferredRepositories,
+    );
+  }
+
+  const confirmedByNumeric = new Map<number, ConfirmedCandidate[]>();
+  for (const row of confirmed) {
+    const rows = confirmedByNumeric.get(row.githubRepositoryId) ?? [];
+    rows.push(row);
+    confirmedByNumeric.set(row.githubRepositoryId, rows);
+  }
+  const conflictedNumeric = new Set<number>();
+  const currentIdsForNumeric = (numeric: number): string[] => [
+    ...new Set((confirmedByNumeric.get(numeric) ?? [])
+      .flatMap((row) => row.orcaRepositoryIds)),
+  ].sort();
+  const markNumericConflict = (
+    numerics: ReadonlySet<number>,
+    reason: 'canonical_conflict' | 'project_conflict',
+    rowIndex: number,
+    identity: CanonicalGithubRepository,
+  ): void => {
+    const ids = [...numerics].flatMap((numeric) => [
+      ...currentIdsForNumeric(numeric), ...idsForNumeric(numeric),
+    ]);
+    for (const numeric of numerics) {
+      conflictedNumeric.add(numeric);
+      carryNumeric(numeric);
+    }
+    addBlock(ids, reason, rowIndex, identity);
+  };
+
+  const evidenceByCanonical = new Map<string, ConfirmedCandidate[]>();
+  for (const row of confirmed) {
+    for (const canonicalKey of [row.observed.canonicalKey, row.authoritative.canonicalKey]) {
+      const rows = evidenceByCanonical.get(canonicalKey) ?? [];
+      rows.push(row);
+      evidenceByCanonical.set(canonicalKey, rows);
+    }
+  }
+  for (const rows of evidenceByCanonical.values()) {
+    const numerics = new Set(rows.map((row) => row.githubRepositoryId));
+    if (numerics.size > 1) {
+      markNumericConflict(
+        numerics,
+        'canonical_conflict',
+        Math.min(...rows.map((row) => row.rowIndex)),
+        rows[0]!.authoritative,
+      );
+    }
+  }
+  for (const row of confirmed) {
+    const linked = new Set<number>();
+    for (const canonicalKey of [
+      row.observed.canonicalKey,
+      row.authoritative.canonicalKey,
+      ...row.orcaRepositoryIds.map((id) => previousBindingById.get(id)?.canonicalKey)
+        .filter((key): key is CanonicalGithubRepository['canonicalKey'] =>
+          key !== null && key !== undefined),
+    ]) {
+      const numeric = previousByCanonical.get(canonicalKey)?.githubRepositoryId;
+      if (numeric !== null && numeric !== undefined) linked.add(numeric);
+    }
+    const contradictory = new Set([...linked].filter((numeric) =>
+      numeric !== row.githubRepositoryId));
+    if (contradictory.size > 0) {
+      markNumericConflict(
+        new Set([row.githubRepositoryId, ...contradictory]),
+        'canonical_conflict', row.rowIndex, row.authoritative,
+      );
+    }
+  }
+
+  const resolvedByNumeric = new Map<number, ResolvedRepository>();
+  for (const [numeric, rows] of [...confirmedByNumeric.entries()].sort(([a], [b]) => a - b)) {
+    if (conflictedNumeric.has(numeric)) continue;
+    const authoritativeKeys = new Set(rows.map((row) => row.authoritative.canonicalKey));
+    if (authoritativeKeys.size !== 1) {
+      markNumericConflict(
+        new Set([numeric]), 'canonical_conflict',
+        Math.min(...rows.map((row) => row.rowIndex)), rows[0]!.authoritative,
+      );
+      continue;
+    }
+    const numericLkg = previousByNumeric.get(numeric);
+    const explicitProjects = new Set<string>();
+    const addExplicitProject = (
+      canonicalKey: CanonicalGithubRepository['canonicalKey'],
+    ): void => {
+      const configured = explicitByCanonical.get(canonicalKey);
+      if (configured !== undefined) explicitProjects.add(configured);
+      const durable = previousByCanonical.get(canonicalKey);
+      if (durable?.projectOrigin === 'explicit') explicitProjects.add(durable.projectKey);
+    };
+    if (numericLkg?.projectOrigin === 'explicit') explicitProjects.add(numericLkg.projectKey);
+    for (const row of rows) {
+      addExplicitProject(row.observed.canonicalKey);
+      addExplicitProject(row.authoritative.canonicalKey);
+      for (const id of row.orcaRepositoryIds) {
+        const canonicalKey = previousBindingById.get(id)?.canonicalKey;
+        if (canonicalKey !== null && canonicalKey !== undefined) addExplicitProject(canonicalKey);
+      }
+    }
+    const identity = rows[0]!.authoritative;
+    const rowIndex = Math.min(...rows.map((row) => row.rowIndex));
+    if (explicitProjects.size > 1) {
+      markNumericConflict(new Set([numeric]), 'project_conflict', rowIndex, identity);
+      continue;
+    }
+    const observedCanonicalKeys = new Set(rows.map((row) => row.observed.canonicalKey));
+    const firstObservedCanonical = [...observedCanonicalKeys].sort(compareText)[0]!;
+    const projectKey = [...explicitProjects][0] ??
+      (numericLkg?.projectOrigin === 'auto'
+        ? numericLkg.projectKey
+        : `auto:${firstObservedCanonical}`);
+    const projectOrigin: EffectiveProjectOrigin = explicitProjects.size === 0 ? 'auto' : 'explicit';
+    const currentIds = [...new Set(rows.flatMap((row) => row.orcaRepositoryIds))].sort();
+    const allIds = idsForNumeric(numeric, currentIds);
+    if (allIds.length > idLimit) {
+      addBlock(allIds, 'capacity_conflict', rowIndex, identity);
+      carryNumeric(numeric);
+      continue;
+    }
+    resolvedByNumeric.set(numeric, {
+      observedCanonicalKeys,
+      identity,
+      githubRepositoryId: numeric,
+      projectKey,
+      projectOrigin,
+      rowIndex,
+      orcaRepositoryIds: new Set(currentIds),
+    });
+  }
+
   for (const resolved of resolvedByNumeric.values()) {
+    const numericLkg = previousByNumeric.get(resolved.githubRepositoryId);
+    if (numericLkg !== undefined && numericLkg.canonicalKey !== resolved.identity.canonicalKey) {
+      repositoryInputs.delete(numericLkg.canonicalKey);
+    }
     repositoryInputs.set(resolved.identity.canonicalKey, repositoryInput(
       resolved.identity,
       resolved.githubRepositoryId,
@@ -619,6 +851,74 @@ export async function runRepositoryDiscoveryPass(
     }
   }
 
+  const projectedAutoNumeric = new Set(activeAutoNumeric);
+  for (const repository of repositoryInputs.values()) {
+    if (repository.githubRepositoryId === null) continue;
+    if (repository.projectOrigin === 'auto') projectedAutoNumeric.add(repository.githubRepositoryId);
+    else projectedAutoNumeric.delete(repository.githubRepositoryId);
+  }
+  if (explicitCapacityFloor + projectedAutoNumeric.size > repositoryLimit) {
+    diagnostics.push({
+      rowIndex: -1,
+      code: 'capacity_conflict',
+      effect: 'group_blocked',
+      entityRef: redactedEntityRef(
+        'repository-capacity', String(explicitCapacityFloor + projectedAutoNumeric.size),
+      ),
+    });
+    return failedFromPrevious(
+      'capacity_conflict', source.rows.length, blocks, diagnostics,
+      deferredRepositories, 'capacity_conflict',
+    );
+  }
+
+  const renameCanonical = new Map<string, string>();
+  for (const repository of repositoryInputs.values()) {
+    if (repository.githubRepositoryId === null) continue;
+    const prior = previousByNumeric.get(repository.githubRepositoryId);
+    if (prior !== undefined) renameCanonical.set(prior.canonicalKey, repository.canonicalKey);
+  }
+  const inactiveCutoff = Date.parse(at) - 24 * 60 * 60 * 1_000;
+  const projectedBindings = new Map<string, string | null>();
+  for (const binding of previous.bindings) {
+    const submitted = bindingInputs.get(binding.orcaRepositoryId);
+    const remainsActive = submitted !== undefined ||
+      !(binding.consecutiveMissingPasses >= 1 && Date.parse(binding.lastSeenAt) <= inactiveCutoff);
+    if (!remainsActive) continue;
+    const canonicalKey = submitted?.canonicalKey ?? binding.canonicalKey;
+    projectedBindings.set(
+      binding.orcaRepositoryId,
+      canonicalKey === null ? null : renameCanonical.get(canonicalKey) ?? canonicalKey,
+    );
+  }
+  for (const binding of bindingInputs.values()) {
+    if (projectedBindings.has(binding.orcaRepositoryId)) continue;
+    projectedBindings.set(
+      binding.orcaRepositoryId,
+      binding.canonicalKey === null
+        ? null : renameCanonical.get(binding.canonicalKey) ?? binding.canonicalKey,
+    );
+  }
+  const projectedIdsByCanonical = new Map<string, string[]>();
+  for (const [id, canonicalKey] of projectedBindings) {
+    if (canonicalKey === null) continue;
+    const ids = projectedIdsByCanonical.get(canonicalKey) ?? [];
+    ids.push(id);
+    projectedIdsByCanonical.set(canonicalKey, ids);
+  }
+  for (const [canonicalKey, ids] of projectedIdsByCanonical) {
+    const ordered = [...new Set(ids)].sort();
+    if (ordered.length <= idLimit) continue;
+    addBlock(
+      ordered, 'capacity_conflict', -1, identityFromRecord(
+        canonicalKey, canonicalKey.slice('github.com/'.length),
+      ),
+    );
+    return failedFromPrevious(
+      'capacity_conflict', source.rows.length, blocks, diagnostics, deferredRepositories,
+    );
+  }
+
   let durable: EffectiveDiscoverySnapshot;
   try {
     durable = options.store.replaceDiscoverySnapshot({
@@ -635,13 +935,21 @@ export async function runRepositoryDiscoveryPass(
       options.config, lkgCompatible ? previous : EMPTY_SNAPSHOT,
       {
         configFingerprint: fingerprint,
-        ...(lkgCompatible ? {} : { routingBlock: 'config_drift' as const }),
+        blockedBindings: blocks,
+        remoteUnverifiedOrcaRepositoryIds: remoteUnverifiedIds,
+        diagnostics,
+        repositoryProjects: projectOverrides,
+        ...(lkgProofFailed ? { routingBlock: 'config_drift' as const } : {}),
       },
     );
     return {
-      status: 'failed', failure: 'store_failed', configFingerprint: fingerprint,
+      status: 'failed', failure: lkgProofFailed ? 'config_drift' : 'store_failed',
+      configFingerprint: fingerprint,
       snapshot: previous, effectiveConfig,
-      counts: resultCounts(source.rows.length, lkgCompatible ? previous : EMPTY_SNAPSHOT, [], 0),
+      counts: resultCounts(
+        source.rows.length, lkgCompatible ? previous : EMPTY_SNAPSHOT,
+        blocks, deferredRepositories,
+      ),
     };
   }
 

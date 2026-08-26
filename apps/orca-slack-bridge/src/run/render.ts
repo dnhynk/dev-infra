@@ -333,8 +333,23 @@ function pullRequestLine(pr: RunPullRequestRecord): string {
   return `• #${pr.number} ${emoji} ${label} · ${verdict}`;
 }
 
+function structuredDegradedSuffix(d: RunDegraded): string {
+  const parts: string[] = [];
+  if (d.entityRefs !== undefined) {
+    parts.push(`refs ${[...d.entityRefs].sort().map(esc).join(', ') || '없음'}`);
+  }
+  if (d.counts !== undefined) {
+    const counts = Object.entries(d.counts)
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, value]) => `${esc(key)}=${value}`)
+      .join(', ');
+    parts.push(`counts ${counts || '없음'}`);
+  }
+  return parts.length === 0 ? '' : ` · ${parts.join(' · ')}`;
+}
+
 function degradedLine(d: RunDegraded): string {
-  return `• [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}`;
+  return `• [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}${structuredDegradedSuffix(d)}`;
 }
 
 /**
@@ -349,7 +364,7 @@ function degradedLine(d: RunDegraded): string {
  * "Task도 worker도 없다"를 나눈다. 여기서는 그것을 그린다.
  */
 function unregisteredDegradedLine(d: RunDegraded): string {
-  return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}`;
+  return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}${structuredDegradedSuffix(d)}`;
 }
 
 /**
@@ -364,10 +379,18 @@ function unregisteredLines(unregistered: UnregisteredRuns): string[] {
   const lines = [`${unregistered.count}`];
   if (unregistered.count === 0) return lines;
   for (const u of unregistered.runs.slice(0, ENTRY_CAP)) {
-    lines.push(
-      `• ${esc(u.runId)} — 관측된 Orca repository id: ` +
-        `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
-    );
+    const runIdentity = u.runRef ?? u.runId;
+    if (u.repositoryRefs !== undefined) {
+      lines.push(
+        `• ${esc(runIdentity)} — redacted repository refs: ` +
+          `${u.repositoryRefs.length === 0 ? '없음' : [...u.repositoryRefs].sort().map(esc).join(', ')}`,
+      );
+    } else {
+      lines.push(
+        `• ${esc(runIdentity)} — 관측된 Orca repository id: ` +
+          `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
+      );
+    }
     // degraded를 빼면 이 두 줄이 바이트 동일해진다. 그러면 이 절이 두 사건을 함께 센다.
     lines.push(...u.degraded.map(unregisteredDegradedLine));
   }

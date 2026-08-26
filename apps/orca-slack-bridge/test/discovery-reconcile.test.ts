@@ -1,16 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   bridgeConfigFingerprint,
   buildEffectiveBridgeConfig,
 } from '../src/discovery/effective-config.js';
-import { runRepositoryDiscoveryPass } from '../src/discovery/reconcile.js';
-import type { RepositoryIdentityConfirmer } from '../src/github/repository.js';
+import {
+  runRepositoryDiscoveryPass,
+  type RepositoryDiscoveryPassOptions,
+} from '../src/discovery/reconcile.js';
+import type {
+  RepositoryIdentityConfirmer,
+  RepositoryIdentityConfirmationOptions,
+} from '../src/github/repository.js';
 import { repositoryIdentity } from '../src/identity/repository.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { parseConfig, type ParsedBridgeConfig } from '../src/project/config.js';
+import type { OperationalStore } from '../src/store/operational-types.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 
 type RepoRow = ReturnType<typeof repoRow>;
@@ -77,6 +84,17 @@ class FakeGithub implements RepositoryIdentityConfirmer {
   }
 }
 
+class NeverGithub implements RepositoryIdentityConfirmer {
+  readonly calls: string[] = [];
+  signal: AbortSignal | null = null;
+
+  confirm(nameWithOwner: string, options: RepositoryIdentityConfirmationOptions) {
+    this.calls.push(nameWithOwner);
+    this.signal = options.signal;
+    return new Promise<ReturnType<typeof repositoryIdentity>>(() => undefined);
+  }
+}
+
 function config(
   projects: readonly {
     readonly name: string;
@@ -113,17 +131,41 @@ describe('O1-3 repository discovery reconciliation', () => {
   const pass = async (
     rows: readonly RepoRow[],
     bridgeConfig: ParsedBridgeConfig,
-    github: FakeGithub,
+    github: RepositoryIdentityConfirmer,
     at = T0,
-    extra: { readonly lastKnownGoodConfigFingerprint?: string } = {},
+    extra: {
+      readonly lastKnownGoodConfigFingerprint?: string | null;
+      readonly deadlineAt?: number;
+      readonly signal?: AbortSignal;
+    } = {},
   ) => {
     const orca = new FakeOrca(envelope(rows));
     const result = await runRepositoryDiscoveryPass({
-      orca, github, store, config: bridgeConfig, now: () => new Date(at), ...extra,
+      orca, github, store, config: bridgeConfig, now: () => new Date(at),
+      lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(bridgeConfig),
+      ...extra,
     });
     expect(orca.calls).toEqual([['repo', 'list', '--json']]);
     return result;
   };
+
+  const storeBytes = (): readonly (string | null)[] => [
+    join(directory, 'state.db'),
+    join(directory, 'state.db-wal'),
+  ].map((path) => existsSync(path) ? readFileSync(path).toString('base64') : null);
+
+  const countingStore = (onWrite: () => void): OperationalStore => new Proxy(store, {
+    get(target, property) {
+      if (property === 'replaceDiscoverySnapshot') {
+        return (...args: Parameters<OperationalStore['replaceDiscoverySnapshot']>) => {
+          onWrite();
+          return target.replaceDiscoverySnapshot(...args);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as OperationalStore;
 
   it('GitHub-confirmed auto discovery creates one stable singleton Project', async () => {
     const github = new FakeGithub(() => ({ id: 101, nameWithOwner: 'acme/widget' }));
@@ -372,6 +414,351 @@ describe('O1-3 repository discovery reconciliation', () => {
     }]);
   });
 
+  it.each(['deadline', 'external-abort'] as const)(
+    'bounds a never-settling confirmer with %s and performs zero store writes',
+    async (mode) => {
+      const github = new NeverGithub();
+      const bridgeConfig = config();
+      const before = store.readEffectiveDiscoverySnapshot();
+      const bytes = storeBytes();
+      const controller = new AbortController();
+      const abortTimer = mode === 'external-abort'
+        ? setTimeout(() => controller.abort(), 20)
+        : undefined;
+      const startedAt = Date.now();
+      const result = await pass(
+        [repoRow('private-id-that-must-not-persist', 'acme/widget')],
+        bridgeConfig,
+        github,
+        T0,
+        {
+          deadlineAt: Date.now() + (mode === 'deadline' ? 20 : 1_000),
+          ...(mode === 'external-abort' ? { signal: controller.signal } : {}),
+        },
+      );
+      if (abortTimer !== undefined) clearTimeout(abortTimer);
+
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+      expect(result).toMatchObject({ status: 'failed', failure: 'github_unavailable' });
+      expect(result.snapshot).toEqual(before);
+      expect(store.readEffectiveDiscoverySnapshot()).toEqual(before);
+      expect(storeBytes()).toEqual(bytes);
+      expect(result.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+        status: 'blocked', reason: 'github_identity_unverified',
+      }));
+      if (mode === 'deadline') {
+        expect(github.calls).toEqual(['acme/widget']);
+        expect(github.signal?.aborted).toBe(true);
+      }
+    },
+  );
+
+  it('discards an already-confirmed prefix when a later GitHub candidate reaches the deadline', async () => {
+    const bridgeConfig = config();
+    const calls: string[] = [];
+    const github: RepositoryIdentityConfirmer = {
+      confirm(nameWithOwner) {
+        calls.push(nameWithOwner);
+        if (nameWithOwner === 'acme/fast') {
+          return Promise.resolve(repositoryIdentity(139, 'acme/fast'));
+        }
+        return new Promise(() => undefined);
+      },
+    };
+    const before = store.readEffectiveDiscoverySnapshot();
+    const result = await pass(
+      [repoRow('orca-fast', 'acme/fast'), repoRow('orca-hung', 'acme/hung')],
+      bridgeConfig,
+      github,
+      T0,
+      { deadlineAt: Date.now() + 20 },
+    );
+
+    expect(calls).toEqual(['acme/fast', 'acme/hung']);
+    expect(result).toMatchObject({ status: 'failed', failure: 'github_unavailable' });
+    expect(result.snapshot).toEqual(before);
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual(before);
+    expect(result.effectiveConfig.projects).toEqual([]);
+    expect(result.effectiveConfig.bindings.filter((binding) =>
+      binding.status === 'blocked')).toHaveLength(2);
+  });
+
+  it.each(['schema', 'query'] as const)(
+    'leaves the exact durable snapshot and bytes untouched on whole-pass %s failure',
+    async (mode) => {
+      const bridgeConfig = config();
+      const seed = await pass(
+        [repoRow('orca-known', 'acme/known')], bridgeConfig,
+        new FakeGithub(() => ({ id: 130, nameWithOwner: 'acme/known' })),
+      );
+      const before = store.readEffectiveDiscoverySnapshot();
+      const bytes = storeBytes();
+      let writes = 0;
+      const malformed = envelope([repoRow('orca-known', 'acme/known')]) as Record<string, unknown>;
+      malformed['unexpected'] = true;
+      const result = await runRepositoryDiscoveryPass({
+        orca: new FakeOrca(mode === 'schema' ? malformed : new Error('private query marker')),
+        github: new FakeGithub(() => new Error('not called')),
+        store: countingStore(() => { writes += 1; }),
+        config: bridgeConfig,
+        lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(bridgeConfig),
+        now: () => new Date(T1),
+      });
+
+      expect(result.failure).toBe(mode === 'schema' ? 'schema_drift' : 'query_failed');
+      expect(writes).toBe(0);
+      expect(result.snapshot).toEqual(before);
+      expect(store.readEffectiveDiscoverySnapshot()).toEqual(before);
+      expect(storeBytes()).toEqual(bytes);
+      expect(result.effectiveConfig.revision).toBe(seed.effectiveConfig.revision);
+      expect(result.snapshot.issues).toEqual(before.issues);
+    },
+  );
+
+  it('quarantines every current and durable alias for a same-numeric cross-Project identity', async () => {
+    const bridgeConfig = config([
+      { name: 'alpha', repositories: ['acme/old'] },
+      { name: 'beta', repositories: ['acme/new'] },
+    ]);
+    await pass(
+      [repoRow('orca-old', 'acme/old')], bridgeConfig,
+      new FakeGithub(() => ({ id: 131, nameWithOwner: 'acme/old' })),
+    );
+    const result = await pass(
+      [repoRow('orca-old', 'acme/old'), repoRow('orca-new', 'acme/new')],
+      bridgeConfig,
+      new FakeGithub(() => ({ id: 131, nameWithOwner: 'acme/current' })),
+      T1,
+    );
+
+    const affected = result.effectiveConfig.bindings.filter((binding) =>
+      binding.orcaRepositoryIds.some((id) => id === 'orca-old' || id === 'orca-new'));
+    expect(affected).toHaveLength(1);
+    expect(affected[0]).toMatchObject({
+      status: 'blocked', reason: 'project_conflict',
+      orcaRepositoryIds: ['orca-new', 'orca-old'],
+    });
+    expect(result.effectiveConfig.bindings.some((binding) =>
+      binding.status === 'bound' && binding.orcaRepositoryIds.includes('orca-old'))).toBe(false);
+  });
+
+  it.each([16, 17, 18])(
+    'enforces the post-convergence Orca-ID bound at %i fresh aliases',
+    async (count) => {
+      const first = Math.floor(count / 2);
+      const rows = [
+        ...Array.from({ length: first }, (_, index) => repoRow(`orca-a-${index}`, 'acme/alias-a')),
+        ...Array.from({ length: count - first }, (_, index) =>
+          repoRow(`orca-b-${index}`, 'acme/alias-b')),
+      ];
+      const result = await pass(
+        rows,
+        config(),
+        new FakeGithub(() => ({ id: 132, nameWithOwner: 'acme/current' })),
+      );
+
+      if (count === 16) {
+        expect(result.snapshot.bindings).toHaveLength(16);
+        expect(result.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+          status: 'bound', orcaRepositoryIds: expect.arrayContaining(['orca-a-0', 'orca-b-0']),
+        }));
+      } else {
+        expect(result.snapshot.repositories).toEqual([]);
+        expect(result.snapshot.bindings).toEqual([]);
+        expect(result.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+          status: 'blocked', reason: 'capacity_conflict',
+        }));
+        expect(result.counts.blockedBindings).toBe(count);
+      }
+    },
+  );
+
+  it.each([
+    { seed: 15, added: 1, total: 16 },
+    { seed: 16, added: 1, total: 17 },
+    { seed: 16, added: 2, total: 18 },
+  ])('counts grace-retained aliases before accepting $total IDs', async ({ seed, added, total }) => {
+    const bridgeConfig = config();
+    await pass(
+      Array.from({ length: seed }, (_, index) => repoRow(`orca-old-${index}`, 'acme/group')),
+      bridgeConfig,
+      new FakeGithub(() => ({ id: 133, nameWithOwner: 'acme/group' })),
+    );
+    const result = await pass(
+      Array.from({ length: added }, (_, index) => repoRow(`orca-new-${index}`, 'acme/group')),
+      bridgeConfig,
+      new FakeGithub(() => ({ id: 133, nameWithOwner: 'acme/group' })),
+      T1,
+    );
+
+    if (total === 16) {
+      expect(result.snapshot.bindings).toHaveLength(16);
+      expect(result.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+        status: 'bound', orcaRepositoryIds: expect.arrayContaining(['orca-new-0', 'orca-old-0']),
+      }));
+    } else {
+      expect(result.snapshot.bindings).toHaveLength(16);
+      expect(result.snapshot.bindings.some((binding) =>
+        binding.orcaRepositoryId.startsWith('orca-new-'))).toBe(false);
+      expect(result.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+        status: 'blocked', reason: 'capacity_conflict',
+      }));
+      expect(result.counts.blockedBindings).toBe(total);
+    }
+  });
+
+  it('confirms a full-capacity numeric rename but defers a genuinely unrelated seventeenth repo', async () => {
+    const bridgeConfig = config();
+    const rows = Array.from({ length: 16 }, (_, index) =>
+      repoRow(`orca-${index}`, `acme/repo-${index}`));
+    await pass(rows, bridgeConfig, new FakeGithub((name) => ({
+      id: 200 + Number(name.slice('acme/repo-'.length)), nameWithOwner: name,
+    })));
+
+    const renameGithub = new FakeGithub(() => ({ id: 200, nameWithOwner: 'acme/renamed' }));
+    const renamed = await pass(
+      [repoRow('orca-0', 'acme/repo-0')], bridgeConfig, renameGithub, T1,
+    );
+    expect(renameGithub.calls).toEqual(['acme/repo-0']);
+    expect(renamed.snapshot.repositories).toHaveLength(16);
+    expect(renamed.snapshot.bindings.find((binding) =>
+      binding.orcaRepositoryId === 'orca-0')?.canonicalKey).toBe('github.com/acme/renamed');
+    expect(renamed.counts.deferredRepositories).toBe(0);
+
+    const newGithub = new FakeGithub(() => ({ id: 999, nameWithOwner: 'acme/seventeenth' }));
+    const deferred = await pass(
+      [repoRow('orca-seventeen', 'acme/seventeenth')], bridgeConfig, newGithub,
+      '2026-08-26T02:00:00.000Z',
+    );
+    expect(newGithub.calls).toEqual([]);
+    expect(deferred.snapshot.repositories).toHaveLength(16);
+    expect(deferred.counts.deferredRepositories).toBe(1);
+    expect(deferred.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+      status: 'blocked', reason: 'capacity_deferred',
+      orcaRepositoryIds: ['orca-seventeen'],
+    }));
+  });
+
+  it('preserves current live conflict blocks when the atomic store rolls back', async () => {
+    const bridgeConfig = config();
+    await pass(
+      [repoRow('orca-stable', 'acme/stable')], bridgeConfig,
+      new FakeGithub(() => ({ id: 134, nameWithOwner: 'acme/stable' })),
+    );
+    const databasePath = join(directory, 'state.db');
+    store.close();
+    store = new SqliteDigestStore(databasePath, {
+      operationalFault: (point) => {
+        if (point === 'after_discovery_registry') throw new Error('private rollback marker');
+      },
+    });
+    const failed = await pass(
+      [repoRow('orca-stable', 'acme/other')], bridgeConfig,
+      new FakeGithub(() => ({ id: 135, nameWithOwner: 'acme/other' })),
+      T1,
+    );
+
+    expect(failed).toMatchObject({ status: 'failed', failure: 'store_failed' });
+    expect(failed.snapshot.repositories[0]).toMatchObject({ githubRepositoryId: 134 });
+    expect(failed.effectiveConfig.bindings.find((binding) =>
+      binding.orcaRepositoryIds.includes('orca-stable'))).toMatchObject({
+        status: 'blocked', reason: 'canonical_conflict',
+      });
+    expect(failed.effectiveConfig.bindings.some((binding) =>
+      binding.status === 'bound' && binding.orcaRepositoryIds.includes('orca-stable'))).toBe(false);
+  });
+
+  it('carries a GitHub-proven auto rename through a later outage on its old alias', async () => {
+    const bridgeConfig = config();
+    await pass(
+      [repoRow('orca-auto', 'acme/old')], bridgeConfig,
+      new FakeGithub(() => ({ id: 136, nameWithOwner: 'acme/old' })),
+    );
+    const renamed = await pass(
+      [repoRow('orca-auto', 'acme/old')], bridgeConfig,
+      new FakeGithub(() => ({ id: 136, nameWithOwner: 'acme/new' })),
+      T1,
+    );
+    expect(renamed.snapshot.repositories[0]).toMatchObject({
+      canonicalKey: 'github.com/acme/new', projectKey: 'auto:github.com/acme/old',
+    });
+
+    const outage = await pass(
+      [repoRow('orca-auto', 'acme/old')], bridgeConfig,
+      new FakeGithub(() => new Error('private outage marker')),
+      T2,
+    );
+    expect(outage.effectiveConfig.bindings.find((binding) =>
+      binding.orcaRepositoryIds.includes('orca-auto'))).toMatchObject({
+        status: 'bound', githubRepositoryId: 136,
+      });
+    expect(outage.effectiveConfig.diagnostics).toContainEqual(expect.objectContaining({
+      code: 'github_identity_unverified', effect: 'lkg_carried',
+    }));
+    expect(outage.effectiveConfig.bindings.some((binding) =>
+      binding.status === 'blocked' && binding.reason === 'canonical_conflict')).toBe(false);
+  });
+
+  it('requires explicit fingerprint proof for LKG and preserves only a matching proof', async () => {
+    const bridgeConfig = config();
+    await pass(
+      [repoRow('orca-known', 'acme/known')], bridgeConfig,
+      new FakeGithub(() => ({ id: 137, nameWithOwner: 'acme/known' })),
+    );
+    const baseOptions = {
+      orca: new FakeOrca(new Error('private query marker')),
+      github: new FakeGithub(() => new Error('not called')),
+      store,
+      config: bridgeConfig,
+      now: () => new Date(T1),
+    };
+    const match = await runRepositoryDiscoveryPass({
+      ...baseOptions,
+      lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(bridgeConfig),
+    });
+    const mismatch = await runRepositoryDiscoveryPass({
+      ...baseOptions,
+      lastKnownGoodConfigFingerprint: 'mismatched-proof',
+    });
+    const absent = await runRepositoryDiscoveryPass({
+      ...baseOptions,
+      lastKnownGoodConfigFingerprint: null,
+    });
+    const missing = await runRepositoryDiscoveryPass(baseOptions as unknown as RepositoryDiscoveryPassOptions);
+
+    expect(match.effectiveConfig.projects).toContainEqual(expect.objectContaining({
+      key: 'auto:github.com/acme/known',
+    }));
+    for (const result of [mismatch, absent, missing]) {
+      expect(result).toMatchObject({ status: 'failed', failure: 'config_drift' });
+      expect(result.effectiveConfig.projects).toEqual([]);
+      expect(result.effectiveConfig.routing).toEqual({ status: 'blocked', reason: 'config_drift' });
+    }
+  });
+
+  it('keeps the semantic revision stable when repo-list row order changes', async () => {
+    const bridgeConfig = config();
+    const valid = repoRow('orca-good', 'acme/good');
+    const unsupported = repoRow('orca-unsupported', 'acme/unsupported', {
+      url: 'https://example.test/acme/unsupported',
+    });
+    const first = await pass(
+      [valid, unsupported], bridgeConfig,
+      new FakeGithub(() => ({ id: 138, nameWithOwner: 'acme/good' })),
+    );
+    const second = await pass(
+      [unsupported, valid], bridgeConfig,
+      new FakeGithub(() => ({ id: 138, nameWithOwner: 'acme/good' })),
+      T1,
+    );
+
+    expect(second.effectiveConfig.revision).toBe(first.effectiveConfig.revision);
+    expect(second.effectiveConfig.bindings).toEqual(first.effectiveConfig.bindings);
+    expect(second.effectiveConfig.projects).toEqual(first.effectiveConfig.projects);
+    expect(second.effectiveConfig.diagnostics.some((row) => row.rowIndex !==
+      first.effectiveConfig.diagnostics[0]?.rowIndex)).toBe(true);
+  });
+
   it('does not consume a mismatched-config LKG when the whole repository query fails', async () => {
     const bridgeConfig = config();
     await pass(
@@ -425,6 +812,7 @@ describe('O1-3 repository discovery reconciliation', () => {
       orca: new FakeOrca(malformed),
       github: new FakeGithub(() => new Error('not called')),
       store, config: bridgeConfig, now: () => new Date(T1),
+      lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(bridgeConfig),
     });
 
     expect(failed).toMatchObject({ status: 'failed', failure: 'schema_drift' });

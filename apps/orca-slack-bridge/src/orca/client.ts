@@ -301,7 +301,12 @@ function repositoryIdReadability(
   source: string,
 ): 'absent' | 'readable' | 'unreadable' {
   if (source === '') return 'absent';
-  return repositoryIdFromWorktreeId(source) === null ? 'unreadable' : 'readable';
+  const separator = source.indexOf('::');
+  if (separator <= 0 || repositoryIdFromWorktreeId(source) === null) return 'unreadable';
+  const suffix = source.slice(separator + 2);
+  const incarnation = suffix.indexOf('@@');
+  const path = incarnation < 0 ? suffix : suffix.slice(0, incarnation);
+  return path.trim() === '' ? 'unreadable' : 'readable';
 }
 
 export async function listRuns(
@@ -464,11 +469,18 @@ export async function listTasks(runner: OrcaRunner, runId: string): Promise<Orca
 export async function listTaskPage(
   runner: OrcaRunner,
   runId: string,
-): Promise<{ tasks: OrcaTask[]; count: number }> {
-  const r = await call<{ tasks?: unknown[]; count?: unknown }>(runner, [
+): Promise<{
+  tasks: OrcaTask[];
+  count: number;
+  /** False when the repository-bearing row set may be omitted or truncated. */
+  repositoryEvidenceComplete: boolean;
+}> {
+  const r = await call<{ tasks?: unknown; count?: unknown }>(runner, [
     'orchestration', 'task-list', '--run', runId, '--json',
   ]);
-  const tasks = (r.tasks ?? []).map((row) => {
+  const hasTaskArray = Array.isArray(r.tasks);
+  const taskRows: unknown[] = hasTaskArray ? r.tasks as unknown[] : [];
+  const tasks = taskRows.map((row) => {
     const o = row as Record<string, unknown>;
     const inc = str(o['created_by_process_incarnation']);
     return {
@@ -499,9 +511,11 @@ export async function listTaskPage(
     };
   });
   const count = r.count;
+  const hasReliableCount = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
   return {
     tasks,
-    count: typeof count === 'number' && Number.isSafeInteger(count) ? count : tasks.length,
+    count: hasReliableCount ? count : tasks.length,
+    repositoryEvidenceComplete: hasTaskArray && hasReliableCount && count === tasks.length,
   };
 }
 
@@ -839,11 +853,16 @@ export type OrcaWorker = {
  * **liveness 근거로 쓰지 않는다**(docs/contracts §5). 여기서 쓰는 것은 attempt 수와
  * repository 후보 두 가지뿐이다.
  */
-export async function listWorkers(runner: OrcaRunner, runId: string): Promise<OrcaWorker[]> {
-  const r = await call<{ workers?: unknown[] }>(runner, [
+export async function listWorkerPage(
+  runner: OrcaRunner,
+  runId: string,
+): Promise<{ workers: OrcaWorker[]; repositoryEvidenceComplete: boolean }> {
+  const r = await call<{ workers?: unknown; count?: unknown; counts?: unknown }>(runner, [
     'orchestration', 'worker-list', '--run', runId, '--json',
   ]);
-  return (r.workers ?? []).map((row) => {
+  const hasWorkerArray = Array.isArray(r.workers);
+  const workerRows: unknown[] = hasWorkerArray ? r.workers as unknown[] : [];
+  const workers = workerRows.map((row) => {
     const o = row as Record<string, unknown>;
     const resource = isRecord(o['resource']) ? o['resource'] : {};
     const worktreeId = str(resource['worktreeId']);
@@ -856,6 +875,35 @@ export async function listWorkers(runner: OrcaRunner, runId: string): Promise<Or
       repositoryIdReadability: repositoryIdReadability(worktreeId),
     };
   });
+  let countMatches = true;
+  if ('count' in r) {
+    countMatches = typeof r.count === 'number' && Number.isSafeInteger(r.count) &&
+      r.count >= 0 && r.count === workers.length;
+  }
+  if ('counts' in r) {
+    if (!isRecord(r.counts)) {
+      countMatches = false;
+    } else {
+      let total = 0;
+      for (const value of Object.values(r.counts)) {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+          countMatches = false;
+          break;
+        }
+        total += value;
+        if (!Number.isSafeInteger(total)) {
+          countMatches = false;
+          break;
+        }
+      }
+      if (total !== workers.length) countMatches = false;
+    }
+  }
+  return { workers, repositoryEvidenceComplete: hasWorkerArray && countMatches };
+}
+
+export async function listWorkers(runner: OrcaRunner, runId: string): Promise<OrcaWorker[]> {
+  return (await listWorkerPage(runner, runId)).workers;
 }
 
 export type StrictResumeWorker = {

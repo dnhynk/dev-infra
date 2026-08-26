@@ -2,13 +2,34 @@ import { repositoryIdentity, type RepositoryIdentity } from '../identity/reposit
 import { normalizeGithubNameWithOwner } from '../discovery/github-remote.js';
 import { ghJson, type GhRunner } from './runner.js';
 
+export type RepositoryIdentityConfirmationOptions = {
+  /** Discovery owns this signal and aborts it when the shared pass deadline expires. */
+  readonly signal: AbortSignal;
+  /** Absolute epoch deadline shared by every confirmation in one discovery pass. */
+  readonly deadlineAt: number;
+};
+
 /** Injectable seam used by discovery; tests never need a live GitHub process or network. */
 export interface RepositoryIdentityConfirmer {
-  confirm(nameWithOwner: string): Promise<RepositoryIdentity>;
+  confirm(
+    nameWithOwner: string,
+    options: RepositoryIdentityConfirmationOptions,
+  ): Promise<RepositoryIdentity>;
 }
 
 export function repositoryIdentityConfirmer(runner: GhRunner): RepositoryIdentityConfirmer {
-  return { confirm: (nameWithOwner) => fetchRepositoryIdentity(runner, nameWithOwner) };
+  return {
+    confirm: (nameWithOwner, options) => {
+      const remaining = Math.trunc(options.deadlineAt - Date.now());
+      if (options.signal.aborted || remaining <= 0) {
+        throw new Error('GitHub repository confirmation deadline exceeded');
+      }
+      return fetchRepositoryIdentity(runner, nameWithOwner, {
+        signal: options.signal,
+        timeoutMs: remaining,
+      });
+    },
+  };
 }
 
 /**
@@ -20,13 +41,14 @@ export function repositoryIdentityConfirmer(runner: GhRunner): RepositoryIdentit
 export async function fetchRepositoryIdentity(
   runner: GhRunner,
   nameWithOwner: string,
+  options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
 ): Promise<RepositoryIdentity> {
   const raw = await ghJson<{ id?: unknown; full_name?: unknown }>(runner, [
     'api',
     `repos/${nameWithOwner}`,
     '--jq',
     '{id: .id, full_name: .full_name}',
-  ]);
+  ], options);
   if (typeof raw.id !== 'number') {
     throw new TypeError(`repos/${nameWithOwner} 응답에 숫자 id가 없다`);
   }

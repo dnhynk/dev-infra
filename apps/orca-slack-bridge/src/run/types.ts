@@ -324,6 +324,8 @@ export type UnregisteredRuns = {
  */
 export type UnregisteredRun = {
   readonly runId: string;
+  /** Effective routing renders this digest instead of exposing the unregistered raw Run ID. */
+  readonly runRef?: string;
   /** Legacy manual mode의 관측 ID. Effective mode는 이 배열을 비우고 repositoryRefs만 싣는다. */
   readonly repositoryIds: readonly string[];
   /** Effective routing exposes only these digests; legacy manual mode retains repositoryIds. */

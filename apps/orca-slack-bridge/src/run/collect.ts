@@ -3,7 +3,7 @@ import {
   listGates,
   listRuns,
   listTaskPage,
-  listWorkers,
+  listWorkerPage,
   readInbox,
   showAgentWait,
   unreadableGateFields,
@@ -104,10 +104,30 @@ function message(e: unknown): string {
 }
 
 /** 읽지 못한 칸 하나를 degraded 한 줄로 옮긴다. 어느 row의 어느 칸인지를 잃지 않는다(OD-079). */
-function unreadableDegraded(f: UnreadableField): RunDegraded {
+function unreadableDegraded(f: UnreadableField, redact = false): RunDegraded {
+  if (redact) {
+    return {
+      kind: 'unreadable_field',
+      detail: 'an Orca Run source field was unreadable',
+      entityRefs: [redactedEntityRef(
+        'orca-unreadable-field',
+        [f.subject, f.id, f.field, f.reason].join('\u0000'),
+      )],
+      counts: { unreadableFields: 1 },
+    };
+  }
   return {
     kind: 'unreadable_field',
     detail: `${f.subject} ${f.id}의 ${f.field}를 읽지 못했다: ${f.reason}`,
+  };
+}
+
+function redactedSourceFailure(row: RunDegraded): RunDegraded {
+  return {
+    kind: row.kind,
+    detail: 'an Orca Run source query failed',
+    entityRefs: [redactedEntityRef('orca-run-source-failure', row.detail)],
+    counts: { failedSources: 1 },
   };
 }
 
@@ -164,6 +184,7 @@ async function readRunSources(
     // 집계(`aggregateTasks`·`aggregateDispatches`)와 badge 순서는 이 순서에 의존하지 않는다.
     tasks = [...page.tasks].sort(byId((t) => t.id));
     taskCount = page.count;
+    repositoryIdentityReliable = page.repositoryEvidenceComplete;
   } catch (e) {
     repositoryIdentityReliable = false;
     degraded.push({ kind: 'query_failed', detail: `task-list 실패: ${message(e)}` });
@@ -187,7 +208,9 @@ async function readRunSources(
   }
   let workers: readonly OrcaWorker[] = [];
   try {
-    workers = [...(await listWorkers(orca, run.id))].sort(byId((w) => w.dispatchId));
+    const page = await listWorkerPage(orca, run.id);
+    workers = [...page.workers].sort(byId((w) => w.dispatchId));
+    repositoryIdentityReliable = repositoryIdentityReliable && page.repositoryEvidenceComplete;
   } catch (e) {
     repositoryIdentityReliable = false;
     degraded.push({ kind: 'query_failed', detail: `worker-list 실패: ${message(e)}` });
@@ -282,6 +305,7 @@ export function projectRun(
     }
   }
   const consensus = [...new Set(matched)].sort();
+  if (effective && consensus.length > 1) routeBlocks.add('project_conflict');
   const complete = repositoryIds.length > 0 && matched.length === repositoryIds.length;
   const project = routeBlocks.size === 0 && complete && consensus.length === 1
     ? consensus[0]!
@@ -293,11 +317,8 @@ export function projectRun(
       : (base.projects.find((p) => p.name === project)?.repositories ?? []);
 
   const degraded: RunDegraded[] = [
-    ...(effective ? sources.degraded.map((row): RunDegraded =>
-      row.kind === 'query_failed'
-        ? { kind: 'query_failed', detail: 'an Orca Run source query failed' }
-        : row) : sources.degraded),
-    ...sources.unreadable.map(unreadableDegraded),
+    ...(effective ? sources.degraded.map(redactedSourceFailure) : sources.degraded),
+    ...sources.unreadable.map((field) => unreadableDegraded(field, effective)),
   ];
   if (repositoryIds.length === 0) {
     if (effective && sources.repositoryIdentityReliable === false) {
@@ -471,7 +492,8 @@ export async function collectRunFacts(
   }
   validateRunWorkingSet(listedRuns);
   const orderedRuns = [...listedRuns].sort(byRunRecency);
-  const base = isEffectiveBridgeConfig(config) ? config.base : config;
+  const effective = isEffectiveBridgeConfig(config);
+  const base = effective ? config.base : config;
   const runLimit = base.automation?.capacity.runsPerPass ??
     DEFAULT_AUTOMATION_CONFIG.capacity.runsPerPass;
   const runs = orderedRuns.slice(0, runLimit);
@@ -507,7 +529,7 @@ export async function collectRunFacts(
 
   // Run row의 세대를 읽지 못한 것은 Run 하나가 아니라 관찰의 사실이다. 그 Run의 live/stale이
   // `unknown`으로 접히는 이유가 여기 남는다(OD-079).
-  for (const f of unreadableRunFields(runs)) degraded.push(unreadableDegraded(f));
+  for (const f of unreadableRunFields(runs)) degraded.push(unreadableDegraded(f, effective));
 
   let askInbox: AskInbox = {
     asks: [],
@@ -519,13 +541,18 @@ export async function collectRunFacts(
   try {
     askInbox = askThreadsFrom(await readInbox(orca, options.inboxLimit));
   } catch (e) {
-    degraded.push({
+    degraded.push(effective ? {
+      kind: 'query_failed',
+      detail: 'the Orca inbox source query failed; ask and escalation facts are unavailable',
+      entityRefs: [redactedEntityRef('orca-inbox-failure', message(e))],
+      counts: { failedSources: 1 },
+    } : {
       kind: 'query_failed',
       detail: `inbox 실패: ${message(e)}. ask와 escalation badge가 없다`,
     });
   }
   for (const f of [...askInbox.unreadable].sort(byUnreadableField)) {
-    degraded.push(unreadableDegraded(f));
+    degraded.push(unreadableDegraded(f, effective));
   }
   // 포화는 **무조건** 컬렉션 수준으로 드러낸다. 이 Run에 미답 ask가 보일 때만 알리면 포화의 더
   // 나쁜 방향 — ask 행 자체가 조회 창 밖으로 밀려 badge도 degraded도 없이 사라지는 경우 — 이
@@ -552,9 +579,10 @@ export async function collectRunFacts(
       // degraded를 함께 싣는다. 이것이 없으면 조회에 실패한 Run이 미등록으로 둔갑해 OD-078의
       // 완화 장치가 다른 사건을 센다.
       unregisteredRuns.push({
-        runId: run.id,
-        repositoryIds: isEffectiveBridgeConfig(config) ? [] : projected.observedRepositoryIds,
-        ...(isEffectiveBridgeConfig(config) ? {
+        runId: effective ? '' : run.id,
+        repositoryIds: effective ? [] : projected.observedRepositoryIds,
+        ...(effective ? {
+          runRef: redactedEntityRef('orca-run', run.id),
           repositoryRefs: projected.observedRepositoryIds.map((id) =>
             redactedEntityRef('orca-repository', id)),
         } : {}),
@@ -608,7 +636,7 @@ export function formatRunCollection(c: RunCollection): string {
   for (const u of c.unregistered.runs) {
     const identities = u.repositoryRefs ?? u.repositoryIds;
     const label = u.repositoryRefs === undefined ? 'repoIds' : 'repoRefs';
-    lines.push(`  ${u.runId}  ${label}=${identities.join(',') || '관측 없음'}`);
+    lines.push(`  ${u.runRef ?? u.runId}  ${label}=${identities.join(',') || '관측 없음'}`);
     // 여기를 비우면 "조회했더니 등록에 없다"와 "조회가 실패해 판정할 수 없다"가 같은 줄이 된다.
     for (const d of u.degraded) lines.push(`    degraded   ${d.kind}  ${d.detail}`);
   }

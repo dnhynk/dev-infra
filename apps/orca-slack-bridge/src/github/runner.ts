@@ -11,14 +11,22 @@ const execFileAsync = promisify(execFile);
  */
 export interface GhRunner {
   /** stdout을 그대로 반환한다. 0이 아닌 종료 코드는 던진다. */
-  run(args: readonly string[]): Promise<string>;
+  run(args: readonly string[], options?: GhRunOptions): Promise<string>;
 }
+
+export type GhRunOptions = {
+  /** Cancels the command and terminates the production child process. */
+  readonly signal?: AbortSignal;
+  /** Defense-in-depth subprocess timeout; callers still own an outer promise deadline. */
+  readonly timeoutMs?: number;
+};
 
 export class GhCommandError extends Error {
   constructor(
     readonly args: readonly string[],
     readonly exitCode: number | null,
     readonly stderr: string,
+    readonly terminated: boolean = false,
   ) {
     super(`gh ${args.join(' ')} 실패 (exit ${exitCode ?? 'unknown'}): ${stderr.trim()}`);
     this.name = 'GhCommandError';
@@ -28,23 +36,44 @@ export class GhCommandError extends Error {
 export class GhCli implements GhRunner {
   constructor(private readonly bin = 'gh') {}
 
-  async run(args: readonly string[]): Promise<string> {
+  async run(args: readonly string[], options: GhRunOptions = {}): Promise<string> {
+    if (options.timeoutMs !== undefined &&
+        (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1)) {
+      throw new TypeError('GitHub CLI timeout must be a finite positive number');
+    }
     try {
       const { stdout } = await execFileAsync(this.bin, [...args], {
         encoding: 'utf8',
         maxBuffer: 32 * 1024 * 1024,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.timeoutMs === undefined ? {} : { timeout: Math.trunc(options.timeoutMs) }),
+        killSignal: 'SIGTERM',
       });
       return stdout;
     } catch (e) {
-      const err = e as { code?: number; stderr?: string };
-      throw new GhCommandError(args, err.code ?? null, err.stderr ?? String(e));
+      const err = e as {
+        code?: number | string;
+        stderr?: string;
+        killed?: boolean;
+        signal?: string;
+      };
+      throw new GhCommandError(
+        args,
+        typeof err.code === 'number' ? err.code : null,
+        err.stderr ?? String(e),
+        options.signal?.aborted === true || err.killed === true || err.signal !== undefined,
+      );
     }
   }
 }
 
 /** stdout을 JSON으로 파싱한다. 실패를 조용히 넘기지 않는다. */
-export async function ghJson<T>(runner: GhRunner, args: readonly string[]): Promise<T> {
-  const out = await runner.run(args);
+export async function ghJson<T>(
+  runner: GhRunner,
+  args: readonly string[],
+  options?: GhRunOptions,
+): Promise<T> {
+  const out = await runner.run(args, options);
   try {
     return JSON.parse(out) as T;
   } catch {

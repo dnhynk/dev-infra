@@ -3,6 +3,7 @@ import { buildEffectiveBridgeConfig } from '../src/discovery/effective-config.js
 import type { CanonicalGithubRepository } from '../src/discovery/types.js';
 import type { OrcaRunner } from '../src/orca/client.js';
 import { collectRunFacts } from '../src/run/collect.js';
+import { renderRunCard, renderRunCollectionCard } from '../src/run/render.js';
 import { parseConfig, type ParsedBridgeConfig } from '../src/project/config.js';
 import type {
   EffectiveDiscoverySnapshot,
@@ -111,13 +112,18 @@ class RunOrca implements OrcaRunner {
     private readonly runs: readonly RunRow[],
     private readonly repositoryIds: ReadonlyMap<string, readonly string[]>,
     private readonly malformedRuns: ReadonlySet<string> = new Set(),
+    private readonly overrides: ReadonlyMap<string, unknown | Error> = new Map(),
   ) {}
 
   async run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
     const command = args[1];
+    const override = command === undefined ? undefined : this.overrides.get(command);
+    if (override instanceof Error) throw override;
     let result: unknown;
-    if (command === 'run-list') {
+    if (override !== undefined) {
+      result = override;
+    } else if (command === 'run-list') {
       result = { runs: this.runs };
     } else if (command === 'inbox') {
       result = { messages: [] };
@@ -139,6 +145,16 @@ class RunOrca implements OrcaRunner {
     }
     return JSON.stringify({ id: 'synthetic-call', ok: true, result });
   }
+}
+
+function workerRow(runId: string, worktreeId: string, dispatchStatus = 'completed') {
+  return {
+    dispatchId: `ctx_${runId}`,
+    taskId: `task_${runId}_0`,
+    runId,
+    dispatchStatus,
+    resource: { worktreeId },
+  };
 }
 
 function taskRow(runId: string, incarnation: string, index: number) {
@@ -230,6 +246,21 @@ describe('O1-3 effective Run routing', () => {
     expect(degraded?.counts).toMatchObject({ observedRepositories: 2, resolvedProjects: 2 });
     expect(JSON.stringify(result)).not.toContain('private-orca-one');
     expect(JSON.stringify(result)).not.toContain('private-orca-two');
+    expect(JSON.stringify(result)).not.toContain('run_cross');
+
+    const rendered = JSON.stringify(renderRunCollectionCard({
+      cards: result.runs.length,
+      collection: { degraded: result.degraded, unregistered: result.unregistered },
+    }));
+    for (const ref of result.unregistered.runs[0]?.repositoryRefs ?? []) {
+      expect(rendered).toContain(ref);
+    }
+    for (const ref of degraded?.entityRefs ?? []) expect(rendered).toContain(ref);
+    expect(rendered).toContain('observedRepositories=2');
+    expect(rendered).toContain('resolvedProjects=2');
+    expect(rendered).toContain('blockingReasons=1');
+    expect(rendered).not.toContain('private-orca-one');
+    expect(rendered).not.toContain('private-orca-two');
   });
 
   it.each([
@@ -290,6 +321,178 @@ describe('O1-3 effective Run routing', () => {
     expect(result.unregistered.runs[0]?.degraded).toContainEqual(expect.objectContaining({
       kind: 'repository_identity_unreadable',
     }));
+  });
+
+  it.each([
+    {
+      name: 'missing task array',
+      overrides: new Map<string, unknown>([
+        ['task-list', { count: 1 }],
+        ['worker-list', { workers: [workerRow('run_shape', 'orca-manual::X:/synthetic')] }],
+      ]),
+    },
+    {
+      name: 'missing worker array',
+      overrides: new Map<string, unknown>([['worker-list', {}]]),
+    },
+    {
+      name: 'truncated task rows',
+      overrides: new Map<string, unknown>([
+        ['task-list', {
+          tasks: [taskRow('run_shape', 'orca-manual::X:/synthetic@@hash:worker', 0)],
+          count: 2,
+        }],
+        ['worker-list', { workers: [] }],
+      ]),
+    },
+    {
+      name: 'truncated worker rows',
+      overrides: new Map<string, unknown>([
+        ['worker-list', {
+          workers: [workerRow('run_shape', 'orca-manual::X:/synthetic')],
+          counts: { completed: 2 },
+        }],
+      ]),
+    },
+    {
+      name: 'empty task worktree suffix',
+      overrides: new Map<string, unknown>([
+        ['task-list', { tasks: [taskRow('run_shape', 'orca-manual::', 0)], count: 1 }],
+        ['worker-list', { workers: [] }],
+      ]),
+    },
+    {
+      name: 'empty worker worktree suffix',
+      overrides: new Map<string, unknown>([
+        ['task-list', { tasks: [], count: 0 }],
+        ['worker-list', { workers: [workerRow('run_shape', 'orca-manual::')] }],
+      ]),
+    },
+  ])('routes zero when repository-bearing sources are unreliable: $name', async ({ overrides }) => {
+    const bridgeConfig = config([{
+      name: 'manual', repositories: ['acme/one'], orcaRepositoryIds: ['orca-manual'],
+    }]);
+    const routing = buildEffectiveBridgeConfig(bridgeConfig, {
+      repositories: [], bindings: [], issues: [],
+    });
+    const result = await collectRunFacts(
+      new RunOrca(
+        [runRow('run_shape', EVIDENCE_AT)],
+        new Map([['run_shape', ['orca-manual']]]),
+        new Set(),
+        overrides,
+      ),
+      routing,
+      { now: () => OBSERVED_AT },
+    );
+
+    expect(result.runs).toEqual([]);
+    expect(result.unregistered.runs[0]?.degraded).toContainEqual(expect.objectContaining({
+      kind: 'repository_identity_unreadable',
+    }));
+    expect(JSON.stringify(result)).not.toContain('orca-manual');
+    expect(JSON.stringify(result)).not.toContain('run_shape');
+  });
+
+  it('keeps legacy manual routing when only an effective snapshot would reject incomplete axes', async () => {
+    const bridgeConfig = config([{
+      name: 'manual', repositories: ['acme/one'], orcaRepositoryIds: ['orca-manual'],
+    }]);
+    const result = await collectRunFacts(
+      new RunOrca(
+        [runRow('run_legacy_shape', EVIDENCE_AT)],
+        new Map([['run_legacy_shape', ['orca-manual']]]),
+        new Set(),
+        new Map([['worker-list', {}]]),
+      ),
+      bridgeConfig,
+      { now: () => OBSERVED_AT },
+    );
+    expect(result.runs[0]).toMatchObject({ project: 'manual' });
+  });
+
+  it.each([
+    {
+      name: 'task query',
+      overrides: (marker: string) => new Map<string, unknown | Error>([
+        ['task-list', new Error(marker)],
+        ['worker-list', { workers: [workerRow('run_redaction', 'orca-manual::X:/synthetic')] }],
+      ]),
+    },
+    {
+      name: 'worker query',
+      overrides: (marker: string) => new Map<string, unknown | Error>([
+        ['worker-list', new Error(marker)],
+      ]),
+    },
+    {
+      name: 'gate query',
+      overrides: (marker: string) => new Map<string, unknown | Error>([
+        ['gate-list', new Error(marker)],
+      ]),
+    },
+    {
+      name: 'worker-show query',
+      overrides: (marker: string) => new Map<string, unknown | Error>([
+        ['worker-list', {
+          workers: [workerRow('run_redaction', 'orca-manual::X:/synthetic', 'dispatched')],
+        }],
+        ['worker-show', new Error(marker)],
+      ]),
+    },
+    {
+      name: 'inbox query',
+      overrides: (marker: string) => new Map<string, unknown | Error>([
+        ['inbox', new Error(marker)],
+      ]),
+    },
+    {
+      name: 'unreadable task field',
+      overrides: (marker: string) => new Map<string, unknown | Error>([
+        ['task-list', {
+          tasks: [{
+            ...taskRow('run_redaction', 'orca-manual::X:/synthetic@@hash:worker', 0),
+            id: marker,
+            created_by_run_generation: marker,
+          }],
+          count: 1,
+        }],
+      ]),
+    },
+  ])('redacts raw markers from effective $name failures and rendered blocks', async ({ overrides }) => {
+    const marker = 'RAW_PAYLOAD_MARKER C:/private/path private-id CLI_OUTPUT';
+    const bridgeConfig = config([{
+      name: 'manual', repositories: ['acme/one'], orcaRepositoryIds: ['orca-manual'],
+    }]);
+    const routing = buildEffectiveBridgeConfig(bridgeConfig, {
+      repositories: [], bindings: [], issues: [],
+    });
+    const result = await collectRunFacts(
+      new RunOrca(
+        [runRow('run_redaction', EVIDENCE_AT)],
+        new Map([['run_redaction', ['orca-manual']]]),
+        new Set(),
+        overrides(marker),
+      ),
+      routing,
+      { now: () => OBSERVED_AT },
+    );
+    const collection = { degraded: result.degraded, unregistered: result.unregistered };
+    const rendered = result.runs[0] === undefined
+      ? renderRunCollectionCard({ cards: 0, collection })
+      : renderRunCard({ run: result.runs[0], pullRequests: [], collection });
+    const serialized = JSON.stringify({ result, rendered });
+    for (const raw of ['RAW_PAYLOAD_MARKER', 'C:/private/path', 'private-id', 'CLI_OUTPUT']) {
+      expect(serialized).not.toContain(raw);
+    }
+    const degraded = [
+      ...result.degraded,
+      ...result.runs.flatMap((run) => run.degraded),
+      ...result.unregistered.runs.flatMap((run) => run.degraded),
+    ].filter((row) => row.kind === 'query_failed' || row.kind === 'unreadable_field');
+    expect(degraded.length).toBeGreaterThan(0);
+    expect(degraded.every((row) => (row.entityRefs?.length ?? 0) > 0)).toBe(true);
+    expect(degraded.every((row) => Object.keys(row.counts ?? {}).length > 0)).toBe(true);
   });
 
   it('preserves D1 manual-only routing without a discovery snapshot', async () => {

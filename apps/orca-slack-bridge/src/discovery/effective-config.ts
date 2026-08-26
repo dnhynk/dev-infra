@@ -78,10 +78,6 @@ function clonedConfig(config: ParsedBridgeConfig): ParsedBridgeConfig {
   return JSON.parse(JSON.stringify(config)) as ParsedBridgeConfig;
 }
 
-function autoProjectKey(identity: CanonicalGithubRepository): string {
-  return `auto:${identity.canonicalKey}`;
-}
-
 function identityFromCanonical(canonicalKey: string): CanonicalGithubRepository {
   return normalizeGithubNameWithOwner(canonicalKey.slice('github.com/'.length));
 }
@@ -130,6 +126,27 @@ export function buildEffectiveBridgeConfig(
     for (const id of block.orcaRepositoryIds) blockedById.set(id, block);
   }
 
+  // Defense in depth for snapshots produced by an older writer. Reconciliation normally catches
+  // this before its transaction, but an already-over-limit LKG must still route zero for the
+  // complete canonical group rather than reviving the first sixteen aliases.
+  const idsByCanonical = new Map<string, string[]>();
+  for (const binding of snapshot.bindings) {
+    if (binding.canonicalKey === null) continue;
+    const ids = idsByCanonical.get(binding.canonicalKey) ?? [];
+    ids.push(binding.orcaRepositoryId);
+    idsByCanonical.set(binding.canonicalKey, ids);
+  }
+  for (const [canonicalKey, ids] of idsByCanonical) {
+    const ordered = [...new Set(ids)].sort(compareText);
+    if (ordered.length <= config.automation.capacity.orcaIdsPerCanonicalRepository) continue;
+    const block: EffectiveBindingBlock = {
+      orcaRepositoryIds: ordered,
+      reason: 'capacity_conflict',
+      identity: identityFromCanonical(canonicalKey),
+    };
+    for (const id of ordered) blockedById.set(id, block);
+  }
+
   const repositories = new Map(snapshot.repositories.map((row) => [row.canonicalKey, row]));
   const repositoryProject = new Map<string, {
     readonly projectKey: string;
@@ -147,7 +164,10 @@ export function buildEffectiveBridgeConfig(
     } else if (explicit !== undefined) {
       assignment = { projectKey: explicit, projectOrigin: 'explicit' };
     } else if (repository.projectOrigin === 'auto') {
-      assignment = { projectKey: autoProjectKey(repository), projectOrigin: 'auto' };
+      // Auto Project keys remain stable across an authoritative GitHub rename. Besides avoiding
+      // downstream identity churn, the durable key records the observed alias that GitHub already
+      // proved, which lets a later bounded outage carry that rename without guessing.
+      assignment = { projectKey: repository.projectKey, projectOrigin: 'auto' };
     } else if (projects.has(repository.projectKey)) {
       // A current-pass verified rename can keep an explicit Project while its configured display
       // spelling catches up. Stale explicit rows without a surviving Project are never trusted.
@@ -269,8 +289,13 @@ export function buildEffectiveBridgeConfig(
     }))
     .sort((a, b) => compareText(a.key, b.key));
 
-  const effectiveRepositoryCount = new Set(
-    effectiveProjects.flatMap((project) => project.repositories.map((row) => row.canonicalKey)),
+  // Configured repositories consume their explicit slots. A GitHub-confirmed spelling change in
+  // the same explicit Project is not an extra repository, while every auto numeric identity is.
+  const effectiveRepositoryCount = explicitByCanonical.size + new Set(
+    snapshot.repositories
+      .filter((repository) => repository.githubRepositoryId !== null &&
+        repositoryProject.get(repository.canonicalKey)?.projectOrigin === 'auto')
+      .map((repository) => repository.githubRepositoryId as number),
   ).size;
   const routingBlock = options.routingBlock ?? (
     effectiveRepositoryCount > config.automation.capacity.repositories ? 'capacity_conflict' : undefined
@@ -284,7 +309,14 @@ export function buildEffectiveBridgeConfig(
       : { status: 'partially_blocked', blockedBindingCount };
   const diagnostics = (options.diagnostics ?? []).map((row) => ({ ...row })).sort((a, b) =>
     a.rowIndex - b.rowIndex || compareText(a.code, b.code));
-  const revision = contentRevision({ fingerprint, effectiveProjects, bindings, diagnostics, routing });
+  // rowIndex is useful source provenance, not routing content. Orca may permute identical rows;
+  // hashing that position would produce a new revision for the same semantic effective config.
+  const semanticDiagnostics = diagnostics
+    .map(({ rowIndex: _rowIndex, ...row }) => row)
+    .sort((a, b) => compareText(canonicalJson(a), canonicalJson(b)));
+  const revision = contentRevision({
+    fingerprint, effectiveProjects, bindings, diagnostics: semanticDiagnostics, routing,
+  });
 
   return deepFreeze({
     base: clonedConfig(config),
