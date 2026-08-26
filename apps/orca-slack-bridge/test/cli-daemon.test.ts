@@ -202,6 +202,24 @@ class FakeOrca implements OrcaRunner {
   }
   run(args: readonly string[]): Promise<string> {
     this.calls.push([...args]);
+    if (args[1] === 'run-show') {
+      return Promise.resolve(JSON.stringify({
+        id: 'run', ok: true,
+        result: {
+          run: {
+            id: RUN_ID,
+            objective: 'test',
+            home_database: 'this_database',
+            coordinator_handle: 'term_current_coordinator',
+            coordinator_pane_key: 'tab:pane',
+            consumer_generation: 2,
+            legacy: 0,
+            created_at: '2026-08-24T09:00:00.000Z',
+            updated_at: '2026-08-24T10:00:00.000Z',
+          },
+        },
+      }));
+    }
     if (args[1] === 'gate-list') {
       const response = JSON.stringify({ id: 'x', ok: true, result: { runId: RUN_ID, gates: [this.gate()], count: 1 } });
       if (this.blockFirstList && this.calls.filter((call) => call[1] === 'gate-list').length === 1) {
@@ -619,7 +637,9 @@ describe('daemon production wiring', () => {
     expect(code).toBe(0);
     expect(acks).toBe(1);
     expect(closed).toBe(1);
-    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list', 'gate-list', 'gate-resolve', 'gate-list']);
+    expect(orca.calls.map((call) => call[1])).toEqual([
+      'gate-list', 'gate-list', 'run-show', 'gate-resolve', 'gate-list',
+    ]);
     expect(slack.updates).toHaveLength(2);
     expect(JSON.stringify(slack.updates[0])).toContain('resolving');
     expect(JSON.stringify(slack.updates.at(-1))).toContain('Coordinator 통지 대기');
@@ -795,7 +815,9 @@ describe('daemon production wiring', () => {
 
     expect(code).toBe(1);
     expect(closed).toBeGreaterThanOrEqual(1);
-    expect(orca.calls.map((call) => call[1])).toEqual(['gate-list', 'gate-list', 'gate-resolve', 'gate-list']);
+    expect(orca.calls.map((call) => call[1])).toEqual([
+      'gate-list', 'gate-list', 'run-show', 'gate-resolve', 'gate-list',
+    ]);
     const reopened = new SqliteDigestStore(statePath);
     expect(reopened.findGateResolution(GATE)?.lifecycle).toBe('resolved');
     reopened.close();
@@ -895,7 +917,7 @@ describe('daemon production wiring', () => {
     expect(starts).toBe(1);
     expect(slack.updates).toHaveLength(3);
     expect(orca.calls.map((call) => call[1])).toEqual([
-      'gate-list', 'gate-list', 'gate-resolve', 'gate-list', 'task-list',
+      'gate-list', 'gate-list', 'run-show', 'gate-resolve', 'gate-list', 'task-list',
     ]);
     const reopened = new SqliteDigestStore(statePath);
     expect(reopened.findGateResolution(GATE)).toMatchObject({

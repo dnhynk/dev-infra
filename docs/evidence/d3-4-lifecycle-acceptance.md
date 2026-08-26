@@ -108,14 +108,16 @@ stateful default-engine daemon composition. The repaired tree adds exact regress
 Approval still requires fresh reviews of the pushed repaired head; the coordinator owns those
 exact-head audits.
 
-## Residual: `LIVE_CHANNEL_UNVERIFIED`
+## Offline residual, narrowed but not closed by live observation
 
 No actual Claude Code 2.1.243 Channel was registered or launched, no development warning was
 confirmed, no user `.mcp.json` or Bridge configuration was changed, and no live Slack or Orca
 resource was mutated. Offline notification writes, probe receipts, Gate consumption, and simulated
 Task/Dispatch shapes do not prove that a real coordinator resumed.
 
-Keep `LIVE_CHANNEL_UNVERIFIED` until the coordinator manually confirms the every-launch warning in
-an interactive Claude Code 2.1.243 development-channel session and observes both the exact
-post-baseline Orca Task/Dispatch resume witness and the corresponding existing Slack card update on
-the reviewed build.
+On 2026-08-26 the operator personally approved an interactive Claude Code 2.1.243 development
+Channel session, and the exercise observed the post-baseline Orca Dispatch witness, same-message
+Slack update, duplicate-receipt no-op, and restart/reconnect behavior. The session Adapter had been
+launched from the pre-repair build while the daemon was rebuilt after the authority repair, so this
+does not satisfy the one-exact-build release condition. Keep `LIVE_CHANNEL_UNVERIFIED`; see
+[D3 live Channel acceptance evidence](d3-live-channel-acceptance.md).
