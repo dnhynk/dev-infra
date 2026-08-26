@@ -241,7 +241,10 @@ O1-4는 daemon scheduling이나 Windows Task를 활성화하지 않고 redacted 
 rotation-aware `logs`, O1-5용 heartbeat/job telemetry adapter까지만 제공한다. 운영 job scheduling과 설치 성공
 판정은 각각 O1-5와 O1-6/7 출구 조건에 남는다. closed status snapshot은 immutable SQLite online backup을,
 live WAL은 daemon/store owner의 strict aggregate cache와 bounded private local RPC를 사용해 status process가
-source DB/WAL/SHM을 열지 않는다. disabled observer job은 opt-out으로 분류하며, logs follow는 exact bigint file
+source DB/WAL/SHM을 열지 않는다. RPC는 current-user-only rotating capability와 HMAC으로 owner를 attestation하고,
+Windows에서는 protected artifact에 기록된 OS-assigned `127.0.0.1` endpoint, 비-Windows에서는 private local pipe를
+쓴다. 두 방향 모두 bounded length prefix 하나와 EOF를 요구해 split/coalesced/partial/trailing/replay frame을
+fail closed한다. disabled observer job은 opt-out으로 분류하며, logs follow는 exact bigint file
 identity·verified chain epoch·initial append/unterminated handoff·retained multi-rotation drain·
 content-witness truncate detection을 보장한다.
 

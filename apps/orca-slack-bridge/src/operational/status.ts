@@ -1,8 +1,8 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { backup, DatabaseSync } from 'node:sqlite';
 import {
@@ -25,6 +25,21 @@ import {
   operationalLogPath,
   resolveOperationalLogDir,
 } from './logger.js';
+import {
+  activeOperationalStatusCapability,
+  CurrentUserOperationalStatusCapabilityStore,
+  operationalStatusCapabilityIsFresh,
+  operationalStatusCapabilityPath,
+  operationalStatusStateIdentity,
+  retiredOperationalStatusCapability,
+  STATUS_OWNER_CAPABILITY_FUTURE_TOLERANCE_MS,
+  STATUS_OWNER_CAPABILITY_MAX_AGE_MS,
+  STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS,
+  type ActiveOperationalStatusCapability,
+  type OperationalStatusCapabilityStore,
+  type OperationalStatusTransportEndpoint,
+  type RetiredOperationalStatusCapability,
+} from './status-capability.js';
 export { OPERATIONAL_JOB_NAMES } from './logger.js';
 
 export const STATUS_CODES = [
@@ -137,8 +152,12 @@ export type InspectOperationalStatusOptions = {
   readonly afterSqliteBackupStep?: () => void;
   /** Test-only parent for proving that the online snapshot leaves no temporary file. */
   readonly temporaryDirectory?: string;
-  /** Test seam for a private status owner endpoint; production derives it from the state path. */
+  /** POSIX test seam; Windows endpoints come only from the protected owner capability. */
   readonly ownerPipePath?: string;
+  /** Test seam for the protected capability artifact; production uses a per-user runtime path. */
+  readonly ownerCapabilityPath?: string;
+  /** Safe platform abstraction for synthetic permission/rotation races. */
+  readonly ownerCapabilityStore?: OperationalStatusCapabilityStore;
   /** Bounded local owner request timeout. */
   readonly ownerTimeoutMilliseconds?: number;
   /** Transport freshness clock, deliberately separate from heartbeat classification time. */
@@ -367,28 +386,35 @@ export function projectOperationalStore(
   return projectCapturedOperationalStore(captureOperationalStore(store), expectations);
 }
 
-const STATUS_OWNER_PROTOCOL_VERSION = 1;
-const STATUS_OWNER_MAX_REQUEST_BYTES = 512;
+const STATUS_OWNER_PROTOCOL_VERSION = 2;
+const STATUS_OWNER_MAX_REQUEST_BYTES = 1_024;
 const STATUS_OWNER_MAX_RESPONSE_BYTES = 64 * 1024;
 const STATUS_OWNER_MAX_CONNECTIONS = 8;
 const STATUS_OWNER_DEFAULT_TIMEOUT_MS = 1_000;
 const STATUS_OWNER_DEFAULT_REFRESH_MS = 1_000;
-const STATUS_OWNER_MAX_AGE_MS = 5_000;
-const STATUS_OWNER_FUTURE_TOLERANCE_MS = 1_000;
+const STATUS_OWNER_MESSAGE_MAX_AGE_MS = 5_000;
 const FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
 const NONCE_PATTERN = /^[0-9a-f]{32}$/;
 const FAILURE_CODE_SET = new Set<string>(OPERATIONAL_FAILURE_CODES);
 
 type OwnerRequest = {
-  readonly version: 1;
+  readonly version: 2;
+  readonly stateIdentity: string;
+  readonly capabilityId: string;
+  readonly transport: OperationalStatusTransportEndpoint;
   readonly nonce: string;
+  readonly sentAt: string;
   readonly configFingerprint: string;
   readonly buildFingerprint: string | null;
+  readonly authenticator: string;
 };
 
-type OwnerCache = {
+type UnsignedOwnerRequest = Omit<OwnerRequest, 'authenticator'>;
+
+type OwnerGeneration = {
   readonly capturedAt: string;
   readonly captured: CapturedOperationalStore;
+  readonly capability: ActiveOperationalStatusCapability;
 };
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
@@ -413,23 +439,85 @@ function nullableIso(value: unknown): value is string | null {
   return value === null || canonicalIso(value);
 }
 
-function parseOwnerRequest(value: unknown): OwnerRequest | null {
+function ownerAuthenticator(secret: string, domain: 'request' | 'response', value: unknown): string {
+  return createHmac('sha256', Buffer.from(secret, 'hex'))
+    .update(`orca-slack-bridge-status-owner-v2:${domain}\0`, 'utf8')
+    .update(canonicalJson(value), 'utf8')
+    .digest('hex');
+}
+
+function sameAuthenticator(expected: string, actual: unknown): boolean {
+  if (typeof actual !== 'string' || !FINGERPRINT_PATTERN.test(actual)) return false;
+  return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
+}
+
+function sameCanonical(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function encodeOwnerFrame(value: unknown, maximumBytes: number): Buffer | null {
+  const payload = Buffer.from(JSON.stringify(value), 'utf8');
+  if (payload.length === 0 || payload.length > maximumBytes - 4) return null;
+  const frame = Buffer.allocUnsafe(payload.length + 4);
+  frame.writeUInt32BE(payload.length, 0);
+  payload.copy(frame, 4);
+  return frame;
+}
+
+function declaredOwnerFrameLength(input: Buffer, maximumBytes: number): number | null {
+  if (input.length < 4) return null;
+  const declared = input.readUInt32BE(0);
+  return declared > 0 && declared <= maximumBytes - 4 ? declared : -1;
+}
+
+function parseExactOwnerFrame(input: Buffer, maximumBytes: number): unknown | null {
+  const declared = declaredOwnerFrameLength(input, maximumBytes);
+  if (declared === null || declared < 0 || input.length !== declared + 4) return null;
+  try {
+    return JSON.parse(input.subarray(4).toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function parseOwnerRequest(
+  value: unknown,
+  generation: OwnerGeneration,
+  now: Date,
+): OwnerRequest | null {
   const record = exactRecord(value, [
-    'version', 'nonce', 'configFingerprint', 'buildFingerprint',
+    'version', 'stateIdentity', 'capabilityId', 'nonce', 'sentAt',
+    'transport', 'configFingerprint', 'buildFingerprint', 'authenticator',
   ]);
   if (record === null || record['version'] !== STATUS_OWNER_PROTOCOL_VERSION ||
+      record['stateIdentity'] !== generation.capability.stateIdentity ||
+      record['capabilityId'] !== generation.capability.capabilityId ||
+      !sameCanonical(record['transport'], generation.capability.transport) ||
       typeof record['nonce'] !== 'string' || !NONCE_PATTERN.test(record['nonce']) ||
+      !canonicalIso(record['sentAt']) ||
       typeof record['configFingerprint'] !== 'string' ||
       !FINGERPRINT_PATTERN.test(record['configFingerprint']) ||
       (record['buildFingerprint'] !== null &&
        (typeof record['buildFingerprint'] !== 'string' ||
         !FINGERPRINT_PATTERN.test(record['buildFingerprint'])))) return null;
-  return {
-    version: 1,
+  const age = now.getTime() - Date.parse(record['sentAt']);
+  if (age < -STATUS_OWNER_CAPABILITY_FUTURE_TOLERANCE_MS ||
+      age > STATUS_OWNER_MESSAGE_MAX_AGE_MS) return null;
+  const unsigned: UnsignedOwnerRequest = {
+    version: 2,
+    stateIdentity: record['stateIdentity'] as string,
+    capabilityId: record['capabilityId'] as string,
+    transport: generation.capability.transport,
     nonce: record['nonce'],
+    sentAt: record['sentAt'],
     configFingerprint: record['configFingerprint'],
     buildFingerprint: record['buildFingerprint'] as string | null,
   };
+  if (!sameAuthenticator(
+    ownerAuthenticator(generation.capability.secret, 'request', unsigned),
+    record['authenticator'],
+  )) return null;
+  return { ...unsigned, authenticator: record['authenticator'] as string };
 }
 
 function parseStatusJob(value: unknown): OperationalStatusJob | null {
@@ -521,11 +609,27 @@ export function operationalStatusOwnerPipePath(
   statePath: string,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const canonical = platform === 'win32' ? resolve(statePath).toLowerCase() : resolve(statePath);
-  const key = createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 24);
-  if (platform === 'win32') return String.raw`\\.\pipe\orca-slack-bridge-status-v1-${key}`;
+  if (platform === 'win32') throw new TypeError('status.owner_transport_invalid');
+  const key = operationalStatusStateIdentity(statePath, platform).slice(0, 24);
   const user = typeof process.getuid === 'function' ? String(process.getuid()) : 'user';
-  return `\0orca-slack-bridge-status-v1-${user}-${key}`;
+  return `\0orca-slack-bridge-status-v2-${user}-${key}`;
+}
+
+function expectedOwnerTransport(
+  value: unknown,
+  statePath: string,
+  pipePath: string | undefined,
+  platform: NodeJS.Platform,
+): value is OperationalStatusTransportEndpoint {
+  if (platform === 'win32') {
+    const record = exactRecord(value, ['kind', 'host', 'port']);
+    return pipePath === undefined && record !== null && record['kind'] === 'tcp' &&
+      record['host'] === '127.0.0.1' && Number.isSafeInteger(record['port']) &&
+      Number(record['port']) >= 1 && Number(record['port']) <= 65_535;
+  }
+  const record = exactRecord(value, ['kind', 'path']);
+  return record !== null && record['kind'] === 'pipe' &&
+    record['path'] === (pipePath ?? operationalStatusOwnerPipePath(statePath, platform));
 }
 
 export type OperationalStatusOwnerServerLike = {
@@ -542,6 +646,10 @@ export type OperationalStatusOwnerServerOptions = {
     'readEffectiveDiscoverySnapshot' | 'readOperationalAggregateCounts'
   >;
   readonly pipePath?: string;
+  readonly capabilityPath?: string;
+  readonly capabilityStore?: OperationalStatusCapabilityStore;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly platform?: NodeJS.Platform;
   readonly clock?: () => Date;
   readonly refreshMilliseconds?: number | null;
   readonly beforeRefresh?: () => void;
@@ -553,21 +661,38 @@ export type OperationalStatusOwnerServerOptions = {
  * serialize the finite projection, so the status process never opens or maps the live DB/WAL/SHM.
  */
 export class OperationalStatusOwnerServer implements OperationalStatusOwnerServerLike {
-  private readonly pipePath: string;
+  private readonly platform: NodeJS.Platform;
+  private readonly pipePath: string | null;
+  private readonly stateIdentity: string;
+  private readonly capabilityPath: string;
+  private readonly capabilityStore: OperationalStatusCapabilityStore;
   private readonly clock: () => Date;
   private readonly refreshMilliseconds: number | null;
   private server: Server | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private cache: OwnerCache | null = null;
+  private generation: OwnerGeneration | null = null;
   private readonly sockets = new Set<Socket>();
 
   constructor(private readonly options: OperationalStatusOwnerServerOptions) {
-    this.pipePath = options.pipePath ?? operationalStatusOwnerPipePath(options.statePath);
+    const platform = options.platform ?? process.platform;
+    const env = options.env ?? process.env;
+    if (platform === 'win32' && options.pipePath !== undefined) {
+      throw new TypeError('status.owner_transport_invalid');
+    }
+    this.platform = platform;
+    this.pipePath = platform === 'win32'
+      ? null
+      : options.pipePath ?? operationalStatusOwnerPipePath(options.statePath, platform);
+    this.stateIdentity = operationalStatusStateIdentity(options.statePath, platform);
+    this.capabilityPath = options.capabilityPath ??
+      operationalStatusCapabilityPath(options.statePath, env, platform);
+    this.capabilityStore = options.capabilityStore ??
+      new CurrentUserOperationalStatusCapabilityStore(platform, env);
     this.clock = options.clock ?? (() => new Date());
     const refreshMilliseconds = options.refreshMilliseconds ?? STATUS_OWNER_DEFAULT_REFRESH_MS;
     if (refreshMilliseconds !== null &&
         (!Number.isSafeInteger(refreshMilliseconds) || refreshMilliseconds < 100 ||
-         refreshMilliseconds > STATUS_OWNER_MAX_AGE_MS)) {
+         refreshMilliseconds > STATUS_OWNER_CAPABILITY_MAX_AGE_MS)) {
       throw new TypeError('status.owner_refresh_invalid');
     }
     this.refreshMilliseconds = refreshMilliseconds;
@@ -575,11 +700,35 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
 
   refresh(): void {
     try {
+      const previous = this.generation;
+      if (this.server === null || previous === null) throw new Error('status.snapshot_unavailable');
       this.options.beforeRefresh?.();
       const captured = captureOperationalStore(this.options.store, this.options.afterDaemonCapture);
       const now = transportNow(this.clock);
       if (now === null) throw new Error('status.snapshot_unavailable');
-      this.cache = { capturedAt: now.toISOString(), captured };
+      const previousAge = now.getTime() - Date.parse(previous.capability.publishedAt);
+      const capability = previousAge < 0 ||
+          previousAge >= STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS
+        ? activeOperationalStatusCapability(
+          this.stateIdentity,
+          previous.capability.transport,
+          now.toISOString(),
+        )
+        : previous.capability;
+      const generation: OwnerGeneration = {
+        capturedAt: now.toISOString(),
+        captured,
+        capability,
+      };
+      if (capability !== previous.capability) {
+        this.capabilityStore.publish(this.capabilityPath, generation.capability);
+        const confirmed = this.capabilityStore.read(this.capabilityPath);
+        if (confirmed.kind !== 'ready' || confirmed.value.status !== 'active' ||
+            !sameCanonical(confirmed.value, generation.capability)) {
+          throw new Error('status.snapshot_unavailable');
+        }
+      }
+      this.generation = generation;
     } catch {
       throw new Error('status.snapshot_unavailable');
     }
@@ -587,22 +736,76 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
 
   async start(): Promise<void> {
     if (this.server !== null) throw new Error('status.owner_start_failed');
-    this.refresh();
-    const server = createServer((socket) => this.accept(socket));
+    const server = createServer({ allowHalfOpen: true }, (socket) => this.accept(socket));
     this.server = server;
+    let published: ActiveOperationalStatusCapability | null = null;
     try {
       await new Promise<void>((resolveListen, reject) => {
         const failed = (): void => reject(new Error('status.owner_start_failed'));
         server.once('error', failed);
-        server.listen(this.pipePath, () => {
+        const ready = (): void => {
           server.off('error', failed);
           server.on('error', () => undefined);
           resolveListen();
-        });
+        };
+        if (this.platform === 'win32') {
+          // libuv named pipes cannot preserve the readable half after client EOF on Windows.
+          // Loopback TCP supplies the exact request-EOF/response-EOF boundary on one connection.
+          server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, ready);
+        } else {
+          server.listen(this.pipePath!, ready);
+        }
       });
+      const transport = this.boundTransport(server);
+      if (transport === null) throw new Error('status.owner_start_failed');
+      this.options.beforeRefresh?.();
+      const captured = captureOperationalStore(this.options.store, this.options.afterDaemonCapture);
+      const now = transportNow(this.clock);
+      if (now === null) throw new Error('status.owner_start_failed');
+      const generation: OwnerGeneration = {
+        capturedAt: now.toISOString(),
+        captured,
+        capability: activeOperationalStatusCapability(
+          this.stateIdentity,
+          transport,
+          now.toISOString(),
+        ),
+      };
+      const existing = this.capabilityStore.read(this.capabilityPath);
+      if (existing.kind === 'invalid' ||
+          (existing.kind === 'ready' && existing.value.stateIdentity !== this.stateIdentity) ||
+          (existing.kind === 'ready' && existing.value.status === 'active' &&
+           operationalStatusCapabilityIsFresh(existing.value, now))) {
+        throw new Error('status.owner_start_failed');
+      }
+      published = generation.capability;
+      this.capabilityStore.publish(this.capabilityPath, generation.capability);
+      const confirmed = this.capabilityStore.read(this.capabilityPath);
+      if (confirmed.kind !== 'ready' || confirmed.value.status !== 'active' ||
+          !sameCanonical(confirmed.value, generation.capability)) {
+        throw new Error('status.owner_start_failed');
+      }
+      this.generation = generation;
     } catch {
       this.server = null;
-      try { server.close(); } catch { /* no owned listener survived */ }
+      for (const socket of this.sockets) socket.destroy();
+      this.sockets.clear();
+      await new Promise<void>((resolveClose) => {
+        try { server.close(() => resolveClose()); } catch { resolveClose(); }
+      });
+      if (published !== null) {
+        try {
+          const now = transportNow(this.clock);
+          const current = this.capabilityStore.read(this.capabilityPath);
+          if (now !== null && current.kind === 'ready' && current.value.status === 'active' &&
+              sameCanonical(current.value, published)) {
+            const retired = retiredOperationalStatusCapability(published, now.toISOString());
+            this.capabilityStore.publish(this.capabilityPath, retired);
+            this.capabilityStore.remove(this.capabilityPath, retired);
+          }
+        } catch { /* stale protected metadata fails closed */ }
+      }
+      this.generation = null;
       throw new Error('status.owner_start_failed');
     }
     if (this.refreshMilliseconds !== null) {
@@ -613,21 +816,57 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     }
   }
 
+  private boundTransport(server: Server): OperationalStatusTransportEndpoint | null {
+    if (this.platform !== 'win32') {
+      return this.pipePath === null ? null : { kind: 'pipe', path: this.pipePath };
+    }
+    const address = server.address();
+    return address !== null && typeof address !== 'string' && address.family === 'IPv4' &&
+        address.address === '127.0.0.1' && Number.isSafeInteger(address.port) &&
+        address.port >= 1 && address.port <= 65_535
+      ? { kind: 'tcp', host: '127.0.0.1', port: address.port }
+      : null;
+  }
+
   async stop(): Promise<void> {
     if (this.timer !== null) clearInterval(this.timer);
     this.timer = null;
-    for (const socket of this.sockets) socket.destroy();
-    this.sockets.clear();
     const server = this.server;
     this.server = null;
-    if (server === null) return;
-    await new Promise<void>((resolveClose) => {
-      try { server.close(() => resolveClose()); } catch { resolveClose(); }
-    });
+    const active = this.generation?.capability ?? null;
+    this.generation = null;
+    let retired: RetiredOperationalStatusCapability | null = null;
+    let failed = false;
+    if (active !== null) {
+      try {
+        const now = transportNow(this.clock);
+        const current = this.capabilityStore.read(this.capabilityPath);
+        if (now === null || current.kind !== 'ready' || current.value.status !== 'active' ||
+            !sameCanonical(current.value, active)) {
+          throw new Error('status.owner_stop_failed');
+        }
+        retired = retiredOperationalStatusCapability(active, now.toISOString());
+        this.capabilityStore.publish(this.capabilityPath, retired);
+      } catch {
+        failed = true;
+      }
+    }
+    for (const socket of this.sockets) socket.destroy();
+    this.sockets.clear();
+    if (server !== null) {
+      await new Promise<void>((resolveClose) => {
+        try { server.close(() => resolveClose()); } catch { resolveClose(); }
+      });
+    }
+    if (retired !== null) {
+      try { this.capabilityStore.remove(this.capabilityPath, retired); } catch { failed = true; }
+    }
+    if (failed) throw new Error('status.owner_stop_failed');
   }
 
   private accept(socket: Socket): void {
-    if (this.sockets.size >= STATUS_OWNER_MAX_CONNECTIONS) {
+    if ((this.platform === 'win32' && socket.remoteAddress !== '127.0.0.1') ||
+        this.sockets.size >= STATUS_OWNER_MAX_CONNECTIONS) {
       socket.destroy();
       return;
     }
@@ -636,44 +875,73 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     socket.on('error', () => undefined);
     socket.on('close', () => this.sockets.delete(socket));
     let input = Buffer.alloc(0);
-    let handled = false;
+    let rejected = false;
     socket.on('data', (chunk: Buffer) => {
-      if (handled) return;
+      if (rejected) return;
       if (input.length + chunk.length > STATUS_OWNER_MAX_REQUEST_BYTES) {
-        handled = true;
+        rejected = true;
         socket.destroy();
         return;
       }
       input = Buffer.concat([input, chunk]);
-      const delimiter = input.indexOf(0x0a);
-      if (delimiter < 0) return;
-      handled = true;
-      if (delimiter !== input.length - 1) {
+      const declared = declaredOwnerFrameLength(input, STATUS_OWNER_MAX_REQUEST_BYTES);
+      if (declared !== null && (declared < 0 || input.length > declared + 4)) {
+        rejected = true;
+        socket.destroy();
+      }
+    });
+    socket.on('end', () => {
+      if (rejected) return;
+      const generation = this.generation;
+      const now = transportNow(this.clock);
+      const persisted = this.capabilityStore.read(this.capabilityPath);
+      if (generation === null || now === null ||
+          !operationalStatusCapabilityIsFresh(generation.capability, now) ||
+          persisted.kind !== 'ready' || persisted.value.status !== 'active' ||
+          !sameCanonical(persisted.value, generation.capability)) {
         socket.destroy();
         return;
       }
-      let request: OwnerRequest | null = null;
-      try {
-        request = parseOwnerRequest(JSON.parse(input.subarray(0, delimiter).toString('utf8')));
-      } catch {
-        request = null;
-      }
-      const cached = this.cache;
-      if (request === null || cached === null) {
+      const request = parseOwnerRequest(
+        parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
+        generation,
+        now,
+      );
+      if (request === null) {
         socket.destroy();
         return;
       }
-      const response = Buffer.from(`${JSON.stringify({
-        version: STATUS_OWNER_PROTOCOL_VERSION,
+      const unsignedRequest: UnsignedOwnerRequest = {
+        version: request.version,
+        stateIdentity: request.stateIdentity,
+        capabilityId: request.capabilityId,
+        transport: request.transport,
         nonce: request.nonce,
-        capturedAt: cached.capturedAt,
+        sentAt: request.sentAt,
+        configFingerprint: request.configFingerprint,
+        buildFingerprint: request.buildFingerprint,
+      };
+      const unsignedResponse = {
+        version: STATUS_OWNER_PROTOCOL_VERSION,
+        stateIdentity: request.stateIdentity,
+        capabilityId: request.capabilityId,
+        transport: request.transport,
+        nonce: request.nonce,
+        capturedAt: generation.capturedAt,
         schemaVersion: SCHEMA_VERSION,
-        snapshot: projectCapturedOperationalStore(cached.captured, {
+        snapshot: projectCapturedOperationalStore(generation.captured, {
           configFingerprint: request.configFingerprint,
           buildFingerprint: request.buildFingerprint,
         }),
-      })}\n`, 'utf8');
-      if (response.length > STATUS_OWNER_MAX_RESPONSE_BYTES) {
+      };
+      const response = encodeOwnerFrame({
+        ...unsignedResponse,
+        authenticator: ownerAuthenticator(generation.capability.secret, 'response', {
+          request: unsignedRequest,
+          response: unsignedResponse,
+        }),
+      }, STATUS_OWNER_MAX_RESPONSE_BYTES);
+      if (response === null) {
         socket.destroy();
         return;
       }
@@ -684,17 +952,40 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
 
 function parseOwnerResponse(
   value: unknown,
-  nonce: string,
+  request: UnsignedOwnerRequest,
+  capability: ActiveOperationalStatusCapability,
   now: Date,
 ): OperationalStatusSnapshot | null {
   const response = exactRecord(value, [
-    'version', 'nonce', 'capturedAt', 'schemaVersion', 'snapshot',
+    'version', 'stateIdentity', 'capabilityId', 'transport', 'nonce', 'capturedAt',
+    'schemaVersion', 'snapshot', 'authenticator',
   ]);
   if (response === null || response['version'] !== STATUS_OWNER_PROTOCOL_VERSION ||
-      response['nonce'] !== nonce || response['schemaVersion'] !== SCHEMA_VERSION ||
+      response['stateIdentity'] !== request.stateIdentity ||
+      response['capabilityId'] !== request.capabilityId ||
+      !sameCanonical(response['transport'], request.transport) ||
+      response['nonce'] !== request.nonce || response['schemaVersion'] !== SCHEMA_VERSION ||
       !canonicalIso(response['capturedAt'])) return null;
   const age = now.getTime() - Date.parse(response['capturedAt']);
-  if (age < -STATUS_OWNER_FUTURE_TOLERANCE_MS || age > STATUS_OWNER_MAX_AGE_MS) return null;
+  if (age < -STATUS_OWNER_CAPABILITY_FUTURE_TOLERANCE_MS ||
+      age > STATUS_OWNER_MESSAGE_MAX_AGE_MS) return null;
+  const unsignedResponse = {
+    version: response['version'],
+    stateIdentity: response['stateIdentity'],
+    capabilityId: response['capabilityId'],
+    transport: response['transport'],
+    nonce: response['nonce'],
+    capturedAt: response['capturedAt'],
+    schemaVersion: response['schemaVersion'],
+    snapshot: response['snapshot'],
+  };
+  if (!sameAuthenticator(
+    ownerAuthenticator(capability.secret, 'response', {
+      request,
+      response: unsignedResponse,
+    }),
+    response['authenticator'],
+  )) return null;
   return parseOperationalStatusSnapshot(response['snapshot']);
 }
 
@@ -702,24 +993,59 @@ async function requestOwnedOperationalStatus(
   statePath: string,
   expectations: OperationalStatusExpectations,
   pipePath: string | undefined,
+  capabilityPath: string | undefined,
+  capabilityStore: OperationalStatusCapabilityStore | undefined,
   timeoutMilliseconds: number | undefined,
   clock: () => Date,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
 ): Promise<OperationalStatusSnapshot | null> {
   const timeout = timeoutMilliseconds ?? STATUS_OWNER_DEFAULT_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeout) || timeout < 10 || timeout > 5_000) return null;
+  const now = transportNow(clock);
+  if (now === null) return null;
+  const stateIdentity = operationalStatusStateIdentity(statePath, platform);
+  let resolvedCapabilityPath: string;
+  try {
+    resolvedCapabilityPath = capabilityPath ?? operationalStatusCapabilityPath(statePath, env, platform);
+  } catch {
+    return null;
+  }
+  const store = capabilityStore ?? new CurrentUserOperationalStatusCapabilityStore(platform, env);
+  const observed = store.read(resolvedCapabilityPath);
+  if (observed.kind !== 'ready' || observed.value.status !== 'active' ||
+      observed.value.stateIdentity !== stateIdentity ||
+      !expectedOwnerTransport(observed.value.transport, statePath, pipePath, platform) ||
+      !operationalStatusCapabilityIsFresh(observed.value, now)) return null;
+  const capability = observed.value;
   const nonce = randomBytes(16).toString('hex');
-  const request = Buffer.from(`${JSON.stringify({
+  const unsignedRequest: UnsignedOwnerRequest = {
     version: STATUS_OWNER_PROTOCOL_VERSION,
+    stateIdentity,
+    capabilityId: capability.capabilityId,
+    transport: capability.transport,
     nonce,
+    sentAt: now.toISOString(),
     configFingerprint: expectations.configFingerprint,
     buildFingerprint: expectations.buildFingerprint,
-  })}\n`, 'utf8');
-  if (request.length > STATUS_OWNER_MAX_REQUEST_BYTES) return null;
+  };
+  const request = encodeOwnerFrame({
+    ...unsignedRequest,
+    authenticator: ownerAuthenticator(capability.secret, 'request', unsignedRequest),
+  }, STATUS_OWNER_MAX_REQUEST_BYTES);
+  if (request === null) return null;
 
   return await new Promise<OperationalStatusSnapshot | null>((resolveRequest) => {
-    const socket = createConnection(pipePath ?? operationalStatusOwnerPipePath(statePath));
+    const socket = capability.transport.kind === 'tcp'
+      ? createConnection({
+        host: capability.transport.host,
+        port: capability.transport.port,
+        allowHalfOpen: true,
+      })
+      : createConnection({ path: capability.transport.path, allowHalfOpen: true });
     let settled = false;
     let input = Buffer.alloc(0);
+    let receivedEnd = false;
     const finish = (value: OperationalStatusSnapshot | null): void => {
       if (settled) return;
       settled = true;
@@ -729,21 +1055,24 @@ async function requestOwnedOperationalStatus(
     };
     const timer = setTimeout(() => finish(null), timeout);
     timer.unref?.();
-    socket.on('connect', () => socket.write(request));
+    socket.on('connect', () => socket.end(request));
     socket.on('error', () => finish(null));
-    socket.on('close', () => finish(null));
+    socket.on('close', () => {
+      if (!receivedEnd) finish(null);
+    });
     socket.on('data', (chunk: Buffer) => {
       if (input.length + chunk.length > STATUS_OWNER_MAX_RESPONSE_BYTES) {
         finish(null);
         return;
       }
       input = Buffer.concat([input, chunk]);
-      const delimiter = input.indexOf(0x0a);
-      if (delimiter < 0) return;
-      if (delimiter !== input.length - 1) {
+      const declared = declaredOwnerFrameLength(input, STATUS_OWNER_MAX_RESPONSE_BYTES);
+      if (declared !== null && (declared < 0 || input.length > declared + 4)) {
         finish(null);
-        return;
       }
+    });
+    socket.on('end', () => {
+      receivedEnd = true;
       try {
         const responseNow = transportNow(clock);
         if (responseNow === null) {
@@ -751,8 +1080,9 @@ async function requestOwnedOperationalStatus(
           return;
         }
         finish(parseOwnerResponse(
-          JSON.parse(input.subarray(0, delimiter).toString('utf8')),
-          nonce,
+          parseExactOwnerFrame(input, STATUS_OWNER_MAX_RESPONSE_BYTES),
+          unsignedRequest,
+          capability,
           responseNow,
         ));
       } catch {
@@ -775,8 +1105,12 @@ async function readStoredStatus(
   afterSqliteBackupStep: (() => void) | undefined,
   temporaryDirectory: string,
   ownerPipePath: string | undefined,
+  ownerCapabilityPath: string | undefined,
+  ownerCapabilityStore: OperationalStatusCapabilityStore | undefined,
   ownerTimeoutMilliseconds: number | undefined,
   ownerTransportClock: () => Date,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
 ): Promise<SnapshotResult> {
   try {
     if (!pathExists(path)) return { kind: 'absent' };
@@ -800,8 +1134,12 @@ async function readStoredStatus(
         path,
         expectations,
         ownerPipePath,
+        ownerCapabilityPath,
+        ownerCapabilityStore,
         ownerTimeoutMilliseconds,
         ownerTransportClock,
+        env,
+        platform,
       );
       return owned === null
         ? { kind: 'owner_unavailable' }
@@ -914,8 +1252,12 @@ export async function inspectOperationalStatus(
       options.afterSqliteBackupStep,
       options.temporaryDirectory ?? tmpdir(),
       options.ownerPipePath,
+      options.ownerCapabilityPath,
+      options.ownerCapabilityStore,
       options.ownerTimeoutMilliseconds,
       options.ownerTransportClock ?? (() => new Date()),
+      env,
+      platform,
     )
     : injectedSnapshot === null
       ? { kind: 'owner_unavailable' }

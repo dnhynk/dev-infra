@@ -347,10 +347,21 @@ fallback print하지 않는다.
 read-only connection과 `sqlite3_backup_*` scratch image로 읽는다. live WAL은 새 SQLite reader를 열지 않는다.
 mutable WAL의 logical read-only connection도 `-shm` read mark를 바꿀 수 있기 때문이다. 대신 daemon/store
 owner가 같은 event-loop ownership turn에서 O1-2 strict read API를 직렬로 읽어 versioned, aggregate-only
-snapshot cache를 갱신하고, state path digest로 이름 붙인 private local pipe가 nonce-bound request에 그 cache만
-내준다. request는 config/build digest만 받고 response는 match state, finite job/error, timestamp와 bounded count만
-포함한다. status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와 source directory entry가
-그대로다. owner cache가 absent/stale/malformed이면 static `state.snapshot_unavailable` exit 2로 fail closed한다.
+snapshot cache를 갱신한다. daemon은 listener를 먼저 소유한 뒤 current-user-only capability를 atomic publish하고
+15초마다 secret/capability ID를 교체한다. capability는 state identity와 typed transport endpoint를 포함하며 30초가
+지나면 무효다. Windows는 `127.0.0.1`에 OS-assigned ephemeral port 하나만 bind하고 DACL이 상속되지 않는
+current-user-only directory/file에 endpoint를 둔다. PowerShell ACL helper에는 token-bearing daemon env 대신
+SystemRoot와 artifact path/kind만 전달한다. 비-Windows는 state path digest로 이름 붙인 private local pipe와
+0700/0600 capability를 쓴다.
+
+각 연결은 4-byte big-endian length prefix가 붙은 request 정확히 하나를 EOF까지 받은 다음 response 정확히 하나를
+EOF까지 보낸다. 두 방향 모두 partial/oversize/두 번째 frame/trailing bytes/timeout을 거부한다. HMAC transcript는
+request nonce·freshness·state/capability/transport identity·expected config/build를, response protocol/schema/version·
+capture freshness·complete aggregate snapshot을 함께 묶는다. 따라서 listener나 port만 먼저 차지하고 nonce를
+echo하는 process는 operational data를 만들 수 없다. response는 match state, finite job/error, timestamp와 bounded
+count만 포함한다. status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와 source directory
+entry가 그대로다. owner cache/capability가 absent/stale/malformed/permission-drift/raced이면 static
+`state.snapshot_unavailable` exit 2로 fail closed한다.
 closed DB scratch는 모든 판정 뒤 제거하며 v13일 때만 O1-2 strict store API로 읽는다.
 `automation.enabled=false`이면 repository discovery, Run observer,
 PR digest row는 intentionally disabled라 absent/old failure가 health를 낮추지 않지만 Gate reconcile과 Channel

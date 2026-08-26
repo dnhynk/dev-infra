@@ -588,6 +588,11 @@ function startDaemon(options: {
   const events = options.events;
   const running = runDaemonCommand(parsedDaemon(), CONFIG, {
     channelServer: options.channelServer,
+    statusOwnerServer: {
+      start: () => Promise.resolve(),
+      refresh: () => undefined,
+      stop: () => Promise.resolve(),
+    },
     orca: options.orca,
     orcaTimeoutMs: 200,
     slack: options.slack ?? new RejectingSlack(),
