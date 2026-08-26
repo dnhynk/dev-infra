@@ -5,6 +5,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createConnection, createServer } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../src/project/config.js';
 import {
@@ -12,7 +13,9 @@ import {
   fingerprintOperationalConfig,
   formatOperationalStatus,
   inspectOperationalStatus,
+  OperationalStatusOwnerServer,
   OPERATIONAL_JOB_NAMES,
+  operationalStatusOwnerPipePath,
   projectOperationalStore,
   type OperationalStatusSnapshot,
 } from '../src/operational/status.js';
@@ -97,9 +100,16 @@ function inspect(overrides: Parameters<typeof inspectOperationalStatus>[0] = {})
   });
 }
 
-function snapshotAndClose(store: SqliteDigestStore): OperationalStatusSnapshot {
+function snapshotAndClose(
+  store: SqliteDigestStore,
+  expectedConfig = config,
+  expectedBuild: string | null = BUILD,
+): OperationalStatusSnapshot {
   try {
-    return projectOperationalStore(store);
+    return projectOperationalStore(store, {
+      configFingerprint: fingerprintOperationalConfig(expectedConfig),
+      buildFingerprint: expectedBuild === null ? null : fingerprintOperationalBuild(expectedBuild),
+    });
   } finally {
     store.close();
   }
@@ -107,6 +117,27 @@ function snapshotAndClose(store: SqliteDigestStore): OperationalStatusSnapshot {
 
 function sha256(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+async function rawOwnerFrame(pipePath: string): Promise<string> {
+  return await new Promise<string>((resolveFrame, reject) => {
+    const socket = createConnection(pipePath);
+    let output = '';
+    socket.setTimeout(1_000, () => socket.destroy(new Error('owner timeout')));
+    socket.on('connect', () => socket.write(`${JSON.stringify({
+      version: 1,
+      nonce: 'a'.repeat(32),
+      configFingerprint: fingerprintOperationalConfig(config),
+      buildFingerprint: fingerprintOperationalBuild(BUILD),
+    })}\n`));
+    socket.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+      if (!output.includes('\n')) return;
+      socket.destroy();
+      resolveFrame(output);
+    });
+    socket.on('error', reject);
+  });
 }
 
 function projectedSnapshot(
@@ -159,6 +190,9 @@ function projectedSnapshot(
       uncertain: { slackRootIntents: uncertain, total: uncertain },
       dead: { unavailableResumeBaselines: dead, total: dead },
     }),
+  }, {
+    configFingerprint: fingerprintOperationalConfig(config),
+    buildFingerprint: fingerprintOperationalBuild(BUILD),
   });
 }
 
@@ -181,15 +215,96 @@ describe('read-only operational status classification', () => {
     }
   });
 
-  it('reads the live WAL snapshot while the daemon-owned store remains open', async () => {
+  it('reads the daemon-owner projection without changing main, WAL, SHM, or directory entries', async () => {
     const store = healthyStore();
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      refreshMilliseconds: null,
+    });
     try {
-      const sourceFiles = [`${statePath}`, `${statePath}-wal`];
+      await owner.start();
+      const sourceFiles = [`${statePath}`, `${statePath}-wal`, `${statePath}-shm`];
       const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
       const beforeFiles = readdirSync(dir).sort();
+      const wire = await rawOwnerFrame(operationalStatusOwnerPipePath(statePath));
+      expect(JSON.parse(wire)).toMatchObject({ version: 1, schemaVersion: 13 });
+      for (const privateValue of [
+        INSTANCE, BUILD, fingerprintOperationalConfig(config),
+        fingerprintOperationalBuild(BUILD), statePath, dir,
+      ]) expect(wire).not.toContain(privateValue);
       const report = await inspect();
       expect(report).toMatchObject({ exitCode: 0, schema: { state: 'matched' } });
       expect(store.readDaemonHealth()).toMatchObject({ state: 'running' });
+      for (const source of before) expect(sha256(source.path)).toBe(source.hash);
+      expect(readdirSync(dir).sort()).toEqual(beforeFiles);
+    } finally {
+      await owner.stop();
+      store.close();
+    }
+  });
+
+  it('retains a fresh owner snapshot across an exact commit/checkpoint refresh interleaving', async () => {
+    const store = healthyStore();
+    const checkpoint = new DatabaseSync(statePath);
+    const freshHeartbeat = '2026-08-26T00:02:00.000Z';
+    let armed = false;
+    let checkpointed = false;
+    let checkpointResult: { readonly busy: number; readonly log: number; readonly checkpointed: number } | null = null;
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      refreshMilliseconds: null,
+      beforeRefresh: () => {
+        if (armed) expect(store.recordDaemonHeartbeat(INSTANCE, freshHeartbeat)).not.toBeNull();
+      },
+      afterDaemonCapture: () => {
+        if (!armed || checkpointed) return;
+        checkpointed = true;
+        checkpointResult = checkpoint.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
+          readonly busy: number; readonly log: number; readonly checkpointed: number;
+        };
+      },
+    });
+    try {
+      await owner.start();
+      armed = true;
+      owner.refresh();
+      const sourceFiles = [`${statePath}`, `${statePath}-wal`, `${statePath}-shm`];
+      const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
+      const beforeFiles = readdirSync(dir).sort();
+      const report = await inspect({
+        clock: () => new Date('2026-08-26T00:02:30.000Z'),
+      });
+      expect(checkpointed).toBe(true);
+      expect(checkpointResult).toMatchObject({ busy: 0 });
+      expect(report).toMatchObject({
+        exitCode: 0,
+        daemon: { heartbeatAgeSeconds: 30 },
+        codes: ['status.healthy'],
+      });
+      expect(store.readDaemonHealth()?.heartbeatAt).toBe(freshHeartbeat);
+      for (const source of before) expect(sha256(source.path)).toBe(source.hash);
+      expect(readdirSync(dir).sort()).toEqual(beforeFiles);
+    } finally {
+      await owner.stop();
+      checkpoint.close();
+      store.close();
+    }
+  });
+
+  it('fails closed without touching a live WAL when its owner endpoint is absent', async () => {
+    const store = healthyStore();
+    try {
+      const sourceFiles = [`${statePath}`, `${statePath}-wal`, `${statePath}-shm`];
+      const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
+      const beforeFiles = readdirSync(dir).sort();
+      const report = await inspect({ ownerTimeoutMilliseconds: 50 });
+      expect(report).toMatchObject({
+        exitCode: 2,
+        schema: { state: 'unavailable' },
+        codes: ['state.snapshot_unavailable'],
+      });
       for (const source of before) expect(sha256(source.path)).toBe(source.hash);
       expect(readdirSync(dir).sort()).toEqual(beforeFiles);
     } finally {
@@ -197,38 +312,57 @@ describe('read-only operational status classification', () => {
     }
   });
 
-  it('uses one SQLite backup epoch across an exact commit/checkpoint interleaving', async () => {
+  it('rejects a malformed aggregate owner response without echoing or touching source files', async () => {
     const store = healthyStore();
-    const checkpoint = new DatabaseSync(statePath);
-    const scratchParent = join(dir, 'snapshot-scratch');
-    mkdirSync(scratchParent);
-    const freshHeartbeat = '2026-08-26T00:02:00.000Z';
-    let checkpointed = false;
-    let checkpointResult: { readonly busy: number; readonly log: number; readonly checkpointed: number } | null = null;
+    const pipePath = operationalStatusOwnerPipePath(statePath);
+    const server = createServer((socket) => {
+      socket.once('data', () => socket.end('{"version":1,"body":"SENTINEL_PRIVATE"}\n'));
+    });
+    await new Promise<void>((resolveListen, reject) => {
+      server.once('error', reject);
+      server.listen(pipePath, resolveListen);
+    });
     try {
-      expect(store.recordDaemonHeartbeat(INSTANCE, freshHeartbeat)).not.toBeNull();
-      const report = await inspect({
-        clock: () => new Date('2026-08-26T00:02:30.000Z'),
-        temporaryDirectory: scratchParent,
-        afterSqliteBackupStep: () => {
-          if (checkpointed) return;
-          checkpointed = true;
-          checkpointResult = checkpoint.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
-            readonly busy: number; readonly log: number; readonly checkpointed: number;
-          };
-        },
-      });
-      expect(checkpointed).toBe(true);
-      expect(checkpointResult).toEqual({ busy: 0, log: 0, checkpointed: 0 });
-      expect(report).toMatchObject({
-        exitCode: 0,
-        daemon: { heartbeatAgeSeconds: 30 },
-        codes: ['status.healthy'],
-      });
-      expect(store.readDaemonHealth()?.heartbeatAt).toBe(freshHeartbeat);
-      expect(readdirSync(scratchParent)).toEqual([]);
+      const sourceFiles = [`${statePath}`, `${statePath}-wal`, `${statePath}-shm`];
+      const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
+      const beforeFiles = readdirSync(dir).sort();
+      const report = await inspect({ ownerPipePath: pipePath });
+      expect(report).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
+      expect(JSON.stringify(report)).not.toContain('SENTINEL');
+      for (const source of before) expect(sha256(source.path)).toBe(source.hash);
+      expect(readdirSync(dir).sort()).toEqual(beforeFiles);
     } finally {
-      checkpoint.close();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      store.close();
+    }
+  });
+
+  it('rejects a stale owner cache and removes the endpoint on bounded shutdown', async () => {
+    const store = healthyStore();
+    const pipePath = operationalStatusOwnerPipePath(statePath);
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      pipePath,
+      refreshMilliseconds: null,
+      clock: () => new Date('2000-01-01T00:00:00.000Z'),
+    });
+    try {
+      await owner.start();
+      const sourceFiles = [`${statePath}`, `${statePath}-wal`, `${statePath}-shm`];
+      const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
+      const beforeFiles = readdirSync(dir).sort();
+      expect(await inspect({ ownerPipePath: pipePath })).toMatchObject({
+        exitCode: 2, codes: ['state.snapshot_unavailable'],
+      });
+      for (const source of before) expect(sha256(source.path)).toBe(source.hash);
+      expect(readdirSync(dir).sort()).toEqual(beforeFiles);
+      await owner.stop();
+      expect(await inspect({ ownerPipePath: pipePath, ownerTimeoutMilliseconds: 50 })).toMatchObject({
+        exitCode: 2, codes: ['state.snapshot_unavailable'],
+      });
+    } finally {
+      await owner.stop();
       store.close();
     }
   });
@@ -280,7 +414,7 @@ describe('read-only operational status classification', () => {
 
     rmSync(statePath, { force: true });
     expect(await inspect({
-      snapshot: snapshotAndClose(healthyStore()), expectedBuildIdentity: null, env: {},
+      snapshot: snapshotAndClose(healthyStore(), config, null), expectedBuildIdentity: null, env: {},
     })).toMatchObject({
       exitCode: 1, codes: expect.arrayContaining(['build.unverified']),
     });
@@ -307,7 +441,9 @@ describe('read-only operational status classification', () => {
   it('ignores disabled observer rows while Gate and Channel jobs remain required', async () => {
     const requiredJobs = ['gate-reconcile', 'channel-delivery'] as const;
     let store = healthyStore({ config: disabledConfig, jobNames: requiredJobs });
-    let report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    let report = await inspect({
+      config: disabledConfig, snapshot: snapshotAndClose(store, disabledConfig),
+    });
     expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
     expect(report.jobs.filter((job) => job.state === 'absent').map((job) => job.job)).toEqual([
       'repository-discovery', 'run-observer', 'pr-digest',
@@ -324,7 +460,9 @@ describe('read-only operational status classification', () => {
       if (failed === null) throw new Error('expected disabled observer failure');
       if (job === 'run-observer') store.scheduleDaemonJobBackoff(job, failed.revision, AT2, AT2);
     }
-    report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    report = await inspect({
+      config: disabledConfig, snapshot: snapshotAndClose(store, disabledConfig),
+    });
     expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
     expect(report.jobs.find((job) => job.job === 'repository-discovery')?.state).toBe('failed');
     expect(report.jobs.find((job) => job.job === 'run-observer')?.state).toBe('backoff');
@@ -335,12 +473,16 @@ describe('read-only operational status classification', () => {
       jobNames: requiredJobs,
       failure: 'gate-reconcile',
     });
-    report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    report = await inspect({
+      config: disabledConfig, snapshot: snapshotAndClose(store, disabledConfig),
+    });
     expect(report).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.failed']) });
 
     rmSync(statePath, { force: true });
     store = healthyStore({ config: disabledConfig, jobNames: ['gate-reconcile'] });
-    report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    report = await inspect({
+      config: disabledConfig, snapshot: snapshotAndClose(store, disabledConfig),
+    });
     expect(report).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.absent']) });
   });
 

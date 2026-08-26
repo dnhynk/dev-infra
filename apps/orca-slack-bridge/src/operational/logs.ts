@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Stats } from 'node:fs';
+import type { BigIntStats } from 'node:fs';
 import { open, stat, type FileHandle } from 'node:fs/promises';
 import type { DaemonJobName } from '../store/operational-types.js';
 import {
@@ -28,6 +28,8 @@ export type ReadOperationalLogsOptions = {
   readonly backupLimit?: number;
   readonly clock?: () => Date;
   readonly signal?: AbortSignal;
+  /** Deterministic test seam invoked before each captured name epoch is validated. */
+  readonly afterLogChainCapture?: (attempt: number) => void | Promise<void>;
 };
 
 export type FollowOperationalLogsOptions = ReadOperationalLogsOptions & {
@@ -52,7 +54,6 @@ type OpenLogGeneration = {
   readonly generation: number;
   readonly path: string;
   readonly handle: FileHandle;
-  readonly info: Stats;
   readonly identity: string;
   readonly size: number;
 };
@@ -65,7 +66,6 @@ type FollowCursor = {
   readonly identity: string;
   readonly offset: number;
   readonly digest: string;
-  readonly changeToken: string;
 };
 
 function validateOptions(options: ReadOperationalLogsOptions): ValidatedOptions {
@@ -133,17 +133,22 @@ async function openIfPresent(path: string): Promise<FileHandle | null> {
   }
 }
 
-function fileIdentity(info: Stats): string {
-  return `${String(info.dev)}:${String(info.ino)}`;
+export function serializeOperationalLogFileIdentity(
+  info: Pick<BigIntStats, 'dev' | 'ino'>,
+): string {
+  return `${info.dev.toString(10)}:${info.ino.toString(10)}`;
 }
 
-function fileChangeToken(file: OpenLogGeneration): string {
-  return `${String(file.info.size)}:${String(file.info.ctimeMs)}:${String(file.info.mtimeMs)}`;
+function safeFileSize(info: Pick<BigIntStats, 'size'>): number {
+  if (info.size < 0n || info.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('logs.read_failed');
+  }
+  return Number(info.size);
 }
 
-async function statIfPresent(path: string): Promise<Stats | null> {
+async function statIfPresent(path: string): Promise<BigIntStats | null> {
   try {
-    return await stat(path);
+    return await stat(path, { bigint: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -173,14 +178,13 @@ async function captureLogChainOnce(current: string, backupLimit: number): Promis
       const handle = await openIfPresent(path);
       if (handle === null) continue;
       try {
-        const info = await handle.stat();
+        const info = await handle.stat({ bigint: true });
         entries.push({
           generation,
           path,
           handle,
-          info,
-          identity: fileIdentity(info),
-          size: info.size,
+          identity: serializeOperationalLogFileIdentity(info),
+          size: safeFileSize(info),
         });
       } catch (error) {
         await handle.close();
@@ -202,7 +206,8 @@ async function snapshotStillNamesSameFiles(
   const identities = new Map(snapshot.entries.map((entry) => [entry.generation, entry.identity]));
   for (let generation = 0; generation <= backupLimit; generation += 1) {
     const info = await statIfPresent(generationPath(current, generation));
-    if ((info === null ? null : fileIdentity(info)) !== (identities.get(generation) ?? null)) return false;
+    if ((info === null ? null : serializeOperationalLogFileIdentity(info)) !==
+        (identities.get(generation) ?? null)) return false;
   }
   return true;
 }
@@ -211,10 +216,15 @@ async function snapshotStillNamesSameFiles(
  * Opens and pins one coherent chain naming epoch. A rotation during capture is retried; appends
  * do not invalidate the epoch because every handle's size is already the exact read boundary.
  */
-async function captureLogChain(current: string, backupLimit: number): Promise<LogChainSnapshot> {
+async function captureLogChain(
+  current: string,
+  backupLimit: number,
+  afterCapture?: (attempt: number) => void | Promise<void>,
+): Promise<LogChainSnapshot> {
   for (let attempt = 0; attempt < SNAPSHOT_ATTEMPTS; attempt += 1) {
     const snapshot = await captureLogChainOnce(current, backupLimit);
     try {
+      await afterCapture?.(attempt);
       if (await snapshotStillNamesSameFiles(current, backupLimit, snapshot)) return snapshot;
     } catch (error) {
       await closeSnapshot(snapshot);
@@ -222,9 +232,9 @@ async function captureLogChain(current: string, backupLimit: number): Promise<Lo
     }
     await closeSnapshot(snapshot);
   }
-  // A continuously rotating writer still receives a bounded final capture; pinned identities,
-  // rather than path names, remain authoritative to the drain logic.
-  return await captureLogChainOnce(current, backupLimit);
+  // Generation labels are useful only when every pinned handle belongs to one verified naming
+  // epoch. A continuously rotating writer therefore fails closed after the bounded retry budget.
+  throw new Error('logs.read_failed');
 }
 
 /** Reads one pinned file backwards without retaining an unbounded corrupt line in memory. */
@@ -261,14 +271,18 @@ async function* reverseLines(
       continue;
     }
 
+    const terminalBatch = !sawDelimiter;
     sawDelimiter = true;
     const lastNewline = newlines[newlines.length - 1] as number;
     const trailing = bytes.subarray(lastNewline + 1);
-    const terminalDelimiter = position + lastNewline + 1 === file.size;
-    if (carryOversize || trailing.length + carry.length + 1 > MAX_OPERATIONAL_LOG_LINE_BYTES) {
-      yield { kind: 'oversize' };
-    } else if (!terminalDelimiter || trailing.length + carry.length > 0) {
-      yield { kind: 'line', bytes: Buffer.concat([trailing, carry]) };
+    // The bytes after the last LF are not a physical NDJSON record yet. The initial tail omits
+    // that suffix; follow transfers the same bytes into its forward decoder until an LF arrives.
+    if (!terminalBatch) {
+      if (carryOversize || trailing.length + carry.length + 1 > MAX_OPERATIONAL_LOG_LINE_BYTES) {
+        yield { kind: 'oversize' };
+      } else {
+        yield { kind: 'line', bytes: Buffer.concat([trailing, carry]) };
+      }
     }
 
     for (let index = newlines.length - 1; index >= 1; index -= 1) {
@@ -286,8 +300,10 @@ async function* reverseLines(
     if (carryOversize) carry = Buffer.alloc(0);
   }
 
-  if (carryOversize) yield { kind: 'oversize' };
-  else if (carry.length > 0 || sawDelimiter) yield { kind: 'line', bytes: carry };
+  if (sawDelimiter) {
+    if (carryOversize) yield { kind: 'oversize' };
+    else yield { kind: 'line', bytes: carry };
+  }
 }
 
 function includeRecord(record: OperationalLogRecord, job: DaemonJobName | null): boolean {
@@ -323,7 +339,11 @@ export async function readOperationalLogTail(
 ): Promise<readonly OperationalLogRecord[]> {
   const validated = validateOptions(options);
   if (options.signal?.aborted === true) return [];
-  const snapshot = await captureLogChain(operationalLogPath(options.logDir), validated.backupLimit);
+  const snapshot = await captureLogChain(
+    operationalLogPath(options.logDir),
+    validated.backupLimit,
+    options.afterLogChainCapture,
+  );
   try {
     return await readTailFromSnapshot(snapshot, validated, options.signal);
   } finally {
@@ -425,6 +445,27 @@ async function digestPrefix(
   return hash.digest('hex');
 }
 
+async function unterminatedSuffixStart(
+  file: OpenLogGeneration,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  let position = file.size;
+  while (position > 0) {
+    if (signal?.aborted === true) return null;
+    const length = Math.min(READ_CHUNK_BYTES, position);
+    position -= length;
+    const buffer = Buffer.allocUnsafe(length);
+    const result = await file.handle.read(buffer, 0, length, position);
+    if (result.bytesRead !== length) throw new Error('logs.read_failed');
+    for (let index = result.bytesRead - 1; index >= 0; index -= 1) {
+      if (buffer[index] !== 0x0a) continue;
+      const start = position + index + 1;
+      return start === file.size ? null : start;
+    }
+  }
+  return file.size === 0 ? null : 0;
+}
+
 function waitForPoll(signal: AbortSignal, milliseconds: number): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
   return new Promise((resolve) => {
@@ -459,14 +500,16 @@ async function drainFollowSnapshot(
   const current = entries.find((entry) => entry.generation === 0) ?? null;
   if (current === null) return { records: output, cursor: previous };
 
-  const currentChangeToken = fileChangeToken(current);
-  if (previous !== null && previous.identity === current.identity &&
-    previous.offset === current.size && previous.changeToken === currentChangeToken) {
-    return { records: output, cursor: previous };
-  }
-
   const finalDigest = await digestPrefix(current, current.size, signal);
   if (finalDigest === null) return { records: output, cursor: previous };
+
+  // File identity, size, ctime, and mtime can all collide on Windows. Only the content witness can
+  // prove that a consumed generation is unchanged, so even the no-growth path hashes before it
+  // returns. This intentionally trades O(current-size) changed-poll I/O for lossless observation.
+  if (previous !== null && previous.identity === current.identity &&
+      previous.offset === current.size && previous.digest === finalDigest) {
+    return { records: output, cursor: previous };
+  }
 
   if (previous === null) {
     output.push(...await readRange(current, 0, current.size, decoder, signal));
@@ -474,7 +517,6 @@ async function drainFollowSnapshot(
       records: output,
       cursor: {
         identity: current.identity, offset: current.size, digest: finalDigest,
-        changeToken: currentChangeToken,
       },
     };
   }
@@ -496,7 +538,6 @@ async function drainFollowSnapshot(
       records: output,
       cursor: {
         identity: current.identity, offset: current.size, digest: finalDigest,
-        changeToken: currentChangeToken,
       },
     };
   }
@@ -531,7 +572,6 @@ async function drainFollowSnapshot(
     records: output,
     cursor: {
       identity: current.identity, offset: current.size, digest: finalDigest,
-      changeToken: currentChangeToken,
     },
   };
 }
@@ -551,20 +591,29 @@ export async function* followOperationalLogs(
   if (options.signal.aborted) return;
 
   const path = operationalLogPath(options.logDir);
-  const initialSnapshot = await captureLogChain(path, validated.backupLimit);
+  const initialSnapshot = await captureLogChain(
+    path,
+    validated.backupLimit,
+    options.afterLogChainCapture,
+  );
   let initial: readonly OperationalLogRecord[];
   let cursor: FollowCursor | null = null;
+  const decoder = new ForwardLineDecoder(validated.clock);
   try {
     const current = initialSnapshot.entries.find((entry) => entry.generation === 0) ?? null;
     await options.afterInitialSnapshot?.();
     initial = await readTailFromSnapshot(initialSnapshot, validated, options.signal);
     if (current !== null) {
+      const suffixStart = await unterminatedSuffixStart(current, options.signal);
+      if (suffixStart !== null) {
+        const seeded = await readRange(current, suffixStart, current.size, decoder, options.signal);
+        if (seeded.length !== 0) throw new Error('logs.read_failed');
+      }
       const digest = await digestPrefix(current, current.size, options.signal);
       if (digest !== null) cursor = {
         identity: current.identity,
         offset: current.size,
         digest,
-        changeToken: fileChangeToken(current),
       };
     }
   } finally {
@@ -578,9 +627,12 @@ export async function* followOperationalLogs(
     yield record;
   }
 
-  const decoder = new ForwardLineDecoder(validated.clock);
   while (await waitForPoll(options.signal, pollMilliseconds)) {
-    const snapshot = await captureLogChain(path, validated.backupLimit);
+    const snapshot = await captureLogChain(
+      path,
+      validated.backupLimit,
+      options.afterLogChainCapture,
+    );
     let drained: Awaited<ReturnType<typeof drainFollowSnapshot>>;
     try {
       drained = await drainFollowSnapshot(snapshot, cursor, decoder, options.signal);

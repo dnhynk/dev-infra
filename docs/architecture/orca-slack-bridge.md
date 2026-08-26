@@ -343,12 +343,16 @@ rotation 기본은 5 MiB current + 5 backups이고 config bound는 1..100 MiB, 1
 logger failure는 `logger.write_failed` 한 줄만 stderr와 daemon-facing failure callback으로 보낸다. 원 payload를
 fallback print하지 않는다.
 
-`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 source를 SQLite read-only connection으로
-열고 `sqlite3_backup_*` 기반 Node online backup 한 번으로 transactionally consistent scratch image를 만든다.
-동시 commit/checkpoint가 있으면 SQLite가 backup epoch를 restart하므로 main/WAL을 따로 복사할 때의 lost-commit
-창이 없다. WAL이 없는 closed DB는 immutable read로 열고, live WAL은 daemon이 이미 소유한 `-shm` index를
-사용하므로 source DB/WAL create, migration, checkpoint, durable write가 없다. scratch는 모든 판정 뒤 제거하며
-v13일 때만 O1-2 strict store API로 읽는다. `automation.enabled=false`이면 repository discovery, Run observer,
+`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 WAL이 없는 closed DB만 immutable
+read-only connection과 `sqlite3_backup_*` scratch image로 읽는다. live WAL은 새 SQLite reader를 열지 않는다.
+mutable WAL의 logical read-only connection도 `-shm` read mark를 바꿀 수 있기 때문이다. 대신 daemon/store
+owner가 같은 event-loop ownership turn에서 O1-2 strict read API를 직렬로 읽어 versioned, aggregate-only
+snapshot cache를 갱신하고, state path digest로 이름 붙인 private local pipe가 nonce-bound request에 그 cache만
+내준다. request는 config/build digest만 받고 response는 match state, finite job/error, timestamp와 bounded count만
+포함한다. status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와 source directory entry가
+그대로다. owner cache가 absent/stale/malformed이면 static `state.snapshot_unavailable` exit 2로 fail closed한다.
+closed DB scratch는 모든 판정 뒤 제거하며 v13일 때만 O1-2 strict store API로 읽는다.
+`automation.enabled=false`이면 repository discovery, Run observer,
 PR digest row는 intentionally disabled라 absent/old failure가 health를 낮추지 않지만 Gate reconcile과 Channel
 delivery는 계속 required다. task ownership은 O1-6이 주입할 facet이며 현재 기본
 `unavailable`은 중립이다. exit은 healthy 0, degraded/stale 1, absent/stopped/schema/config mismatch 2다.
@@ -357,11 +361,16 @@ timestamp와 aggregate count만 있다. O1-2가 diagnostic으로 보존하는 le
 표시하되 actionable pending total에서 제외한다.
 
 `logs --tail N [--follow] [--job NAME] [--log-dir ...]`는 current와 최대 configured bound의 numbered chain을
-read-only로 역순 scan해 마지막 1..5,000 safe record만 고른 뒤 시간순으로 출력한다. job filter는 JSON을
+read-only로 역순 scan해 마지막 1..5,000 safe record만 고른 뒤 시간순으로 출력한다. 모든 generation identity는
+bigint stat의 exact device/file ID를 lossless decimal로 직렬화한다. capture 뒤 path label과 pinned identity를
+재검증하고 rotation이 bounded retry 동안 계속되면 unverified generation order를 내보내지 않고 static failure로
+끝난다. job filter는 JSON을
 strict parse한 뒤 allowlisted `job` field에만 적용한다. corrupt/invalid UTF-8/oversize/unknown-field line은
 blank physical record까지 각각 원문 대신 static diagnostic record가 된다. follow initial tail은 pinned size와
-cursor를 같은 epoch에서 잡아 그 사이 append를 다음 drain으로 정확히 한 번 넘긴다. poll 사이 여러 rotation은
+cursor를 같은 epoch에서 잡아 그 사이 append를 다음 drain으로 정확히 한 번 넘긴다. initial current의 LF 없는
+suffix는 tail에서 빼고 forward decoder로 넘겨 LF가 도착할 때 정확히 한 번 emit한다. poll 사이 여러 rotation은
 old identity를 numbered chain에서 찾아 모든 intermediate generation을 시간순으로 drain한다. 같은 inode의
-truncate-and-rewrite는 consumed prefix의 SHA-256 witness로 smaller/equal/larger replacement를 구별한다. 각 bounded
+truncate-and-rewrite는 consumed prefix의 SHA-256 witness로 smaller/equal/larger replacement를 구별한다. identity,
+size, ctime, mtime가 모두 같아도 no-growth fast path가 SHA-256 검증을 생략하지 않는다. 각 bounded
 scan 뒤 yield 전에 모든 handle을 닫으므로 Windows rotation을 막지 않으며 partial line과 SIGINT/SIGTERM 종료도
 처리한다.

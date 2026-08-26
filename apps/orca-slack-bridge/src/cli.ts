@@ -70,7 +70,9 @@ import type { DaemonJobName } from './store/operational-types.js';
 import {
   formatOperationalStatus,
   inspectOperationalStatus,
+  OperationalStatusOwnerServer,
   type InspectOperationalStatusOptions,
+  type OperationalStatusOwnerServerLike,
 } from './operational/status.js';
 import {
   followOperationalLogs,
@@ -899,6 +901,8 @@ export type DaemonDependencies = {
   readonly reconcileIntervalMs?: number;
   readonly waitForStop?: () => Promise<void>;
   readonly channelServer?: ChannelDaemonServer;
+  /** Test seam; production serves aggregate-only status from the daemon/store owner. */
+  readonly statusOwnerServer?: OperationalStatusOwnerServerLike;
   readonly createChannelDelivery?: (
     store: GateStore,
     orca: OrcaRunner,
@@ -950,6 +954,7 @@ export async function runDaemonCommand(
   let store: SqliteDigestStore | null = null;
   let transport: SlackSocketTransport | null = null;
   let channelServer: ChannelDaemonServer | null = null;
+  let statusOwnerServer: OperationalStatusOwnerServerLike | null = null;
   let channelDelivery: ChannelDeliveryRuntime | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
@@ -985,7 +990,13 @@ export async function runDaemonCommand(
     acceptedWorkAbort.abort();
   };
   try {
-    store = new SqliteDigestStore(resolveStatePath(parsed.statePath));
+    const resolvedStatePath = resolveStatePath(parsed.statePath);
+    store = new SqliteDigestStore(resolvedStatePath);
+    statusOwnerServer = dependencies.statusOwnerServer ?? new OperationalStatusOwnerServer({
+      statePath: resolvedStatePath,
+      store,
+    });
+    await statusOwnerServer.start();
     const configuredOrcaTimeout = dependencies.orcaTimeoutMs ?? 15_000;
     if (!Number.isFinite(configuredOrcaTimeout) || configuredOrcaTimeout < 10) {
       throw new TypeError('orcaTimeoutMs must be a finite number >= 10');
@@ -1203,6 +1214,13 @@ export async function runDaemonCommand(
         await channelServer.stop();
       } catch {
         // Pipe shutdown failure cannot authorize a second daemon or a different external write.
+      }
+    }
+    if (statusOwnerServer !== null) {
+      try {
+        await statusOwnerServer.stop();
+      } catch {
+        // The store remains the owner until the bounded local status listener has been retired.
       }
     }
     store?.close();
