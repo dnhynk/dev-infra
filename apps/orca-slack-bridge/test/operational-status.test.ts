@@ -3,7 +3,7 @@ import { createHash, createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
   chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
-  readdirSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync,
+  readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
@@ -2463,14 +2463,19 @@ describe('read-only operational status classification', () => {
       const nativePath = join(dir, 'lost-posix-claim', 'owner.json');
       const identity = operationalStatusStateIdentity(statePath, 'linux');
       const claimPath = `${nativePath}.claim`;
+      const bootstrapPath = `${claimPath}.bootstrap`;
       const detachedPath = `${claimPath}.detached`;
       const native = new CurrentUserOperationalStatusCapabilityStore('linux', process.env);
       const claim = await native.acquireOwnerClaim(nativePath, identity);
       renameSync(claimPath, detachedPath);
       writeFileSync(claimPath, '{}\n', { mode: 0o600 });
       chmodSync(claimPath, 0o600);
+      const detachedIdentity = lstatSync(detachedPath, { bigint: true });
       const hasDetachedDescriptor = (): boolean => readdirSync('/proc/self/fd').some((entry) => {
-        try { return readlinkSync(`/proc/self/fd/${entry}`) === detachedPath; } catch { return false; }
+        try {
+          const observed = statSync(`/proc/self/fd/${entry}`, { bigint: true });
+          return observed.dev === detachedIdentity.dev && observed.ino === detachedIdentity.ino;
+        } catch { return false; }
       });
 
       expect(hasDetachedDescriptor()).toBe(true);
@@ -2478,6 +2483,11 @@ describe('read-only operational status classification', () => {
       expect(hasDetachedDescriptor()).toBe(false);
       expect(readFileSync(claimPath, 'utf8')).toBe('{}\n');
       expect(existsSync(detachedPath)).toBe(true);
+      const bootstrapIdentity = lstatSync(bootstrapPath, { bigint: true });
+      expect({ dev: bootstrapIdentity.dev, ino: bootstrapIdentity.ino }).toEqual({
+        dev: detachedIdentity.dev,
+        ino: detachedIdentity.ino,
+      });
     },
   );
 
@@ -2515,6 +2525,7 @@ describe('read-only operational status classification', () => {
       const nativePath = join(dir, 'initial-posix-claim-swap', 'owner.json');
       const identity = operationalStatusStateIdentity(statePath, 'linux');
       const claimPath = `${nativePath}.claim`;
+      const bootstrapPath = `${claimPath}.bootstrap`;
       const detachedPath = `${claimPath}.held`;
       let armed = true;
       const native = new CurrentUserOperationalStatusCapabilityStore('linux', process.env, {
@@ -2528,19 +2539,38 @@ describe('read-only operational status classification', () => {
           renameSync(replacement, path);
         },
       });
-      const hasDetachedDescriptor = (): boolean => readdirSync('/proc/self/fd').some((entry) => {
-        try { return readlinkSync(`/proc/self/fd/${entry}`) === detachedPath; } catch { return false; }
+      await expect(native.acquireOwnerClaim(nativePath, identity))
+        .rejects.toThrow('status.owner_claim_failed');
+      const detachedIdentity = lstatSync(detachedPath, { bigint: true });
+      const replacementIdentity = lstatSync(claimPath, { bigint: true });
+      const hasOpenDescriptor = (identity: typeof detachedIdentity): boolean =>
+        readdirSync('/proc/self/fd').some((entry) => {
+          try {
+            const observed = statSync(`/proc/self/fd/${entry}`, { bigint: true });
+            return observed.dev === identity.dev && observed.ino === identity.ino;
+          } catch { return false; }
+        });
+      expect(hasOpenDescriptor(detachedIdentity)).toBe(false);
+      expect(hasOpenDescriptor(replacementIdentity)).toBe(false);
+      expect(existsSync(claimPath)).toBe(true);
+      expect(existsSync(detachedPath)).toBe(true);
+      const bootstrapIdentity = lstatSync(bootstrapPath, { bigint: true });
+      expect({ dev: bootstrapIdentity.dev, ino: bootstrapIdentity.ino }).toEqual({
+        dev: detachedIdentity.dev,
+        ino: detachedIdentity.ino,
+      });
+      expect({ dev: replacementIdentity.dev, ino: replacementIdentity.ino }).not.toEqual({
+        dev: detachedIdentity.dev,
+        ino: detachedIdentity.ino,
       });
 
       await expect(native.acquireOwnerClaim(nativePath, identity))
         .rejects.toThrow('status.owner_claim_failed');
-      expect(hasDetachedDescriptor()).toBe(false);
+      expect(hasOpenDescriptor(detachedIdentity)).toBe(false);
+      expect(hasOpenDescriptor(replacementIdentity)).toBe(false);
+      expect(existsSync(bootstrapPath)).toBe(true);
       expect(existsSync(claimPath)).toBe(true);
       expect(existsSync(detachedPath)).toBe(true);
-
-      const rebound = await native.acquireOwnerClaim(nativePath, identity);
-      rebound.assertHeld();
-      await rebound.release();
     },
   );
 
