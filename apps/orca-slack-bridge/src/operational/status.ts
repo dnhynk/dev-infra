@@ -626,7 +626,14 @@ export function operationalStatusOwnerPipePath(
 }
 
 function ownerPipePathForCapability(capabilityPath: string, stateKey: string): string {
-  const path = posix.join(posix.dirname(capabilityPath), `owner-${stateKey}.sock`);
+  const capabilityDirectory = posix.dirname(capabilityPath);
+  const user = typeof process.getuid === 'function' ? String(process.getuid()) : 'user';
+  const socketDirectory = /^orca-slack-bridge-status-v2-(?:[0-9]+|user)$/u.test(
+    posix.basename(capabilityDirectory),
+  )
+    ? posix.join(posix.dirname(capabilityDirectory), `.osb-status-${user}`)
+    : capabilityDirectory;
+  const path = posix.join(socketDirectory, `owner-${stateKey}.sock`);
   if (!posix.isAbsolute(path) || path[0] === '\0' || Buffer.byteLength(path, 'utf8') > 103) {
     throw new TypeError('status.owner_transport_invalid');
   }

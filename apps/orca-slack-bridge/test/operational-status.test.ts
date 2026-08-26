@@ -352,6 +352,8 @@ class MemoryCapabilityStore implements OperationalStatusCapabilityStore {
     stateIdentity: string,
     claim: OperationalStatusOwnerClaim,
   ): void {
+    claim.assertHeld();
+    if (!existsSync(transport.path)) return;
     this.assertOwnerTransport(transport, stateIdentity, claim);
     renameSync(transport.path, `${transport.path}.retired-${transport.inode}`);
   }
@@ -1539,7 +1541,8 @@ describe('read-only operational status classification', () => {
       'linux',
     );
     expect(socket[0]).not.toBe('\0');
-    expect(socket.startsWith(`${posix.dirname(capability)}/`)).toBe(true);
+    expect(socket.startsWith(`${runtime}/`)).toBe(true);
+    expect(posix.dirname(socket)).not.toBe(posix.dirname(capability));
     expect(Buffer.byteLength(socket, 'utf8')).toBeLessThanOrEqual(103);
     expect(operationalStatusPosixProtectionIsExact(
       { uid: 1000n, mode: 0o140600n, type: 'socket' },
