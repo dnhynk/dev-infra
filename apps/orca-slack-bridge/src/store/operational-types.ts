@@ -141,6 +141,11 @@ export type DaemonJobCompletion = {
   readonly checkpoint?: number;
 };
 
+export type DaemonJobSuccessCompletion = DaemonJobCompletion & {
+  /** Completion-based regular schedule; the next run cannot precede this success. */
+  readonly nextRunAt: string;
+};
+
 export type OperationalAggregateCounts = {
   readonly pending: {
     readonly gateCards: number;
@@ -227,7 +232,7 @@ export interface OperationalStore {
   readDaemonHealth(): DaemonHealthRecord | null;
 
   startDaemonJob(jobName: DaemonJobName, at: string): DaemonJobClaim | null;
-  completeDaemonJobSuccess(input: DaemonJobCompletion): DaemonJobOutcomeRecord | null;
+  completeDaemonJobSuccess(input: DaemonJobSuccessCompletion): DaemonJobOutcomeRecord | null;
   completeDaemonJobFailure(input: DaemonJobCompletion & { readonly errorCode: string }): DaemonJobOutcomeRecord | null;
   scheduleDaemonJobBackoff(jobName: DaemonJobName, expectedRevision: number, nextRunAt: string, at: string): DaemonJobOutcomeRecord | null;
   advanceDaemonJobCheckpoint(jobName: DaemonJobName, expectedCheckpoint: number, checkpoint: number, at: string): DaemonJobOutcomeRecord | null;

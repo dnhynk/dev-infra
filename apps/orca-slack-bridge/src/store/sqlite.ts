@@ -101,6 +101,7 @@ import type {
   DaemonJobCompletion,
   DaemonJobName,
   DaemonJobOutcomeRecord,
+  DaemonJobSuccessCompletion,
   EffectiveDiscoverySnapshot,
   OperationalAggregateCounts,
   OperationalStore,
@@ -1946,8 +1947,8 @@ function toDaemonJobOutcome(row: DaemonJobOutcomeRow): DaemonJobOutcomeRecord {
     (row.state === 'running' && completedAt === null && durationMs === null &&
       nextRunAt === null && errorCode === null) ||
     (row.state === 'succeeded' && completedAt !== null && durationMs !== null &&
-      lastSuccessAt === completedAt && nextRunAt === null && errorCode === null &&
-      consecutiveFailures === 0) ||
+      lastSuccessAt === completedAt && nextRunAt !== null && nextRunAt >= updatedAt &&
+      errorCode === null && consecutiveFailures === 0) ||
     (row.state === 'failed' && completedAt !== null && durationMs !== null &&
       lastFailureAt === completedAt && nextRunAt === null && errorCode !== null &&
       consecutiveFailures >= 1) ||
@@ -5636,7 +5637,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           instance_id = excluded.instance_id,
           build_fingerprint = excluded.build_fingerprint,
           config_fingerprint = excluded.config_fingerprint,
-          desired_state = 'running', state = 'running',
+          desired_state = daemon_health.desired_state, state = 'running',
           started_at = excluded.started_at, heartbeat_at = excluded.heartbeat_at,
           clean_stopped_at = NULL, last_error_code = NULL, updated_at = excluded.updated_at
         WHERE excluded.updated_at >= daemon_health.updated_at`)
@@ -5711,7 +5712,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (existingRow !== undefined) {
         const existing = toDaemonJobOutcome(existingRow);
         if (existing.state === 'running' || existing.updatedAt > safeAt ||
-            (existing.state === 'backoff' && existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
+            (existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
           this.db.exec('COMMIT');
           return null;
         }
@@ -5746,19 +5747,20 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     }
   }
 
-  completeDaemonJobSuccess(input: DaemonJobCompletion): DaemonJobOutcomeRecord | null {
-    return this.completeDaemonJob(input, null);
+  completeDaemonJobSuccess(input: DaemonJobSuccessCompletion): DaemonJobOutcomeRecord | null {
+    return this.completeDaemonJob(input, null, operationalIso(input.nextRunAt, true));
   }
 
   completeDaemonJobFailure(
     input: DaemonJobCompletion & { readonly errorCode: string },
   ): DaemonJobOutcomeRecord | null {
-    return this.completeDaemonJob(input, operationalCode(input.errorCode, true));
+    return this.completeDaemonJob(input, operationalCode(input.errorCode, true), null);
   }
 
   private completeDaemonJob(
     input: DaemonJobCompletion,
     errorCode: string | null,
+    nextRunAt: string | null,
   ): DaemonJobOutcomeRecord | null {
     const jobName = operationalJobName(input.claim.jobName);
     const revision = operationalInteger(input.claim.revision, true);
@@ -5770,14 +5772,17 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     const checkpoint = input.checkpoint === undefined
       ? null
       : operationalInteger(input.checkpoint, true);
-    if (at < startedAt) operationalFail('OPERATIONAL_INPUT_INVALID');
+    if (at < startedAt || (nextRunAt !== null && nextRunAt < at) ||
+        (errorCode === null) !== (nextRunAt !== null)) {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
     const state = errorCode === null ? 'succeeded' : 'failed';
     return this.transitionDaemonJob(jobName, () => Number(this.db.prepare(`
       UPDATE daemon_job_outcome
          SET revision = revision + 1, state = ?, completed_at = ?,
              last_success_at = CASE WHEN ? = 'succeeded' THEN ? ELSE last_success_at END,
              last_failure_at = CASE WHEN ? = 'failed' THEN ? ELSE last_failure_at END,
-             duration_ms = ?, next_run_at = NULL, error_code = ?,
+             duration_ms = ?, next_run_at = ?, error_code = ?,
              consecutive_failures = CASE WHEN ? = 'succeeded' THEN 0 ELSE consecutive_failures + 1 END,
              processed_count = ?, deferred_count = ?,
              checkpoint = CASE WHEN ? IS NULL THEN checkpoint ELSE ? END,
@@ -5785,7 +5790,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
        WHERE job_name = ? AND revision = ? AND state = 'running' AND started_at = ?
          AND updated_at <= ? AND (? IS NULL OR checkpoint <= ?)`)
       .run(
-        state, at, state, at, state, at, durationMs, errorCode, state,
+        state, at, state, at, state, at, durationMs, nextRunAt, errorCode, state,
         processedCount, deferredCount, checkpoint, checkpoint, at,
         jobName, revision, startedAt, at, checkpoint, checkpoint,
       ).changes));
@@ -5857,14 +5862,17 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   readOperationalAggregateCounts(): OperationalAggregateCounts {
     const row = this.db.prepare(`
       SELECT
-        (SELECT COUNT(*) FROM gate_resolution_outbox WHERE card_pending = 1) AS gate_cards,
+        (SELECT COUNT(*) FROM gate_resolution_outbox o
+          WHERE o.card_pending = 1
+            AND NOT EXISTS (SELECT 1 FROM gate_channel_delivery d WHERE d.gate_key = o.gate_key))
+          AS gate_cards,
         (SELECT COUNT(*) FROM gate_channel_delivery
           WHERE state IN ('pending','attempted','receipted')
-            AND resume_baseline_state <> 'unavailable') AS channel_deliveries,
+            AND resume_baseline_state = 'recorded') AS channel_deliveries,
         (SELECT COUNT(*) FROM gate_channel_delivery
           WHERE state <> 'consumed' AND resume_baseline_state = 'required') AS resume_baselines,
         (SELECT COUNT(*) FROM gate_resolution_outbox o
-          WHERE o.notification_state = 'pending'
+          WHERE o.notification_state = 'pending' AND o.card_pending = 0
             AND NOT EXISTS (SELECT 1 FROM gate_channel_delivery d WHERE d.gate_key = o.gate_key))
           AS legacy_notifications,
         (SELECT COUNT(*) FROM slack_root_intent WHERE state IN ('pending','sending'))

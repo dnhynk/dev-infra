@@ -26,6 +26,10 @@ const AT0 = '2026-08-26T00:00:00.000Z';
 const AT1 = '2026-08-26T00:00:01.000Z';
 const AT2 = '2026-08-26T00:00:02.000Z';
 const AT3 = '2026-08-26T00:00:03.000Z';
+const AT4 = '2026-08-26T00:00:04.000Z';
+const AT5 = '2026-08-26T00:00:05.000Z';
+const AT6 = '2026-08-26T00:00:06.000Z';
+const AT7 = '2026-08-26T00:00:07.000Z';
 
 function downgradeToV12(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
@@ -258,10 +262,20 @@ describe('daemon health and monotonic job outcomes', () => {
     expect(store.recordDaemonHeartbeat('wrong-instance', AT1)).toBeNull();
     expect(store.recordDaemonHeartbeat('instance-a', AT1)).toMatchObject({ heartbeatAt: AT1 });
     expect(store.setDaemonDesiredState('stopped', AT2)).toMatchObject({ desiredState: 'stopped' });
-    expect(store.recordDaemonCleanStop('instance-a', AT3)).toMatchObject({
-      state: 'stopped', cleanStoppedAt: AT3,
+    expect(store.recordDaemonStart({
+      instanceId: 'instance-b', buildFingerprint: 'build.1', configFingerprint: 'config.1', at: AT3,
+    })).toMatchObject({ state: 'running', desiredState: 'stopped', instanceId: 'instance-b' });
+    expect(store.recordDaemonCleanStop('instance-b', AT4)).toMatchObject({
+      state: 'stopped', desiredState: 'stopped', cleanStoppedAt: AT4,
     });
-    expect(store.recordDaemonHeartbeat('instance-a', AT3)).toBeNull();
+    expect(store.recordDaemonHeartbeat('instance-b', AT4)).toBeNull();
+    expect(store.setDaemonDesiredState('running', AT5)).toMatchObject({ desiredState: 'running' });
+    expect(store.recordDaemonStart({
+      instanceId: 'instance-c', buildFingerprint: 'build.1', configFingerprint: 'config.1', at: AT6,
+    })).toMatchObject({ state: 'running', desiredState: 'running' });
+    expect(store.recordDaemonCleanStop('instance-c', AT7)).toMatchObject({
+      state: 'stopped', desiredState: 'running', cleanStoppedAt: AT7,
+    });
     store.close();
   });
 
@@ -269,9 +283,16 @@ describe('daemon health and monotonic job outcomes', () => {
     const store = new SqliteDigestStore(path);
     const first = store.startDaemonJob('repository-discovery', AT0)!;
     expect(store.startDaemonJob('repository-discovery', AT0)).toBeNull();
+    expect(() => store.completeDaemonJobSuccess({
+      claim: first, at: AT1, nextRunAt: AT0, durationMs: 1000,
+    })).toThrow(OperationalStoreError);
     expect(store.completeDaemonJobSuccess({
-      claim: first, at: AT1, durationMs: 1000, processedCount: 4, deferredCount: 1, checkpoint: 5,
-    })).toMatchObject({ state: 'succeeded', checkpoint: 5, consecutiveFailures: 0 });
+      claim: first, at: AT1, nextRunAt: AT2, durationMs: 1000,
+      processedCount: 4, deferredCount: 1, checkpoint: 5,
+    })).toMatchObject({
+      state: 'succeeded', checkpoint: 5, consecutiveFailures: 0, nextRunAt: AT2,
+    });
+    expect(store.startDaemonJob('repository-discovery', AT1)).toBeNull();
     expect(() => store.advanceDaemonJobCheckpoint('repository-discovery', 5, 4, AT2))
       .toThrow(OperationalStoreError);
     const second = store.startDaemonJob('repository-discovery', AT2)!;
@@ -366,8 +387,10 @@ describe('exact operational pending categories', () => {
        state, attempt_count, last_attempt_at, next_attempt_at, receipted_at, consumed_at,
        lease_owner, lease_expires_at, last_error_code, created_at, updated_at, resume_baseline_state)
       VALUES (?, 'run:r', 'task:t', 'dispatch-id', 0, 0, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)`);
-    insertOutbox.run('gate:legacy', 1, null, AT0, AT0);
-    insertOutbox.run('gate:required', 0, AT0, AT0, AT0);
+    insertOutbox.run('gate:card', 1, null, AT0, AT0);
+    insertOutbox.run('gate:legacy', 0, AT0, AT0, AT0);
+    // The sidecar owns this key: neither card_pending nor legacy notification may shadow it.
+    insertOutbox.run('gate:required', 1, null, AT0, AT0);
     insertDelivery.run('gate:required', 'pending', 0, null, AT1, null, null, AT0, AT0, 'required');
     insertOutbox.run('gate:recorded', 0, AT0, AT0, AT0);
     insertDelivery.run('gate:recorded', 'receipted', 1, AT1, AT2, AT2, null, AT0, AT2, 'recorded');
@@ -379,8 +402,8 @@ describe('exact operational pending categories', () => {
 
     expect(store.readOperationalAggregateCounts()).toEqual({
       pending: {
-        gateCards: 1, channelDeliveries: 2, resumeBaselines: 1,
-        legacyNotifications: 1, slackRootIntents: 1, total: 6,
+        gateCards: 1, channelDeliveries: 1, resumeBaselines: 1,
+        legacyNotifications: 1, slackRootIntents: 1, total: 5,
       },
       uncertain: { slackRootIntents: 1, total: 1 },
       dead: { unavailableResumeBaselines: 1, total: 1 },

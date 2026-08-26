@@ -719,8 +719,8 @@ CREATE TABLE daemon_job_outcome (
     (state = 'running' AND completed_at IS NULL AND duration_ms IS NULL
       AND next_run_at IS NULL AND error_code IS NULL)
     OR (state = 'succeeded' AND completed_at IS NOT NULL AND duration_ms IS NOT NULL
-      AND last_success_at = completed_at AND next_run_at IS NULL AND error_code IS NULL
-      AND consecutive_failures = 0)
+      AND last_success_at = completed_at AND next_run_at IS NOT NULL AND error_code IS NULL
+      AND consecutive_failures = 0 AND next_run_at >= updated_at)
     OR (state = 'failed' AND completed_at IS NOT NULL AND duration_ms IS NOT NULL
       AND last_failure_at = completed_at AND next_run_at IS NULL AND error_code IS NOT NULL
       AND consecutive_failures >= 1)
