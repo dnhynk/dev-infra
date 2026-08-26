@@ -387,6 +387,75 @@ describe('discovery registry transactions', () => {
     faulty.close();
   });
 
+  it('atomically replaces an incompatible routing generation while preserving issue history', () => {
+    let store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'reconcile',
+      repositories: [repository], bindings: [binding], issues: [issue], at: AT0,
+    });
+    store.close();
+
+    const replacement = {
+      ...repository,
+      canonicalKey: 'github.com/acme/replacement' as const,
+      nameWithOwner: 'acme/replacement' as const,
+      githubRepositoryId: 202,
+      projectKey: 'project-two',
+    };
+    const replacementBinding = {
+      ...binding,
+      orcaRepositoryId: 'replacement-orca-id',
+      canonicalKey: replacement.canonicalKey,
+      projectKey: replacement.projectKey,
+    };
+    const faulty = new SqliteDigestStore(path, {
+      operationalFault: (point) => {
+        if (point === 'after_discovery_registry') throw new Error('injected');
+      },
+    });
+    expect(() => faulty.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'replace',
+      repositories: [replacement], bindings: [replacementBinding], issues: [], at: AT1,
+    })).toThrow(OperationalStoreError);
+    expect(faulty.readEffectiveDiscoverySnapshot()).toMatchObject({
+      repositories: [{ canonicalKey: repository.canonicalKey }],
+      bindings: [{ orcaRepositoryId: binding.orcaRepositoryId }],
+      issues: [{ issueHash: issue.issueHash, active: true }],
+    });
+    faulty.close();
+
+    store = new SqliteDigestStore(path);
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'replace',
+      repositories: [replacement], bindings: [replacementBinding], issues: [], at: AT1,
+    })).toMatchObject({
+      repositories: [{ canonicalKey: replacement.canonicalKey, firstSeenAt: AT1 }],
+      bindings: [{ orcaRepositoryId: replacementBinding.orcaRepositoryId, firstSeenAt: AT1 }],
+      issues: [],
+    });
+    store.close();
+
+    const raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM repository_registry').get())
+      .toEqual({ count: 1 });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM orca_repository_binding').get())
+      .toEqual({ count: 1 });
+    expect(raw.prepare(`SELECT active, resolved_at IS NOT NULL AS resolved
+                          FROM repository_discovery_issue WHERE issue_hash = ?`)
+      .get(issue.issueHash)).toEqual({ active: 0, resolved: 1 });
+    raw.close();
+
+    store = new SqliteDigestStore(path);
+    expect(() => store.replaceDiscoverySnapshot({
+      passOutcome: 'failed', routingMode: 'replace',
+      repositories: [], bindings: [], issues: [], at: AT2,
+    })).toThrowError(new OperationalStoreError('OPERATIONAL_INPUT_INVALID'));
+    expect(store.readEffectiveDiscoverySnapshot().repositories).toMatchObject([{
+      canonicalKey: replacement.canonicalKey,
+    }]);
+    store.close();
+  });
+
   it('rejects duplicate identities, project mismatch, and non-manual null bindings', () => {
     const store = new SqliteDigestStore(path);
     for (const input of [

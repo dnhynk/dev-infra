@@ -607,7 +607,7 @@ describe('O1-3 repository discovery reconciliation', () => {
     }
   });
 
-  it('confirms a full-capacity numeric rename but defers a genuinely unrelated seventeenth repo', async () => {
+  it('confirms a new-ID/new-alias rename at full capacity and defers a true seventeenth numeric group', async () => {
     const bridgeConfig = config();
     const rows = Array.from({ length: 16 }, (_, index) =>
       repoRow(`orca-${index}`, `acme/repo-${index}`));
@@ -617,12 +617,15 @@ describe('O1-3 repository discovery reconciliation', () => {
 
     const renameGithub = new FakeGithub(() => ({ id: 200, nameWithOwner: 'acme/renamed' }));
     const renamed = await pass(
-      [repoRow('orca-0', 'acme/repo-0')], bridgeConfig, renameGithub, T1,
+      [repoRow('orca-renamed-alias', 'acme/fresh-alias')], bridgeConfig, renameGithub, T1,
     );
-    expect(renameGithub.calls).toEqual(['acme/repo-0']);
+    expect(renameGithub.calls).toEqual(['acme/fresh-alias']);
     expect(renamed.snapshot.repositories).toHaveLength(16);
     expect(renamed.snapshot.bindings.find((binding) =>
       binding.orcaRepositoryId === 'orca-0')?.canonicalKey).toBe('github.com/acme/renamed');
+    expect(renamed.snapshot.bindings.find((binding) =>
+      binding.orcaRepositoryId === 'orca-renamed-alias')?.canonicalKey)
+      .toBe('github.com/acme/renamed');
     expect(renamed.counts.deferredRepositories).toBe(0);
 
     const newGithub = new FakeGithub(() => ({ id: 999, nameWithOwner: 'acme/seventeenth' }));
@@ -630,12 +633,63 @@ describe('O1-3 repository discovery reconciliation', () => {
       [repoRow('orca-seventeen', 'acme/seventeenth')], bridgeConfig, newGithub,
       '2026-08-26T02:00:00.000Z',
     );
-    expect(newGithub.calls).toEqual([]);
+    expect(newGithub.calls).toEqual(['acme/seventeenth']);
     expect(deferred.snapshot.repositories).toHaveLength(16);
     expect(deferred.counts.deferredRepositories).toBe(1);
     expect(deferred.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
       status: 'blocked', reason: 'capacity_deferred',
       orcaRepositoryIds: ['orca-seventeen'],
+    }));
+  });
+
+  it('charges one slot to a complete same-numeric alias group and binds every alias atomically', async () => {
+    const bridgeConfig = config();
+    const rows = Array.from({ length: 15 }, (_, index) =>
+      repoRow(`orca-seed-${index}`, `acme/seed-${index}`));
+    await pass(rows, bridgeConfig, new FakeGithub((name) => ({
+      id: 300 + Number(name.slice('acme/seed-'.length)), nameWithOwner: name,
+    })));
+
+    const github = new FakeGithub(() => ({ id: 999, nameWithOwner: 'acme/converged' }));
+    const converged = await pass([
+      repoRow('orca-alias-b', 'acme/fresh-b'),
+      repoRow('orca-alias-a', 'acme/fresh-a'),
+    ], bridgeConfig, github, T1);
+
+    expect(github.calls).toEqual(['acme/fresh-a', 'acme/fresh-b']);
+    expect(converged.snapshot.repositories).toHaveLength(16);
+    expect(converged.snapshot.bindings.filter((binding) =>
+      binding.canonicalKey === 'github.com/acme/converged').map((binding) =>
+      binding.orcaRepositoryId)).toEqual(['orca-alias-a', 'orca-alias-b']);
+    expect(converged.counts.deferredRepositories).toBe(0);
+    expect(converged.effectiveConfig.bindings.some((binding) =>
+      binding.status === 'blocked' && binding.orcaRepositoryIds.some((id) =>
+        id.startsWith('orca-alias-')))).toBe(false);
+  });
+
+  it.each([
+    ['forward', ['orca-high', 'orca-low']],
+    ['reverse', ['orca-low', 'orca-high']],
+  ])('selects complete numeric groups deterministically under capacity: %s', async (_name, ids) => {
+    const rowsById = new Map([
+      ['orca-high', repoRow('orca-high', 'acme/a-high')],
+      ['orca-low', repoRow('orca-low', 'acme/z-low')],
+    ]);
+    const github = new FakeGithub((name) => name === 'acme/a-high'
+      ? { id: 900, nameWithOwner: name }
+      : { id: 100, nameWithOwner: name });
+    const result = await pass(
+      ids.map((id) => rowsById.get(id)!),
+      config([], { repositories: 1 }),
+      github,
+    );
+
+    expect(github.calls).toEqual(['acme/a-high', 'acme/z-low']);
+    expect(result.snapshot.repositories).toMatchObject([{
+      canonicalKey: 'github.com/acme/z-low', githubRepositoryId: 100,
+    }]);
+    expect(result.effectiveConfig.bindings).toContainEqual(expect.objectContaining({
+      status: 'blocked', reason: 'capacity_deferred', orcaRepositoryIds: ['orca-high'],
     }));
   });
 
@@ -780,24 +834,71 @@ describe('O1-3 repository discovery reconciliation', () => {
     expect(result.effectiveConfig.routing).toEqual({ status: 'blocked', reason: 'config_drift' });
   });
 
-  it('uses only current verified facts after a successful pass with an incompatible LKG fingerprint', async () => {
+  it('atomically replaces an incompatible routing generation and never revives it on the next failure', async () => {
     const bridgeConfig = config();
     await pass(
-      [repoRow('orca-old', 'acme/old')], bridgeConfig,
-      new FakeGithub(() => ({ id: 121, nameWithOwner: 'acme/old' })),
+      Array.from({ length: 16 }, (_, index) =>
+        repoRow(`orca-old-${index}`, `acme/old-${index}`)),
+      bridgeConfig,
+      new FakeGithub((name) => ({
+        id: 121 + Number(name.slice('acme/old-'.length)), nameWithOwner: name,
+      })),
     );
     const result = await pass(
       [repoRow('orca-new', 'acme/new')], bridgeConfig,
-      new FakeGithub(() => ({ id: 122, nameWithOwner: 'acme/new' })), T1,
+      new FakeGithub(() => ({ id: 900, nameWithOwner: 'acme/new' })), T1,
       { lastKnownGoodConfigFingerprint: 'different-config-fingerprint' },
     );
 
+    expect(result.counts.deferredRepositories).toBe(0);
     expect(result.snapshot.repositories.map((row) => row.canonicalKey)).toEqual([
-      'github.com/acme/new', 'github.com/acme/old',
+      'github.com/acme/new',
     ]);
     expect(result.effectiveConfig.projects.map((row) => row.key)).toEqual([
       'auto:github.com/acme/new',
     ]);
+
+    const failure = await runRepositoryDiscoveryPass({
+      orca: new FakeOrca(new Error('private query failure')),
+      github: new FakeGithub(() => new Error('not called')),
+      store,
+      config: bridgeConfig,
+      now: () => new Date(T2),
+      lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(bridgeConfig),
+    });
+    expect(failure).toMatchObject({ status: 'failed', failure: 'query_failed' });
+    expect(failure.snapshot.repositories.map((row) => row.canonicalKey)).toEqual([
+      'github.com/acme/new',
+    ]);
+    expect(failure.effectiveConfig.projects.map((row) => row.key)).toEqual([
+      'auto:github.com/acme/new',
+    ]);
+  });
+
+  it('excludes an incompatible explicit Project from current conflict inference', async () => {
+    const alpha = config([{ name: 'alpha', repositories: ['acme/shared'] }]);
+    await pass(
+      [repoRow('orca-shared', 'acme/shared')], alpha,
+      new FakeGithub(() => ({ id: 901, nameWithOwner: 'acme/shared' })),
+    );
+    const beta = config([{ name: 'beta', repositories: ['acme/shared'] }]);
+    const github = new FakeGithub(() => ({ id: 901, nameWithOwner: 'acme/shared' }));
+    const current = await pass(
+      [repoRow('orca-shared', 'acme/shared')], beta,
+      github, T1,
+      { lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(alpha) },
+    );
+
+    expect(github.calls).toEqual(['acme/shared']);
+    expect(current.status).toBe('succeeded');
+    expect(current.snapshot.repositories).toMatchObject([{
+      canonicalKey: 'github.com/acme/shared', projectKey: 'beta', projectOrigin: 'explicit',
+    }]);
+    expect(current.snapshot.bindings).toMatchObject([{
+      orcaRepositoryId: 'orca-shared', projectKey: 'beta',
+    }]);
+    expect(current.effectiveConfig.bindings.some((binding) =>
+      binding.status === 'blocked' && binding.reason === 'project_conflict')).toBe(false);
   });
 
   it('preserves the prior routing revision when strict parser shape fails', async () => {
@@ -866,7 +967,7 @@ describe('O1-3 repository discovery reconciliation', () => {
     const result = await pass(rows, config(), github);
 
     expect(result.snapshot.repositories).toHaveLength(Math.min(count, 16));
-    expect(github.calls).toHaveLength(Math.min(count, 16));
+    expect(github.calls).toHaveLength(count);
     expect(result.counts.deferredRepositories).toBe(count > 16 ? 1 : 0);
     if (count > 16) {
       expect(result.effectiveConfig.bindings.some((row) =>
@@ -944,5 +1045,52 @@ describe('O1-3 repository discovery reconciliation', () => {
     expect(Object.isFrozen(first)).toBe(true);
     expect(Object.isFrozen(first.projects)).toBe(true);
     expect(Object.isFrozen(first.projects[0])).toBe(true);
+  });
+
+  it('fails closed without merging an auto repository into a colliding hand-built explicit key', async () => {
+    const seedConfig = config();
+    const seeded = await pass(
+      [repoRow('orca-auto', 'acme/auto')], seedConfig,
+      new FakeGithub(() => ({ id: 902, nameWithOwner: 'acme/auto' })),
+    );
+    const safeExplicit = config([{
+      name: 'safe-explicit', repositories: ['acme/configured'],
+    }]);
+    const colliding = {
+      ...safeExplicit,
+      projects: [{
+        ...safeExplicit.projects[0]!,
+        name: 'auto:github.com/acme/auto',
+      }],
+    } as ParsedBridgeConfig;
+    const effective = buildEffectiveBridgeConfig(colliding, seeded.snapshot);
+
+    expect(effective.routing).toEqual({ status: 'blocked', reason: 'project_conflict' });
+    expect(effective.projects).toMatchObject([{
+      key: 'auto:github.com/acme/auto',
+      origin: 'explicit',
+      repositories: [{ canonicalKey: 'github.com/acme/configured' }],
+      orcaRepositoryIds: [],
+    }]);
+    expect(effective.bindings).toContainEqual(expect.objectContaining({
+      status: 'blocked', reason: 'project_conflict', orcaRepositoryIds: ['orca-auto'],
+    }));
+    expect(effective.bindings.some((binding) => binding.status === 'bound' &&
+      binding.orcaRepositoryIds.includes('orca-auto'))).toBe(false);
+
+    let writes = 0;
+    const orca = new FakeOrca(envelope([repoRow('orca-auto', 'acme/auto')]));
+    const failed = await runRepositoryDiscoveryPass({
+      orca,
+      github: new FakeGithub(() => ({ id: 902, nameWithOwner: 'acme/auto' })),
+      store: countingStore(() => { writes += 1; }),
+      config: colliding,
+      now: () => new Date(T1),
+      lastKnownGoodConfigFingerprint: bridgeConfigFingerprint(colliding),
+    });
+    expect(failed).toMatchObject({ status: 'failed', failure: 'config_drift' });
+    expect(failed.effectiveConfig.routing).toEqual({ status: 'blocked', reason: 'project_conflict' });
+    expect(orca.calls).toEqual([]);
+    expect(writes).toBe(0);
   });
 });

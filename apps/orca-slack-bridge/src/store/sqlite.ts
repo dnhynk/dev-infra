@@ -5537,6 +5537,14 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     if (input.passOutcome !== 'succeeded' && input.passOutcome !== 'failed') {
       operationalFail('OPERATIONAL_INPUT_INVALID');
     }
+    if (input.routingMode !== undefined &&
+        input.routingMode !== 'reconcile' && input.routingMode !== 'replace') {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
+    const replaceRouting = input.routingMode === 'replace';
+    if (replaceRouting && input.passOutcome !== 'succeeded') {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
     const canonicalKeys = new Set<string>();
     const githubIds = new Set<number>();
     const repositoryProjects = new Map<string, string>();
@@ -5608,6 +5616,14 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (discoveryFloor?.updated_at !== null && discoveryFloor?.updated_at !== undefined &&
           operationalIso(discoveryFloor.updated_at) > at) {
         operationalFail('OPERATIONAL_STALE_TRANSITION');
+      }
+
+      // A config-fingerprint transition starts a new routing generation. Delete only the two
+      // routing tables inside this transaction; issue history and every unrelated operational
+      // table remain intact, and any later fault restores the complete prior generation.
+      if (replaceRouting) {
+        this.db.prepare('DELETE FROM orca_repository_binding').run();
+        this.db.prepare('DELETE FROM repository_registry').run();
       }
 
       // GitHub's numeric repository identity survives owner/name changes. Rename the durable PK

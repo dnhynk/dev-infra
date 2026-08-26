@@ -18,7 +18,11 @@ import {
 import { discoveryIssueHash, redactedEntityRef } from './redaction.js';
 import { listRepositories, type OrcaRunner } from '../orca/client.js';
 import type { RepositoryIdentityConfirmer } from '../github/repository.js';
-import type { ParsedBridgeConfig } from '../project/config.js';
+import {
+  AUTO_PROJECT_KEY_PREFIX,
+  isReservedAutoProjectName,
+  type ParsedBridgeConfig,
+} from '../project/config.js';
 import type {
   DiscoveryObservationEvidence,
   EffectiveDiscoverySnapshot,
@@ -176,7 +180,7 @@ function repositoryInput(
 }
 
 function autoProjectKey(identity: CanonicalGithubRepository): string {
-  return `auto:${identity.canonicalKey}`;
+  return `${AUTO_PROJECT_KEY_PREFIX}${identity.canonicalKey}`;
 }
 
 async function confirmBeforeDeadline(
@@ -257,6 +261,7 @@ export async function runRepositoryDiscoveryPass(
   const previous = options.store.readEffectiveDiscoverySnapshot();
   const hasDurableLkg = previous.repositories.length > 0 || previous.bindings.length > 0;
   const lkgProofFailed = lkgProof === undefined || (hasDurableLkg && !lkgCompatible);
+  const prior = lkgCompatible ? previous : EMPTY_SNAPSHOT;
 
   const failedFromPrevious = (
     requestedFailure: RepositoryDiscoveryFailure,
@@ -264,11 +269,10 @@ export async function runRepositoryDiscoveryPass(
     blocks: readonly EffectiveBindingBlock[] = [],
     diagnostics: readonly RepositoryDiscoveryDiagnostic[] = [],
     deferredRepositories = 0,
-    routingBlock?: 'capacity_conflict',
+    routingBlock?: 'capacity_conflict' | 'project_conflict',
   ): RepositoryDiscoveryPassResult => {
     const failure = lkgProofFailed ? 'config_drift' : requestedFailure;
-    const usable = lkgCompatible ? previous : EMPTY_SNAPSHOT;
-    const effectiveConfig = buildEffectiveBridgeConfig(options.config, usable, {
+    const effectiveConfig = buildEffectiveBridgeConfig(options.config, prior, {
       configFingerprint: fingerprint,
       blockedBindings: blocks,
       diagnostics,
@@ -282,9 +286,19 @@ export async function runRepositoryDiscoveryPass(
       configFingerprint: fingerprint,
       snapshot: previous,
       effectiveConfig,
-      counts: resultCounts(sourceRows, usable, blocks, deferredRepositories),
+      counts: resultCounts(sourceRows, prior, blocks, deferredRepositories),
     };
   };
+
+  if (options.config.projects.some((project) => isReservedAutoProjectName(project.name))) {
+    const diagnostics: RepositoryDiscoveryDiagnostic[] = [{
+      rowIndex: -1,
+      code: 'project_conflict',
+      effect: 'group_blocked',
+      entityRef: redactedEntityRef('project-namespace', AUTO_PROJECT_KEY_PREFIX),
+    }];
+    return failedFromPrevious('config_drift', 0, [], diagnostics, 0, 'project_conflict');
+  }
 
   let source: RepositoryDiscoverySnapshot;
   try {
@@ -308,17 +322,17 @@ export async function runRepositoryDiscoveryPass(
     for (const id of project.orcaRepositoryIds) manualById.set(id, project.name);
   }
 
-  const previousByCanonical = new Map(previous.repositories.map((row) => [row.canonicalKey, row]));
-  const previousByNumeric = new Map(previous.repositories
+  const previousByCanonical = new Map(prior.repositories.map((row) => [row.canonicalKey, row]));
+  const previousByNumeric = new Map(prior.repositories
     .filter((row) => row.githubRepositoryId !== null)
     .map((row) => [row.githubRepositoryId as number, row]));
-  const previousBindingsByCanonical = new Map<string, typeof previous.bindings>();
-  for (const binding of previous.bindings) {
+  const previousBindingsByCanonical = new Map<string, typeof prior.bindings>();
+  for (const binding of prior.bindings) {
     if (binding.canonicalKey === null) continue;
     const rows = previousBindingsByCanonical.get(binding.canonicalKey) ?? [];
     previousBindingsByCanonical.set(binding.canonicalKey, [...rows, binding]);
   }
-  const previousBindingById = new Map(previous.bindings.map((row) => [row.orcaRepositoryId, row]));
+  const previousBindingById = new Map(prior.bindings.map((row) => [row.orcaRepositoryId, row]));
   const idsForCanonical = (
     canonicalKey: CanonicalGithubRepository['canonicalKey'],
     extra: readonly string[] = [],
@@ -336,7 +350,7 @@ export async function runRepositoryDiscoveryPass(
     options.config.projects.map((project) => [project.name, project.repositories.length]),
   );
   const priorExplicitByProject = new Map<string, Set<number>>();
-  for (const repository of previous.repositories) {
+  for (const repository of prior.repositories) {
     if (repository.projectOrigin !== 'explicit' || repository.githubRepositoryId === null) continue;
     const ids = priorExplicitByProject.get(repository.projectKey) ?? new Set<number>();
     ids.add(repository.githubRepositoryId);
@@ -352,10 +366,10 @@ export async function runRepositoryDiscoveryPass(
     );
   }
   const activeAutoNumeric = new Set<number>();
-  for (const repository of previous.repositories) {
+  for (const repository of prior.repositories) {
     if (repository.projectOrigin !== 'auto' || repository.githubRepositoryId === null) continue;
-    const stableAlias = repository.projectKey.startsWith('auto:')
-      ? repository.projectKey.slice('auto:'.length) : '';
+    const stableAlias = repository.projectKey.startsWith(AUTO_PROJECT_KEY_PREFIX)
+      ? repository.projectKey.slice(AUTO_PROJECT_KEY_PREFIX.length) : '';
     if (explicitByCanonical.has(repository.canonicalKey) || explicitByCanonical.has(stableAlias)) {
       continue;
     }
@@ -630,37 +644,13 @@ export async function runRepositoryDiscoveryPass(
     : Number.isFinite(options.deadlineAt)
       ? Math.min(configuredDeadline, Math.trunc(options.deadlineAt))
       : Date.now() - 1;
-  const related: CanonicalCandidate[] = [];
-  const newAuto: CanonicalCandidate[] = [];
-  for (const candidate of eligible) {
-    const prior = candidate.orcaRepositoryIds.some((id) => {
-      const canonicalKey = previousBindingById.get(id)?.canonicalKey;
-      if (canonicalKey === null || canonicalKey === undefined) return false;
-      return previousByCanonical.get(canonicalKey)?.githubRepositoryId != null;
-    });
-    const observedLkg = previousByCanonical.get(candidate.observed.canonicalKey);
-    if (explicitByCanonical.has(candidate.observed.canonicalKey) ||
-        observedLkg?.githubRepositoryId != null ||
-        prior) {
-      related.push(candidate);
-    } else {
-      newAuto.push(candidate);
-    }
-  }
-
   const confirmed: ConfirmedCandidate[] = [];
-  const newAutoNumerics = new Set<number>();
   const attempt = async (candidate: CanonicalCandidate): Promise<void> => {
     try {
       const row = await confirmBeforeDeadline(
         options.github, candidate, deadlineAt, options.signal,
       );
       confirmed.push(row);
-      const explicit = explicitByCanonical.has(row.observed.canonicalKey) ||
-        explicitByCanonical.has(row.authoritative.canonicalKey);
-      if (!explicit && !previousByNumeric.has(row.githubRepositoryId)) {
-        newAutoNumerics.add(row.githubRepositoryId);
-      }
     } catch (error) {
       if (error instanceof RepositoryConfirmationDeadlineError) throw error;
       handleGithubFailure(candidate);
@@ -668,19 +658,9 @@ export async function runRepositoryDiscoveryPass(
   };
 
   try {
-    for (const candidate of related) await attempt(candidate);
-    const autoSlots = repositoryLimit - capacityFloor;
-    for (const candidate of newAuto) {
-      if (newAutoNumerics.size >= autoSlots) {
-        deferredRepositories += 1;
-        addBlock(
-          candidate.orcaRepositoryIds, 'capacity_deferred', candidate.rowIndex,
-          candidate.observed, 'group_deferred',
-        );
-        continue;
-      }
-      await attempt(candidate);
-    }
+    // Confirmation is bounded by one shared deadline and deliberately precedes slot accounting.
+    // Only complete positive numeric groups can consume or reuse repository capacity.
+    for (const candidate of eligible) await attempt(candidate);
   } catch (error) {
     if (!(error instanceof RepositoryConfirmationDeadlineError)) throw error;
     // A deadline makes all GitHub evidence from this pass unusable. Overlay every current group on
@@ -805,7 +785,7 @@ export async function runRepositoryDiscoveryPass(
     const projectKey = [...explicitProjects][0] ??
       (numericLkg?.projectOrigin === 'auto'
         ? numericLkg.projectKey
-        : `auto:${firstObservedCanonical}`);
+        : `${AUTO_PROJECT_KEY_PREFIX}${firstObservedCanonical}`);
     const projectOrigin: EffectiveProjectOrigin = explicitProjects.size === 0 ? 'auto' : 'explicit';
     const currentIds = [...new Set(rows.flatMap((row) => row.orcaRepositoryIds))].sort();
     const allIds = idsForNumeric(numeric, currentIds);
@@ -825,7 +805,34 @@ export async function runRepositoryDiscoveryPass(
     });
   }
 
+  // Apply capacity to whole numeric identities after every bounded confirmation has converged.
+  // Existing identities never consume another slot, and aliases for one new identity are accepted
+  // or deferred together. Numeric ordering is stable across repo-list permutations and locales.
+  const occupiedAutoNumeric = new Set(activeAutoNumeric);
   for (const resolved of resolvedByNumeric.values()) {
+    if (resolved.projectOrigin === 'explicit') occupiedAutoNumeric.delete(resolved.githubRepositoryId);
+  }
+  let availableAutoSlots = repositoryLimit - explicitCapacityFloor - occupiedAutoNumeric.size;
+  const acceptedByNumeric = new Map<number, ResolvedRepository>();
+  for (const [numeric, resolved] of [...resolvedByNumeric.entries()].sort(([a], [b]) => a - b)) {
+    if (resolved.projectOrigin === 'explicit' || occupiedAutoNumeric.has(numeric)) {
+      acceptedByNumeric.set(numeric, resolved);
+      continue;
+    }
+    if (availableAutoSlots > 0) {
+      availableAutoSlots -= 1;
+      occupiedAutoNumeric.add(numeric);
+      acceptedByNumeric.set(numeric, resolved);
+      continue;
+    }
+    deferredRepositories += 1;
+    addBlock(
+      idsForNumeric(numeric, [...resolved.orcaRepositoryIds]),
+      'capacity_deferred', resolved.rowIndex, resolved.identity, 'group_deferred',
+    );
+  }
+
+  for (const resolved of acceptedByNumeric.values()) {
     const numericLkg = previousByNumeric.get(resolved.githubRepositoryId);
     if (numericLkg !== undefined && numericLkg.canonicalKey !== resolved.identity.canonicalKey) {
       repositoryInputs.delete(numericLkg.canonicalKey);
@@ -880,7 +887,7 @@ export async function runRepositoryDiscoveryPass(
   }
   const inactiveCutoff = Date.parse(at) - 24 * 60 * 60 * 1_000;
   const projectedBindings = new Map<string, string | null>();
-  for (const binding of previous.bindings) {
+  for (const binding of prior.bindings) {
     const submitted = bindingInputs.get(binding.orcaRepositoryId);
     const remainsActive = submitted !== undefined ||
       !(binding.consecutiveMissingPasses >= 1 && Date.parse(binding.lastSeenAt) <= inactiveCutoff);
@@ -923,6 +930,7 @@ export async function runRepositoryDiscoveryPass(
   try {
     durable = options.store.replaceDiscoverySnapshot({
       passOutcome: 'succeeded',
+      routingMode: hasDurableLkg && !lkgCompatible ? 'replace' : 'reconcile',
       repositories: [...repositoryInputs.values()].sort((a, b) =>
         compareText(a.canonicalKey, b.canonicalKey)),
       bindings: [...bindingInputs.values()].sort((a, b) =>
@@ -932,7 +940,7 @@ export async function runRepositoryDiscoveryPass(
     });
   } catch {
     const effectiveConfig = buildEffectiveBridgeConfig(
-      options.config, lkgCompatible ? previous : EMPTY_SNAPSHOT,
+      options.config, prior,
       {
         configFingerprint: fingerprint,
         blockedBindings: blocks,
@@ -947,19 +955,15 @@ export async function runRepositoryDiscoveryPass(
       configFingerprint: fingerprint,
       snapshot: previous, effectiveConfig,
       counts: resultCounts(
-        source.rows.length, lkgCompatible ? previous : EMPTY_SNAPSHOT,
+        source.rows.length, prior,
         blocks, deferredRepositories,
       ),
     };
   }
 
-  const effectiveSnapshot: EffectiveDiscoverySnapshot = lkgCompatible ? durable : {
-    repositories: durable.repositories.filter((row) =>
-      repositoryInputs.get(row.canonicalKey)?.evidence === 'verified'),
-    bindings: durable.bindings.filter((row) =>
-      bindingInputs.get(row.orcaRepositoryId)?.evidence === 'verified'),
-    issues: durable.issues,
-  };
+  // A mismatched routing generation was replaced inside the transaction, so every active durable
+  // row now belongs to current verified inference. Compatible passes retain ordinary LKG/grace.
+  const effectiveSnapshot: EffectiveDiscoverySnapshot = durable;
   const effectiveConfig = buildEffectiveBridgeConfig(options.config, effectiveSnapshot, {
     configFingerprint: fingerprint,
     blockedBindings: blocks,

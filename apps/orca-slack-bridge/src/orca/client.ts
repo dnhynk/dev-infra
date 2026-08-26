@@ -875,7 +875,7 @@ export async function listWorkerPage(
       repositoryIdReadability: repositoryIdReadability(worktreeId),
     };
   });
-  let countMatches = true;
+  let countMatches = false;
   if ('count' in r) {
     countMatches = typeof r.count === 'number' && Number.isSafeInteger(r.count) &&
       r.count >= 0 && r.count === workers.length;
@@ -885,18 +885,20 @@ export async function listWorkerPage(
       countMatches = false;
     } else {
       let total = 0;
+      let bucketCountsValid = true;
       for (const value of Object.values(r.counts)) {
         if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-          countMatches = false;
+          bucketCountsValid = false;
           break;
         }
         total += value;
         if (!Number.isSafeInteger(total)) {
-          countMatches = false;
+          bucketCountsValid = false;
           break;
         }
       }
-      if (total !== workers.length) countMatches = false;
+      const bucketsMatch = bucketCountsValid && total === workers.length;
+      countMatches = 'count' in r ? countMatches && bucketsMatch : bucketsMatch;
     }
   }
   return { workers, repositoryEvidenceComplete: hasWorkerArray && countMatches };

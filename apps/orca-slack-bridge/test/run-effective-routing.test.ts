@@ -138,7 +138,7 @@ class RunOrca implements OrcaRunner {
       } else if (command === 'gate-list') {
         result = { gates: [] };
       } else if (command === 'worker-list') {
-        result = { workers: [] };
+        result = { workers: [], count: 0 };
       } else {
         throw new Error('unexpected synthetic Orca command');
       }
@@ -328,7 +328,9 @@ describe('O1-3 effective Run routing', () => {
       name: 'missing task array',
       overrides: new Map<string, unknown>([
         ['task-list', { count: 1 }],
-        ['worker-list', { workers: [workerRow('run_shape', 'orca-manual::X:/synthetic')] }],
+        ['worker-list', {
+          workers: [workerRow('run_shape', 'orca-manual::X:/synthetic')], count: 1,
+        }],
       ]),
     },
     {
@@ -342,7 +344,7 @@ describe('O1-3 effective Run routing', () => {
           tasks: [taskRow('run_shape', 'orca-manual::X:/synthetic@@hash:worker', 0)],
           count: 2,
         }],
-        ['worker-list', { workers: [] }],
+        ['worker-list', { workers: [], count: 0 }],
       ]),
     },
     {
@@ -355,17 +357,21 @@ describe('O1-3 effective Run routing', () => {
       ]),
     },
     {
+      name: 'omitted worker count evidence',
+      overrides: new Map<string, unknown>([['worker-list', { workers: [] }]]),
+    },
+    {
       name: 'empty task worktree suffix',
       overrides: new Map<string, unknown>([
         ['task-list', { tasks: [taskRow('run_shape', 'orca-manual::', 0)], count: 1 }],
-        ['worker-list', { workers: [] }],
+        ['worker-list', { workers: [], count: 0 }],
       ]),
     },
     {
       name: 'empty worker worktree suffix',
       overrides: new Map<string, unknown>([
         ['task-list', { tasks: [], count: 0 }],
-        ['worker-list', { workers: [workerRow('run_shape', 'orca-manual::')] }],
+        ['worker-list', { workers: [workerRow('run_shape', 'orca-manual::')], count: 1 }],
       ]),
     },
   ])('routes zero when repository-bearing sources are unreliable: $name', async ({ overrides }) => {
@@ -416,7 +422,9 @@ describe('O1-3 effective Run routing', () => {
       name: 'task query',
       overrides: (marker: string) => new Map<string, unknown | Error>([
         ['task-list', new Error(marker)],
-        ['worker-list', { workers: [workerRow('run_redaction', 'orca-manual::X:/synthetic')] }],
+        ['worker-list', {
+          workers: [workerRow('run_redaction', 'orca-manual::X:/synthetic')], count: 1,
+        }],
       ]),
     },
     {
@@ -436,6 +444,7 @@ describe('O1-3 effective Run routing', () => {
       overrides: (marker: string) => new Map<string, unknown | Error>([
         ['worker-list', {
           workers: [workerRow('run_redaction', 'orca-manual::X:/synthetic', 'dispatched')],
+          count: 1,
         }],
         ['worker-show', new Error(marker)],
       ]),

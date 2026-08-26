@@ -9,7 +9,11 @@ import type {
   EffectiveRoutingState,
   RepositoryDiscoveryDiagnostic,
 } from './types.js';
-import type { ParsedBridgeConfig } from '../project/config.js';
+import {
+  AUTO_PROJECT_KEY_PREFIX,
+  isReservedAutoProjectName,
+  type ParsedBridgeConfig,
+} from '../project/config.js';
 import type {
   EffectiveDiscoverySnapshot,
 } from '../store/operational-types.js';
@@ -103,6 +107,9 @@ export function buildEffectiveBridgeConfig(
   const projects = new Map<string, MutableProject>();
   const explicitByCanonical = new Map<string, string>();
   const manualById = new Map<string, string>();
+  let projectNamespaceConflict = config.projects.some((project) =>
+    isReservedAutoProjectName(project.name));
+  const namespaceConflictCanonicals = new Set<string>();
 
   for (const project of config.projects) {
     const mutable: MutableProject = {
@@ -174,8 +181,16 @@ export function buildEffectiveBridgeConfig(
       assignment = { projectKey: repository.projectKey, projectOrigin: 'explicit' };
     }
     if (assignment === null) continue;
+    const existingProject = projects.get(assignment.projectKey);
+    if (assignment.projectOrigin === 'auto' &&
+        (!assignment.projectKey.startsWith(AUTO_PROJECT_KEY_PREFIX) ||
+         existingProject?.origin === 'explicit')) {
+      projectNamespaceConflict = true;
+      namespaceConflictCanonicals.add(repository.canonicalKey);
+      continue;
+    }
     repositoryProject.set(repository.canonicalKey, assignment);
-    let project = projects.get(assignment.projectKey);
+    let project = existingProject;
     if (project === undefined && assignment.projectOrigin === 'auto') {
       project = {
         key: assignment.projectKey,
@@ -237,6 +252,13 @@ export function buildEffectiveBridgeConfig(
     }
     const repository = repositories.get(binding.canonicalKey);
     const assignment = repositoryProject.get(binding.canonicalKey);
+    if (namespaceConflictCanonicals.has(binding.canonicalKey)) {
+      blockedById.set(binding.orcaRepositoryId, {
+        orcaRepositoryIds: [binding.orcaRepositoryId], reason: 'project_conflict',
+        ...(repository === undefined ? {} : { identity: identityFromCanonical(repository.canonicalKey) }),
+      });
+      continue;
+    }
     if (repository?.githubRepositoryId === null || repository === undefined || assignment === undefined) {
       blockedById.set(binding.orcaRepositoryId, {
         orcaRepositoryIds: [binding.orcaRepositoryId], reason: 'github_identity_unverified',
@@ -297,9 +319,11 @@ export function buildEffectiveBridgeConfig(
         repositoryProject.get(repository.canonicalKey)?.projectOrigin === 'auto')
       .map((repository) => repository.githubRepositoryId as number),
   ).size;
-  const routingBlock = options.routingBlock ?? (
-    effectiveRepositoryCount > config.automation.capacity.repositories ? 'capacity_conflict' : undefined
-  );
+  const routingBlock = projectNamespaceConflict
+    ? 'project_conflict'
+    : options.routingBlock ?? (
+      effectiveRepositoryCount > config.automation.capacity.repositories ? 'capacity_conflict' : undefined
+    );
   const blockedBindingCount = bindings.filter((row) => row.status === 'blocked')
     .reduce((count, row) => count + row.orcaRepositoryIds.length, 0);
   const routing: EffectiveRoutingState = routingBlock !== undefined
