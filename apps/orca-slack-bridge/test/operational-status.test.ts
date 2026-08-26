@@ -652,10 +652,14 @@ function projectedSnapshot(
 
 describe('read-only operational status classification', () => {
   // This one integration owns schema creation, WAL checkpoint, online backup, and strict reopen.
-  // Keep its CI contention budget local; transport deadlines and the global test timeout stay tight.
+  // Only fixture preparation gets the wider CI contention budget; the product read stays strict.
   it('reports a fully matched daemon as healthy with static aggregate-only output', async () => {
     healthyStore().close();
+    const inspectStartedAt = process.hrtime.bigint();
     const report = await inspect();
+    const inspectElapsedMilliseconds =
+      Number(process.hrtime.bigint() - inspectStartedAt) / 1_000_000;
+    expect(inspectElapsedMilliseconds).toBeLessThan(4_000);
     expect(report).toMatchObject({
       overall: 'healthy', exitCode: 0, codes: ['status.healthy'],
       schema: { state: 'matched', expectedVersion: 13, foundVersion: 13 },
