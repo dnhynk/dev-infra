@@ -5537,16 +5537,26 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     if (input.passOutcome !== 'succeeded' && input.passOutcome !== 'failed') {
       operationalFail('OPERATIONAL_INPUT_INVALID');
     }
+    if (input.routingMode !== undefined &&
+        input.routingMode !== 'reconcile' && input.routingMode !== 'replace') {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
+    const replaceRouting = input.routingMode === 'replace';
+    if (replaceRouting && input.passOutcome !== 'succeeded') {
+      operationalFail('OPERATIONAL_INPUT_INVALID');
+    }
     const canonicalKeys = new Set<string>();
     const githubIds = new Set<number>();
     const repositoryProjects = new Map<string, string>();
+    const submittedAutoProjectOwners = new Map<string, number>();
     for (const repository of input.repositories) {
       const canonical = canonicalRepository(repository.canonicalKey, true);
       if (repository.nameWithOwner !== canonical.nameWithOwner || canonicalKeys.has(canonical.canonicalKey)) {
         operationalFail('OPERATIONAL_INPUT_INVALID');
       }
       canonicalKeys.add(canonical.canonicalKey);
-      repositoryProjects.set(canonical.canonicalKey, validateProjectKey(repository.projectKey, true));
+      const projectKey = validateProjectKey(repository.projectKey, true);
+      repositoryProjects.set(canonical.canonicalKey, projectKey);
       if (repository.projectOrigin !== 'explicit' && repository.projectOrigin !== 'auto') {
         operationalFail('OPERATIONAL_INPUT_INVALID');
       }
@@ -5557,6 +5567,11 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         const id = operationalInteger(repository.githubRepositoryId, true, 1);
         if (githubIds.has(id)) operationalFail('OPERATIONAL_INPUT_INVALID');
         githubIds.add(id);
+        if (repository.projectOrigin === 'auto') {
+          const owner = submittedAutoProjectOwners.get(projectKey);
+          if (owner !== undefined && owner !== id) operationalFail('OPERATIONAL_INPUT_INVALID');
+          submittedAutoProjectOwners.set(projectKey, id);
+        }
       } else if (repository.projectOrigin === 'auto' && repository.evidence === 'verified') {
         // Automatically discovered candidates are not strong evidence until GitHub confirms
         // the durable numeric identity.
@@ -5608,6 +5623,31 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (discoveryFloor?.updated_at !== null && discoveryFloor?.updated_at !== undefined &&
           operationalIso(discoveryFloor.updated_at) > at) {
         operationalFail('OPERATIONAL_STALE_TRANSITION');
+      }
+
+      // A config-fingerprint transition starts a new routing generation. Delete only the two
+      // routing tables inside this transaction; issue history and every unrelated operational
+      // table remain intact, and any later fault restores the complete prior generation.
+      if (replaceRouting) {
+        this.db.prepare('DELETE FROM orca_repository_binding').run();
+        this.db.prepare('DELETE FROM repository_registry').run();
+      }
+
+      // Auto Project keys are durable numeric-identity claims. This query deliberately includes
+      // inactive rows; compatible generations may retain them, but a different numeric owner may
+      // never reuse their key. Incompatible generations were deleted immediately above.
+      const findDifferentAutoProjectOwner = this.db.prepare(`
+        SELECT 1 FROM repository_registry
+         WHERE project_origin = 'auto' AND project_key = ?
+           AND github_repository_id IS NOT NULL AND github_repository_id <> ?
+         LIMIT 1`);
+      for (const repository of input.repositories) {
+        if (repository.projectOrigin !== 'auto' || repository.githubRepositoryId === null) continue;
+        if (findDifferentAutoProjectOwner.get(
+          repository.projectKey, repository.githubRepositoryId,
+        ) !== undefined) {
+          operationalFail('OPERATIONAL_CONFLICT');
+        }
       }
 
       // GitHub's numeric repository identity survives owner/name changes. Rename the durable PK
@@ -5814,6 +5854,12 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
                 (b.active = 1 AND r.active <> 1))
          LIMIT 1`).get();
       if (invalidBinding !== undefined) operationalFail('OPERATIONAL_CONFLICT');
+      const invalidAutoProjectOwner = this.db.prepare(`
+        SELECT 1 FROM repository_registry
+         WHERE project_origin = 'auto' AND github_repository_id IS NOT NULL
+         GROUP BY project_key HAVING COUNT(DISTINCT github_repository_id) > 1
+         LIMIT 1`).get();
+      if (invalidAutoProjectOwner !== undefined) operationalFail('OPERATIONAL_CONFLICT');
       const snapshot = readDiscoverySnapshot(this.db, true);
       this.db.exec('COMMIT');
       transactionOpen = false;
@@ -5824,6 +5870,21 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       }
       if (error instanceof OperationalStoreError) throw error;
       operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
+  hasDiscoveryRoutingRows(): boolean {
+    try {
+      const row = this.db.prepare(`
+        SELECT CASE
+          WHEN EXISTS (SELECT 1 FROM repository_registry)
+            OR EXISTS (SELECT 1 FROM orca_repository_binding)
+          THEN 1 ELSE 0 END AS present`).get() as { readonly present: unknown } | undefined;
+      if (row === undefined) operationalFail('OPERATIONAL_STORE_CORRUPT');
+      return operationalBoolean(row.present);
+    } catch (error) {
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_STORE_CORRUPT');
     }
   }
 

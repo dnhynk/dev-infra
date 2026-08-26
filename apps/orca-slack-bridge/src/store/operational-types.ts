@@ -21,6 +21,7 @@ export type OrcaRepositoryBindingInput = {
 
 export type DiscoveryPassOutcome = 'succeeded' | 'failed';
 export type DiscoveryObservationEvidence = 'verified' | 'carried_forward';
+export type DiscoveryRoutingSnapshotMode = 'reconcile' | 'replace';
 
 export type RepositoryDiscoveryIssueCategory =
   | 'no_remote'
@@ -45,6 +46,11 @@ export type RepositoryDiscoveryIssueInput = {
 export type ReplaceDiscoverySnapshotInput = {
   /** Failed whole passes record diagnostics but never consume grace or replace LKG. */
   readonly passOutcome: DiscoveryPassOutcome;
+  /**
+   * `replace` atomically discards the prior routing generation before writing current facts.
+   * Non-routing discovery issue history is preserved. It is valid only for a successful pass.
+   */
+  readonly routingMode?: DiscoveryRoutingSnapshotMode;
   readonly repositories: readonly RepositoryRegistryInput[];
   readonly bindings: readonly OrcaRepositoryBindingInput[];
   readonly issues: readonly RepositoryDiscoveryIssueInput[];
@@ -281,6 +287,8 @@ export type SlackRootPostedInput = {
 
 export interface OperationalStore {
   replaceDiscoverySnapshot(input: ReplaceDiscoverySnapshotInput): EffectiveDiscoverySnapshot;
+  /** Includes inactive rows so config-generation decisions cannot be made from the active view. */
+  hasDiscoveryRoutingRows(): boolean;
   readEffectiveDiscoverySnapshot(): EffectiveDiscoverySnapshot;
 
   recordDaemonStart(input: DaemonStartInput): DaemonHealthRecord;

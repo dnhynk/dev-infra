@@ -83,6 +83,8 @@ export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = Object.freeze({
 });
 
 export const MAX_EXPLICIT_REPOSITORIES_PER_PROJECT = 16;
+/** Reserved prefix for synthesized discovery-only Project keys. */
+export const AUTO_PROJECT_KEY_PREFIX = 'auto:';
 
 /**
  * Slack 식별자. **토큰은 여기 두지 않는다.**
@@ -163,6 +165,11 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 /** Locale-independent compatibility fold for Project identity comparisons. */
 function caseFold(value: string): string {
   return value.normalize('NFKC').toUpperCase().toLowerCase();
+}
+
+/** Explicit Project names may never enter the synthesized discovery namespace. */
+export function isReservedAutoProjectName(value: string): boolean {
+  return caseFold(value.trim()).startsWith(AUTO_PROJECT_KEY_PREFIX);
 }
 
 function assertOnlyKeys(raw: Record<string, unknown>, allowed: readonly string[], at: string): void {
@@ -477,6 +484,9 @@ export function parseConfig(raw: unknown): ParsedBridgeConfig {
       throw new TypeError(`projects[${i}].name이 비어 있다`);
     }
     const projectName = name.trim();
+    if (isReservedAutoProjectName(projectName)) {
+      throw new TypeError(`projects[${i}].name이 예약된 auto Project namespace를 사용한다`);
+    }
     const nameKey = caseFold(projectName);
     const previousName = seenNames.get(nameKey);
     if (previousName !== undefined) {

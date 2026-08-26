@@ -5,6 +5,7 @@ import {
   defaultConfigPath,
   DEFAULT_AUTOMATION_CONFIG,
   DEFAULT_CORRELATION_KEYS,
+  AUTO_PROJECT_KEY_PREFIX,
   MAX_EXPLICIT_REPOSITORIES_PER_PROJECT,
 } from '../src/project/config.js';
 
@@ -61,6 +62,17 @@ describe('parseConfig', () => {
       { name: 'Straße', repositories: ['o/a'] },
       { name: 'STRASSE', repositories: ['o/b'] },
     ] })).toThrow(/case-fold 중복/);
+  });
+
+  it('synthesized auto Project key namespace를 explicit Project 이름에서 예약한다', () => {
+    for (const name of [
+      `${AUTO_PROJECT_KEY_PREFIX}github.com/acme/auto`,
+      'AUTO:github.com/acme/auto',
+    ]) {
+      expect(() => parseConfig({
+        projects: [{ name, repositories: ['acme/configured'] }],
+      })).toThrow(/예약된 auto Project namespace/);
+    }
   });
 
   it('같은 Project 안의 repository 중복을 대소문자와 무관하게 거부한다', () => {

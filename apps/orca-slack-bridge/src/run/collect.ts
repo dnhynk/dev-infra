@@ -3,7 +3,7 @@ import {
   listGates,
   listRuns,
   listTaskPage,
-  listWorkers,
+  listWorkerPage,
   readInbox,
   showAgentWait,
   unreadableGateFields,
@@ -18,7 +18,13 @@ import {
   type OrcaWorker,
   type UnreadableField,
 } from '../orca/client.js';
-import { projectForOrcaRepositoryId, type BridgeConfig } from '../project/config.js';
+import {
+  DEFAULT_AUTOMATION_CONFIG,
+  type BridgeConfig,
+} from '../project/config.js';
+import { isEffectiveBridgeConfig } from '../discovery/effective-config.js';
+import { redactedEntityRef } from '../discovery/redaction.js';
+import type { EffectiveBridgeConfig } from '../discovery/types.js';
 import { projectGateDecisions } from '../gate/project.js';
 import type { GateMetadata } from '../gate/types.js';
 import { runKey } from '../identity/keys.js';
@@ -69,17 +75,59 @@ export type RunSources = {
   readonly degraded: readonly RunDegraded[];
   /** 읽은 row 중 읽지 못한 칸 전부(OD-079). 조회 실패(`degraded`)와 다른 사건이다. */
   readonly unreadable: readonly UnreadableField[];
+  /** False if either repository-bearing query failed or a non-empty identity was malformed. */
+  readonly repositoryIdentityReliable?: boolean;
 };
+
+export type RunRoutingConfig = BridgeConfig | EffectiveBridgeConfig;
+
+export type RunCollectionContractErrorCode =
+  | 'RUN_LIST_HARD_LIMIT'
+  | 'RUN_ORDERING_UNRELIABLE';
+
+const RUN_CONTRACT_MESSAGES: Readonly<Record<RunCollectionContractErrorCode, string>> = {
+  RUN_LIST_HARD_LIMIT: 'Orca Run list exceeds the supported hard limit',
+  RUN_ORDERING_UNRELIABLE: 'Orca Run ordering evidence is missing or inconsistent',
+};
+
+export class RunCollectionContractError extends TypeError {
+  constructor(readonly code: RunCollectionContractErrorCode) {
+    super(RUN_CONTRACT_MESSAGES[code]);
+    this.name = 'RunCollectionContractError';
+  }
+}
+
+export const RUN_LIST_HARD_LIMIT = 256;
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
 /** 읽지 못한 칸 하나를 degraded 한 줄로 옮긴다. 어느 row의 어느 칸인지를 잃지 않는다(OD-079). */
-function unreadableDegraded(f: UnreadableField): RunDegraded {
+function unreadableDegraded(f: UnreadableField, redact = false): RunDegraded {
+  if (redact) {
+    return {
+      kind: 'unreadable_field',
+      detail: 'an Orca Run source field was unreadable',
+      entityRefs: [redactedEntityRef(
+        'orca-unreadable-field',
+        [f.subject, f.id, f.field, f.reason].join('\u0000'),
+      )],
+      counts: { unreadableFields: 1 },
+    };
+  }
   return {
     kind: 'unreadable_field',
     detail: `${f.subject} ${f.id}의 ${f.field}를 읽지 못했다: ${f.reason}`,
+  };
+}
+
+function redactedSourceFailure(row: RunDegraded): RunDegraded {
+  return {
+    kind: row.kind,
+    detail: 'an Orca Run source query failed',
+    entityRefs: [redactedEntityRef('orca-run-source-failure', row.detail)],
+    counts: { failedSources: 1 },
   };
 }
 
@@ -121,11 +169,13 @@ async function readRunSources(
       agentWaits: [],
       degraded: [],
       unreadable: [],
+      repositoryIdentityReliable: true,
     };
   }
   const degraded: RunDegraded[] = [];
   let tasks: readonly OrcaTask[] = [];
   let taskCount = 0;
+  let repositoryIdentityReliable = true;
   try {
     const page = await listTaskPage(orca, run.id);
     // 원천 행의 순서를 여기서 고정한다. `unreadableTaskFields`·`unreadableGateFields`와 아래
@@ -134,7 +184,9 @@ async function readRunSources(
     // 집계(`aggregateTasks`·`aggregateDispatches`)와 badge 순서는 이 순서에 의존하지 않는다.
     tasks = [...page.tasks].sort(byId((t) => t.id));
     taskCount = page.count;
+    repositoryIdentityReliable = page.repositoryEvidenceComplete;
   } catch (e) {
+    repositoryIdentityReliable = false;
     degraded.push({ kind: 'query_failed', detail: `task-list 실패: ${message(e)}` });
   }
   let gates: readonly OrcaGate[] = [];
@@ -156,8 +208,11 @@ async function readRunSources(
   }
   let workers: readonly OrcaWorker[] = [];
   try {
-    workers = [...(await listWorkers(orca, run.id))].sort(byId((w) => w.dispatchId));
+    const page = await listWorkerPage(orca, run.id);
+    workers = [...page.workers].sort(byId((w) => w.dispatchId));
+    repositoryIdentityReliable = repositoryIdentityReliable && page.repositoryEvidenceComplete;
   } catch (e) {
+    repositoryIdentityReliable = false;
     degraded.push({ kind: 'query_failed', detail: `worker-list 실패: ${message(e)}` });
   }
   const agentWaits: { worker: OrcaWorker; wait: OrcaAgentWait }[] = [];
@@ -182,6 +237,9 @@ async function readRunSources(
     agentWaits,
     degraded,
     unreadable: [...unreadableTaskFields(tasks), ...unreadableGateFields(gates)],
+    repositoryIdentityReliable: repositoryIdentityReliable &&
+      !tasks.some((task) => task.repositoryIdReadability === 'unreadable') &&
+      !workers.some((worker) => worker.repositoryIdReadability === 'unreadable'),
   };
 }
 
@@ -202,49 +260,121 @@ export function projectRun(
   run: OrcaRun,
   sources: RunSources,
   askInbox: AskInbox,
-  config: BridgeConfig,
+  config: RunRoutingConfig,
 ): RunFacts {
   const identity = runIdentity(run, sources.tasks);
   const repositoryIds = observedRepositoryIds(sources);
-  // 매치를 전부 모은다. 첫 매치만 보면 두 Project에 걸친 Run이 조용히 한쪽으로 간다.
-  const matched = [
-    ...new Set(
-      repositoryIds
-        .map((id) => projectForOrcaRepositoryId(config, id))
-        .filter((n): n is string => n !== null),
-    ),
-  ].sort();
-  const project = matched[0] ?? null;
-  const repositories =
-    project === null ? [] : (config.projects.find((p) => p.name === project)?.repositories ?? []);
+  const effective = isEffectiveBridgeConfig(config);
+  const base = effective ? config.base : config;
+  const matched: string[] = [];
+  const routeBlocks = new Set<string>();
+  let remoteUnverified = false;
+  if (effective) {
+    if (config.routing.status === 'blocked') routeBlocks.add(config.routing.reason);
+    for (const id of repositoryIds) {
+      const rows = config.bindings.filter((binding) => binding.orcaRepositoryIds.includes(id));
+      if (rows.length !== 1) {
+        routeBlocks.add(rows.length === 0 ? 'unregistered_repository' : 'binding_conflict');
+        continue;
+      }
+      const binding = rows[0]!;
+      if (binding.status === 'blocked') {
+        routeBlocks.add(binding.reason);
+        continue;
+      }
+      const targetProject = config.projects.find((project) => project.key === binding.projectKey);
+      if (targetProject === undefined ||
+          (binding.verification === 'github_verified' &&
+           (binding.identity === null || binding.githubRepositoryId === null)) ||
+          (binding.identity !== null && !targetProject.repositories.some((repository) =>
+            repository.canonicalKey === binding.identity?.canonicalKey))) {
+        routeBlocks.add('project_conflict');
+        continue;
+      }
+      matched.push(binding.projectKey);
+      if (binding.verification === 'remote_unverified') remoteUnverified = true;
+    }
+    if (sources.repositoryIdentityReliable === false) {
+      routeBlocks.add('repository_identity_unreadable');
+    }
+  } else {
+    for (const id of repositoryIds) {
+      for (const project of base.projects) {
+        if (project.orcaRepositoryIds.includes(id)) matched.push(project.name);
+      }
+    }
+  }
+  const consensus = [...new Set(matched)].sort();
+  if (effective && consensus.length > 1) routeBlocks.add('project_conflict');
+  const complete = repositoryIds.length > 0 && matched.length === repositoryIds.length;
+  const project = routeBlocks.size === 0 && complete && consensus.length === 1
+    ? consensus[0]!
+    : null;
+  const repositories = project === null
+    ? []
+    : effective
+      ? (config.projects.find((p) => p.key === project)?.repositories.map((r) => r.nameWithOwner) ?? [])
+      : (base.projects.find((p) => p.name === project)?.repositories ?? []);
 
   const degraded: RunDegraded[] = [
-    ...sources.degraded,
-    ...sources.unreadable.map(unreadableDegraded),
+    ...(effective ? sources.degraded.map(redactedSourceFailure) : sources.degraded),
+    ...sources.unreadable.map((field) => unreadableDegraded(field, effective)),
   ];
   if (repositoryIds.length === 0) {
-    // 원인이 둘이다. 조회가 실패했으면 "관측할 것이 없었다"가 아니라 "관측하지 못했다"이고,
-    // 그 차이가 아래 등록 판정을 신뢰할 수 있는지를 가른다(OD-078의 완화 장치가 여기 걸린다).
-    const failed = sources.degraded.some((d) => d.kind === 'query_failed');
+    if (effective && sources.repositoryIdentityReliable === false) {
+      degraded.push({
+        kind: 'repository_identity_unreadable',
+        detail: 'repository-bearing Orca evidence was present but its identity was unreadable',
+        counts: { observedRepositories: 0, blockingReasons: 1 },
+      });
+    } else {
+      // 원인이 둘이다. 조회가 실패했으면 "관측할 것이 없었다"가 아니라 "관측하지 못했다"이고,
+      // 그 차이가 아래 등록 판정을 신뢰할 수 있는지를 가른다(OD-078의 완화 장치가 여기 걸린다).
+      const failed = sources.degraded.some((d) => d.kind === 'query_failed');
+      degraded.push({
+        kind: 'repository_unobservable',
+        detail: failed
+          ? 'Orca 조회가 실패해 repository id를 관측하지 못했다. 등록 여부를 판정할 수 없다'
+          : 'Task도 worker도 없어 Orca repository id를 관측하지 못했다',
+        ...(effective ? {
+          counts: { observedRepositories: 0, resolvedProjects: 0, blockingReasons: 1 },
+        } : {}),
+      });
+    }
+  } else if (effective && project === null) {
+    const kinds = [...routeBlocks].sort();
     degraded.push({
-      kind: 'repository_unobservable',
-      detail: failed
-        ? 'Orca 조회가 실패해 repository id를 관측하지 못했다. 등록 여부를 판정할 수 없다'
-        : 'Task도 worker도 없어 Orca repository id를 관측하지 못했다',
+      kind: routeBlocks.has('repository_identity_unreadable')
+        ? 'repository_identity_unreadable'
+        : 'repository_route_blocked',
+      detail: 'effective repository routing did not produce one complete Project consensus',
+      entityRefs: repositoryIds.map((id) => redactedEntityRef('orca-repository', id)),
+      counts: {
+        observedRepositories: repositoryIds.length,
+        resolvedProjects: consensus.length,
+        blockingReasons: kinds.length,
+      },
     });
-  } else if (project === null) {
+  } else if (project === null && consensus.length <= 1) {
     degraded.push({
       kind: 'unregistered_repository',
       detail:
         `관측된 Orca repository id가 설정에 없다: ${repositoryIds.join(', ')}. ` +
         'projects[].orcaRepositoryIds에 등록해야 이 Run이 표시 대상이 된다(OD-078)',
     });
-  } else if (matched.length > 1) {
+  } else if (project === null && consensus.length > 1) {
     degraded.push({
       kind: 'multiple_project_match',
-      detail:
-        `관측된 repository id가 Project ${matched.join(', ')}에 걸쳐 있다. ` +
-        `${project}로 접었으므로 나머지 Project의 카드에서 이 Run이 빠진다`,
+      detail: '관측된 repository id가 여러 Project에 걸쳐 있어 어느 쪽으로도 route하지 않았다',
+      counts: { observedRepositories: repositoryIds.length, resolvedProjects: consensus.length },
+    });
+  }
+  if (effective && project !== null && remoteUnverified) {
+    degraded.push({
+      kind: 'remote_unverified_repository',
+      detail: 'explicit manual repository identity is active without a verified live remote',
+      entityRefs: repositoryIds.map((id) => redactedEntityRef('orca-repository', id)),
+      counts: { observedRepositories: repositoryIds.length },
     });
   }
   if (identity.liveness === 'unknown') {
@@ -295,12 +425,12 @@ export function projectRun(
 /**
  * Run 목록의 순서. **입력 순서에 tie를 남기지 않는 total order다.**
  *
- * `(createdAt DESC, runId ASC)`. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 미등록
+ * `(updatedAt DESC, createdAt DESC, runId ASC)`. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 미등록
  * 목록의 상위 ENTRY_CAP건과 run-row degraded 줄의 순서가 관찰마다 뒤바뀌고, 사실이 그대로여도
  * 렌더 지문이 흔들려 `publish.ts`의 `skip`이 컬렉션 카드와 모든 Run 카드에서 발화하지 않는다.
  * `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 `ORDER BY`로 같은 것을 막는다.
  *
- * **1차 키가 `runId`가 아니라 `createdAt`인 이유.** `runId`는 최신성과 무관해서 상위 ENTRY_CAP건이
+ * **최신성 키가 `runId`보다 먼저인 이유.** `runId`는 최신성과 무관해서 상위 ENTRY_CAP건이
  * 임의-안정 부분집합이 된다. 실측(2026-08-24, 미등록 18건)에서 id 순 상위 5건이 폐기용 probe Run을
  * 싣고 그날 만들어진 Run을 밀어냈다. 지문은 안정됐지만 사람이 보는 5건이 무의미해진 것이다.
  * `runId`는 tie만 깬다 — 두 키를 합치면 여전히 total order라 지문 안정성은 그대로다.
@@ -309,22 +439,32 @@ export function projectRun(
  * 타임존 없는 `2026-08-21 14:32:45`), 한 응답에 섞여 나온 것이 실측이다. 문자열 비교는 `' ' < 'T'`
  * 때문에 실제 시각과 무관하게 후자를 앞세운다. 파싱된 `Date`의 epoch로 비교한다.
  *
- * **`createdAt`을 읽지 못한 행의 자리는 맨 뒤다.** 두 경우가 다르다.
- * - `created_at`이 없거나 형식 자체가 어긋나면 `listRuns`의 `parseOrcaTimestamp`가 던져 관찰이
- *   통째로 실패한다. 그 행은 여기까지 오지 않으므로 정렬에서 조용히 사라질 자리가 없다.
- * - 형식은 맞고 값이 범위 밖이면(`2026-13-45 99:99:99`) `parseOrcaTimestamp`의 타임존 없는 갈래가
- *   NaN 검사 없이 Invalid Date를 돌려준다. 그 행은 여기까지 온다. NaN을 그대로 빼면 비교가 NaN이
- *   되어 정렬 결과가 엔진 재량이 되고 지문이 흔들리므로, epoch를 `-Infinity`로 접어 **맨 뒤**에
- *   둔다. 읽지 못한 시각은 최신성을 주장할 근거가 아니다. 자리만 정하고 행을 버리지는 않는다.
+ * 두 시각 중 하나라도 읽을 수 없거나 updatedAt이 createdAt보다 이르면 working set 자체를
+ * 증명할 수 없으므로 pass를 실패시킨다. 불완전한 행을 뒤로 미는 것은 deterministic처럼 보여도
+ * 최신 64건이라는 주장을 뒷받침하지 못한다.
  */
 function byRunRecency(a: OrcaRun, b: OrcaRun): number {
-  const at = (r: OrcaRun): number => {
-    const t = r.createdAt.getTime();
-    return Number.isNaN(t) ? -Infinity : t;
-  };
-  const [x, y] = [at(a), at(b)];
-  if (x !== y) return x > y ? -1 : 1;
+  const [updatedA, updatedB] = [a.updatedAt.getTime(), b.updatedAt.getTime()];
+  if (updatedA !== updatedB) return updatedA > updatedB ? -1 : 1;
+  const [createdA, createdB] = [a.createdAt.getTime(), b.createdAt.getTime()];
+  if (createdA !== createdB) return createdA > createdB ? -1 : 1;
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+function validateRunWorkingSet(runs: readonly OrcaRun[]): void {
+  if (runs.length > RUN_LIST_HARD_LIMIT) {
+    throw new RunCollectionContractError('RUN_LIST_HARD_LIMIT');
+  }
+  const ids = new Set<string>();
+  for (const run of runs) {
+    const created = run.createdAt.getTime();
+    const updated = run.updatedAt.getTime();
+    if (run.id.trim() === '' || run.id !== run.id.trim() || ids.has(run.id) ||
+        !Number.isFinite(created) || !Number.isFinite(updated) || updated < created) {
+      throw new RunCollectionContractError('RUN_ORDERING_UNRELIABLE');
+    }
+    ids.add(run.id);
+  }
 }
 
 /**
@@ -336,11 +476,28 @@ function byRunRecency(a: OrcaRun, b: OrcaRun): number {
  */
 export async function collectRunFacts(
   orca: OrcaRunner,
-  config: BridgeConfig,
+  config: RunRoutingConfig,
   options: CollectOptions = {},
 ): Promise<RunCollection> {
   const now = options.now ?? (() => new Date());
-  const runs = [...(await listRuns(orca))].sort(byRunRecency);
+  const observedAt = now();
+  if (!Number.isFinite(observedAt.getTime())) {
+    throw new RunCollectionContractError('RUN_ORDERING_UNRELIABLE');
+  }
+  let listedRuns: readonly OrcaRun[];
+  try {
+    listedRuns = await listRuns(orca);
+  } catch {
+    throw new RunCollectionContractError('RUN_ORDERING_UNRELIABLE');
+  }
+  validateRunWorkingSet(listedRuns);
+  const orderedRuns = [...listedRuns].sort(byRunRecency);
+  const effective = isEffectiveBridgeConfig(config);
+  const base = effective ? config.base : config;
+  const runLimit = base.automation?.capacity.runsPerPass ??
+    DEFAULT_AUTOMATION_CONFIG.capacity.runsPerPass;
+  const runs = orderedRuns.slice(0, runLimit);
+  const deferredRuns = orderedRuns.slice(runLimit);
 
   const degraded: RunDegraded[] = [
     {
@@ -351,9 +508,28 @@ export async function collectRunFacts(
     },
   ];
 
+  if (deferredRuns.length > 0) {
+    const oldestUpdated = Math.min(...deferredRuns.map((run) => run.updatedAt.getTime()));
+    degraded.push({
+      kind: 'capacity_deferred',
+      detail:
+        `deterministic Run capacity deferred ${deferredRuns.length} of ${orderedRuns.length}; ` +
+        `oldest deferred age ${Math.max(0, Math.floor(
+          (observedAt.getTime() - oldestUpdated) / 1_000,
+        ))} seconds`,
+      counts: {
+        totalRuns: orderedRuns.length,
+        deferredRuns: deferredRuns.length,
+        oldestDeferredAgeSeconds: Math.max(0, Math.floor(
+          (observedAt.getTime() - oldestUpdated) / 1_000,
+        )),
+      },
+    });
+  }
+
   // Run row의 세대를 읽지 못한 것은 Run 하나가 아니라 관찰의 사실이다. 그 Run의 live/stale이
   // `unknown`으로 접히는 이유가 여기 남는다(OD-079).
-  for (const f of unreadableRunFields(runs)) degraded.push(unreadableDegraded(f));
+  for (const f of unreadableRunFields(runs)) degraded.push(unreadableDegraded(f, effective));
 
   let askInbox: AskInbox = {
     asks: [],
@@ -365,13 +541,18 @@ export async function collectRunFacts(
   try {
     askInbox = askThreadsFrom(await readInbox(orca, options.inboxLimit));
   } catch (e) {
-    degraded.push({
+    degraded.push(effective ? {
+      kind: 'query_failed',
+      detail: 'the Orca inbox source query failed; ask and escalation facts are unavailable',
+      entityRefs: [redactedEntityRef('orca-inbox-failure', message(e))],
+      counts: { failedSources: 1 },
+    } : {
       kind: 'query_failed',
       detail: `inbox 실패: ${message(e)}. ask와 escalation badge가 없다`,
     });
   }
   for (const f of [...askInbox.unreadable].sort(byUnreadableField)) {
-    degraded.push(unreadableDegraded(f));
+    degraded.push(unreadableDegraded(f, effective));
   }
   // 포화는 **무조건** 컬렉션 수준으로 드러낸다. 이 Run에 미답 ask가 보일 때만 알리면 포화의 더
   // 나쁜 방향 — ask 행 자체가 조회 창 밖으로 밀려 badge도 degraded도 없이 사라지는 경우 — 이
@@ -398,8 +579,13 @@ export async function collectRunFacts(
       // degraded를 함께 싣는다. 이것이 없으면 조회에 실패한 Run이 미등록으로 둔갑해 OD-078의
       // 완화 장치가 다른 사건을 센다.
       unregisteredRuns.push({
-        runId: run.id,
-        repositoryIds: projected.observedRepositoryIds,
+        runId: effective ? '' : run.id,
+        repositoryIds: effective ? [] : projected.observedRepositoryIds,
+        ...(effective ? {
+          runRef: redactedEntityRef('orca-run', run.id),
+          repositoryRefs: projected.observedRepositoryIds.map((id) =>
+            redactedEntityRef('orca-repository', id)),
+        } : {}),
         degraded: projected.degraded,
       });
       continue;
@@ -408,7 +594,7 @@ export async function collectRunFacts(
   }
 
   const unregistered: UnregisteredRuns = { count: unregisteredRuns.length, runs: unregisteredRuns };
-  return { observedAt: now().toISOString(), runs: facts, unregistered, degraded };
+  return { observedAt: observedAt.toISOString(), runs: facts, unregistered, degraded };
 }
 
 /** 사람이 읽는 요약. 확정된 사실만 적는다. 비율을 만들지 않는다(OD-069). */
@@ -448,7 +634,9 @@ export function formatRunCollection(c: RunCollection): string {
   }
   lines.push('', `등록되지 않은 Run: ${c.unregistered.count}`);
   for (const u of c.unregistered.runs) {
-    lines.push(`  ${u.runId}  repoIds=${u.repositoryIds.join(',') || '관측 없음'}`);
+    const identities = u.repositoryRefs ?? u.repositoryIds;
+    const label = u.repositoryRefs === undefined ? 'repoIds' : 'repoRefs';
+    lines.push(`  ${u.runRef ?? u.runId}  ${label}=${identities.join(',') || '관측 없음'}`);
     // 여기를 비우면 "조회했더니 등록에 없다"와 "조회가 실패해 판정할 수 없다"가 같은 줄이 된다.
     for (const d of u.degraded) lines.push(`    degraded   ${d.kind}  ${d.detail}`);
   }

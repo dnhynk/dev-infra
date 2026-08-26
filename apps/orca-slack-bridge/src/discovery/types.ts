@@ -25,17 +25,31 @@ export type GithubRemoteErrorCode =
 export type RepositoryDiscoveryDiagnosticCode =
   | GithubRemoteErrorCode
   | 'no_remote'
+  | 'unsupported_remote'
+  | 'invalid_remote'
   | 'canonical_conflict'
   | 'duplicate_orca_id'
   | 'manual_remote_conflict'
-  | 'capacity_conflict';
+  | 'capacity_conflict'
+  | 'project_conflict'
+  | 'github_identity_unverified'
+  | 'capacity_deferred'
+  | 'remote_unverified';
 
-/** A safe row-local diagnostic. rowIndex locates the row without copying a private Orca ID. */
+/** A safe row/group diagnostic. rowIndex locates source evidence without copying a private ID. */
 export type RepositoryDiscoveryDiagnostic = {
   readonly rowIndex: number;
   readonly code: RepositoryDiscoveryDiagnosticCode;
-  /** Only this source row is unusable; unrelated valid rows remain routable. */
-  readonly effect: 'row_blocked';
+  /** The exact scope of the fail-closed decision; unrelated groups remain routable. */
+  readonly effect:
+    | 'row_blocked'
+    | 'group_blocked'
+    | 'group_deferred'
+    | 'remote_unverified'
+    | 'lkg_carried'
+    | 'coalesced';
+  /** Redacted correlation only. Raw Orca IDs and remotes never cross this boundary. */
+  readonly entityRef?: string;
 };
 
 type RepositoryRowBase = {
@@ -79,9 +93,12 @@ export type EffectiveProject = {
 export type EffectiveRepositoryBinding =
   | {
       readonly status: 'bound';
-      readonly identity: CanonicalGithubRepository;
+      /** Null only for the explicit manual-ID fallback whose live remote cannot be verified. */
+      readonly identity: CanonicalGithubRepository | null;
+      readonly githubRepositoryId: number | null;
       readonly projectKey: string;
       readonly projectOrigin: EffectiveProjectOrigin;
+      readonly verification: 'github_verified' | 'remote_unverified';
       readonly orcaRepositoryIds: readonly string[];
     }
   | {
@@ -93,7 +110,10 @@ export type EffectiveRepositoryBinding =
         | 'canonical_conflict'
         | 'duplicate_orca_id'
         | 'manual_remote_conflict'
-        | 'capacity_conflict';
+        | 'capacity_conflict'
+        | 'project_conflict'
+        | 'github_identity_unverified'
+        | 'capacity_deferred';
       readonly orcaRepositoryIds: readonly string[];
       readonly identity?: CanonicalGithubRepository;
     };
@@ -108,12 +128,13 @@ export type EffectiveRoutingState =
   | {
       /** A whole-snapshot invariant failed, so no automatic route may be selected. */
       readonly status: 'blocked';
-      readonly reason: 'schema_drift' | 'project_conflict' | 'capacity_conflict';
+      readonly reason: 'schema_drift' | 'project_conflict' | 'capacity_conflict' | 'config_drift';
     };
 
-/** Immutable input contract for later discovery/routing PRs. This PR does not reconcile it. */
+/** Immutable, content-revisioned input to Run routing. */
 export type EffectiveBridgeConfig = {
   readonly base: ParsedBridgeConfig;
+  readonly configFingerprint: string;
   readonly revision: number;
   readonly projects: readonly EffectiveProject[];
   readonly bindings: readonly EffectiveRepositoryBinding[];

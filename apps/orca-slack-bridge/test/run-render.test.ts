@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { renderRunCard, runIdentityLine, type RunCardInput } from '../src/run/render.js';
+import {
+  renderRunCard,
+  renderRunCollectionCard,
+  runIdentityLine,
+  type RunCardInput,
+} from '../src/run/render.js';
 import { renderFingerprint } from '../src/digest/render.js';
 import { pullRequestKey, runKey } from '../src/identity/keys.js';
 import type { RunPullRequestRecord } from '../src/store/schema.js';
@@ -582,6 +587,51 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
     expect(section).toContain('other-id');
     expect(section).toContain('run_bbb');
     expect(section).toContain('projects[].orcaRepositoryIds');
+  });
+
+  it('구조화 ref가 지원 상한을 넘으면 누락 수를 밝히고 Slack 한계를 지킨다', () => {
+    const refs = Array.from({ length: 257 }, (_, index) => index.toString(16).padStart(12, '0'));
+    const card = renderRunCollectionCard({
+      cards: 0,
+      collection: {
+        degraded: [],
+        unregistered: {
+          count: 1,
+          runs: [
+            {
+              runId: '',
+              runRef: 'run-ref',
+              repositoryIds: [],
+              repositoryRefs: refs,
+              degraded: [
+                {
+                  kind: 'multiple_project_match',
+                  detail: 'route zero',
+                  counts: {
+                    observedRepositories: 257,
+                    resolvedProjects: 2,
+                    blockingReasons: 1,
+                  },
+                  entityRefs: refs,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    const text = cardText(card);
+
+    expect(text).toContain('observedRepositories=257');
+    expect(text).toContain('omittedRefs=1');
+    expect(text).toContain(refs[255]);
+    expect(text).not.toContain(refs[256]);
+    expect(text.indexOf('observedRepositories=257')).toBeLessThan(text.indexOf(refs[0] as string));
+    expect(card.blocks.length).toBeLessThanOrEqual(50);
+    for (const block of card.blocks) {
+      const sectionText = (block['text'] as { text?: string } | undefined)?.text;
+      if (sectionText !== undefined) expect(sectionText.length).toBeLessThanOrEqual(3_000);
+    }
   });
   /*
    * 이것이 회귀 방지다. 이 절이 degraded를 버리던 동안 아래 세 경우는 **바이트 동일한 카드**였고

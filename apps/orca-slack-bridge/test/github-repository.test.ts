@@ -1,12 +1,23 @@
 import { describe, it, expect } from 'vitest';
-import { fetchRepositoryIdentity } from '../src/github/repository.js';
-import { ghJson, type GhRunner } from '../src/github/runner.js';
+import {
+  fetchRepositoryIdentity,
+  repositoryIdentityConfirmer,
+} from '../src/github/repository.js';
+import {
+  GhCli,
+  GhCommandError,
+  ghJson,
+  type GhRunner,
+  type GhRunOptions,
+} from '../src/github/runner.js';
 
 class FakeGh implements GhRunner {
   readonly calls: string[][] = [];
+  readonly options: (GhRunOptions | undefined)[] = [];
   constructor(private readonly stdout: string) {}
-  async run(args: readonly string[]): Promise<string> {
+  async run(args: readonly string[], options?: GhRunOptions): Promise<string> {
     this.calls.push([...args]);
+    this.options.push(options);
     return this.stdout;
   }
 }
@@ -37,6 +48,30 @@ describe('fetchRepositoryIdentity', () => {
   it('full_name이 없으면 거부한다', async () => {
     const gh = new FakeGh('{"id":1}');
     await expect(fetchRepositoryIdentity(gh, 'x/y')).rejects.toThrow(TypeError);
+  });
+
+  it('authoritative full_name도 strict canonical grammar를 통과하고 lowercase로 저장한다', async () => {
+    const gh = new FakeGh('{"id":7,"full_name":"Acme/Widget"}');
+    const controller = new AbortController();
+    await expect(repositoryIdentityConfirmer(gh).confirm('acme/widget', {
+      signal: controller.signal,
+      deadlineAt: Date.now() + 1_000,
+    })).resolves.toMatchObject({
+      githubId: 7, nameWithOwner: 'acme/widget',
+    });
+    expect(gh.options[0]?.signal).toBe(controller.signal);
+    expect(gh.options[0]?.timeoutMs).toBeGreaterThan(0);
+    expect(gh.options[0]?.timeoutMs).toBeLessThanOrEqual(1_000);
+
+    const malformed = new FakeGh('{"id":7,"full_name":"acme/widget/extra"}');
+    await expect(fetchRepositoryIdentity(malformed, 'acme/widget')).rejects.toThrow(TypeError);
+  });
+
+  it('production GhCli terminates a child at its injected timeout', async () => {
+    const gh = new GhCli(process.execPath);
+    const outcome = gh.run(['-e', 'setInterval(() => undefined, 1000)'], { timeoutMs: 25 });
+    await expect(outcome).rejects.toBeInstanceOf(GhCommandError);
+    await expect(outcome).rejects.toMatchObject({ terminated: true });
   });
 });
 

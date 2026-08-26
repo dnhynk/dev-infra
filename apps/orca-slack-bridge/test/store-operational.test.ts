@@ -346,6 +346,7 @@ describe('additive v13 operational schema', () => {
 describe('discovery registry transactions', () => {
   it('replaces one effective snapshot, aggregates issues, and preserves LKG across rollback', () => {
     const store = new SqliteDigestStore(path);
+    expect(store.hasDiscoveryRoutingRows()).toBe(false);
     expect(store.replaceDiscoverySnapshot({
       passOutcome: 'succeeded',
       repositories: [repository], bindings: [binding], issues: [issue], at: AT0,
@@ -354,6 +355,7 @@ describe('discovery registry transactions', () => {
       bindings: [{ orcaRepositoryId: binding.orcaRepositoryId, active: true }],
       issues: [{ issueHash: issue.issueHash, occurrenceCount: 1, active: true }],
     });
+    expect(store.hasDiscoveryRoutingRows()).toBe(true);
     store.replaceDiscoverySnapshot({
       passOutcome: 'succeeded',
       repositories: [repository],
@@ -387,6 +389,75 @@ describe('discovery registry transactions', () => {
     faulty.close();
   });
 
+  it('atomically replaces an incompatible routing generation while preserving issue history', () => {
+    let store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'reconcile',
+      repositories: [repository], bindings: [binding], issues: [issue], at: AT0,
+    });
+    store.close();
+
+    const replacement = {
+      ...repository,
+      canonicalKey: 'github.com/acme/replacement' as const,
+      nameWithOwner: 'acme/replacement' as const,
+      githubRepositoryId: 202,
+      projectKey: 'project-two',
+    };
+    const replacementBinding = {
+      ...binding,
+      orcaRepositoryId: 'replacement-orca-id',
+      canonicalKey: replacement.canonicalKey,
+      projectKey: replacement.projectKey,
+    };
+    const faulty = new SqliteDigestStore(path, {
+      operationalFault: (point) => {
+        if (point === 'after_discovery_registry') throw new Error('injected');
+      },
+    });
+    expect(() => faulty.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'replace',
+      repositories: [replacement], bindings: [replacementBinding], issues: [], at: AT1,
+    })).toThrow(OperationalStoreError);
+    expect(faulty.readEffectiveDiscoverySnapshot()).toMatchObject({
+      repositories: [{ canonicalKey: repository.canonicalKey }],
+      bindings: [{ orcaRepositoryId: binding.orcaRepositoryId }],
+      issues: [{ issueHash: issue.issueHash, active: true }],
+    });
+    faulty.close();
+
+    store = new SqliteDigestStore(path);
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'replace',
+      repositories: [replacement], bindings: [replacementBinding], issues: [], at: AT1,
+    })).toMatchObject({
+      repositories: [{ canonicalKey: replacement.canonicalKey, firstSeenAt: AT1 }],
+      bindings: [{ orcaRepositoryId: replacementBinding.orcaRepositoryId, firstSeenAt: AT1 }],
+      issues: [],
+    });
+    store.close();
+
+    const raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM repository_registry').get())
+      .toEqual({ count: 1 });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM orca_repository_binding').get())
+      .toEqual({ count: 1 });
+    expect(raw.prepare(`SELECT active, resolved_at IS NOT NULL AS resolved
+                          FROM repository_discovery_issue WHERE issue_hash = ?`)
+      .get(issue.issueHash)).toEqual({ active: 0, resolved: 1 });
+    raw.close();
+
+    store = new SqliteDigestStore(path);
+    expect(() => store.replaceDiscoverySnapshot({
+      passOutcome: 'failed', routingMode: 'replace',
+      repositories: [], bindings: [], issues: [], at: AT2,
+    })).toThrowError(new OperationalStoreError('OPERATIONAL_INPUT_INVALID'));
+    expect(store.readEffectiveDiscoverySnapshot().repositories).toMatchObject([{
+      canonicalKey: replacement.canonicalKey,
+    }]);
+    store.close();
+  });
+
   it('rejects duplicate identities, project mismatch, and non-manual null bindings', () => {
     const store = new SqliteDigestStore(path);
     for (const input of [
@@ -396,6 +467,68 @@ describe('discovery registry transactions', () => {
     ]) {
       expect(() => store.replaceDiscoverySnapshot(input)).toThrow(OperationalStoreError);
     }
+    store.close();
+  });
+
+  it('reserves auto Project keys for one numeric identity across inactive rows', () => {
+    const autoOriginal = {
+      ...repository,
+      canonicalKey: 'github.com/acme/new' as const,
+      nameWithOwner: 'acme/new' as const,
+      projectKey: 'auto:github.com/acme/old',
+      projectOrigin: 'auto' as const,
+    };
+    const originalBinding = {
+      ...binding,
+      canonicalKey: autoOriginal.canonicalKey,
+      projectKey: autoOriginal.projectKey,
+    };
+    const store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [autoOriginal], bindings: [originalBinding],
+      issues: [], at: AT0,
+    });
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [], bindings: [], issues: [],
+      at: '2026-08-26T01:00:00.000Z',
+    });
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [], bindings: [], issues: [],
+      at: '2026-08-27T01:00:01.000Z',
+    });
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual({
+      repositories: [], bindings: [], issues: [],
+    });
+    expect(store.hasDiscoveryRoutingRows()).toBe(true);
+
+    const reused = {
+      ...autoOriginal,
+      canonicalKey: 'github.com/acme/old' as const,
+      nameWithOwner: 'acme/old' as const,
+      githubRepositoryId: 202,
+    };
+    const reusedBinding = {
+      ...originalBinding,
+      orcaRepositoryId: 'orca-reused',
+      canonicalKey: reused.canonicalKey,
+    };
+    expect(() => store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'reconcile',
+      repositories: [reused], bindings: [reusedBinding], issues: [],
+      at: '2026-08-27T02:00:00.000Z',
+    })).toThrowError(new OperationalStoreError('OPERATIONAL_CONFLICT'));
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual({
+      repositories: [], bindings: [], issues: [],
+    });
+
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'replace',
+      repositories: [reused], bindings: [reusedBinding], issues: [],
+      at: '2026-08-27T02:00:00.000Z',
+    })).toMatchObject({
+      repositories: [{ githubRepositoryId: 202, projectKey: autoOriginal.projectKey }],
+      bindings: [{ orcaRepositoryId: 'orca-reused' }],
+    });
     store.close();
   });
 
@@ -477,6 +610,7 @@ describe('discovery registry transactions', () => {
       .toEqual({ count: 1 });
     raw.close();
     const reopened = new SqliteDigestStore(path);
+    expect(reopened.hasDiscoveryRoutingRows()).toBe(true);
     expect(reopened.readEffectiveDiscoverySnapshot()).toEqual({
       repositories: [], bindings: [], issues: [],
     });

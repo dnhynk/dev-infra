@@ -83,6 +83,18 @@ const SECTION_TEXT_CAP = 3000;
 
 const SECTION_TRUNCATION_MARK = '\n…(표시 한도 3000자를 넘어 잘림)';
 
+/** Slack accepts at most 50 blocks in a message. Fixed entry/ref caps keep cards below it. */
+const MESSAGE_BLOCK_CAP = 50;
+
+/** O1's supported maximum: 16 canonical repositories × 16 exact Orca IDs. */
+const STRUCTURED_REF_CAP = 256;
+
+/** Keeps a packed ref line comfortably below a section after its label and summaries are added. */
+const REFERENCE_LINE_CAP = 2_600;
+
+/** Source failure kinds are finite; this only fences malformed hand-built renderer input. */
+const UNREGISTERED_DEGRADED_CAP = 16;
+
 /** Run objective 한 줄의 상한. Orca가 상한 없이 받는 자유 문자열이다. */
 const OBJECTIVE_CAP = 200;
 
@@ -136,6 +148,25 @@ function section(text: string): SlackBlock {
 
 function labelled(label: string, lines: readonly string[]): SlackBlock {
   return section([`*${label}*`, ...lines].join('\n'));
+}
+
+/** Splits logical lines across section blocks without ever slicing a structured ref token. */
+function labelledSections(label: string, lines: readonly string[]): SlackBlock[] {
+  const blocks: SlackBlock[] = [];
+  let blockIndex = 0;
+  let current = [`*${label}*`];
+  for (const line of lines) {
+    const candidate = [...current, line].join('\n');
+    if (candidate.length <= SECTION_TEXT_CAP) {
+      current.push(line);
+      continue;
+    }
+    blocks.push(section(current.join('\n')));
+    blockIndex += 1;
+    current = [`*${label} · 계속 ${blockIndex}*`, line];
+  }
+  blocks.push(section(current.join('\n')));
+  return blocks;
 }
 
 /**
@@ -333,8 +364,32 @@ function pullRequestLine(pr: RunPullRequestRecord): string {
   return `• #${pr.number} ${emoji} ${label} · ${verdict}`;
 }
 
+function structuredDegradedSuffix(d: RunDegraded): string {
+  const parts: string[] = [];
+  if (d.counts !== undefined) {
+    const counts = Object.entries(d.counts)
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, value]) => `${esc(key)}=${value}`)
+      .join(', ');
+    parts.push(`counts ${counts || '없음'}`);
+  }
+  if (d.entityRefs !== undefined) {
+    parts.push(`refs ${[...d.entityRefs].sort().map(esc).join(', ') || '없음'}`);
+  }
+  return parts.length === 0 ? '' : ` · ${parts.join(' · ')}`;
+}
+
+function structuredCountsSuffix(d: RunDegraded): string {
+  if (d.counts === undefined) return '';
+  const counts = Object.entries(d.counts)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([key, value]) => `${esc(key)}=${value}`)
+    .join(', ');
+  return ` · counts ${counts || '없음'}`;
+}
+
 function degradedLine(d: RunDegraded): string {
-  return `• [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}`;
+  return `• [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}${structuredDegradedSuffix(d)}`;
 }
 
 /**
@@ -349,7 +404,36 @@ function degradedLine(d: RunDegraded): string {
  * "Task도 worker도 없다"를 나눈다. 여기서는 그것을 그린다.
  */
 function unregisteredDegradedLine(d: RunDegraded): string {
-  return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}`;
+  return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}${structuredDegradedSuffix(d)}`;
+}
+
+/** Mandatory route-zero summary; potentially large ref detail is emitted afterwards. */
+function unregisteredDegradedSummaryLine(d: RunDegraded): string {
+  return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}${structuredCountsSuffix(d)}`;
+}
+
+function referenceLines(label: string, refs: readonly string[]): string[] {
+  const ordered = [...new Set(refs)].sort();
+  const visible = ordered.slice(0, STRUCTURED_REF_CAP);
+  const omitted = ordered.length - visible.length;
+  const summary = `    ↳ ${label} count=${ordered.length}` +
+    (omitted === 0 ? '' : ` · omittedRefs=${omitted}`);
+  if (visible.length === 0) return [summary, '    ↳ refs 없음'];
+
+  const lines: string[] = [];
+  let current = '    ↳ refs ';
+  for (const ref of visible) {
+    const token = esc(cut(ref, DETAIL_CAP));
+    const candidate = current.endsWith('refs ') ? `${current}${token}` : `${current}, ${token}`;
+    if (candidate.length <= REFERENCE_LINE_CAP) {
+      current = candidate;
+      continue;
+    }
+    lines.push(current);
+    current = `    ↳ refs 계속 ${token}`;
+  }
+  lines.push(current);
+  return [summary, ...lines];
 }
 
 /**
@@ -364,15 +448,47 @@ function unregisteredLines(unregistered: UnregisteredRuns): string[] {
   const lines = [`${unregistered.count}`];
   if (unregistered.count === 0) return lines;
   for (const u of unregistered.runs.slice(0, ENTRY_CAP)) {
-    lines.push(
-      `• ${esc(u.runId)} — 관측된 Orca repository id: ` +
-        `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
-    );
-    // degraded를 빼면 이 두 줄이 바이트 동일해진다. 그러면 이 절이 두 사건을 함께 센다.
-    lines.push(...u.degraded.map(unregisteredDegradedLine));
+    const runIdentity = u.runRef ?? u.runId;
+    if (u.repositoryRefs !== undefined) {
+      lines.push(`• ${esc(runIdentity)} — route-zero structured evidence`);
+      const visibleDegraded = u.degraded.slice(0, UNREGISTERED_DEGRADED_CAP);
+      lines.push(...visibleDegraded.map(unregisteredDegradedSummaryLine));
+      if (u.degraded.length > visibleDegraded.length) {
+        const omittedDegraded = u.degraded.slice(UNREGISTERED_DEGRADED_CAP);
+        const omittedRefs = omittedDegraded.reduce((count, degraded) =>
+          count + (degraded.entityRefs ?? []).length, 0);
+        lines.push(
+          `    ↳ omittedDegraded=${omittedDegraded.length}` +
+            (omittedRefs === 0 ? '' : ` · omittedRefs=${omittedRefs}`),
+        );
+      }
+
+      // repositoryRefs and route-block entityRefs normally name the same set. Emit the set once,
+      // then only additional structured refs, so the supported maximum fits in bounded chunks.
+      lines.push(...referenceLines('redacted repository refs', u.repositoryRefs));
+      const repositoryRefs = new Set(u.repositoryRefs);
+      const additionalRefs = visibleDegraded.flatMap((degraded) =>
+        (degraded.entityRefs ?? []).filter((ref) => !repositoryRefs.has(ref)));
+      if (additionalRefs.length > 0) {
+        lines.push(...referenceLines('additional structured refs', additionalRefs));
+      }
+    } else {
+      lines.push(
+        `• ${esc(runIdentity)} — 관측된 Orca repository id: ` +
+          `${u.repositoryIds.length === 0 ? '없음' : esc(u.repositoryIds.join(', '))}`,
+      );
+      // Legacy/manual mode intentionally retains its established raw-ID display contract.
+      lines.push(...u.degraded.map(unregisteredDegradedLine));
+    }
   }
   if (unregistered.runs.length > ENTRY_CAP) {
-    lines.push(`• 외 ${unregistered.runs.length - ENTRY_CAP}건은 카드에 싣지 않았다`);
+    const omittedRuns = unregistered.runs.slice(ENTRY_CAP);
+    const omittedRefs = omittedRuns.reduce((count, run) => count +
+      (run.repositoryRefs ?? []).length + run.degraded.reduce((sum, degraded) =>
+        sum + (degraded.entityRefs ?? []).length, 0), 0);
+    lines.push(
+      `• omittedRuns=${omittedRuns.length}` + (omittedRefs === 0 ? '' : ` · omittedRefs=${omittedRefs}`),
+    );
   }
   // 모두에게 "등록하라"고 말하지 않는다. 조회가 실패한 Run은 등록 여부가 아직 미판정이다.
   lines.push(
@@ -526,7 +642,7 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    * 이 수가 오르는 것이 "등록 열쇠가 어긋나 Run이 조용히 사라진다"를 관측 가능하게 만드는
    * 유일한 장치다. 절을 조건부로 만들면 그 장치가 조건부가 된다.
    */
-  blocks.push(labelled('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
+  blocks.push(...labelledSections('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
 
   // blocks를 그리지 못하는 자리에서도 identity·Run ID·판정이 남아야 한다. 그 자리도 mrkdwn으로
   // 해석되므로 blocks와 같은 이스케이프를 거친 값을 쓴다.
@@ -534,6 +650,9 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
     `${live.emoji} ${escapedIdentity} · ${esc(id.runId)} · ${escapedObjective}` +
     ` — 소유자 binding ${live.label}`;
 
+  if (blocks.length > MESSAGE_BLOCK_CAP) {
+    throw new RangeError('Run card exceeds the bounded Slack block count');
+  }
   return { text, blocks };
 }
 
@@ -587,7 +706,7 @@ export function renderRunCollectionCard(input: RunCollectionCardInput): Rendered
   );
 
   // Run 카드와 같은 함수를 쓴다. 0이어도 그린다.
-  blocks.push(labelled('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
+  blocks.push(...labelledSections('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
 
   /*
    * degraded 절(OD-072). **비어 있어도 그린다.**
@@ -606,5 +725,8 @@ export function renderRunCollectionCard(input: RunCollectionCardInput): Rendered
   // blocks와 같은 이스케이프를 거친 값을 쓴다 — 여기 값은 전부 수이므로 이스케이프할 것이 없다.
   const text = `관찰 요약 · Run 카드 ${cards}장 · 등록되지 않은 Run ${collection.unregistered.count}건`;
 
+  if (blocks.length > MESSAGE_BLOCK_CAP) {
+    throw new RangeError('Run collection card exceeds the bounded Slack block count');
+  }
   return { text, blocks };
 }

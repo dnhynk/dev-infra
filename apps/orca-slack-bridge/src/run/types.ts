@@ -227,6 +227,10 @@ export type NotObservableSource = {
 export type RunDegraded = {
   readonly kind: DegradedKind;
   readonly detail: string;
+  /** Hashed correlation only; raw Orca repository IDs are not emitted by effective routing. */
+  readonly entityRefs?: readonly string[];
+  /** Bounded structured counts used by status/renderers without parsing prose. */
+  readonly counts?: Readonly<Record<string, number>>;
 };
 
 export type DegradedKind =
@@ -244,11 +248,18 @@ export type DegradedKind =
   /**
    * 관측된 repository id가 서로 다른 두 등록 Project에 걸쳐 있다(OD-078).
    *
-   * 등록은 Project 하나를 고르는 열쇠인데 열쇠가 둘을 가리킨다. 지금은 사전순 첫 매치가
-   * 이기므로 다른 Project 쪽 카드에서 이 Run이 빠진다. 어느 쪽이 맞는지 원천이 정하지 않으므로
-   * 고르지 않고 사실을 드러낸다.
+   * 등록은 Project 하나를 고르는 열쇠인데 열쇠가 둘을 가리킨다. 어느 쪽이 맞는지 원천이
+   * 정하지 않으므로 아무 Project도 고르지 않고 route zero 사실을 드러낸다.
    */
   | 'multiple_project_match'
+  /** Effective routing rejected an incomplete, conflicting, or globally blocked identity set. */
+  | 'repository_route_blocked'
+  /** A non-empty Orca worktree identity could not be parsed, so the Run cannot be routed. */
+  | 'repository_identity_unreadable'
+  /** A bounded Run working set omitted older rows deterministically. */
+  | 'capacity_deferred'
+  /** Explicit manual-ID routing proceeded without a supported live remote. */
+  | 'remote_unverified_repository'
   /**
    * Orca row의 한 칸을 읽지 못했다(OD-079).
    *
@@ -313,8 +324,12 @@ export type UnregisteredRuns = {
  */
 export type UnregisteredRun = {
   readonly runId: string;
-  /** 관측된 repository id. 사용자가 설정에 무엇을 넣어야 하는지 그대로 보여준다. */
+  /** Effective routing renders this digest instead of exposing the unregistered raw Run ID. */
+  readonly runRef?: string;
+  /** Legacy manual mode의 관측 ID. Effective mode는 이 배열을 비우고 repositoryRefs만 싣는다. */
   readonly repositoryIds: readonly string[];
+  /** Effective routing exposes only these digests; legacy manual mode retains repositoryIds. */
+  readonly repositoryRefs?: readonly string[];
   /** 이 Run의 degraded 전부. 등록 판정을 신뢰할 수 있는지가 여기 있다. */
   readonly degraded: readonly RunDegraded[];
 };
