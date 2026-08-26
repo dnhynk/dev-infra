@@ -54,7 +54,7 @@ describe('O1-5 daemon-facing health/telemetry seam', () => {
       state: 'succeeded', processedCount: 4, deferredCount: 1, nextRunAt: AT3,
     });
     expect(observed).toMatchObject([
-      { event: 'daemon.started', entityRef: expect.stringMatching(/^[0-9a-f]{12}$/) },
+      { event: 'daemon.started', entityIdentity: expect.any(Object) },
       { event: 'daemon.heartbeat' },
       { event: 'job.started', job: 'repository-discovery' },
       {

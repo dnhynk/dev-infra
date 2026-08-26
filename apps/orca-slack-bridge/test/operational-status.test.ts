@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -29,6 +31,11 @@ const config = parseConfig({
   slack: null,
   projects: [{ name: 'Project Sentinel', repositories: ['private-owner/private-repository'] }],
 });
+const disabledConfig = parseConfig({
+  slack: null,
+  projects: [{ name: 'Project Sentinel', repositories: ['private-owner/private-repository'] }],
+  automation: { enabled: false },
+});
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'orca-operational-status-'));
@@ -40,8 +47,9 @@ function completeJobs(
   store: SqliteDigestStore,
   failure: DaemonJobName | null = null,
   backoff = false,
+  jobs: readonly DaemonJobName[] = OPERATIONAL_JOB_NAMES,
 ): void {
-  for (const job of OPERATIONAL_JOB_NAMES) {
+  for (const job of jobs) {
     const claim = store.startDaemonJob(job, AT0);
     if (claim === null) throw new Error('expected job claim');
     if (job === failure) {
@@ -62,15 +70,19 @@ function healthyStore(options: {
   readonly failure?: DaemonJobName | null;
   readonly backoff?: boolean;
   readonly jobs?: boolean;
+  readonly jobNames?: readonly DaemonJobName[];
+  readonly config?: typeof config;
 } = {}): SqliteDigestStore {
   const store = new SqliteDigestStore(statePath);
   store.recordDaemonStart({
     instanceId: INSTANCE,
     buildFingerprint: options.buildFingerprint ?? fingerprintOperationalBuild(BUILD),
-    configFingerprint: options.configFingerprint ?? fingerprintOperationalConfig(config),
+    configFingerprint: options.configFingerprint ?? fingerprintOperationalConfig(options.config ?? config),
     at: AT0,
   });
-  if (options.jobs !== false) completeJobs(store, options.failure ?? null, options.backoff ?? false);
+  if (options.jobs !== false) {
+    completeJobs(store, options.failure ?? null, options.backoff ?? false, options.jobNames);
+  }
   return store;
 }
 
@@ -83,6 +95,14 @@ function inspect(overrides: Parameters<typeof inspectOperationalStatus>[0] = {})
     clock: () => new Date('2026-08-26T00:00:30.000Z'),
     ...overrides,
   });
+}
+
+function snapshotAndClose(store: SqliteDigestStore): OperationalStatusSnapshot {
+  try {
+    return projectOperationalStore(store);
+  } finally {
+    store.close();
+  }
 }
 
 function sha256(path: string): string {
@@ -164,24 +184,65 @@ describe('read-only operational status classification', () => {
   it('reads the live WAL snapshot while the daemon-owned store remains open', async () => {
     const store = healthyStore();
     try {
+      const sourceFiles = [`${statePath}`, `${statePath}-wal`];
+      const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
+      const beforeFiles = readdirSync(dir).sort();
       const report = await inspect();
       expect(report).toMatchObject({ exitCode: 0, schema: { state: 'matched' } });
       expect(store.readDaemonHealth()).toMatchObject({ state: 'running' });
+      for (const source of before) expect(sha256(source.path)).toBe(source.hash);
+      expect(readdirSync(dir).sort()).toEqual(beforeFiles);
     } finally {
       store.close();
     }
   });
 
+  it('uses one SQLite backup epoch across an exact commit/checkpoint interleaving', async () => {
+    const store = healthyStore();
+    const checkpoint = new DatabaseSync(statePath);
+    const scratchParent = join(dir, 'snapshot-scratch');
+    mkdirSync(scratchParent);
+    const freshHeartbeat = '2026-08-26T00:02:00.000Z';
+    let checkpointed = false;
+    let checkpointResult: { readonly busy: number; readonly log: number; readonly checkpointed: number } | null = null;
+    try {
+      expect(store.recordDaemonHeartbeat(INSTANCE, freshHeartbeat)).not.toBeNull();
+      const report = await inspect({
+        clock: () => new Date('2026-08-26T00:02:30.000Z'),
+        temporaryDirectory: scratchParent,
+        afterSqliteBackupStep: () => {
+          if (checkpointed) return;
+          checkpointed = true;
+          checkpointResult = checkpoint.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
+            readonly busy: number; readonly log: number; readonly checkpointed: number;
+          };
+        },
+      });
+      expect(checkpointed).toBe(true);
+      expect(checkpointResult).toEqual({ busy: 0, log: 0, checkpointed: 0 });
+      expect(report).toMatchObject({
+        exitCode: 0,
+        daemon: { heartbeatAgeSeconds: 30 },
+        codes: ['status.healthy'],
+      });
+      expect(store.readDaemonHealth()?.heartbeatAt).toBe(freshHeartbeat);
+      expect(readdirSync(scratchParent)).toEqual([]);
+    } finally {
+      checkpoint.close();
+      store.close();
+    }
+  });
+
   it('uses the injected clock for fresh/stale and clock-drift classifications', async () => {
-    healthyStore().close();
-    expect((await inspect({ clock: () => new Date('2026-08-26T00:01:30.000Z') })).exitCode).toBe(0);
-    const stale = await inspect({ clock: () => new Date('2026-08-26T00:01:31.000Z') });
+    const snapshot = snapshotAndClose(healthyStore());
+    expect((await inspect({ snapshot, clock: () => new Date('2026-08-26T00:01:30.000Z') })).exitCode).toBe(0);
+    const stale = await inspect({ snapshot, clock: () => new Date('2026-08-26T00:01:31.000Z') });
     expect(stale.exitCode).toBe(1);
     expect(stale.codes).toContain('daemon.stale');
-    const future = await inspect({ clock: () => new Date('2026-08-25T23:59:00.000Z') });
+    const future = await inspect({ snapshot, clock: () => new Date('2026-08-25T23:59:00.000Z') });
     expect(future.exitCode).toBe(1);
     expect(future.codes).toContain('daemon.clock_drift');
-    const broken = await inspect({ clock: () => { throw new Error('SENTINEL_CLOCK_DETAIL'); } });
+    const broken = await inspect({ snapshot, clock: () => { throw new Error('SENTINEL_CLOCK_DETAIL'); } });
     expect(broken).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['daemon.clock_drift']) });
     expect(JSON.stringify(broken)).not.toContain('SENTINEL');
   });
@@ -189,98 +250,138 @@ describe('read-only operational status classification', () => {
   it('maps stopped/config/schema absence to exit 2 and build/job degradation to exit 1', async () => {
     let store = healthyStore();
     store.recordDaemonCleanStop(INSTANCE, AT2);
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 2, codes: expect.arrayContaining(['daemon.stopped']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 2, codes: expect.arrayContaining(['daemon.stopped']),
+    });
 
     rmSync(statePath, { force: true });
     store = healthyStore();
     store.setDaemonDesiredState('stopped', AT2);
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 2, codes: expect.arrayContaining(['daemon.stopped']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 2, codes: expect.arrayContaining(['daemon.stopped']),
+    });
 
     rmSync(statePath, { force: true });
-    new SqliteDigestStore(statePath).close();
-    expect(await inspect()).toMatchObject({ exitCode: 2, codes: expect.arrayContaining(['daemon.absent']) });
+    expect(await inspect({ snapshot: snapshotAndClose(new SqliteDigestStore(statePath)) })).toMatchObject({
+      exitCode: 2, codes: expect.arrayContaining(['daemon.absent']),
+    });
 
     rmSync(statePath, { force: true });
     store = healthyStore({ configFingerprint: 'different-config' });
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 2, codes: expect.arrayContaining(['config.drift']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 2, codes: expect.arrayContaining(['config.drift']),
+    });
 
     rmSync(statePath, { force: true });
     store = healthyStore({ buildFingerprint: 'different-build' });
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['build.drift']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 1, codes: expect.arrayContaining(['build.drift']),
+    });
 
     rmSync(statePath, { force: true });
-    healthyStore().close();
-    expect(await inspect({ expectedBuildIdentity: null, env: {} })).toMatchObject({
+    expect(await inspect({
+      snapshot: snapshotAndClose(healthyStore()), expectedBuildIdentity: null, env: {},
+    })).toMatchObject({
       exitCode: 1, codes: expect.arrayContaining(['build.unverified']),
     });
 
     rmSync(statePath, { force: true });
     store = healthyStore({ failure: 'repository-discovery' });
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.failed']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 1, codes: expect.arrayContaining(['job.failed']),
+    });
 
     rmSync(statePath, { force: true });
     store = healthyStore({ failure: 'repository-discovery', backoff: true });
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.backoff']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 1, codes: expect.arrayContaining(['job.backoff']),
+    });
 
     rmSync(statePath, { force: true });
     store = healthyStore({ jobs: false });
-    store.close();
-    expect(await inspect()).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.absent']) });
+    expect(await inspect({ snapshot: snapshotAndClose(store) })).toMatchObject({
+      exitCode: 1, codes: expect.arrayContaining(['job.absent']),
+    });
+  });
+
+  it('ignores disabled observer rows while Gate and Channel jobs remain required', async () => {
+    const requiredJobs = ['gate-reconcile', 'channel-delivery'] as const;
+    let store = healthyStore({ config: disabledConfig, jobNames: requiredJobs });
+    let report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
+    expect(report.jobs.filter((job) => job.state === 'absent').map((job) => job.job)).toEqual([
+      'repository-discovery', 'run-observer', 'pr-digest',
+    ]);
+
+    rmSync(statePath, { force: true });
+    store = healthyStore({ config: disabledConfig, jobNames: requiredJobs });
+    for (const job of ['repository-discovery', 'run-observer', 'pr-digest'] as const) {
+      const claim = store.startDaemonJob(job, AT0);
+      if (claim === null) throw new Error('expected disabled observer claim');
+      const failed = store.completeDaemonJobFailure({
+        claim, at: AT1, durationMs: 1, errorCode: 'github.unavailable',
+      });
+      if (failed === null) throw new Error('expected disabled observer failure');
+      if (job === 'run-observer') store.scheduleDaemonJobBackoff(job, failed.revision, AT2, AT2);
+    }
+    report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
+    expect(report.jobs.find((job) => job.job === 'repository-discovery')?.state).toBe('failed');
+    expect(report.jobs.find((job) => job.job === 'run-observer')?.state).toBe('backoff');
+
+    rmSync(statePath, { force: true });
+    store = healthyStore({
+      config: disabledConfig,
+      jobNames: requiredJobs,
+      failure: 'gate-reconcile',
+    });
+    report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    expect(report).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.failed']) });
+
+    rmSync(statePath, { force: true });
+    store = healthyStore({ config: disabledConfig, jobNames: ['gate-reconcile'] });
+    report = await inspect({ config: disabledConfig, snapshot: snapshotAndClose(store) });
+    expect(report).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.absent']) });
   });
 
   it('accepts an injected O1-6 task facet without inspecting or mutating Task Scheduler', async () => {
-    healthyStore().close();
-    expect(await inspect({ taskFacet: () => ({ ownership: 'absent', state: 'stopped' }) })).toMatchObject({
+    const snapshot = snapshotAndClose(healthyStore());
+    expect(await inspect({ snapshot, taskFacet: () => ({ ownership: 'absent', state: 'stopped' }) })).toMatchObject({
       exitCode: 2, codes: expect.arrayContaining(['task.absent', 'task.stopped']),
     });
-    expect(await inspect({ taskFacet: () => ({ ownership: 'drifted', state: 'running' }) })).toMatchObject({
+    expect(await inspect({ snapshot, taskFacet: () => ({ ownership: 'drifted', state: 'running' }) })).toMatchObject({
       exitCode: 2, codes: expect.arrayContaining(['task.drift']),
     });
-    expect(await inspect({ taskFacet: () => ({ ownership: 'matched', state: 'running' }) })).toMatchObject({
+    expect(await inspect({ snapshot, taskFacet: () => ({ ownership: 'matched', state: 'running' }) })).toMatchObject({
       exitCode: 0,
     });
   });
 
-  it('does not create, migrate, WAL-open, or alter absent/old/future/corrupt source databases', async () => {
+  it('does not create an absent source database or a temporary snapshot', async () => {
     expect(existsSync(statePath)).toBe(false);
     expect((await inspect()).codes).toContain('schema.absent');
     expect(existsSync(statePath)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+  });
 
+  it.each([12, 14] as const)('does not migrate or alter a schema-v%s source database', async (version) => {
     healthyStore().close();
-    let raw = new DatabaseSync(statePath);
-    raw.prepare('UPDATE schema_version SET version = 12 WHERE id = 1').run();
+    const raw = new DatabaseSync(statePath);
+    raw.prepare('UPDATE schema_version SET version = ? WHERE id = 1').run(version);
     raw.close();
-    let beforeHash = sha256(statePath);
-    let beforeFiles = readdirSync(dir).sort();
-    let report = await inspect();
-    expect(report).toMatchObject({ exitCode: 2, schema: { state: 'mismatched', foundVersion: 12 } });
+    const beforeHash = sha256(statePath);
+    const beforeFiles = readdirSync(dir).sort();
+    const report = await inspect();
+    expect(report).toMatchObject({ exitCode: 2, schema: { state: 'mismatched', foundVersion: version } });
     expect(sha256(statePath)).toBe(beforeHash);
     expect(readdirSync(dir).sort()).toEqual(beforeFiles);
-    raw = new DatabaseSync(statePath, { readOnly: true });
-    expect((raw.prepare('SELECT version FROM schema_version WHERE id = 1').get() as { version: number }).version).toBe(12);
-    raw.close();
+  }, 15_000);
 
-    raw = new DatabaseSync(statePath);
-    raw.prepare('UPDATE schema_version SET version = 14 WHERE id = 1').run();
-    raw.close();
-    beforeHash = sha256(statePath);
-    beforeFiles = readdirSync(dir).sort();
-    report = await inspect();
-    expect(report).toMatchObject({ exitCode: 2, schema: { state: 'mismatched', foundVersion: 14 } });
-    expect(sha256(statePath)).toBe(beforeHash);
-    expect(readdirSync(dir).sort()).toEqual(beforeFiles);
-
-    rmSync(statePath, { force: true });
+  it('does not alter or echo a corrupt source database', async () => {
     writeFileSync(statePath, 'SENTINEL_CORRUPT_DATABASE');
-    beforeHash = sha256(statePath);
-    beforeFiles = readdirSync(dir).sort();
-    report = await inspect();
+    const beforeHash = sha256(statePath);
+    const beforeFiles = readdirSync(dir).sort();
+    const report = await inspect();
     expect(report).toMatchObject({ exitCode: 2, schema: { state: 'corrupt' } });
     expect(JSON.stringify(report)).not.toContain('SENTINEL');
     expect(sha256(statePath)).toBe(beforeHash);

@@ -331,8 +331,10 @@ latest operational state의 권위는 v13 SQLite이고, 시간순 history는
 `ts`, `level`, `service`, `schemaVersion`, `build`, `event`, `job`, `outcome`, `attempt`,
 `durationMs`, `nextRunAt`, `errorCode`, `retryable`, bounded numeric `counts`, `entityRef`
 
-event/outcome/job/error/count key는 finite catalog이고 build와 entity identity는 writer 진입 전에 SHA-256으로
-바뀐다. `entityRef`는 앞 12 hex만 남긴다. Error, free-form detail, token/authorization/cookie/secret/password,
+event/outcome/job/error/count key는 finite catalog이고 build identity는 logger construction에서, entity identity는
+concrete runtime sink 안에서 SHA-256으로 바뀐다. caller는 opaque raw-identity token이나 raw string만 넘길 수 있고
+이미 redacted됐다고 주장하는 `entityRef` input은 거부한다. persisted `entityRef`는 항상 digest 앞 12 lowercase
+hex다. Error, free-form detail, token/authorization/cookie/secret/password,
 Slack/Gate/GitHub/Orca payload·body·options, raw ID, remote URL, full path를 받을 field는 없다. runtime에서
 unknown key/value나 getter/Proxy 실패를 만나면 입력을 문자열화하지 않고 static `telemetry.rejected`로 바꾼다.
 
@@ -341,9 +343,14 @@ rotation 기본은 5 MiB current + 5 backups이고 config bound는 1..100 MiB, 1
 logger failure는 `logger.write_failed` 한 줄만 stderr와 daemon-facing failure callback으로 보낸다. 원 payload를
 fallback print하지 않는다.
 
-`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 source DB와 WAL을 scratch directory에
-복사하고 source schema version을 먼저 확인한다. v13일 때만 scratch copy를 O1-2 strict store API로 읽으므로
-source file create/migration/checkpoint가 없다. task ownership은 O1-6이 주입할 facet이며 현재 기본
+`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 source를 SQLite read-only connection으로
+열고 `sqlite3_backup_*` 기반 Node online backup 한 번으로 transactionally consistent scratch image를 만든다.
+동시 commit/checkpoint가 있으면 SQLite가 backup epoch를 restart하므로 main/WAL을 따로 복사할 때의 lost-commit
+창이 없다. WAL이 없는 closed DB는 immutable read로 열고, live WAL은 daemon이 이미 소유한 `-shm` index를
+사용하므로 source DB/WAL create, migration, checkpoint, durable write가 없다. scratch는 모든 판정 뒤 제거하며
+v13일 때만 O1-2 strict store API로 읽는다. `automation.enabled=false`이면 repository discovery, Run observer,
+PR digest row는 intentionally disabled라 absent/old failure가 health를 낮추지 않지만 Gate reconcile과 Channel
+delivery는 계속 required다. task ownership은 O1-6이 주입할 facet이며 현재 기본
 `unavailable`은 중립이다. exit은 healthy 0, degraded/stale 1, absent/stopped/schema/config mismatch 2다.
 output에는 fingerprint 값, instance/repository/Slack/Orca ID, source path가 없고 match state, static code,
 timestamp와 aggregate count만 있다. O1-2가 diagnostic으로 보존하는 legacy `notification_state` count는
@@ -352,5 +359,9 @@ timestamp와 aggregate count만 있다. O1-2가 diagnostic으로 보존하는 le
 `logs --tail N [--follow] [--job NAME] [--log-dir ...]`는 current와 최대 configured bound의 numbered chain을
 read-only로 역순 scan해 마지막 1..5,000 safe record만 고른 뒤 시간순으로 출력한다. job filter는 JSON을
 strict parse한 뒤 allowlisted `job` field에만 적용한다. corrupt/invalid UTF-8/oversize/unknown-field line은
-원문 대신 static diagnostic record가 된다. follow는 polling 동안 file handle을 붙잡지 않아 Windows rotation을
-막지 않고 inode 교체, truncate-and-rewrite, partial line과 SIGINT/SIGTERM 종료를 처리한다.
+blank physical record까지 각각 원문 대신 static diagnostic record가 된다. follow initial tail은 pinned size와
+cursor를 같은 epoch에서 잡아 그 사이 append를 다음 drain으로 정확히 한 번 넘긴다. poll 사이 여러 rotation은
+old identity를 numbered chain에서 찾아 모든 intermediate generation을 시간순으로 drain한다. 같은 inode의
+truncate-and-rewrite는 consumed prefix의 SHA-256 witness로 smaller/equal/larger replacement를 구별한다. 각 bounded
+scan 뒤 yield 전에 모든 handle을 닫으므로 Windows rotation을 막지 않으며 partial line과 SIGINT/SIGTERM 종료도
+처리한다.

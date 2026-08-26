@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,7 +8,7 @@ import {
   OPERATIONAL_COUNT_FIELDS,
   OPERATIONAL_LOG_FILE,
   OperationalNdjsonLogger,
-  entityRef,
+  entityIdentity,
   parseOperationalLogLine,
   type LoggerFailureNotice,
   type OperationalLogHandle,
@@ -56,7 +57,8 @@ describe('allowlist-only redacted operational logger', () => {
     await logger.log({
       level: 'info', event: 'job.succeeded', job: 'pr-digest', outcome: 'succeeded',
       attempt: 2, durationMs: 42, nextRunAt: '2026-08-26T00:15:00Z',
-      counts: { processed: 3, deferred: 1 }, entityRef: entityRef(sentinels[7] as string),
+      counts: { processed: 3, deferred: 1 },
+      entityIdentity: entityIdentity(sentinels[7] as string),
     });
     for (const sentinel of sentinels) {
       await logger.log({
@@ -87,6 +89,34 @@ describe('allowlist-only redacted operational logger', () => {
         'durationMs', 'nextRunAt', 'errorCode', 'retryable', 'counts', 'entityRef',
       ].includes(key))).toBe(true);
     }
+  });
+
+  it('derives every entityRef inside the runtime sink for raw, 12-hex, and helper inputs', async () => {
+    const rawTwelveHex = 'deadbeefcafe';
+    const rawIdentity = 'instance-SENTINEL-runtime-boundary';
+    const helperIdentity = 'gate-SENTINEL-helper-boundary';
+    const expected = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 12);
+    const logger = await OperationalNdjsonLogger.create({ logDir: dir, buildIdentity: 'build', clock: () => AT });
+
+    await logger.log({ level: 'info', event: 'daemon.started', entityIdentity: rawTwelveHex });
+    await logger.log({ level: 'info', event: 'daemon.started', entityIdentity: rawIdentity });
+    await logger.log({
+      level: 'info', event: 'daemon.started', entityIdentity: entityIdentity(helperIdentity),
+    });
+    await logger.log({ level: 'info', event: 'daemon.started', entityRef: rawTwelveHex });
+    await logger.close();
+
+    const raw = readFileSync(logPath(), 'utf8');
+    expect(raw).not.toContain(rawTwelveHex);
+    expect(raw).not.toContain(rawIdentity);
+    expect(raw).not.toContain(helperIdentity);
+    const records = rawLines().map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records.map((record) => record['entityRef'] ?? null)).toEqual([
+      expected(rawTwelveHex), expected(rawIdentity), expected(helperIdentity), null,
+    ]);
+    expect(records[3]).toMatchObject({
+      event: 'telemetry.rejected', errorCode: 'validation.failed', retryable: false,
+    });
   });
 
   it('fuzzes hostile key/value shapes into a single bounded static rejection shape', async () => {

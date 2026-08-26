@@ -76,6 +76,7 @@ export type OperationalLogEvent = typeof OPERATIONAL_LOG_EVENTS[number];
 export type OperationalLogLevel = typeof OPERATIONAL_LOG_LEVELS[number];
 export type OperationalLogOutcome = typeof OPERATIONAL_LOG_OUTCOMES[number];
 export type OperationalCountField = typeof OPERATIONAL_COUNT_FIELDS[number];
+export type EntityIdentity = object & { readonly __entityIdentity: unique symbol };
 export type EntityRef = string & { readonly __entityRef: unique symbol };
 
 export type OperationalLogCounts = Partial<Readonly<Record<OperationalCountField, number>>>;
@@ -91,7 +92,8 @@ export type OperationalLogInput = {
   readonly errorCode?: OperationalFailureCode;
   readonly retryable?: boolean;
   readonly counts?: OperationalLogCounts;
-  readonly entityRef?: EntityRef;
+  /** Opaque raw identity token. The concrete logger hashes it at the persistence boundary. */
+  readonly entityIdentity?: EntityIdentity;
 };
 
 /** The complete persisted shape. No free-form message/detail/payload field exists. */
@@ -155,16 +157,23 @@ const LOG_FIELDS = [
   'ts', 'level', 'service', 'schemaVersion', 'build', 'event', 'job', 'outcome', 'attempt',
   'durationMs', 'nextRunAt', 'errorCode', 'retryable', 'counts', 'entityRef',
 ] as const;
-const INPUT_FIELDS = LOG_FIELDS.filter((field) => ![
-  'ts', 'service', 'schemaVersion', 'build',
-].includes(field));
+const INPUT_FIELDS = [
+  'level', 'event', 'job', 'outcome', 'attempt', 'durationMs', 'nextRunAt', 'errorCode',
+  'retryable', 'counts', 'entityIdentity',
+] as const;
+const PARSED_INPUT_FIELDS = [
+  'level', 'event', 'job', 'outcome', 'attempt', 'durationMs', 'nextRunAt', 'errorCode',
+  'retryable', 'counts',
+] as const;
 export const OPERATIONAL_JOB_NAMES: readonly DaemonJobName[] = [
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
 ];
 const MAX_COUNT = 1_000_000_000;
+const MAX_ENTITY_IDENTITY_BYTES = 4 * 1024;
 const BUILD_REF_RE = /^[0-9a-f]{12}$/;
 const ENTITY_REF_RE = /^[0-9a-f]{12}$/;
 const RETRYABLE_RENAME_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
+const RAW_ENTITY_IDENTITIES = new WeakMap<object, string>();
 
 const DEFAULT_FILE_SYSTEM: OperationalLoggerFileSystem = {
   mkdir: async (path) => { await nodeMkdir(path, { recursive: true }); },
@@ -206,9 +215,26 @@ export function operationalFingerprint(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-/** The only supported conversion from a private/canonical identity to a log reference. */
-export function entityRef(value: string): EntityRef {
-  return operationalFingerprint(value).slice(0, 12) as EntityRef;
+/**
+ * Wraps a raw private identity without making it enumerable or serializable. The wrapper is
+ * deliberately not a pre-hashed reference: only the concrete logger may derive `entityRef`.
+ */
+export function entityIdentity(value: string): EntityIdentity {
+  const token = Object.freeze(Object.create(null)) as EntityIdentity;
+  RAW_ENTITY_IDENTITIES.set(token, value);
+  return token;
+}
+
+function rawEntityIdentity(value: unknown): string | null {
+  const raw = typeof value === 'string'
+    ? value
+    : typeof value === 'object' && value !== null
+      ? RAW_ENTITY_IDENTITIES.get(value) ?? null
+      : null;
+  if (raw === null || raw.length === 0 || Buffer.byteLength(raw, 'utf8') > MAX_ENTITY_IDENTITY_BYTES) {
+    return null;
+  }
+  return raw;
 }
 
 function normalizeCounts(value: unknown): OperationalLogCounts | null {
@@ -224,50 +250,65 @@ function normalizeCounts(value: unknown): OperationalLogCounts | null {
   return counts;
 }
 
+function normalizeCommonInput(
+  value: Record<string, unknown>,
+): Omit<OperationalLogRecord, 'ts' | 'service' | 'schemaVersion' | 'build' | 'entityRef'> | null {
+  if (!isCatalogValue(value['level'], OPERATIONAL_LOG_LEVELS)) return null;
+  if (!isCatalogValue(value['event'], OPERATIONAL_LOG_EVENTS)) return null;
+
+  const normalized: Record<string, unknown> = { level: value['level'], event: value['event'] };
+  if (value['job'] !== undefined) {
+    if (!isCatalogValue(value['job'], OPERATIONAL_JOB_NAMES)) return null;
+    normalized['job'] = value['job'];
+  }
+  if (value['outcome'] !== undefined) {
+    if (!isCatalogValue(value['outcome'], OPERATIONAL_LOG_OUTCOMES)) return null;
+    normalized['outcome'] = value['outcome'];
+  }
+  for (const field of ['attempt', 'durationMs'] as const) {
+    if (value[field] === undefined) continue;
+    if (!safeInteger(value[field])) return null;
+    normalized[field] = value[field];
+  }
+  if (value['nextRunAt'] !== undefined) {
+    const nextRunAt = canonicalIso(value['nextRunAt']);
+    if (nextRunAt === null) return null;
+    normalized['nextRunAt'] = nextRunAt;
+  }
+  if (value['errorCode'] !== undefined) {
+    if (!isCatalogValue(value['errorCode'], OPERATIONAL_FAILURE_CODES)) return null;
+    normalized['errorCode'] = value['errorCode'];
+  }
+  if (value['retryable'] !== undefined) {
+    if (typeof value['retryable'] !== 'boolean') return null;
+    normalized['retryable'] = value['retryable'];
+  }
+  if (value['counts'] !== undefined) {
+    const counts = normalizeCounts(value['counts']);
+    if (counts === null) return null;
+    normalized['counts'] = counts;
+  }
+  return normalized as Omit<
+    OperationalLogRecord,
+    'ts' | 'service' | 'schemaVersion' | 'build' | 'entityRef'
+  >;
+}
+
 function normalizeInput(value: unknown): Omit<OperationalLogRecord, 'ts' | 'service' | 'schemaVersion' | 'build'> | null {
   try {
     if (!isRecord(value)) return null;
     if (Object.keys(value).some((key) => !(INPUT_FIELDS as readonly string[]).includes(key))) return null;
-    if (!isCatalogValue(value['level'], OPERATIONAL_LOG_LEVELS)) return null;
-    if (!isCatalogValue(value['event'], OPERATIONAL_LOG_EVENTS)) return null;
-
-    const normalized: Record<string, unknown> = { level: value['level'], event: value['event'] };
-    if (value['job'] !== undefined) {
-      if (!isCatalogValue(value['job'], OPERATIONAL_JOB_NAMES)) return null;
-      normalized['job'] = value['job'];
+    const normalized = normalizeCommonInput(value);
+    if (normalized === null) return null;
+    if (value['entityIdentity'] !== undefined) {
+      const identity = rawEntityIdentity(value['entityIdentity']);
+      if (identity === null) return null;
+      return {
+        ...normalized,
+        entityRef: operationalFingerprint(identity).slice(0, 12) as EntityRef,
+      };
     }
-    if (value['outcome'] !== undefined) {
-      if (!isCatalogValue(value['outcome'], OPERATIONAL_LOG_OUTCOMES)) return null;
-      normalized['outcome'] = value['outcome'];
-    }
-    for (const field of ['attempt', 'durationMs'] as const) {
-      if (value[field] === undefined) continue;
-      if (!safeInteger(value[field])) return null;
-      normalized[field] = value[field];
-    }
-    if (value['nextRunAt'] !== undefined) {
-      const nextRunAt = canonicalIso(value['nextRunAt']);
-      if (nextRunAt === null) return null;
-      normalized['nextRunAt'] = nextRunAt;
-    }
-    if (value['errorCode'] !== undefined) {
-      if (!isCatalogValue(value['errorCode'], OPERATIONAL_FAILURE_CODES)) return null;
-      normalized['errorCode'] = value['errorCode'];
-    }
-    if (value['retryable'] !== undefined) {
-      if (typeof value['retryable'] !== 'boolean') return null;
-      normalized['retryable'] = value['retryable'];
-    }
-    if (value['counts'] !== undefined) {
-      const counts = normalizeCounts(value['counts']);
-      if (counts === null) return null;
-      normalized['counts'] = counts;
-    }
-    if (value['entityRef'] !== undefined) {
-      if (typeof value['entityRef'] !== 'string' || !ENTITY_REF_RE.test(value['entityRef'])) return null;
-      normalized['entityRef'] = value['entityRef'] as EntityRef;
-    }
-    return normalized as Omit<OperationalLogRecord, 'ts' | 'service' | 'schemaVersion' | 'build'>;
+    return normalized;
   } catch {
     // Proxies/getters are untrusted input too. Their thrown object is never stringified.
     return null;
@@ -295,11 +336,17 @@ export function parseOperationalLogLine(line: string): OperationalLogRecord | nu
   if (ts === null || ts !== value['ts']) return null;
   if (value['service'] !== OPERATIONAL_LOG_SERVICE || value['schemaVersion'] !== SCHEMA_VERSION) return null;
   if (typeof value['build'] !== 'string' || !BUILD_REF_RE.test(value['build'])) return null;
-  const normalized = normalizeInput(Object.fromEntries(
-    Object.entries(value).filter(([key]) => (INPUT_FIELDS as readonly string[]).includes(key)),
-  ));
+  const parsedInput = Object.fromEntries(
+    Object.entries(value).filter(([key]) => (PARSED_INPUT_FIELDS as readonly string[]).includes(key)),
+  );
+  const normalized = normalizeCommonInput(parsedInput);
   if (normalized === null) return null;
   const { level, event, ...optional } = normalized;
+  let entityRef: EntityRef | undefined;
+  if (value['entityRef'] !== undefined) {
+    if (typeof value['entityRef'] !== 'string' || !ENTITY_REF_RE.test(value['entityRef'])) return null;
+    entityRef = value['entityRef'] as EntityRef;
+  }
   return {
     ts,
     level,
@@ -308,6 +355,7 @@ export function parseOperationalLogLine(line: string): OperationalLogRecord | nu
     build: value['build'],
     event,
     ...optional,
+    ...(entityRef === undefined ? {} : { entityRef }),
   };
 }
 

@@ -10,7 +10,7 @@ import type {
   OperationalStore,
 } from '../store/operational-types.js';
 import {
-  entityRef,
+  entityIdentity,
   type OperationalLogInput,
   type OperationalTelemetrySink,
 } from './logger.js';
@@ -51,7 +51,7 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
     const record = this.store.recordDaemonStart(input);
     await this.event({
       level: 'info', event: 'daemon.started', outcome: 'started',
-      entityRef: entityRef(input.instanceId),
+      entityIdentity: entityIdentity(input.instanceId),
     });
     return record;
   }

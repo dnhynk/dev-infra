@@ -6,6 +6,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +18,7 @@ import {
   readOperationalLogTail,
 } from '../src/operational/logs.js';
 import {
+  MAX_OPERATIONAL_LOG_BACKUPS,
   MAX_OPERATIONAL_LOG_LINE_BYTES,
   OPERATIONAL_LOG_FILE,
   type OperationalLogRecord,
@@ -49,6 +51,27 @@ function record(index: number, job: 'pr-digest' | 'run-observer' = 'pr-digest'):
 
 function lines(...records: readonly OperationalLogRecord[]): string {
   return records.map((value) => `${JSON.stringify(value)}\n`).join('');
+}
+
+function compactRecord(index: number): OperationalLogRecord {
+  return {
+    ts: new Date(Date.UTC(2026, 7, 26, 1, 0, index)).toISOString(),
+    level: 'info',
+    service: 'orca-slack-bridge',
+    schemaVersion: 13,
+    build: 'b'.repeat(12),
+    event: 'daemon.heartbeat',
+    attempt: index + 1,
+  };
+}
+
+function rotateCurrent(next: OperationalLogRecord, backupLimit: number): void {
+  for (let generation = backupLimit; generation >= 2; generation -= 1) {
+    const from = `${current}.${generation - 1}`;
+    if (existsSync(from)) renameSync(from, `${current}.${generation}`);
+  }
+  renameSync(current, `${current}.1`);
+  writeFileSync(current, lines(next));
 }
 
 async function nextWithin(
@@ -128,6 +151,37 @@ describe('rotated read-only tail', () => {
     }
   });
 
+  it('diagnoses every leading, internal, and trailing blank physical record across rotations', async () => {
+    writeFileSync(`${current}.1`, `\n${lines(record(0))}\n`);
+    writeFileSync(current, `\n${lines(record(1))}`);
+    const original = [readFileSync(`${current}.1`), readFileSync(current)];
+
+    const result = await readOperationalLogTail({ logDir: dir, tail: 10 });
+    expect(result.map((value) => value.event)).toEqual([
+      'log.corrupt_line',
+      'job.succeeded',
+      'log.corrupt_line',
+      'log.corrupt_line',
+      'job.succeeded',
+    ]);
+    expect(result.filter((value) => value.event === 'log.corrupt_line')).toHaveLength(3);
+    expect(readFileSync(`${current}.1`)).toEqual(original[0]);
+    expect(readFileSync(current)).toEqual(original[1]);
+  });
+
+  it('diagnoses one blank record whose adjacent delimiters straddle a reverse-read chunk', async () => {
+    const chunk = 64 * 1024;
+    writeFileSync(current, Buffer.concat([
+      Buffer.alloc(chunk - 1, 0x78),
+      Buffer.from('\n\n'),
+      Buffer.alloc(chunk - 1, 0x79),
+    ]));
+    const result = await readOperationalLogTail({ logDir: dir, tail: 10 });
+    expect(result.map((value) => value.event)).toEqual([
+      'log.oversize_line', 'log.corrupt_line', 'log.oversize_line',
+    ]);
+  });
+
   it('validates bounds and treats an absent chain as an empty successful tail', async () => {
     await expect(readOperationalLogTail({ logDir: dir, tail: 0 })).rejects.toThrow('logs.tail_invalid');
     await expect(readOperationalLogTail({ logDir: dir, tail: 5_001 })).rejects.toThrow('logs.tail_invalid');
@@ -150,6 +204,160 @@ describe('follow rotation, truncation, and signal', () => {
       logDir: dir, tail: 1, signal: controller.signal, pollMilliseconds: 10,
     });
     expect(await nextWithin(iterator)).toMatchObject({ done: true });
+  });
+
+  it('hands an append after initial size capture to follow exactly once', async () => {
+    writeFileSync(current, lines(record(0)));
+    const controller = new AbortController();
+    let hookCalls = 0;
+    const iterator = followOperationalLogs({
+      logDir: dir,
+      tail: 1,
+      signal: controller.signal,
+      pollMilliseconds: 10,
+      afterInitialSnapshot: () => {
+        hookCalls += 1;
+        appendFileSync(current, lines(record(1)));
+      },
+    });
+    try {
+      expect((await nextWithin(iterator)).value?.attempt).toBe(1);
+      expect((await nextWithin(iterator)).value?.attempt).toBe(2);
+      appendFileSync(current, lines(record(2)));
+      expect((await nextWithin(iterator)).value?.attempt).toBe(3);
+      expect(hookCalls).toBe(1);
+      controller.abort();
+      expect((await nextWithin(iterator)).done).toBe(true);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
+  });
+
+  it('drains two rotations between polls in chronological order exactly once', async () => {
+    writeFileSync(current, lines(record(0)));
+    const controller = new AbortController();
+    const iterator = followOperationalLogs({
+      logDir: dir, tail: 1, backupLimit: 2, signal: controller.signal, pollMilliseconds: 10,
+    });
+    try {
+      expect((await nextWithin(iterator)).value?.attempt).toBe(1);
+      rotateCurrent(record(1), 2);
+      rotateCurrent(record(2), 2);
+      expect((await nextWithin(iterator)).value?.attempt).toBe(2);
+      expect((await nextWithin(iterator)).value?.attempt).toBe(3);
+      controller.abort();
+      expect((await nextWithin(iterator)).done).toBe(true);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
+  });
+
+  it('drains the maximum supported retained rotation chain exactly once', async () => {
+    writeFileSync(current, lines(record(0)));
+    const controller = new AbortController();
+    const iterator = followOperationalLogs({
+      logDir: dir,
+      tail: 1,
+      backupLimit: MAX_OPERATIONAL_LOG_BACKUPS,
+      signal: controller.signal,
+      pollMilliseconds: 10,
+    });
+    try {
+      expect((await nextWithin(iterator)).value?.attempt).toBe(1);
+      for (let index = 1; index <= MAX_OPERATIONAL_LOG_BACKUPS; index += 1) {
+        rotateCurrent(record(index), MAX_OPERATIONAL_LOG_BACKUPS);
+      }
+      const followed: number[] = [];
+      for (let index = 0; index < MAX_OPERATIONAL_LOG_BACKUPS; index += 1) {
+        followed.push((await nextWithin(iterator)).value?.attempt as number);
+      }
+      expect(followed).toEqual(Array.from(
+        { length: MAX_OPERATIONAL_LOG_BACKUPS },
+        (_unused, index) => index + 2,
+      ));
+      controller.abort();
+      expect((await nextWithin(iterator)).done).toBe(true);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
+  });
+
+  it.each([
+    ['smaller', [compactRecord(1)]],
+    ['equal', [record(1)]],
+    ['larger', [record(1), record(2), record(3)]],
+  ] as const)('detects same-inode %s truncate/rewrite with controlled timestamps', async (_case, replacement) => {
+    writeFileSync(current, lines(record(0)));
+    const fixed = new Date('2026-08-26T02:00:00.000Z');
+    utimesSync(current, fixed, fixed);
+    const initialIdentity = `${String(statSync(current).dev)}:${String(statSync(current).ino)}`;
+    const controller = new AbortController();
+    const iterator = followOperationalLogs({
+      logDir: dir, tail: 1, signal: controller.signal, pollMilliseconds: 10,
+    });
+    try {
+      expect((await nextWithin(iterator)).value?.attempt).toBe(1);
+      writeFileSync(current, lines(...replacement));
+      utimesSync(current, fixed, fixed);
+      expect(`${String(statSync(current).dev)}:${String(statSync(current).ino)}`).toBe(initialIdentity);
+      for (const expected of replacement) {
+        expect((await nextWithin(iterator)).value?.attempt).toBe(expected.attempt);
+      }
+      controller.abort();
+      expect((await nextWithin(iterator)).done).toBe(true);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
+  });
+
+  it('does not duplicate a retained prefix when truncate/rewrite grows past the cursor', async () => {
+    writeFileSync(current, lines(record(0)));
+    const fixed = new Date('2026-08-26T02:00:00.000Z');
+    utimesSync(current, fixed, fixed);
+    const controller = new AbortController();
+    const iterator = followOperationalLogs({
+      logDir: dir, tail: 1, signal: controller.signal, pollMilliseconds: 10,
+    });
+    try {
+      expect((await nextWithin(iterator)).value?.attempt).toBe(1);
+      writeFileSync(current, lines(record(0), record(1), record(2)));
+      utimesSync(current, fixed, fixed);
+      expect((await nextWithin(iterator)).value?.attempt).toBe(2);
+      expect((await nextWithin(iterator)).value?.attempt).toBe(3);
+      controller.abort();
+      expect((await nextWithin(iterator)).done).toBe(true);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
+  });
+
+  it('emits one static diagnostic for each followed blank record across a rotation', async () => {
+    writeFileSync(current, lines(record(0)));
+    const controller = new AbortController();
+    const iterator = followOperationalLogs({
+      logDir: dir, tail: 1, signal: controller.signal, pollMilliseconds: 10,
+    });
+    try {
+      expect((await nextWithin(iterator)).value?.attempt).toBe(1);
+      rotateCurrent(compactRecord(1), 2);
+      writeFileSync(`${current}.1`, '\n\n');
+      const first = await nextWithin(iterator);
+      const second = await nextWithin(iterator);
+      const third = await nextWithin(iterator);
+      expect([first.value?.event, second.value?.event, third.value?.event]).toEqual([
+        'log.corrupt_line', 'log.corrupt_line', 'daemon.heartbeat',
+      ]);
+      controller.abort();
+      expect((await nextWithin(iterator)).done).toBe(true);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
   });
 
   it('emits initial tail, append, truncation replacement, and rotated current, then exits on abort', async () => {

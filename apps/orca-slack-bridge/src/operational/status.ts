@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
-import { copyFileSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
+import { backup, DatabaseSync } from 'node:sqlite';
 import {
   defaultConfigPath,
   loadConfig,
@@ -127,8 +128,12 @@ export type InspectOperationalStatusOptions = {
   readonly platform?: NodeJS.Platform;
   readonly clock?: () => Date;
   readonly taskFacet?: () => TaskStatusFacet | Promise<TaskStatusFacet>;
-  /** Safe projected test/adapter seam; the production CLI always reads the copied O1-2 store. */
+  /** Safe projected test/adapter seam; production reads one online-backed-up O1-2 store image. */
   readonly snapshot?: OperationalStatusSnapshot;
+  /** Deterministic test seam; production never exposes the read-only source connection. */
+  readonly afterSqliteBackupStep?: () => void;
+  /** Test-only parent for proving that the online snapshot leaves no temporary file. */
+  readonly temporaryDirectory?: string;
 };
 
 export type OperationalStatusSnapshot = {
@@ -302,7 +307,18 @@ export function projectOperationalStore(
   };
 }
 
-function readStoredStatus(path: string): SnapshotResult {
+function immutableDatabaseUrl(path: string): URL {
+  const url = pathToFileURL(path);
+  url.searchParams.set('immutable', '1');
+  url.searchParams.set('mode', 'ro');
+  return url;
+}
+
+async function readStoredStatus(
+  path: string,
+  afterSqliteBackupStep: (() => void) | undefined,
+  temporaryDirectory: string,
+): Promise<SnapshotResult> {
   try {
     if (!pathExists(path)) return { kind: 'absent' };
   } catch {
@@ -310,13 +326,26 @@ function readStoredStatus(path: string): SnapshotResult {
   }
 
   let scratch: string | null = null;
+  let source: DatabaseSync | null = null;
   let raw: DatabaseSync | null = null;
   let store: SqliteDigestStore | null = null;
   try {
-    scratch = mkdtempSync(join(tmpdir(), 'orca-slack-bridge-status-'));
+    const walPresent = pathExists(`${path}-wal`);
+    // SQLite can read WAL without write access only when its daemon-owned shared-memory index
+    // already exists. Refuse an orphan WAL instead of creating source-adjacent state.
+    if (walPresent && !pathExists(`${path}-shm`)) return { kind: 'corrupt' };
+    source = new DatabaseSync(
+      walPresent ? path : immutableDatabaseUrl(path),
+      { readOnly: true, timeout: 5_000 },
+    );
+    scratch = mkdtempSync(join(temporaryDirectory, 'orca-slack-bridge-status-'));
     const copy = join(scratch, 'state.db');
-    copyFileSync(path, copy);
-    if (pathExists(`${path}-wal`)) copyFileSync(`${path}-wal`, `${copy}-wal`);
+    // sqlite3_backup_* takes one transactionally consistent image. If a writer commits or
+    // checkpoints concurrently, SQLite restarts the backup rather than combining file epochs.
+    if (afterSqliteBackupStep === undefined) await backup(source, copy);
+    else await backup(source, copy, { rate: 1, progress: afterSqliteBackupStep });
+    source.close();
+    source = null;
 
     raw = new DatabaseSync(copy);
     const version = schemaVersion(raw);
@@ -333,10 +362,15 @@ function readStoredStatus(path: string): SnapshotResult {
   } catch {
     return { kind: 'corrupt' };
   } finally {
+    try { source?.close(); } catch { /* read-only source remains unmodified */ }
     try { raw?.close(); } catch { /* source remains untouched */ }
     try { store?.close(); } catch { /* scratch cleanup still runs */ }
     if (scratch !== null) {
-      try { rmSync(scratch, { recursive: true, force: true }); } catch { /* bounded temp leak only */ }
+      try {
+        rmSync(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+      } catch {
+        // Cleanup remains bounded and never renders the private temp path or triggering error.
+      }
     }
   }
 }
@@ -394,7 +428,11 @@ export async function inspectOperationalStatus(
   }
 
   const snapshot: SnapshotResult = options.snapshot === undefined
-    ? readStoredStatus(statePath)
+    ? await readStoredStatus(
+      statePath,
+      options.afterSqliteBackupStep,
+      options.temporaryDirectory ?? tmpdir(),
+    )
     : { kind: 'ready', value: options.snapshot };
   const logState = readLogState(logDir);
   if (snapshot.kind !== 'ready') {
@@ -471,7 +509,11 @@ export async function inspectOperationalStatus(
     if (daemon.lastErrorCode !== null) add('daemon.degraded', 1);
   }
 
+  const disabledObserverJobs = config.automation.enabled
+    ? new Set<DaemonJobName>()
+    : new Set<DaemonJobName>(['repository-discovery', 'run-observer', 'pr-digest']);
   for (const job of snapshot.value.jobs) {
+    if (disabledObserverJobs.has(job.job)) continue;
     if (job.state === 'absent') add('job.absent', 1);
     else if (job.state === 'failed') add('job.failed', 1);
     else if (job.state === 'backoff') add('job.backoff', 1);
