@@ -47,12 +47,19 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
   권위로 읽고, live/stale은 `consumer_generation`으로 구분한다(OD-020).
 - coordinator 세션의 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID`는 보조 단서로만 쓴다.
 - global worker list의 Run↔worktree 정보는 repository 후보 복구에 사용할 수 있지만 historical/released worker를 liveness로 사용하지 않는다.
-- Git remote 기반 자동 repository 등록은 O1에서 다룬다.
+- O1-1은 `orca repo list --json` success envelope/result와 관측된 14-key repository row를 strict parse하는
+  read-only adapter를 추가한다. whole-envelope 또는 row schema drift는 pass 전체 실패이며 raw path/URL/
+  payload를 오류에 복사하지 않는다. durable last-good registry 적용은 O1-2/O1-3 범위다.
+- O1-1 GitHub normalizer는 HTTPS, SCP-like `git@github.com`, `ssh://git@github.com` 세 syntax만 받고
+  host/owner/repository case와 한 `.git` suffix를 canonicalize한다. Orca `canonicalKey`는 독립 계산값과
+  exact 일치할 때만 evidence이며 mismatch는 row-local `canonical_conflict`다.
 - Run↔repository 연결은 설정의 `projects[].orcaRepositoryIds`와 관측된 `<id>::<path>` 앞부분의 exact
   비교다. 경로로 비교하지 않는다 — coordinator worktree와 Orca worktree는 뿌리가 다르고 id 하나가 둘 다
   덮는다(OD-078).
 - 설정 또는 durable store의 Project↔Repository mapping을 적용한다.
-- 자동 발견된 다중 repository routing도 O1에서 다룬다(OD-068).
+- 자동 발견된 다중 repository routing은 O1-3에서 다룬다(OD-068). O1-1은 explicit/auto Project,
+  canonical GitHub identity, canonical remote당 exact Orca ID N개, blocked conflict를 나타내는 immutable
+  effective-config 타입까지만 제공하고 route나 durable registry를 만들지 않는다.
 
 `run-use` 인수 뒤 coordinator handle·pane key는 새 터미널 값으로 바뀌고 generation이 올라가므로, 최초 handle을
 Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설정(OD-068)을 따르며, 관측된
@@ -277,4 +284,39 @@ metadata를 Orca/Git branch/dispatch 관계와 어느 수준까지 대조할지�
 - 마지막 오류와 재시도 여부
 - 현재 관리 중인 repository/Run/PR 수
 
-health 명령, 로그 형식, secret redaction, 자동 재시작 수단은 기술 스택 결정 뒤 확정한다.
+O1-1은 아래 config/default/bound만 확정한다. health/log 구현과 자동 재시작 수단은 후속 O1 PR에서 이
+계약을 소비하며 이 문서의 현재 상태만으로 구현 완료나 운영 설치를 주장하지 않는다.
+
+### O1 automation config contract (O1-1)
+
+`automation`은 optional config section이지만 생략 시 완성된 O1 제품 기준으로 `enabled=true`다.
+`enabled=false`는 O1 repository discovery/Run observer/PR digest jobs만 끄며 기존 D2 Gate reconcile과 D3
+Channel delivery를 끄지 않는다. scheduling/routing은 deterministic이고 LLM을 사용하지 않는다. 기존 one-shot
+`digest --pr-limit` 기본 50은 바꾸지 않으며 daemon용 기본만 10이다.
+
+| field | default | accepted bound |
+|---|---:|---:|
+| `repositoryDiscovery.intervalSeconds` | 300 | 60..3600 |
+| `repositoryDiscovery.timeoutSeconds` | 30 | 10..120 |
+| `runObserver.intervalSeconds` | 120 | 30..900 |
+| `runObserver.timeoutSeconds` | 90 | 15..300 |
+| `prDigest.intervalSeconds` | 900 | 300..7200 |
+| `prDigest.timeoutSeconds` | 300 | 60..900 |
+| `prDigest.prLimit` | 10 | 1..50 |
+| `prDigest.globalPrBudget` | 100 | 1..1000 |
+| `github.commandBudgetPerHour` | 2000 | 200..4000 |
+| `github.rateLimitFloor` | 1000 | 100..4000 |
+| `scheduler.jitterRatio` | 0.10 | 0..0.25 |
+| `health.heartbeatSeconds` | 15 | 5..60 |
+| `health.staleAfterSeconds` | 90 | `max(3×heartbeat, 30)`..600 |
+| `capacity.repositories` | 16 | 1..64 |
+| `capacity.runsPerPass` | 64 | 1..256 |
+| `capacity.orcaIdsPerCanonicalRepository` | 16 | 1..64 |
+| `logging.maxFileMiB` | 5 | 1..100 |
+| `logging.backupCount` | 5 | 1..20 |
+
+Project config는 name case-fold uniqueness, Project당 repository 1..16, 전체 config의 case-insensitive
+repository uniqueness와 exact Orca ID uniqueness를 preflight에서 검증한다. 기존 `orcaRepositoryIds` manual
+fallback은 그대로 유효하며 같은 Project 안의 duplicate도 deterministic error로 거부한다. configured
+repository는 lowercase canonical `owner/name`으로 저장하고 `.git` suffix는 config에서 거부한다. 이 config contract는
+scheduler, logger, schema v13, Slack write를 이 PR에서 활성화하지 않는다.

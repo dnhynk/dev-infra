@@ -30,6 +30,43 @@
       ]
     }
   ],
+  "automation": {
+    "enabled": true,
+    "repositoryDiscovery": {
+      "intervalSeconds": 300,
+      "timeoutSeconds": 30
+    },
+    "runObserver": {
+      "intervalSeconds": 120,
+      "timeoutSeconds": 90
+    },
+    "prDigest": {
+      "intervalSeconds": 900,
+      "timeoutSeconds": 300,
+      "prLimit": 10,
+      "globalPrBudget": 100
+    },
+    "github": {
+      "commandBudgetPerHour": 2000,
+      "rateLimitFloor": 1000
+    },
+    "scheduler": {
+      "jitterRatio": 0.1
+    },
+    "health": {
+      "heartbeatSeconds": 15,
+      "staleAfterSeconds": 90
+    },
+    "capacity": {
+      "repositories": 16,
+      "runsPerPass": 64,
+      "orcaIdsPerCanonicalRepository": 16
+    },
+    "logging": {
+      "maxFileMiB": 5,
+      "backupCount": 5
+    }
+  },
   "correlationKeys": {
     "run": "orca-run",
     "task": "orca-task",

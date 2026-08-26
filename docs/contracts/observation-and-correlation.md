@@ -20,9 +20,22 @@ Bridge가 구분해야 하는 기본 entity:
 - Slack PR root message
 - Slack Run root message
 
-같은 이름, 여러 Git remote, fork, repository rename, 여러 Run이 같은 repository에서 동작하는 경우의 canonicalization은 TBD다.
+O1-1은 GitHub repository identity를 `github.com/<owner-lower>/<repository-lower>`로 고정한다. Bridge가
+remote URL에서 독립 계산한 값만 canonical identity이며 raw URL, local path, Orca가 반환한 canonical string은
+identity로 보존하지 않는다. 허용 remote는 HTTPS `github.com/owner/repository[.git]`, SCP-like
+`git@github.com:owner/repository[.git]`, SSH `ssh://git@github.com/owner/repository[.git]` 세 형태뿐이다.
+URL 끝에는 한 개의 trailing slash만 추가로 허용한다.
+credential, non-default port, query/fragment, percent encoding, whitespace/control, backslash, dot segment,
+두 segment가 아닌 path, 잘못된 host/scheme/user/name bound, doubled `.git`은 거부한다.
 
-Project↔Repository 관계도 아직 확정하지 않았다. 최소한 설정 또는 durable store가 사람이 보는 Project identity와 GitHub repository identity를 연결하고 Slack routing에 제공해야 한다. cardinality, 자동 발견 시 생성 규칙, rename 처리, 수동 등록 주체는 TBD다.
+Project name은 case-fold unique해야 한다. 명시 Project는 repository 1..16개를 가질 수 있고 repository는
+대소문자를 접은 `owner/name`, Orca repository ID는 exact string으로 config 전체에서 각각 한 번만 나타나야
+한다. 한 canonical GitHub repository는 여러 exact Orca ID를 가질 수 있다. 명시 Project와 이후 O1이 만드는
+auto singleton Project는 origin을 구분하며, no-remote/unsupported/invalid/canonical-conflict/manual-conflict/
+capacity-conflict는 route를 추측하지 않는 typed blocked binding으로 표현한다. row-local no-remote/
+unsupported/invalid/conflict는 그 row 또는 canonical group만 봉쇄하며 unrelated valid binding의 route를
+막지 않는다. whole-snapshot schema/config invariant가 깨진 경우만 전체 automatic routing을 봉쇄한다. O1-1은 이 타입과 parser만
+제공하고 durable registry, GitHub numeric identity 확인, reconciliation과 routing은 후속 O1 PR 범위다.
 
 ## 2. PR correlation metadata
 
@@ -165,6 +178,21 @@ dispatch하면 새 세대가 만든 Task가 하나도 없고, 그 정상 handoff
 global `worker-list`의 `runId`와 `resource.worktreeId`는 repository 후보를 보조할 수 있지만 historical/released
 worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree id의 `<uuid>::<path>` 형식을 반복 사용해
 모두 동작한 것은 관측일 뿐이며, 그 형식의 안정성은 계약으로 보장되지 않았다.
+
+### O1 repository discovery 입력 계약
+
+O1 discovery는 설치된 `orca repo list --json`의 success envelope key를 정확히 `id`, `ok`, `result`,
+`_meta`, result key를 정확히 `repos`로 읽는다. repository row는 설치 버전에서 관측한 14개 top-level
+key와 type을 exact 검증하며 `gitRemoteIdentity`는 `null` 또는 `canonicalKey`, `remoteName`, `remoteUrl`
+string 세 필드의 exact object다. `repoIcon`은 null/object, `hookSettings`는 object까지만 검사하고 내부 raw
+field를 export하지 않는다. envelope/result/row schema drift는 pass 전체 실패다.
+
+정상 row의 remote URL은 위 독립 GitHub normalizer를 거친다. 계산한 key와 Orca `canonicalKey`가 다르면
+그 row는 `canonical_conflict`로 봉쇄하며 어느 쪽도 binding으로 추측하지 않는다. remote가 없거나 지원하지
+않거나 invalid인 row도 각각 typed row-local diagnostic으로 남는다. 같은 canonical remote 또는 같은 exact
+Orca ID가 여러 row에 나타나도 O1-1 parser는 source order대로 모두 보존한다. coalescing/conflict 판정과
+last-good registry는 O1-2/O1-3의 책임이다. thrown operational error는 static code/message만 가지며 raw
+path, URL, ID, payload를 포함하지 않는다.
 
 ## 6. PR canonical state
 
