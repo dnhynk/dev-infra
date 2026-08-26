@@ -367,8 +367,9 @@ pre/post pathname identity를 lifecycle 전체에서 유지한다. clean restart
 residue는 삭제하지 않고 최대 8개까지만 격리한다.
 
 각 연결은 4-byte big-endian length prefix가 붙은 request 정확히 하나를 EOF까지 받은 다음 response 정확히 하나를
-EOF까지 보낸다. 두 방향 모두 partial/oversize/두 번째 frame/trailing bytes/timeout을 거부한다. HMAC transcript는
-request nonce·freshness·state/capability/transport identity·expected config/build를, response protocol/schema/version·
+EOF까지 보낸다. 두 방향 모두 partial/oversize/두 번째 frame/trailing bytes/timeout을 거부한다. raw UDS path는
+wire에 싣지 않고 domain-separated SHA-256 transport binding이 exact path/device/inode를 묶는다. HMAC transcript는
+request nonce·freshness·state/capability/transport binding·expected config/build를, response protocol/schema/version·
 capture freshness·complete aggregate snapshot을 함께 묶는다. 따라서 listener나 port만 먼저 차지하고 nonce를
 echo하는 process는 operational data를 만들 수 없다. server는 1초 idle timeout과 별도로 accept부터 2초의
 non-refreshing monotonic absolute deadline, 최대 8 connection을 적용한다. Windows ACL helper는 비동기·취소

@@ -409,7 +409,7 @@ type OwnerRequest = {
   readonly version: 2;
   readonly stateIdentity: string;
   readonly capabilityId: string;
-  readonly transport: OperationalStatusTransportEndpoint;
+  readonly transportBinding: string;
   readonly nonce: string;
   readonly sentAt: string;
   readonly configFingerprint: string;
@@ -454,6 +454,13 @@ function ownerAuthenticator(secret: string, domain: 'request' | 'response', valu
     .digest('hex');
 }
 
+function ownerTransportBinding(transport: OperationalStatusTransportEndpoint): string {
+  return createHash('sha256')
+    .update('orca-slack-bridge-status-owner-v2:transport\0', 'utf8')
+    .update(canonicalJson(transport), 'utf8')
+    .digest('hex');
+}
+
 function sameAuthenticator(expected: string, actual: unknown): boolean {
   if (typeof actual !== 'string' || !FINGERPRINT_PATTERN.test(actual)) return false;
   return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
@@ -495,12 +502,12 @@ function parseOwnerRequest(
 ): OwnerRequest | null {
   const record = exactRecord(value, [
     'version', 'stateIdentity', 'capabilityId', 'nonce', 'sentAt',
-    'transport', 'configFingerprint', 'buildFingerprint', 'authenticator',
+    'transportBinding', 'configFingerprint', 'buildFingerprint', 'authenticator',
   ]);
   if (record === null || record['version'] !== STATUS_OWNER_PROTOCOL_VERSION ||
       record['stateIdentity'] !== generation.capability.stateIdentity ||
       record['capabilityId'] !== generation.capability.capabilityId ||
-      !sameCanonical(record['transport'], generation.capability.transport) ||
+      record['transportBinding'] !== ownerTransportBinding(generation.capability.transport) ||
       typeof record['nonce'] !== 'string' || !NONCE_PATTERN.test(record['nonce']) ||
       !canonicalIso(record['sentAt']) ||
       typeof record['configFingerprint'] !== 'string' ||
@@ -515,7 +522,7 @@ function parseOwnerRequest(
     version: 2,
     stateIdentity: record['stateIdentity'] as string,
     capabilityId: record['capabilityId'] as string,
-    transport: generation.capability.transport,
+    transportBinding: record['transportBinding'] as string,
     nonce: record['nonce'],
     sentAt: record['sentAt'],
     configFingerprint: record['configFingerprint'],
@@ -1121,7 +1128,7 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         version: request.version,
         stateIdentity: request.stateIdentity,
         capabilityId: request.capabilityId,
-        transport: request.transport,
+        transportBinding: request.transportBinding,
         nonce: request.nonce,
         sentAt: request.sentAt,
         configFingerprint: request.configFingerprint,
@@ -1131,7 +1138,7 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         version: STATUS_OWNER_PROTOCOL_VERSION,
         stateIdentity: request.stateIdentity,
         capabilityId: request.capabilityId,
-        transport: request.transport,
+        transportBinding: request.transportBinding,
         nonce: request.nonce,
         capturedAt: generation.capturedAt,
         schemaVersion: SCHEMA_VERSION,
@@ -1181,13 +1188,13 @@ function parseOwnerResponse(
   now: Date,
 ): OperationalStatusSnapshot | null {
   const response = exactRecord(value, [
-    'version', 'stateIdentity', 'capabilityId', 'transport', 'nonce', 'capturedAt',
+    'version', 'stateIdentity', 'capabilityId', 'transportBinding', 'nonce', 'capturedAt',
     'schemaVersion', 'snapshot', 'authenticator',
   ]);
   if (response === null || response['version'] !== STATUS_OWNER_PROTOCOL_VERSION ||
       response['stateIdentity'] !== request.stateIdentity ||
       response['capabilityId'] !== request.capabilityId ||
-      !sameCanonical(response['transport'], request.transport) ||
+      response['transportBinding'] !== request.transportBinding ||
       response['nonce'] !== request.nonce || response['schemaVersion'] !== SCHEMA_VERSION ||
       !canonicalIso(response['capturedAt'])) return null;
   const age = now.getTime() - Date.parse(response['capturedAt']);
@@ -1197,7 +1204,7 @@ function parseOwnerResponse(
     version: response['version'],
     stateIdentity: response['stateIdentity'],
     capabilityId: response['capabilityId'],
-    transport: response['transport'],
+    transportBinding: response['transportBinding'],
     nonce: response['nonce'],
     capturedAt: response['capturedAt'],
     schemaVersion: response['schemaVersion'],
@@ -1269,7 +1276,7 @@ async function requestOwnedOperationalStatus(
     version: STATUS_OWNER_PROTOCOL_VERSION,
     stateIdentity,
     capabilityId: capability.capabilityId,
-    transport: capability.transport,
+    transportBinding: ownerTransportBinding(capability.transport),
     nonce,
     sentAt: now.toISOString(),
     configFingerprint: expectations.configFingerprint,

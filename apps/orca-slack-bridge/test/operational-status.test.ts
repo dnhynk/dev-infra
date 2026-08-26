@@ -43,6 +43,7 @@ import {
   type OperationalStatusCapabilityStore,
   type OperationalStatusOwnerClaim,
   type OperationalStatusOwnerTransportIdentity,
+  type OperationalStatusTransportEndpoint,
   type RetiredOperationalStatusCapability,
 } from '../src/operational/status-capability.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
@@ -392,6 +393,13 @@ function ownerMac(secret: string, domain: 'request' | 'response', value: unknown
     .digest('hex');
 }
 
+function transportBinding(transport: OperationalStatusTransportEndpoint): string {
+  return createHash('sha256')
+    .update('orca-slack-bridge-status-owner-v2:transport\0', 'utf8')
+    .update(canonicalJson(transport), 'utf8')
+    .digest('hex');
+}
+
 function frame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value), 'utf8');
   const output = Buffer.alloc(payload.length + 4);
@@ -412,7 +420,7 @@ async function rawOwnerFrame(): Promise<Buffer> {
     version: 2,
     stateIdentity: operationalStatusStateIdentity(statePath),
     capabilityId: capability.capabilityId,
-    transport: capability.transport,
+    transportBinding: transportBinding(capability.transport),
     nonce: 'a'.repeat(32),
     sentAt: TRANSPORT_AT,
     configFingerprint: fingerprintOperationalConfig(config),
@@ -437,6 +445,7 @@ async function rawOwnerFrame(): Promise<Buffer> {
 type RawRequestMode =
   | 'valid-split'
   | 'unauthenticated'
+  | 'wrong-transport-binding'
   | 'coalesced'
   | 'delayed-trailing'
   | 'partial'
@@ -452,7 +461,7 @@ function validRawOwnerRequest(
     version: 2,
     stateIdentity: operationalStatusStateIdentity(statePath),
     capabilityId: capability.capabilityId,
-    transport: capability.transport,
+    transportBinding: transportBinding(capability.transport),
     nonce,
     sentAt,
     configFingerprint: fingerprintOperationalConfig(config),
@@ -529,6 +538,14 @@ async function rawOwnerExchange(
       } else if (mode === 'unauthenticated') {
         const parsed = unframe(valid) as Record<string, unknown>;
         socket.end(frame({ ...parsed, authenticator: '0'.repeat(64) }));
+      } else if (mode === 'wrong-transport-binding') {
+        const parsed = unframe(valid) as Record<string, unknown>;
+        const { authenticator: _authenticator, ...unsigned } = parsed;
+        const tampered = { ...unsigned, transportBinding: '0'.repeat(64) };
+        socket.end(frame({
+          ...tampered,
+          authenticator: ownerMac(capability.secret, 'request', tampered),
+        }));
       } else if (mode === 'coalesced') {
         socket.end(Buffer.concat([valid, valid]));
       } else if (mode === 'delayed-trailing') {
@@ -594,7 +611,7 @@ async function inspectThroughFakeOwner(
         version: 2,
         stateIdentity: parsed['stateIdentity'],
         capabilityId: parsed['capabilityId'],
-        transport: parsed['transport'],
+        transportBinding: parsed['transportBinding'],
         nonce: parsed['nonce'],
         capturedAt: TRANSPORT_AT,
         schemaVersion: 13,
@@ -896,7 +913,8 @@ describe('read-only operational status classification', () => {
         schemaVersion: 13,
       });
       for (const mode of [
-        'unauthenticated', 'coalesced', 'delayed-trailing', 'partial', 'oversize',
+        'unauthenticated', 'wrong-transport-binding', 'coalesced', 'delayed-trailing',
+        'partial', 'oversize',
       ] as const) {
         expect(await rawOwnerExchange(mode)).toBeNull();
       }
