@@ -343,8 +343,12 @@ rotation 기본은 5 MiB current + 5 backups이고 config bound는 1..100 MiB, 1
 logger failure는 `logger.write_failed` 한 줄만 stderr와 daemon-facing failure callback으로 보낸다. 원 payload를
 fallback print하지 않는다.
 
-`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 WAL이 없는 closed DB만 immutable
-read-only connection과 `sqlite3_backup_*` scratch image로 읽는다. live WAL은 새 SQLite reader를 열지 않는다.
+`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 per-state exclusive closed-snapshot
+lease를 WAL 판정 전에 획득한 뒤 WAL이 없는 closed DB만 immutable read-only connection과
+`sqlite3_backup_*` scratch image로 읽는다. production daemon은 같은 lease를 writable store open 전부터
+store close와 owner publication/lifecycle 종료까지 유지한다. lease contention은 source DB/WAL/SHM을 열거나
+판정하지 않고 authenticated owner로만 route하며, owner가 없거나 검증되지 않으면 static unavailable이다.
+live WAL은 새 SQLite reader를 열지 않는다.
 mutable WAL의 logical read-only connection도 `-shm` read mark를 바꿀 수 있기 때문이다. 대신 daemon/store
 owner가 같은 event-loop ownership turn에서 O1-2 strict read API를 직렬로 읽어 versioned, aggregate-only
 snapshot cache를 갱신한다. daemon은 listener를 먼저 소유한 뒤 current-user-only capability를 publish하고
@@ -360,11 +364,15 @@ lifecycle 전체에서 per-state exclusive owner claim을 잡고, publish/remove
 fsync한 뒤 두 slot을 같은 최신 generation으로 덮는다. 따라서 crash 중 한 slot이 손상돼도 마지막 complete
 sequence만 선택하고, 정상 rotation/restart/remove는 pathname quarantine을 만들거나 unknown path를 unlink하지
 않으며 이전 secret도 고정 container에서 지운다. raced replacement는 pinned descriptor/path identity 불일치로
-보존한 채 실패한다. 비-Windows는 exact-UID 0700 runtime directory 안의 0600 pathname UDS를 쓰고 capability에
-exact device/inode를 넣어 accept/connect/refresh 때마다 재검증한다. claim은 randomized prepared 0600 inode를
-fsync/identity-check한 뒤 fixed name에 no-replace hard-link하고, 그 stable inode의 kernel `flock`과 descriptor bytes,
-pre/post pathname identity를 lifecycle 전체에서 유지한다. clean restart는 inode/entry를 재사용하며 crash socket
-residue는 삭제하지 않고 최대 8개까지만 격리한다.
+보존한 채 실패한다. 비-Windows는 exact-UID 0700 runtime directory 안의 active 0600 pathname UDS를 쓰고
+capability에 exact device/inode를 넣어 accept/connect/refresh 때마다 재검증한다. claim은 하나의 deterministic
+protected bootstrap inode를 자체 descriptor/`flock`으로 guard하고 fixed claim name에 no-replace hard-link한다.
+create/write/fsync/link crash와 absent-claim contender 뒤에도 bootstrap+claim 두 directory entry만 남으며,
+stable inode의 kernel `flock`과 descriptor bytes, pre/post pathname identity를 lifecycle 전체에서 유지한다.
+clean restart는 inode/entry를 재사용한다. active transport admission은 계속 exact 0600+UID+device/inode만
+허용하지만, held claim과 verified 0700 parent 아래에서 bind 직후 activation 전 crash가 남긴
+exact-current-UID 0755 socket만 같은 bounded quarantine으로 복구한다. crash socket residue는 삭제하지 않고
+최대 8개까지만 격리한다.
 
 각 연결은 4-byte big-endian length prefix가 붙은 request 정확히 하나를 EOF까지 받은 다음 response 정확히 하나를
 EOF까지 보낸다. 두 방향 모두 partial/oversize/두 번째 frame/trailing bytes/timeout을 거부한다. raw UDS path는
@@ -377,8 +385,13 @@ non-refreshing monotonic absolute deadline, 최대 8 connection을 적용한다.
 capability generation당 최대 2,048개를 원자적으로 reserve하고 signed `sentAt + 5초`에 expire하며
 rotation/shutdown에서 비워 cross-connection replay도
 거부한다. response는 match state, finite job/error, timestamp와 bounded
-count만 포함한다. status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와 source directory
-entry가 그대로다. owner cache/capability가 absent/stale/malformed/permission-drift/raced이면 static
+count만 포함한다. closed snapshot은 immutable source close 전까지 lease를 유지하고 negative WAL 판정 뒤와
+source close 뒤 main-file identity/size/time 및 parent-directory witness와 WAL/SHM/journal absence를 다시 확인한다.
+lease를 따르지 않는 writer가 전이 중 나타나면 scratch를 해석하지 않고 authenticated owner 또는 static
+unavailable로만 수렴한다. immutable open/backup 자체가 실패하면 source를 먼저 닫고 held lease와 admitted
+pre-open witness를 다시 확인해, witness drift는 같은 owner/unavailable 경로로 보내고 stable source corruption은
+기존 `schema.corrupt`로 보존한다. live status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와
+source directory entry가 그대로다. owner cache/capability가 absent/stale/malformed/permission-drift/raced이면 static
 `state.snapshot_unavailable` exit 2로 fail closed한다.
 closed DB scratch는 모든 판정 뒤 제거하며 v13일 때만 O1-2 strict store API로 읽는다.
 `automation.enabled=false`이면 repository discovery, Run observer,

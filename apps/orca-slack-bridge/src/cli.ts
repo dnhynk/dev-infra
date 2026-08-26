@@ -75,6 +75,13 @@ import {
   type OperationalStatusOwnerServerLike,
 } from './operational/status.js';
 import {
+  CurrentUserOperationalStatusCapabilityStore,
+  operationalStatusCapabilityPath,
+  operationalStatusStateIdentity,
+  type OperationalStatusSnapshotLease,
+  type OperationalStatusSnapshotLeaseStore,
+} from './operational/status-capability.js';
+import {
   followOperationalLogs,
   formatOperationalLogRecord,
   readOperationalLogTail,
@@ -903,6 +910,10 @@ export type DaemonDependencies = {
   readonly channelServer?: ChannelDaemonServer;
   /** Test seam; production serves aggregate-only status from the daemon/store owner. */
   readonly statusOwnerServer?: OperationalStatusOwnerServerLike;
+  /** Test seam for the cross-process daemon/closed-snapshot exclusion primitive. */
+  readonly statusSnapshotLeaseStore?: OperationalStatusSnapshotLeaseStore;
+  /** Test seam for proving the production lease precedes every writable store open. */
+  readonly openStore?: (statePath: string) => SqliteDigestStore;
   readonly createChannelDelivery?: (
     store: GateStore,
     orca: OrcaRunner,
@@ -955,6 +966,7 @@ export async function runDaemonCommand(
   let transport: SlackSocketTransport | null = null;
   let channelServer: ChannelDaemonServer | null = null;
   let statusOwnerServer: OperationalStatusOwnerServerLike | null = null;
+  let statusSnapshotLease: OperationalStatusSnapshotLease | null = null;
   let channelDelivery: ChannelDeliveryRuntime | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
@@ -991,12 +1003,26 @@ export async function runDaemonCommand(
   };
   try {
     const resolvedStatePath = resolveStatePath(parsed.statePath);
-    store = new SqliteDigestStore(resolvedStatePath);
+    const statusCapabilityPath = operationalStatusCapabilityPath(resolvedStatePath);
+    const nativeStatusStore = dependencies.statusSnapshotLeaseStore === undefined
+      ? new CurrentUserOperationalStatusCapabilityStore()
+      : null;
+    const statusSnapshotLeaseStore = dependencies.statusSnapshotLeaseStore ?? nativeStatusStore!;
+    statusSnapshotLease = await statusSnapshotLeaseStore.tryAcquireSnapshotLease(
+      statusCapabilityPath,
+      operationalStatusStateIdentity(resolvedStatePath),
+    );
+    if (statusSnapshotLease === null) throw new Error('status.snapshot_lease_failed');
+    statusSnapshotLease.assertHeld();
+    store = (dependencies.openStore ?? ((path) => new SqliteDigestStore(path)))(resolvedStatePath);
     statusOwnerServer = dependencies.statusOwnerServer ?? new OperationalStatusOwnerServer({
       statePath: resolvedStatePath,
       store,
+      capabilityPath: statusCapabilityPath,
+      ...(nativeStatusStore === null ? {} : { capabilityStore: nativeStatusStore }),
     });
     await statusOwnerServer.start();
+    statusSnapshotLease.assertHeld();
     const configuredOrcaTimeout = dependencies.orcaTimeoutMs ?? 15_000;
     if (!Number.isFinite(configuredOrcaTimeout) || configuredOrcaTimeout < 10) {
       throw new TypeError('orcaTimeoutMs must be a finite number >= 10');
@@ -1223,7 +1249,18 @@ export async function runDaemonCommand(
         // The store remains the owner until the bounded local status listener has been retired.
       }
     }
-    store?.close();
+    try { store?.close(); } catch {
+      // The lease remains held until the writable handle has attempted its bounded close.
+    }
+    if (statusSnapshotLease !== null) {
+      try {
+        statusSnapshotLease.assertHeld();
+        await statusSnapshotLease.release();
+      } catch {
+        // A lost lease is already fail-closed; shutdown must not open another writer.
+      }
+      statusSnapshotLease = null;
+    }
     processStopLatch?.dispose();
   }
 }

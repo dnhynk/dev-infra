@@ -1,8 +1,8 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, posix } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { backup, DatabaseSync } from 'node:sqlite';
 import {
@@ -39,6 +39,8 @@ import {
   type OperationalStatusCapabilityStore,
   type OperationalStatusOwnerClaim,
   type OperationalStatusOwnerTransportIdentity,
+  type OperationalStatusSnapshotLease,
+  type OperationalStatusSnapshotLeaseStore,
   type OperationalStatusTransportEndpoint,
   type RetiredOperationalStatusCapability,
 } from './status-capability.js';
@@ -152,6 +154,10 @@ export type InspectOperationalStatusOptions = {
   readonly snapshot?: OperationalStatusSnapshot;
   /** Deterministic test seam; production never exposes the read-only source connection. */
   readonly afterSqliteBackupStep?: () => void;
+  /** Deterministic transition seam immediately after a negative closed-WAL classification. */
+  readonly afterClosedWalClassification?: () => void;
+  /** Test observation seam; it fires only when all pre-open stability checks pass. */
+  readonly beforeClosedSourceOpen?: () => void;
   /** Test-only parent for proving that the online snapshot leaves no temporary file. */
   readonly temporaryDirectory?: string;
   /** POSIX test seam; Windows endpoints come only from the protected owner capability. */
@@ -160,6 +166,8 @@ export type InspectOperationalStatusOptions = {
   readonly ownerCapabilityPath?: string;
   /** Safe platform abstraction for synthetic permission/rotation races. */
   readonly ownerCapabilityStore?: OperationalStatusCapabilityStore;
+  /** Cross-process lease seam shared by cooperating daemon startup and closed snapshots. */
+  readonly snapshotLeaseStore?: OperationalStatusSnapshotLeaseStore;
   /** Bounded local owner request timeout. */
   readonly ownerTimeoutMilliseconds?: number;
   /** Transport freshness clock, deliberately separate from heartbeat classification time. */
@@ -696,6 +704,8 @@ export type OperationalStatusOwnerServerOptions = {
   readonly acceptedNonceLimit?: number;
   readonly beforeRefresh?: () => void;
   readonly afterDaemonCapture?: () => void;
+  /** Test-only crash seam after bind and before Linux chmod/identity publication. */
+  readonly afterListen?: () => void | Promise<void>;
 };
 
 /**
@@ -862,6 +872,7 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         }
       });
       if (this.pipePath !== null) {
+        await this.options.afterListen?.();
         this.ownerTransport = this.capabilityStore.activateOwnerTransport(
           this.pipePath,
           this.stateIdentity,
@@ -1352,43 +1363,102 @@ function immutableDatabaseUrl(path: string): URL {
   return url;
 }
 
+type ClosedDatabaseWitness = {
+  readonly database: readonly string[];
+  readonly directory: readonly string[];
+};
+
+function closedDatabaseWitness(path: string): ClosedDatabaseWitness | null {
+  if (pathExists(`${path}-wal`) || pathExists(`${path}-shm`) || pathExists(`${path}-journal`)) {
+    return null;
+  }
+  const database = lstatSync(path, { bigint: true });
+  const directory = lstatSync(dirname(path), { bigint: true });
+  if (!database.isFile() || database.isSymbolicLink() ||
+      !directory.isDirectory() || directory.isSymbolicLink()) return null;
+  return {
+    database: [
+      database.dev, database.ino, database.mode, database.nlink, database.size,
+      database.birthtimeNs, database.ctimeNs, database.mtimeNs,
+    ].map(String),
+    directory: [
+      directory.dev, directory.ino, directory.mode, directory.nlink,
+      directory.birthtimeNs, directory.ctimeNs, directory.mtimeNs,
+    ].map(String),
+  };
+}
+
+function sameClosedDatabaseWitness(
+  left: ClosedDatabaseWitness,
+  right: ClosedDatabaseWitness,
+): boolean {
+  return left.database.length === right.database.length &&
+    left.database.every((value, index) => value === right.database[index]) &&
+    left.directory.length === right.directory.length &&
+    left.directory.every((value, index) => value === right.directory[index]);
+}
+
 async function readStoredStatus(
   path: string,
   expectations: OperationalStatusExpectations,
   afterSqliteBackupStep: (() => void) | undefined,
+  afterClosedWalClassification: (() => void) | undefined,
+  beforeClosedSourceOpen: (() => void) | undefined,
   temporaryDirectory: string,
   ownerPipePath: string | undefined,
   ownerCapabilityPath: string | undefined,
   ownerCapabilityStore: OperationalStatusCapabilityStore | undefined,
+  snapshotLeaseStore: OperationalStatusSnapshotLeaseStore | undefined,
   ownerTimeoutMilliseconds: number | undefined,
   ownerTransportClock: () => Date,
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
 ): Promise<SnapshotResult> {
-  try {
-    if (!pathExists(path)) return { kind: 'absent' };
-  } catch {
-    return { kind: 'corrupt' };
-  }
-
   let scratch: string | null = null;
   let source: DatabaseSync | null = null;
   let raw: DatabaseSync | null = null;
   let store: SqliteDigestStore | null = null;
+  let snapshotLease: OperationalStatusSnapshotLease | null = null;
+  let closedTransitionAdmitted = false;
+  let retainLeaseUntilProcessExit = false;
+  let resolvedCapabilityPath: string;
+  let statusCapabilityStore: OperationalStatusCapabilityStore;
+  let statusSnapshotLeaseStore: OperationalStatusSnapshotLeaseStore;
+  let admittedClosedWitness: ClosedDatabaseWitness | null = null;
   try {
-    const walPresent = pathExists(`${path}-wal`);
-    if (walPresent) {
-      // Every ordinary mutable WAL reader may update read marks in the source SHM, even when the
-      // SQLite connection is logically read-only. The daemon/store owner instead serves a strict
-      // aggregate-only cached projection over its local private pipe; this process opens no source
-      // DB/WAL/SHM handle at all.
-      if (!pathExists(`${path}-shm`)) return { kind: 'owner_unavailable' };
+    resolvedCapabilityPath = ownerCapabilityPath ??
+      operationalStatusCapabilityPath(path, env, platform);
+    statusCapabilityStore = ownerCapabilityStore ??
+      new CurrentUserOperationalStatusCapabilityStore(platform, env);
+    const combined = statusCapabilityStore as Partial<OperationalStatusSnapshotLeaseStore>;
+    statusSnapshotLeaseStore = snapshotLeaseStore ??
+      (typeof combined.tryAcquireSnapshotLease === 'function'
+        ? combined as OperationalStatusSnapshotLeaseStore
+        : new CurrentUserOperationalStatusCapabilityStore(platform, env));
+  } catch {
+    return { kind: 'owner_unavailable' };
+  }
+
+  const releaseSnapshotLease = async (): Promise<boolean> => {
+    const held = snapshotLease;
+    snapshotLease = null;
+    if (held === null) return true;
+    try {
+      held.assertHeld();
+      await held.release();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const requestOwner = async (): Promise<SnapshotResult> => {
+    try {
       const owned = await requestOwnedOperationalStatus(
         path,
         expectations,
         ownerPipePath,
-        ownerCapabilityPath,
-        ownerCapabilityStore,
+        resolvedCapabilityPath,
+        statusCapabilityStore,
         ownerTimeoutMilliseconds,
         ownerTransportClock,
         env,
@@ -1397,7 +1467,52 @@ async function readStoredStatus(
       return owned === null
         ? { kind: 'owner_unavailable' }
         : { kind: 'ready', value: owned };
+    } catch {
+      return { kind: 'owner_unavailable' };
     }
+  };
+  const releaseThenRequestOwner = async (): Promise<SnapshotResult> =>
+    await releaseSnapshotLease() ? await requestOwner() : { kind: 'owner_unavailable' };
+
+  try {
+    snapshotLease = await statusSnapshotLeaseStore.tryAcquireSnapshotLease(
+      resolvedCapabilityPath,
+      operationalStatusStateIdentity(path, platform),
+    );
+    if (snapshotLease === null) return await requestOwner();
+    try {
+      snapshotLease.assertHeld();
+      if (!pathExists(path)) {
+        return await releaseSnapshotLease()
+          ? { kind: 'absent' }
+          : { kind: 'owner_unavailable' };
+      }
+      if (pathExists(`${path}-wal`)) return await releaseThenRequestOwner();
+      closedTransitionAdmitted = true;
+      const classified = closedDatabaseWitness(path);
+      if (classified === null) return await releaseThenRequestOwner();
+      afterClosedWalClassification?.();
+      snapshotLease.assertHeld();
+      const beforeOpen = closedDatabaseWitness(path);
+      if (beforeOpen === null || !sameClosedDatabaseWitness(classified, beforeOpen)) {
+        return await releaseThenRequestOwner();
+      }
+      beforeClosedSourceOpen?.();
+      snapshotLease.assertHeld();
+      const atOpen = closedDatabaseWitness(path);
+      if (atOpen === null || !sameClosedDatabaseWitness(beforeOpen, atOpen)) {
+        return await releaseThenRequestOwner();
+      }
+    } catch {
+      return await releaseThenRequestOwner();
+    }
+
+    // A cooperating daemon cannot open its store while this lease is held. The repeated witness
+    // catches noncooperating writers before an immutable handle is admitted, and the post-close
+    // witness prevents any raced source epoch from becoming an observable status result.
+    const stableAtOpen = closedDatabaseWitness(path);
+    if (stableAtOpen === null) return await releaseThenRequestOwner();
+    admittedClosedWitness = stableAtOpen;
     source = new DatabaseSync(immutableDatabaseUrl(path), { readOnly: true, timeout: 5_000 });
     scratch = mkdtempSync(join(temporaryDirectory, 'orca-slack-bridge-status-'));
     const copy = join(scratch, 'state.db');
@@ -1409,6 +1524,17 @@ async function readStoredStatus(
     else await backup(source, copy, { rate: 1, progress: afterSqliteBackupStep });
     source.close();
     source = null;
+    try {
+      snapshotLease.assertHeld();
+      const afterClose = closedDatabaseWitness(path);
+      if (afterClose === null || !sameClosedDatabaseWitness(stableAtOpen, afterClose)) {
+        return await releaseThenRequestOwner();
+      }
+    } catch {
+      return await releaseThenRequestOwner();
+    }
+    if (!await releaseSnapshotLease()) return { kind: 'owner_unavailable' };
+    closedTransitionAdmitted = false;
 
     raw = new DatabaseSync(copy);
     const version = schemaVersion(raw);
@@ -1423,9 +1549,42 @@ async function readStoredStatus(
     store = new SqliteDigestStore(copy);
     return { kind: 'ready', value: projectOperationalStore(store, expectations) };
   } catch {
+    if (closedTransitionAdmitted) {
+      if (source !== null) {
+        try {
+          source.close();
+          source = null;
+        } catch {
+          retainLeaseUntilProcessExit = true;
+          return { kind: 'owner_unavailable' };
+        }
+      }
+      try {
+        if (snapshotLease === null) throw new Error('status.snapshot_lease_lost');
+        snapshotLease.assertHeld();
+        const afterFailure = closedDatabaseWitness(path);
+        if (admittedClosedWitness !== null && afterFailure !== null &&
+            sameClosedDatabaseWitness(admittedClosedWitness, afterFailure)) {
+          if (!await releaseSnapshotLease()) return { kind: 'owner_unavailable' };
+          closedTransitionAdmitted = false;
+          return { kind: 'corrupt' };
+        }
+      } catch {
+        // Lost lease or an unstable source can only use authenticated owner routing below.
+      }
+      return await releaseThenRequestOwner();
+    }
     return { kind: 'corrupt' };
   } finally {
-    try { source?.close(); } catch { /* read-only source remains unmodified */ }
+    try {
+      source?.close();
+      source = null;
+    } catch {
+      retainLeaseUntilProcessExit = true;
+    }
+    if (!retainLeaseUntilProcessExit) {
+      try { await releaseSnapshotLease(); } catch { /* a lost lease can never authorize output */ }
+    }
     try { raw?.close(); } catch { /* source remains untouched */ }
     try { store?.close(); } catch { /* scratch cleanup still runs */ }
     if (scratch !== null) {
@@ -1505,10 +1664,13 @@ export async function inspectOperationalStatus(
       statePath,
       expectations,
       options.afterSqliteBackupStep,
+      options.afterClosedWalClassification,
+      options.beforeClosedSourceOpen,
       options.temporaryDirectory ?? tmpdir(),
       options.ownerPipePath,
       options.ownerCapabilityPath,
       options.ownerCapabilityStore,
+      options.snapshotLeaseStore,
       options.ownerTimeoutMilliseconds,
       options.ownerTransportClock ?? (() => new Date()),
       env,

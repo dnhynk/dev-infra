@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
   fchmodSync,
   fstatSync,
@@ -19,7 +20,6 @@ import {
   renameSync,
   statSync,
   type BigIntStats,
-  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -92,6 +92,18 @@ export type OperationalStatusOwnerClaim = {
   release(): Promise<void>;
 };
 
+export type OperationalStatusSnapshotLease = {
+  assertHeld(): void;
+  release(): Promise<void>;
+};
+
+export type OperationalStatusSnapshotLeaseStore = {
+  tryAcquireSnapshotLease(
+    path: string,
+    stateIdentity: string,
+  ): Promise<OperationalStatusSnapshotLease | null>;
+};
+
 export type OperationalStatusCapabilityStore = {
   acquireOwnerClaim(path: string, stateIdentity: string): Promise<OperationalStatusOwnerClaim>;
   read(path: string): OperationalStatusCapabilityRead;
@@ -134,7 +146,13 @@ export type OperationalStatusCapabilityStore = {
 export type OperationalStatusCapabilityStoreHooks = {
   readonly afterInstall?: (path: string, temporaryPath: string) => void;
   readonly beforeInstall?: (path: string, temporaryPath: string) => void;
+  readonly afterPosixClaimBootstrapCreate?: (path: string) => void;
+  readonly afterPosixClaimBootstrapWrite?: (path: string) => void;
+  readonly afterPosixClaimBootstrapFsync?: (path: string) => void;
+  readonly afterPosixClaimLink?: (path: string) => void;
+  readonly beforePosixLegacyClaimMutation?: (path: string) => void;
   readonly duringPosixClaimAssertion?: (claimPath: string) => void;
+  readonly duringPosixSnapshotLeaseAssertion?: (leasePath: string) => void;
   readonly windowsKnownLocalAppData?: () => string;
 };
 
@@ -160,6 +178,23 @@ type PosixClaimDocument = {
   readonly pid: number;
   readonly processStart: string;
 };
+
+function validPosixClaimDocument(input: Buffer, stateIdentity: string): boolean {
+  try {
+    const parsed = JSON.parse(input.toString('utf8')) as unknown;
+    const record = exactRecord(parsed, [
+      'version', 'stateIdentity', 'claimId', 'pid', 'processStart',
+    ]);
+    return record !== null && record['version'] === 1 &&
+      record['stateIdentity'] === stateIdentity && typeof record['claimId'] === 'string' &&
+      HEX_32.test(record['claimId']) && Number.isSafeInteger(record['pid']) &&
+      Number(record['pid']) >= 1 && typeof record['processStart'] === 'string' &&
+      DECIMAL.test(record['processStart']) &&
+      input.equals(Buffer.from(`${JSON.stringify(record)}\n`, 'utf8'));
+  } catch {
+    return false;
+  }
+}
 
 type CapabilitySlot = {
   readonly sequence: number;
@@ -504,6 +539,17 @@ export function operationalStatusWindowsOwnerClaimEnvironment(
   };
 }
 
+export function operationalStatusWindowsSnapshotLeaseEnvironment(
+  root: string,
+  name: string,
+): NodeJS.ProcessEnv {
+  return {
+    SystemRoot: root,
+    WINDIR: root,
+    ORCA_STATUS_SNAPSHOT_LEASE_NAME: name,
+  };
+}
+
 export function operationalStatusWindowsKnownFolderEnvironment(root: string): NodeJS.ProcessEnv {
   return { SystemRoot: root, WINDIR: root };
 }
@@ -511,6 +557,11 @@ export function operationalStatusWindowsKnownFolderEnvironment(root: string): No
 export function operationalStatusWindowsOwnerClaimName(stateIdentity: string): string {
   if (!HEX_64.test(stateIdentity)) throw new TypeError('status.owner_claim_invalid');
   return `Global\\orca-slack-bridge-status-v2-${stateIdentity}`;
+}
+
+export function operationalStatusWindowsSnapshotLeaseName(stateIdentity: string): string {
+  if (!HEX_64.test(stateIdentity)) throw new TypeError('status.snapshot_lease_invalid');
+  return `Global\\orca-slack-bridge-status-v2-snapshot-${stateIdentity}`;
 }
 
 const WINDOWS_PROTECT_PATH = String.raw`
@@ -579,9 +630,12 @@ $result = if ($kind -eq 'artifact') {
 [Console]::Out.Write(($result | ConvertTo-Json -Compress -Depth 6))
 `;
 
-const WINDOWS_HOLD_OWNER_MUTEX = String.raw`
+const WINDOWS_HOLD_CURRENT_USER_MUTEX = String.raw`
 $ErrorActionPreference = 'Stop'
 $name = [Environment]::GetEnvironmentVariable('ORCA_STATUS_OWNER_CLAIM_NAME', 'Process')
+$snapshotName = [Environment]::GetEnvironmentVariable('ORCA_STATUS_SNAPSHOT_LEASE_NAME', 'Process')
+if ([String]::IsNullOrEmpty($name)) { $name = $snapshotName }
+if ([String]::IsNullOrEmpty($name)) { exit 16 }
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $security = [Security.AccessControl.MutexSecurity]::new()
 $security.SetAccessRuleProtection($true, $false)
@@ -709,14 +763,21 @@ async function waitForChildExit(child: ChildProcess, timeoutMilliseconds: number
   });
 }
 
-export class CurrentUserOperationalStatusCapabilityStore implements OperationalStatusCapabilityStore {
+export class CurrentUserOperationalStatusCapabilityStore implements
+  OperationalStatusCapabilityStore, OperationalStatusSnapshotLeaseStore {
   private readonly windowsCapabilityBase: string | null;
+  private readonly platform: NodeJS.Platform;
+  private readonly env: NodeJS.ProcessEnv;
+  private readonly hooks: OperationalStatusCapabilityStoreHooks;
 
   constructor(
-    private readonly platform: NodeJS.Platform = process.platform,
-    private readonly env: NodeJS.ProcessEnv = process.env,
-    private readonly hooks: OperationalStatusCapabilityStoreHooks = {},
+    platform: NodeJS.Platform = process.platform,
+    env: NodeJS.ProcessEnv = process.env,
+    hooks: OperationalStatusCapabilityStoreHooks = {},
   ) {
+    this.platform = platform;
+    this.env = env;
+    this.hooks = hooks;
     this.windowsCapabilityBase = platform === 'win32'
       ? canonicalWindowsLocalBase(hooks.windowsKnownLocalAppData)
       : null;
@@ -733,6 +794,25 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
     return this.platform === 'win32'
       ? await this.acquireWindowsOwnerClaim(path, stateIdentity)
       : this.acquirePosixOwnerClaim(path, stateIdentity);
+  }
+
+  async tryAcquireSnapshotLease(
+    path: string,
+    stateIdentity: string,
+  ): Promise<OperationalStatusSnapshotLease | null> {
+    try {
+      if (!HEX_64.test(stateIdentity)) return null;
+      this.assertCapabilityPath(path);
+      this.ensureProtectedDirectory(dirname(path));
+      return this.platform === 'win32'
+        ? await this.acquireWindowsHeldMutex(operationalStatusWindowsSnapshotLeaseEnvironment(
+          operationalStatusWindowsTrustedPowerShell().root,
+          operationalStatusWindowsSnapshotLeaseName(stateIdentity),
+        ))
+        : this.acquirePosixSnapshotLease(path);
+    } catch {
+      return null;
+    }
   }
 
   read(path: string): OperationalStatusCapabilityRead {
@@ -959,13 +1039,14 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
     let observed: BigIntStats;
     try {
       observed = lstatSync(path, { bigint: true });
-      if (!this.posixSocketProtectionIsExact(observed)) {
+      if (!this.posixSocketProtectionIsRecoverable(observed)) {
         throw new Error('status.owner_transport_failed');
       }
       const quarantine = this.posixSocketResiduePath(parent, stateIdentity);
       renameSync(path, quarantine);
       const isolated = lstatSync(quarantine, { bigint: true });
-      if (!sameFileIdentity(observed, isolated) || !this.posixSocketProtectionIsExact(isolated)) {
+      if (!sameFileIdentity(observed, isolated) ||
+          !this.posixSocketProtectionIsRecoverable(isolated)) {
         this.restoreQuarantine(quarantine, path);
         throw new Error('status.owner_transport_failed');
       }
@@ -1060,8 +1141,34 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
   ): Promise<OperationalStatusOwnerClaim> {
     const { root, executable } = operationalStatusWindowsTrustedPowerShell();
     const name = operationalStatusWindowsOwnerClaimName(stateIdentity);
-    const child = spawn(executable, encodedPowerShellArguments(WINDOWS_HOLD_OWNER_MUTEX), {
-      env: operationalStatusWindowsOwnerClaimEnvironment(root, name),
+    let held: OperationalStatusSnapshotLease;
+    try {
+      held = await this.acquireWindowsHeldMutex(
+        operationalStatusWindowsOwnerClaimEnvironment(root, name),
+        executable,
+      );
+    } catch {
+      throw new Error('status.owner_claim_failed');
+    }
+    return {
+      stateIdentity,
+      capabilityPath: path,
+      [CLAIM_AUTHORITY]: this,
+      assertHeld: () => {
+        try { held.assertHeld(); } catch { throw new Error('status.owner_claim_lost'); }
+      },
+      release: async () => {
+        try { await held.release(); } catch { throw new Error('status.owner_claim_release_failed'); }
+      },
+    } as AuthenticatedOwnerClaim;
+  }
+
+  private async acquireWindowsHeldMutex(
+    env: NodeJS.ProcessEnv,
+    executable: string = operationalStatusWindowsTrustedPowerShell().executable,
+  ): Promise<OperationalStatusSnapshotLease> {
+    const child = spawn(executable, encodedPowerShellArguments(WINDOWS_HOLD_CURRENT_USER_MUTEX), {
+      env,
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'ignore'],
     });
@@ -1110,12 +1217,9 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
     child.once('exit', () => { lost = true; });
     let released = false;
     return {
-      stateIdentity,
-      capabilityPath: path,
-      [CLAIM_AUTHORITY]: this,
       assertHeld: () => {
         if (released || lost || child.exitCode !== null || child.signalCode !== null) {
-          throw new Error('status.owner_claim_lost');
+          throw new Error('status.snapshot_lease_lost');
         }
       },
       release: async () => {
@@ -1124,10 +1228,107 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
         stdin.end();
         if (!await waitForChildExit(child, 1_500)) {
           child.kill();
-          if (!await waitForChildExit(child, 500)) throw new Error('status.owner_claim_release_failed');
+          if (!await waitForChildExit(child, 500)) {
+            throw new Error('status.snapshot_lease_release_failed');
+          }
         }
       },
-    } as AuthenticatedOwnerClaim;
+    };
+  }
+
+  private acquirePosixSnapshotLease(path: string): OperationalStatusSnapshotLease {
+    if (this.platform !== 'linux') throw new Error('status.snapshot_lease_failed');
+    const leasePath = `${path}.snapshot-lease`;
+    const parent = posix.dirname(leasePath);
+    let descriptor: number | null = null;
+    try {
+      let created = false;
+      try {
+        descriptor = openSync(leasePath, 'wx+', 0o600);
+        created = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        descriptor = openSync(
+          leasePath,
+          fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+        );
+      }
+      if (created) {
+        fchmodSync(descriptor, 0o600);
+        fsyncSync(descriptor);
+        this.syncDirectory(parent);
+      }
+      const opened = fstatSync(descriptor, { bigint: true });
+      const pathBeforeLock = lstatSync(leasePath, { bigint: true });
+      if (!this.posixFileProtectionIsExact(opened) || opened.size !== 0n || opened.nlink !== 1n ||
+          !sameFileIdentity(opened, pathBeforeLock)) {
+        throw new Error('status.snapshot_lease_failed');
+      }
+      execFileSync(this.trustedPosixFlockExecutable(), ['--exclusive', '--nonblock', '0'], {
+        timeout: 1_000,
+        maxBuffer: 32,
+        stdio: [descriptor, 'ignore', 'ignore'],
+      });
+      const descriptorAfterLock = fstatSync(descriptor, { bigint: true });
+      const pathAfterLock = lstatSync(leasePath, { bigint: true });
+      if (!sameFileIdentity(opened, descriptorAfterLock) ||
+          !sameFileIdentity(opened, pathAfterLock) ||
+          !this.posixFileProtectionIsExact(descriptorAfterLock) ||
+          !this.posixFileProtectionIsExact(pathAfterLock) || descriptorAfterLock.size !== 0n ||
+          pathAfterLock.size !== 0n || descriptorAfterLock.nlink !== 1n ||
+          pathAfterLock.nlink !== 1n) throw new Error('status.snapshot_lease_failed');
+    } catch {
+      if (descriptor !== null) {
+        try { closeSync(descriptor); } catch { /* closing releases any acquired flock */ }
+      }
+      throw new Error('status.snapshot_lease_failed');
+    }
+
+    const heldDescriptor = descriptor;
+    if (heldDescriptor === null) throw new Error('status.snapshot_lease_failed');
+    const descriptorIdentity = fstatSync(heldDescriptor, { bigint: true });
+    let released = false;
+    const assertHeld = (): void => {
+      if (released) throw new Error('status.snapshot_lease_lost');
+      const pathBefore = lstatSync(leasePath, { bigint: true });
+      const descriptorBefore = fstatSync(heldDescriptor, { bigint: true });
+      this.hooks.duringPosixSnapshotLeaseAssertion?.(leasePath);
+      const descriptorAfter = fstatSync(heldDescriptor, { bigint: true });
+      const pathAfter = lstatSync(leasePath, { bigint: true });
+      if (!sameFileIdentity(descriptorIdentity, descriptorBefore) ||
+          !sameFileIdentity(descriptorIdentity, descriptorAfter) ||
+          !sameFileIdentity(descriptorIdentity, pathBefore) ||
+          !sameFileIdentity(descriptorIdentity, pathAfter) ||
+          !this.posixFileProtectionIsExact(descriptorBefore) ||
+          !this.posixFileProtectionIsExact(descriptorAfter) ||
+          !this.posixFileProtectionIsExact(pathBefore) ||
+          !this.posixFileProtectionIsExact(pathAfter) || descriptorBefore.size !== 0n ||
+          descriptorAfter.size !== 0n || pathBefore.size !== 0n || pathAfter.size !== 0n ||
+          descriptorBefore.nlink !== 1n || descriptorAfter.nlink !== 1n ||
+          pathBefore.nlink !== 1n || pathAfter.nlink !== 1n) {
+        throw new Error('status.snapshot_lease_lost');
+      }
+    };
+    try {
+      assertHeld();
+    } catch {
+      released = true;
+      try { closeSync(heldDescriptor); } catch { /* the failed acquisition owns no lease */ }
+      throw new Error('status.snapshot_lease_failed');
+    }
+    return {
+      assertHeld,
+      release: async () => {
+        if (released) return;
+        try { assertHeld(); } catch {
+          released = true;
+          try { closeSync(heldDescriptor); } catch { /* resource is already lost */ }
+          throw new Error('status.snapshot_lease_release_failed');
+        }
+        released = true;
+        closeSync(heldDescriptor);
+      },
+    };
   }
 
   private acquirePosixOwnerClaim(
@@ -1147,59 +1348,192 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
     };
     const serialized = Buffer.from(`${JSON.stringify(document)}\n`, 'utf8');
     const parent = posix.dirname(claimPath);
+    const bootstrapPath = `${claimPath}.bootstrap`;
+    let guardDescriptor: number | null = null;
     let descriptor: number | null = null;
+    let bootstrapIdentity: BigIntStats | null = null;
+    let claimUsesBootstrap = false;
     try {
-      if (!existsSync(claimPath)) {
-        const preparedPath = posix.join(
-          parent,
-          `.owner-claim-bootstrap-${process.pid}-${randomBytes(16).toString('hex')}`,
+      let createdBootstrap = false;
+      try {
+        guardDescriptor = openSync(bootstrapPath, 'wx+', 0o600);
+        createdBootstrap = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        guardDescriptor = openSync(
+          bootstrapPath,
+          fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
         );
-        let prepared: number | null = null;
-        try {
-          prepared = openSync(preparedPath, 'wx+', 0o600);
-          writeFileSync(prepared, serialized);
-          fchmodSync(prepared, 0o600);
-          fsyncSync(prepared);
-          const preparedIdentity = fstatSync(prepared, { bigint: true });
-          const preparedBefore = lstatSync(preparedPath, { bigint: true });
-          const preparedBytes = this.readDescriptorBytes(prepared, serialized.length);
-          const preparedAfter = lstatSync(preparedPath, { bigint: true });
-          if (!this.posixFileProtectionIsExact(preparedIdentity) ||
-              !sameFileIdentity(preparedIdentity, preparedBefore) ||
-              !sameFileIdentity(preparedIdentity, preparedAfter) ||
-              !preparedBytes.equals(serialized)) throw new Error('status.owner_claim_failed');
-          try { linkSync(preparedPath, claimPath); } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-          }
-        } finally {
-          if (prepared !== null) closeSync(prepared);
-        }
       }
-      descriptor = openSync(claimPath, 'r+');
-      const opened = fstatSync(descriptor, { bigint: true });
-      const pathBeforeLock = lstatSync(claimPath, { bigint: true });
-      if (!this.posixFileProtectionIsExact(opened) ||
-          !sameFileIdentity(opened, pathBeforeLock)) throw new Error('status.owner_claim_failed');
+      if (createdBootstrap) {
+        fchmodSync(guardDescriptor, 0o600);
+        fsyncSync(guardDescriptor);
+        this.syncDirectory(parent);
+        this.hooks.afterPosixClaimBootstrapCreate?.(bootstrapPath);
+      }
+      const openedBootstrap = fstatSync(guardDescriptor, { bigint: true });
+      const bootstrapBeforeLock = lstatSync(bootstrapPath, { bigint: true });
+      if (!this.posixFileProtectionIsExact(openedBootstrap) ||
+          !sameFileIdentity(openedBootstrap, bootstrapBeforeLock) ||
+          openedBootstrap.nlink < 1n || openedBootstrap.nlink > 2n ||
+          (openedBootstrap.size !== 0n &&
+           (openedBootstrap.size > 1_024n || !validPosixClaimDocument(
+             this.readDescriptorBytes(guardDescriptor, Number(openedBootstrap.size)),
+             stateIdentity,
+           )))) throw new Error('status.owner_claim_failed');
       execFileSync(this.trustedPosixFlockExecutable(), ['--exclusive', '--nonblock', '0'], {
         timeout: 1_000,
         maxBuffer: 32,
-        stdio: [descriptor, 'ignore', 'ignore'],
+        stdio: [guardDescriptor, 'ignore', 'ignore'],
       });
-      const pathAfterLock = lstatSync(claimPath, { bigint: true });
-      if (!sameFileIdentity(opened, pathAfterLock)) throw new Error('status.owner_claim_failed');
-      ftruncateSync(descriptor, 0);
-      this.writeDescriptorBytes(descriptor, serialized, 0);
-      fsyncSync(descriptor);
-      this.syncDirectory(parent);
+      const lockedBootstrap = fstatSync(guardDescriptor, { bigint: true });
+      const bootstrapAfterLock = lstatSync(bootstrapPath, { bigint: true });
+      if (!sameFileIdentity(openedBootstrap, lockedBootstrap) ||
+          !sameFileIdentity(openedBootstrap, bootstrapAfterLock) ||
+          !this.posixFileProtectionIsExact(lockedBootstrap) ||
+          !this.posixFileProtectionIsExact(bootstrapAfterLock) ||
+          lockedBootstrap.nlink < 1n || lockedBootstrap.nlink > 2n ||
+          (lockedBootstrap.size !== 0n &&
+           (lockedBootstrap.size > 1_024n || !validPosixClaimDocument(
+             this.readDescriptorBytes(guardDescriptor, Number(lockedBootstrap.size)),
+             stateIdentity,
+           )))) {
+        throw new Error('status.owner_claim_failed');
+      }
+      bootstrapIdentity = openedBootstrap;
+
+      if (!existsSync(claimPath)) {
+        if (bootstrapAfterLock.nlink !== 1n) throw new Error('status.owner_claim_failed');
+        ftruncateSync(guardDescriptor, 0);
+        this.writeDescriptorBytes(guardDescriptor, serialized, 0);
+        fchmodSync(guardDescriptor, 0o600);
+        this.hooks.afterPosixClaimBootstrapWrite?.(bootstrapPath);
+        fsyncSync(guardDescriptor);
+        this.hooks.afterPosixClaimBootstrapFsync?.(bootstrapPath);
+        const prepared = fstatSync(guardDescriptor, { bigint: true });
+        const preparedPath = lstatSync(bootstrapPath, { bigint: true });
+        if (!sameFileIdentity(openedBootstrap, prepared) ||
+            !sameFileIdentity(openedBootstrap, preparedPath) ||
+            !this.posixFileProtectionIsExact(prepared) || prepared.nlink !== 1n ||
+            !this.readDescriptorBytes(guardDescriptor, serialized.length).equals(serialized)) {
+          throw new Error('status.owner_claim_failed');
+        }
+        linkSync(bootstrapPath, claimPath);
+        this.hooks.afterPosixClaimLink?.(claimPath);
+        const installed = lstatSync(claimPath, { bigint: true });
+        const linkedBootstrap = lstatSync(bootstrapPath, { bigint: true });
+        if (!sameFileIdentity(openedBootstrap, installed) ||
+            !sameFileIdentity(openedBootstrap, linkedBootstrap) || installed.nlink !== 2n ||
+            !this.posixFileProtectionIsExact(installed)) throw new Error('status.owner_claim_failed');
+        this.syncDirectory(parent);
+        descriptor = guardDescriptor;
+        guardDescriptor = null;
+        claimUsesBootstrap = true;
+      } else {
+        const claimBeforeOpen = lstatSync(claimPath, { bigint: true });
+        if (sameFileIdentity(openedBootstrap, claimBeforeOpen)) {
+          if (claimBeforeOpen.nlink !== 2n || !this.posixFileProtectionIsExact(claimBeforeOpen)) {
+            throw new Error('status.owner_claim_failed');
+          }
+          descriptor = guardDescriptor;
+          guardDescriptor = null;
+          claimUsesBootstrap = true;
+        } else {
+          descriptor = openSync(claimPath, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+          const openedClaim = fstatSync(descriptor, { bigint: true });
+          if (!this.posixFileProtectionIsExact(openedClaim) || openedClaim.nlink < 1n ||
+              openedClaim.nlink > 2n || !sameFileIdentity(openedClaim, claimBeforeOpen)) {
+            throw new Error('status.owner_claim_failed');
+          }
+          execFileSync(this.trustedPosixFlockExecutable(), ['--exclusive', '--nonblock', '0'], {
+            timeout: 1_000,
+            maxBuffer: 32,
+            stdio: [descriptor, 'ignore', 'ignore'],
+          });
+          const claimAfterLock = lstatSync(claimPath, { bigint: true });
+          const lockedClaim = fstatSync(descriptor, { bigint: true });
+          if (!sameFileIdentity(openedClaim, lockedClaim) ||
+              !sameFileIdentity(openedClaim, claimAfterLock) ||
+              !this.posixFileProtectionIsExact(lockedClaim) ||
+              !this.posixFileProtectionIsExact(claimAfterLock) ||
+              lockedClaim.nlink < 1n || lockedClaim.nlink > 2n ||
+              claimAfterLock.nlink < 1n || claimAfterLock.nlink > 2n ||
+              claimAfterLock.size !== lockedClaim.size ||
+              lockedClaim.size > 1_024n) {
+            throw new Error('status.owner_claim_failed');
+          }
+          const admittedClaimBytes = this.readDescriptorBytes(
+            descriptor,
+            Number(lockedClaim.size),
+          );
+          // A distinct inode is a legacy publication. The flock proves it has no cooperating
+          // owner, but only our exact same-state document or our empty released shape authorizes
+          // mutation; every unknown current-user object remains byte-for-byte untouched.
+          if (lockedClaim.size !== 0n &&
+              !validPosixClaimDocument(admittedClaimBytes, stateIdentity)) {
+            throw new Error('status.owner_claim_failed');
+          }
+          ftruncateSync(guardDescriptor, 0);
+          fsyncSync(guardDescriptor);
+          this.hooks.beforePosixLegacyClaimMutation?.(claimPath);
+          const claimBeforeMutation = lstatSync(claimPath, { bigint: true });
+          const descriptorBeforeMutation = fstatSync(descriptor, { bigint: true });
+          const bytesBeforeMutation = this.readDescriptorBytes(
+            descriptor,
+            Number(descriptorBeforeMutation.size),
+          );
+          const descriptorAfterRead = fstatSync(descriptor, { bigint: true });
+          if (!sameFileIdentity(openedClaim, descriptorBeforeMutation) ||
+              !sameFileIdentity(openedClaim, descriptorAfterRead) ||
+              !sameFileIdentity(openedClaim, claimBeforeMutation) ||
+              !this.posixFileProtectionIsExact(descriptorBeforeMutation) ||
+              !this.posixFileProtectionIsExact(descriptorAfterRead) ||
+              !this.posixFileProtectionIsExact(claimBeforeMutation) ||
+              descriptorBeforeMutation.nlink < 1n || descriptorBeforeMutation.nlink > 2n ||
+              descriptorAfterRead.nlink < 1n || descriptorAfterRead.nlink > 2n ||
+              claimBeforeMutation.nlink < 1n || claimBeforeMutation.nlink > 2n ||
+              descriptorBeforeMutation.size !== lockedClaim.size ||
+              descriptorAfterRead.size !== lockedClaim.size ||
+              claimBeforeMutation.size !== lockedClaim.size ||
+              !bytesBeforeMutation.equals(admittedClaimBytes)) {
+            throw new Error('status.owner_claim_failed');
+          }
+        }
+        ftruncateSync(descriptor, 0);
+        this.writeDescriptorBytes(descriptor, serialized, 0);
+        fchmodSync(descriptor, 0o600);
+        fsyncSync(descriptor);
+        this.syncDirectory(parent);
+      }
+
+      const opened = fstatSync(descriptor, { bigint: true });
+      const pathAfterWrite = lstatSync(claimPath, { bigint: true });
+      if (!sameFileIdentity(opened, pathAfterWrite) ||
+          !this.posixFileProtectionIsExact(opened) ||
+          !this.readDescriptorBytes(descriptor, serialized.length).equals(serialized)) {
+        throw new Error('status.owner_claim_failed');
+      }
     } catch {
       if (descriptor !== null) {
         try { closeSync(descriptor); } catch { /* closing releases any acquired flock */ }
+      }
+      if (guardDescriptor !== null) {
+        try { closeSync(guardDescriptor); } catch { /* closing releases the bootstrap guard */ }
       }
       throw new Error('status.owner_claim_failed');
     }
     const heldDescriptor = descriptor;
     if (heldDescriptor === null) throw new Error('status.owner_claim_failed');
     const descriptorIdentity = fstatSync(heldDescriptor, { bigint: true });
+    const heldGuardDescriptor = guardDescriptor;
+    const heldBootstrapIdentity = bootstrapIdentity;
+    if (heldBootstrapIdentity === null) {
+      try { closeSync(heldDescriptor); } catch { /* failed acquisition owns no claim */ }
+      if (heldGuardDescriptor !== null) {
+        try { closeSync(heldGuardDescriptor); } catch { /* failed acquisition owns no guard */ }
+      }
+      throw new Error('status.owner_claim_failed');
+    }
     let released = false;
     const assertHeld = (): void => {
       if (released) throw new Error('status.owner_claim_lost');
@@ -1207,14 +1541,47 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
       const descriptorBefore = fstatSync(heldDescriptor, { bigint: true });
       const bytes = this.readDescriptorBytes(heldDescriptor, serialized.length);
       const descriptorAfter = fstatSync(heldDescriptor, { bigint: true });
+      const bootstrapBefore = lstatSync(bootstrapPath, { bigint: true });
+      const guardBefore = heldGuardDescriptor === null
+        ? descriptorBefore
+        : fstatSync(heldGuardDescriptor, { bigint: true });
       this.hooks.duringPosixClaimAssertion?.(claimPath);
       const pathAfter = lstatSync(claimPath, { bigint: true });
+      const bootstrapAfter = lstatSync(bootstrapPath, { bigint: true });
+      const guardAfter = heldGuardDescriptor === null
+        ? descriptorAfter
+        : fstatSync(heldGuardDescriptor, { bigint: true });
       if (!sameFileIdentity(descriptorIdentity, descriptorBefore) ||
           !sameFileIdentity(descriptorIdentity, descriptorAfter) ||
           !sameFileIdentity(descriptorIdentity, pathBefore) ||
           !sameFileIdentity(descriptorIdentity, pathAfter) ||
+          !sameFileIdentity(heldBootstrapIdentity, bootstrapBefore) ||
+          !sameFileIdentity(heldBootstrapIdentity, bootstrapAfter) ||
+          !sameFileIdentity(heldBootstrapIdentity, guardBefore) ||
+          !sameFileIdentity(heldBootstrapIdentity, guardAfter) ||
           !this.posixFileProtectionIsExact(descriptorBefore) ||
-          !this.posixFileProtectionIsExact(pathBefore) || !bytes.equals(serialized)) {
+          !this.posixFileProtectionIsExact(descriptorAfter) ||
+          !this.posixFileProtectionIsExact(pathBefore) ||
+          !this.posixFileProtectionIsExact(pathAfter) ||
+          !this.posixFileProtectionIsExact(bootstrapBefore) ||
+          !this.posixFileProtectionIsExact(bootstrapAfter) ||
+          !this.posixFileProtectionIsExact(guardBefore) ||
+          !this.posixFileProtectionIsExact(guardAfter) ||
+          descriptorBefore.size !== BigInt(serialized.length) ||
+          descriptorAfter.size !== BigInt(serialized.length) ||
+          pathBefore.size !== BigInt(serialized.length) ||
+          pathAfter.size !== BigInt(serialized.length) ||
+          (claimUsesBootstrap
+            ? descriptorBefore.nlink !== 2n || descriptorAfter.nlink !== 2n ||
+              pathBefore.nlink !== 2n || pathAfter.nlink !== 2n ||
+              bootstrapBefore.nlink !== 2n || bootstrapAfter.nlink !== 2n
+            : guardBefore.size !== 0n || guardAfter.size !== 0n ||
+              guardBefore.nlink !== 1n || guardAfter.nlink !== 1n ||
+              descriptorBefore.nlink < 1n || descriptorBefore.nlink > 2n ||
+              descriptorAfter.nlink < 1n || descriptorAfter.nlink > 2n ||
+              pathBefore.nlink < 1n || pathBefore.nlink > 2n ||
+              pathAfter.nlink < 1n || pathAfter.nlink > 2n) ||
+          !bytes.equals(serialized)) {
         throw new Error('status.owner_claim_lost');
       }
     };
@@ -1223,6 +1590,9 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
     } catch {
       released = true;
       try { closeSync(heldDescriptor); } catch { /* the failed acquisition owns no usable claim */ }
+      if (heldGuardDescriptor !== null) {
+        try { closeSync(heldGuardDescriptor); } catch { /* the failed acquisition owns no guard */ }
+      }
       throw new Error('status.owner_claim_failed');
     }
     return {
@@ -1246,10 +1616,14 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
         } catch {
           released = true;
           try { closeSync(heldDescriptor); } catch { /* resource is already lost */ }
+          if (heldGuardDescriptor !== null) {
+            try { closeSync(heldGuardDescriptor); } catch { /* resource is already lost */ }
+          }
           throw new Error('status.owner_claim_release_failed');
         }
         released = true;
         closeSync(heldDescriptor);
+        if (heldGuardDescriptor !== null) closeSync(heldGuardDescriptor);
       },
     } as AuthenticatedOwnerClaim;
   }
@@ -1478,6 +1852,13 @@ export class CurrentUserOperationalStatusCapabilityStore implements OperationalS
       mode: stat.mode,
       type: stat.isSocket() ? 'socket' : 'other',
     }, expectedUid, 'socket');
+  }
+
+  private posixSocketProtectionIsRecoverable(stat: BigIntStats): boolean {
+    if (this.posixSocketProtectionIsExact(stat)) return true;
+    const expectedUid = typeof process.getuid === 'function' ? BigInt(process.getuid()) : stat.uid;
+    return !stat.isSymbolicLink() && stat.isSocket() && stat.uid === expectedUid &&
+      (stat.mode & 0o777n) === 0o755n;
   }
 
   private trustedPosixFlockExecutable(): string {
