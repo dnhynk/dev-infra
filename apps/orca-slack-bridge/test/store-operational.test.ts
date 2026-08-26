@@ -111,6 +111,12 @@ describe('additive v13 operational schema', () => {
 
     expect(SCHEMA_VERSION).toBe(13);
     expect(objectMap(migrated)).toEqual(objectMap(path));
+    const structural = new DatabaseSync(migrated, { readOnly: true });
+    expect(structural.prepare('PRAGMA foreign_key_list(orca_repository_binding)').all())
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        table: 'repository_registry', from: 'canonical_key', to: 'canonical_key', on_update: 'CASCADE',
+      })]));
+    structural.close();
     const reopened = new SqliteDigestStore(migrated);
     expect(reopened.findPrMessage(prKey)).toMatchObject({ channelId: 'C1', messageTs: '100.1' });
     expect(reopened.findRunMessage('run:existing')).toMatchObject({ channelId: 'C2', messageTs: '100.2' });
@@ -251,6 +257,84 @@ describe('discovery registry transactions', () => {
     }
     store.close();
   });
+
+  it('renames by numeric identity through the FK and applies consecutive-pass plus 24h grace', () => {
+    let store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      repositories: [repository], bindings: [binding], issues: [], at: AT0,
+    });
+    const renamed = {
+      ...repository,
+      canonicalKey: 'github.com/acme/widget-renamed' as const,
+      nameWithOwner: 'acme/widget-renamed' as const,
+    };
+    const renamedBinding = { ...binding, canonicalKey: renamed.canonicalKey };
+    expect(store.replaceDiscoverySnapshot({
+      repositories: [renamed], bindings: [renamedBinding], issues: [], at: AT1,
+    })).toMatchObject({
+      repositories: [{
+        canonicalKey: renamed.canonicalKey, githubRepositoryId: repository.githubRepositoryId,
+        firstSeenAt: AT0, lastSeenAt: AT1, consecutiveMissingPasses: 0,
+      }],
+      bindings: [{
+        canonicalKey: renamed.canonicalKey, firstSeenAt: AT0, lastSeenAt: AT1,
+        consecutiveMissingPasses: 0,
+      }],
+    });
+
+    expect(store.replaceDiscoverySnapshot({
+      repositories: [], bindings: [], issues: [], at: AT2,
+    })).toMatchObject({
+      repositories: [{
+        canonicalKey: renamed.canonicalKey, firstSeenAt: AT0, lastSeenAt: AT1,
+        active: true, consecutiveMissingPasses: 1,
+      }],
+      bindings: [{
+        canonicalKey: renamed.canonicalKey, firstSeenAt: AT0, lastSeenAt: AT1,
+        active: true, consecutiveMissingPasses: 1,
+      }],
+    });
+    store.close();
+    store = new SqliteDigestStore(path);
+    // Reappearance resets only the miss counter; durable first-seen identity is retained.
+    expect(store.replaceDiscoverySnapshot({
+      repositories: [renamed], bindings: [renamedBinding], issues: [], at: AT3,
+    }).repositories[0]).toMatchObject({
+      firstSeenAt: AT0, lastSeenAt: AT3, consecutiveMissingPasses: 0,
+    });
+    expect(store.replaceDiscoverySnapshot({
+      repositories: [], bindings: [], issues: [], at: AT4,
+    }).repositories[0]).toMatchObject({
+      firstSeenAt: AT0, lastSeenAt: AT3, active: true, consecutiveMissingPasses: 1,
+    });
+    const afterGrace = '2026-08-27T00:00:04.000Z';
+    expect(store.replaceDiscoverySnapshot({
+      repositories: [], bindings: [], issues: [], at: afterGrace,
+    })).toEqual({ repositories: [], bindings: [], issues: [] });
+    store.close();
+
+    const raw = new DatabaseSync(path, { readOnly: true });
+    expect(raw.prepare(`SELECT canonical_key, first_seen_at, last_seen_at, active,
+                               consecutive_missing_passes
+                          FROM repository_registry`).get()).toEqual({
+      canonical_key: renamed.canonicalKey, first_seen_at: AT0, last_seen_at: AT3,
+      active: 0, consecutive_missing_passes: 2,
+    });
+    expect(raw.prepare(`SELECT canonical_key, first_seen_at, last_seen_at, active,
+                               consecutive_missing_passes
+                          FROM orca_repository_binding`).get()).toEqual({
+      canonical_key: renamed.canonicalKey, first_seen_at: AT0, last_seen_at: AT3,
+      active: 0, consecutive_missing_passes: 2,
+    });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM repository_registry').get())
+      .toEqual({ count: 1 });
+    raw.close();
+    const reopened = new SqliteDigestStore(path);
+    expect(reopened.readEffectiveDiscoverySnapshot()).toEqual({
+      repositories: [], bindings: [], issues: [],
+    });
+    reopened.close();
+  });
 });
 
 describe('daemon health and monotonic job outcomes', () => {
@@ -283,6 +367,9 @@ describe('daemon health and monotonic job outcomes', () => {
     const store = new SqliteDigestStore(path);
     const first = store.startDaemonJob('repository-discovery', AT0)!;
     expect(store.startDaemonJob('repository-discovery', AT0)).toBeNull();
+    expect(store.advanceDaemonJobCheckpoint(first, 0, 5, AT0)).toMatchObject({
+      revision: first.revision, state: 'running', checkpoint: 5,
+    });
     expect(() => store.completeDaemonJobSuccess({
       claim: first, at: AT1, nextRunAt: AT0, durationMs: 1000,
     })).toThrow(OperationalStoreError);
@@ -293,9 +380,13 @@ describe('daemon health and monotonic job outcomes', () => {
       state: 'succeeded', checkpoint: 5, consecutiveFailures: 0, nextRunAt: AT2,
     });
     expect(store.startDaemonJob('repository-discovery', AT1)).toBeNull();
-    expect(() => store.advanceDaemonJobCheckpoint('repository-discovery', 5, 4, AT2))
+    expect(() => store.advanceDaemonJobCheckpoint(first, 5, 4, AT2))
       .toThrow(OperationalStoreError);
     const second = store.startDaemonJob('repository-discovery', AT2)!;
+    expect(store.advanceDaemonJobCheckpoint(first, 5, 6, AT2)).toBeNull();
+    expect(store.advanceDaemonJobCheckpoint(second, 5, 6, AT2)).toMatchObject({
+      revision: second.revision, state: 'running', checkpoint: 6,
+    });
     const failed = store.completeDaemonJobFailure({
       claim: second, at: AT3, durationMs: 1000, errorCode: 'github.unavailable', checkpoint: 6,
     });
@@ -319,6 +410,18 @@ describe('at-most-once Slack root intents', () => {
     expect(first.markSlackRootIntentUncertain(claim, 'transport.unknown', AT2))
       .toMatchObject({ state: 'uncertain' });
     expect(second.claimSlackRootIntent(entity, 'instance-b', AT3)?.kind).toBe('not_claimed');
+
+    const retry = { kind: 'run', key: 'run:safe-retry' } as const;
+    first.prepareSlackRootIntent({ ...retry, channelId: 'C1', renderFingerprint: 'retry.1', at: AT0 });
+    const retryClaim = expectClaim(first.claimSlackRootIntent(retry, 'instance-a', AT1));
+    expect(first.markSlackRootIntentSafeRetry(retryClaim, 'validation.failed', AT2))
+      .toMatchObject({ state: 'pending', renderFingerprint: 'retry.1' });
+    expect(first.prepareSlackRootIntent({
+      ...retry, channelId: 'C1', renderFingerprint: 'retry.2', at: AT3,
+    })).toMatchObject({ state: 'pending', renderFingerprint: 'retry.2', attemptCount: 1 });
+    const retriedClaim = expectClaim(first.claimSlackRootIntent(retry, 'instance-a', AT4));
+    expect(first.markSlackRootIntentUncertain(retriedClaim, 'transport.unknown', AT5)?.state)
+      .toBe('uncertain');
 
     const recover = { kind: 'run', key: 'run:recover' } as const;
     first.prepareSlackRootIntent({ ...recover, channelId: 'C1', renderFingerprint: 'render.2', at: AT0 });
@@ -360,9 +463,20 @@ describe('at-most-once Slack root intents', () => {
       }, at: AT2,
     })).toMatchObject({ state: 'posted', messageTs: '100.2' });
     expect(posted.findPrMessage(entity.key)).toMatchObject({ channelId: 'C1', messageTs: '100.2' });
+    posted.updateObservation(entity.key, {
+      renderFingerprint: 'render.updated', factsFingerprint: 'facts.updated', summaryJson: null,
+    }, AT3);
+    expect(posted.findPrMessage(entity.key)).toMatchObject({
+      channelId: 'C1', messageTs: '100.2', renderFingerprint: 'render.updated',
+    });
     posted.close();
     const reopened = new SqliteDigestStore(postedPath);
-    expect(reopened.findSlackRootIntent(entity)?.state).toBe('posted');
+    expect(reopened.findSlackRootIntent(entity)).toMatchObject({
+      state: 'posted', messageTs: '100.2', renderFingerprint: 'render.1',
+    });
+    expect(reopened.findPrMessage(entity.key)).toMatchObject({
+      messageTs: '100.2', renderFingerprint: 'render.updated',
+    });
     reopened.close();
   });
 });

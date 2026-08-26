@@ -612,13 +612,16 @@ CREATE TABLE repository_registry (
   project_key          TEXT NOT NULL CHECK (length(project_key) BETWEEN 1 AND 200),
   project_origin       TEXT NOT NULL CHECK (project_origin IN ('explicit','auto')),
   active               INTEGER NOT NULL CHECK (active IN (0, 1)),
+  consecutive_missing_passes INTEGER NOT NULL
+    CHECK (consecutive_missing_passes BETWEEN 0 AND 1000000),
   first_seen_at        TEXT NOT NULL,
   last_seen_at         TEXT NOT NULL,
   last_good_at         TEXT NOT NULL,
   updated_at           TEXT NOT NULL,
   CHECK (last_seen_at >= first_seen_at),
   CHECK (last_good_at >= first_seen_at),
-  CHECK (updated_at >= first_seen_at)
+  CHECK (updated_at >= first_seen_at),
+  CHECK (active = 1 OR consecutive_missing_passes >= 2)
 )`;
 
 const REPOSITORY_REGISTRY_PROJECT_INDEX = `
@@ -628,10 +631,12 @@ CREATE INDEX repository_registry_project
 const ORCA_REPOSITORY_BINDING_TABLE = `
 CREATE TABLE orca_repository_binding (
   orca_repository_id TEXT PRIMARY KEY CHECK (length(orca_repository_id) BETWEEN 1 AND 500),
-  canonical_key      TEXT REFERENCES repository_registry(canonical_key),
+  canonical_key      TEXT REFERENCES repository_registry(canonical_key) ON UPDATE CASCADE,
   project_key        TEXT NOT NULL CHECK (length(project_key) BETWEEN 1 AND 200),
   origin             TEXT NOT NULL CHECK (origin IN ('manual','discovered')),
   active             INTEGER NOT NULL CHECK (active IN (0, 1)),
+  consecutive_missing_passes INTEGER NOT NULL
+    CHECK (consecutive_missing_passes BETWEEN 0 AND 1000000),
   first_seen_at      TEXT NOT NULL,
   last_seen_at       TEXT NOT NULL,
   last_good_at       TEXT NOT NULL,
@@ -639,7 +644,8 @@ CREATE TABLE orca_repository_binding (
   CHECK (canonical_key IS NOT NULL OR origin = 'manual'),
   CHECK (last_seen_at >= first_seen_at),
   CHECK (last_good_at >= first_seen_at),
-  CHECK (updated_at >= first_seen_at)
+  CHECK (updated_at >= first_seen_at),
+  CHECK (active = 1 OR consecutive_missing_passes >= 2)
 )`;
 
 const ORCA_REPOSITORY_BINDING_CANONICAL_INDEX = `

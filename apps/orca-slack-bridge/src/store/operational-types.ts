@@ -44,6 +44,8 @@ export type ReplaceDiscoverySnapshotInput = {
 
 export type RepositoryRegistryRecord = RepositoryRegistryInput & {
   readonly active: boolean;
+  /** Consecutive successful discovery passes in which this identity was absent. */
+  readonly consecutiveMissingPasses: number;
   readonly firstSeenAt: string;
   readonly lastSeenAt: string;
   readonly lastGoodAt: string;
@@ -52,6 +54,8 @@ export type RepositoryRegistryRecord = RepositoryRegistryInput & {
 
 export type OrcaRepositoryBindingRecord = OrcaRepositoryBindingInput & {
   readonly active: boolean;
+  /** Consecutive successful discovery passes in which this exact Orca ID was absent. */
+  readonly consecutiveMissingPasses: number;
   readonly firstSeenAt: string;
   readonly lastSeenAt: string;
   readonly lastGoodAt: string;
@@ -235,7 +239,7 @@ export interface OperationalStore {
   completeDaemonJobSuccess(input: DaemonJobSuccessCompletion): DaemonJobOutcomeRecord | null;
   completeDaemonJobFailure(input: DaemonJobCompletion & { readonly errorCode: string }): DaemonJobOutcomeRecord | null;
   scheduleDaemonJobBackoff(jobName: DaemonJobName, expectedRevision: number, nextRunAt: string, at: string): DaemonJobOutcomeRecord | null;
-  advanceDaemonJobCheckpoint(jobName: DaemonJobName, expectedCheckpoint: number, checkpoint: number, at: string): DaemonJobOutcomeRecord | null;
+  advanceDaemonJobCheckpoint(claim: DaemonJobClaim, expectedCheckpoint: number, checkpoint: number, at: string): DaemonJobOutcomeRecord | null;
   findDaemonJobOutcome(jobName: DaemonJobName): DaemonJobOutcomeRecord | null;
 
   readOperationalAggregateCounts(): OperationalAggregateCounts;

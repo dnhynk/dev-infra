@@ -746,12 +746,12 @@ SELECT t.pr_key AS pr_key,
 
 const SELECT_REPOSITORY_REGISTRY = `
 SELECT canonical_key, github_repository_id, name_with_owner, project_key, project_origin, active,
-       first_seen_at, last_seen_at, last_good_at, updated_at
+       consecutive_missing_passes, first_seen_at, last_seen_at, last_good_at, updated_at
   FROM repository_registry ORDER BY canonical_key`;
 
 const SELECT_ORCA_REPOSITORY_BINDINGS = `
 SELECT orca_repository_id, canonical_key, project_key, origin, active,
-       first_seen_at, last_seen_at, last_good_at, updated_at
+       consecutive_missing_passes, first_seen_at, last_seen_at, last_good_at, updated_at
   FROM orca_repository_binding ORDER BY orca_repository_id`;
 
 const SELECT_REPOSITORY_DISCOVERY_ISSUES = `
@@ -983,6 +983,7 @@ type RepositoryRegistryRow = {
   readonly project_key: string;
   readonly project_origin: string;
   readonly active: number;
+  readonly consecutive_missing_passes: number;
   readonly first_seen_at: string;
   readonly last_seen_at: string;
   readonly last_good_at: string;
@@ -995,6 +996,7 @@ type OrcaRepositoryBindingRow = {
   readonly project_key: string;
   readonly origin: string;
   readonly active: number;
+  readonly consecutive_missing_passes: number;
   readonly first_seen_at: string;
   readonly last_seen_at: string;
   readonly last_good_at: string;
@@ -1758,6 +1760,9 @@ const OPERATIONAL_JOB_NAMES = new Set<DaemonJobName>([
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
 ]);
 
+const DISCOVERY_MISSING_PASS_LIMIT = 1_000_000;
+const DISCOVERY_REMOVAL_GRACE_MS = 24 * 60 * 60 * 1_000;
+
 function operationalText(value: unknown, max: number): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max) {
     operationalFail('OPERATIONAL_STORE_CORRUPT');
@@ -1838,7 +1843,12 @@ function toRepositoryRegistry(row: RepositoryRegistryRow): RepositoryRegistryRec
   const lastSeenAt = operationalIso(row.last_seen_at);
   const lastGoodAt = operationalIso(row.last_good_at);
   const updatedAt = operationalIso(row.updated_at);
-  if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt || updatedAt < firstSeenAt) {
+  const consecutiveMissingPasses = operationalInteger(row.consecutive_missing_passes);
+  const active = operationalBoolean(row.active);
+  if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt ||
+      updatedAt < lastSeenAt || updatedAt < lastGoodAt ||
+      (!active && (consecutiveMissingPasses < 2 ||
+        new Date(updatedAt).valueOf() - new Date(lastSeenAt).valueOf() < DISCOVERY_REMOVAL_GRACE_MS))) {
     operationalFail('OPERATIONAL_STORE_CORRUPT');
   }
   return {
@@ -1846,7 +1856,8 @@ function toRepositoryRegistry(row: RepositoryRegistryRow): RepositoryRegistryRec
     githubRepositoryId,
     projectKey: validateProjectKey(row.project_key),
     projectOrigin: row.project_origin,
-    active: operationalBoolean(row.active),
+    active,
+    consecutiveMissingPasses,
     firstSeenAt,
     lastSeenAt,
     lastGoodAt,
@@ -1862,7 +1873,12 @@ function toOrcaRepositoryBinding(row: OrcaRepositoryBindingRow): OrcaRepositoryB
   const lastSeenAt = operationalIso(row.last_seen_at);
   const lastGoodAt = operationalIso(row.last_good_at);
   const updatedAt = operationalIso(row.updated_at);
-  if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt || updatedAt < firstSeenAt) {
+  const consecutiveMissingPasses = operationalInteger(row.consecutive_missing_passes);
+  const active = operationalBoolean(row.active);
+  if (lastSeenAt < firstSeenAt || lastGoodAt < firstSeenAt ||
+      updatedAt < lastSeenAt || updatedAt < lastGoodAt ||
+      (!active && (consecutiveMissingPasses < 2 ||
+        new Date(updatedAt).valueOf() - new Date(lastSeenAt).valueOf() < DISCOVERY_REMOVAL_GRACE_MS))) {
     operationalFail('OPERATIONAL_STORE_CORRUPT');
   }
   return {
@@ -1870,7 +1886,8 @@ function toOrcaRepositoryBinding(row: OrcaRepositoryBindingRow): OrcaRepositoryB
     canonicalKey,
     projectKey: validateProjectKey(row.project_key),
     origin: row.origin,
-    active: operationalBoolean(row.active),
+    active,
+    consecutiveMissingPasses,
     firstSeenAt,
     lastSeenAt,
     lastGoodAt,
@@ -5531,19 +5548,65 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('UPDATE repository_registry SET active = 0, updated_at = ? WHERE active = 1')
-        .run(at);
+      const discoveryFloor = this.db.prepare(`
+        SELECT MAX(updated_at) AS updated_at FROM (
+          SELECT updated_at FROM repository_registry
+          UNION ALL SELECT updated_at FROM orca_repository_binding
+          UNION ALL SELECT updated_at FROM repository_discovery_issue
+        )`).get() as { readonly updated_at: string | null } | undefined;
+      if (discoveryFloor?.updated_at !== null && discoveryFloor?.updated_at !== undefined &&
+          operationalIso(discoveryFloor.updated_at) > at) {
+        operationalFail('OPERATIONAL_STALE_TRANSITION');
+      }
+
+      // GitHub's numeric repository identity survives owner/name changes. Rename the durable PK
+      // before upsert; ON UPDATE CASCADE moves every exact Orca binding in this same transaction.
+      const findByGithubId = this.db.prepare(`
+        SELECT canonical_key FROM repository_registry WHERE github_repository_id = ?`);
+      const findCanonical = this.db.prepare(`
+        SELECT canonical_key FROM repository_registry WHERE canonical_key = ?`);
+      const renameCanonical = this.db.prepare(`
+        UPDATE repository_registry SET canonical_key = ?, updated_at = ?
+         WHERE canonical_key = ? AND github_repository_id = ?`);
+      for (const repository of input.repositories) {
+        if (repository.githubRepositoryId === null) continue;
+        const existing = findByGithubId.get(repository.githubRepositoryId) as
+          | { readonly canonical_key: string } | undefined;
+        if (existing === undefined || existing.canonical_key === repository.canonicalKey) continue;
+        if (canonicalKeys.has(existing.canonical_key) ||
+            findCanonical.get(repository.canonicalKey) !== undefined ||
+            Number(renameCanonical.run(
+              repository.canonicalKey, at, existing.canonical_key, repository.githubRepositoryId,
+            ).changes) !== 1) {
+          operationalFail('OPERATIONAL_CONFLICT');
+        }
+      }
+
+      const inactiveCutoff = new Date(
+        new Date(at).valueOf() - DISCOVERY_REMOVAL_GRACE_MS,
+      ).toISOString();
+      this.db.prepare(`
+        UPDATE repository_registry
+           SET active = CASE
+                 WHEN active = 1 AND consecutive_missing_passes >= 1 AND last_seen_at <= ?
+                   THEN 0 ELSE active END,
+               consecutive_missing_passes = CASE
+                 WHEN consecutive_missing_passes < ? THEN consecutive_missing_passes + 1
+                 ELSE consecutive_missing_passes END,
+               updated_at = ?`).run(inactiveCutoff, DISCOVERY_MISSING_PASS_LIMIT, at);
       const upsertRepository = this.db.prepare(`
         INSERT INTO repository_registry
           (canonical_key, github_repository_id, name_with_owner, project_key, project_origin,
-           active, first_seen_at, last_seen_at, last_good_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+           active, consecutive_missing_passes,
+           first_seen_at, last_seen_at, last_good_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)
         ON CONFLICT (canonical_key) DO UPDATE SET
           github_repository_id = excluded.github_repository_id,
           name_with_owner = excluded.name_with_owner,
           project_key = excluded.project_key,
           project_origin = excluded.project_origin,
           active = 1,
+          consecutive_missing_passes = 0,
           last_seen_at = excluded.last_seen_at,
           last_good_at = excluded.last_good_at,
           updated_at = excluded.updated_at`);
@@ -5555,18 +5618,26 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       }
       this.operationalFault?.('after_discovery_registry');
 
-      this.db.prepare('UPDATE orca_repository_binding SET active = 0, updated_at = ? WHERE active = 1')
-        .run(at);
+      this.db.prepare(`
+        UPDATE orca_repository_binding
+           SET active = CASE
+                 WHEN active = 1 AND consecutive_missing_passes >= 1 AND last_seen_at <= ?
+                   THEN 0 ELSE active END,
+               consecutive_missing_passes = CASE
+                 WHEN consecutive_missing_passes < ? THEN consecutive_missing_passes + 1
+                 ELSE consecutive_missing_passes END,
+               updated_at = ?`).run(inactiveCutoff, DISCOVERY_MISSING_PASS_LIMIT, at);
       const upsertBinding = this.db.prepare(`
         INSERT INTO orca_repository_binding
-          (orca_repository_id, canonical_key, project_key, origin, active,
+          (orca_repository_id, canonical_key, project_key, origin, active, consecutive_missing_passes,
            first_seen_at, last_seen_at, last_good_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?)
         ON CONFLICT (orca_repository_id) DO UPDATE SET
           canonical_key = excluded.canonical_key,
           project_key = excluded.project_key,
           origin = excluded.origin,
           active = 1,
+          consecutive_missing_passes = 0,
           last_seen_at = excluded.last_seen_at,
           last_good_at = excluded.last_good_at,
           updated_at = excluded.updated_at`);
@@ -5815,21 +5886,24 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   }
 
   advanceDaemonJobCheckpoint(
-    jobName: DaemonJobName,
+    claim: DaemonJobClaim,
     expectedCheckpoint: number,
     checkpoint: number,
     at: string,
   ): DaemonJobOutcomeRecord | null {
-    const safeJob = operationalJobName(jobName);
+    const safeJob = operationalJobName(claim.jobName);
+    const revision = operationalInteger(claim.revision, true);
+    const startedAt = operationalIso(claim.startedAt, true);
     const expected = operationalInteger(expectedCheckpoint, true);
     const next = operationalInteger(checkpoint, true);
     const safeAt = operationalIso(at, true);
     if (next < expected) operationalFail('OPERATIONAL_INPUT_INVALID');
     return this.transitionDaemonJob(safeJob, () => Number(this.db.prepare(`
       UPDATE daemon_job_outcome
-         SET revision = revision + 1, checkpoint = ?, updated_at = ?
-       WHERE job_name = ? AND checkpoint = ? AND updated_at <= ?`)
-      .run(next, safeAt, safeJob, expected, safeAt).changes));
+         SET checkpoint = ?, updated_at = ?
+       WHERE job_name = ? AND revision = ? AND state = 'running' AND started_at = ?
+         AND checkpoint = ? AND updated_at <= ?`)
+      .run(next, safeAt, safeJob, revision, startedAt, expected, safeAt).changes));
   }
 
   findDaemonJobOutcome(jobName: DaemonJobName): DaemonJobOutcomeRecord | null {
@@ -5910,8 +5984,22 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (existingRow !== undefined) {
         const existing = toSlackRootIntent(existingRow);
         if (existing.channelId !== channelId || existing.renderFingerprint !== renderFingerprint) {
-          this.db.exec('ROLLBACK');
-          operationalFail('OPERATIONAL_CONFLICT');
+          if (existing.state !== 'pending' || existing.updatedAt > at ||
+              Number(this.db.prepare(`
+                UPDATE slack_root_intent
+                   SET revision = revision + 1, channel_id = ?, render_fingerprint = ?, updated_at = ?
+                 WHERE entity_kind = ? AND entity_key = ? AND revision = ? AND state = 'pending'`)
+                .run(
+                  channelId, renderFingerprint, at,
+                  existing.kind, existing.key, existing.revision,
+                ).changes) !== 1) {
+            this.db.exec('ROLLBACK');
+            operationalFail('OPERATIONAL_CONFLICT');
+          }
+          const updatedRow = this.db.prepare(SELECT_SLACK_ROOT_INTENT)
+            .get(existing.kind, existing.key) as SlackRootIntentRow;
+          this.db.exec('COMMIT');
+          return toSlackRootIntent(updatedRow);
         }
         this.db.exec('COMMIT');
         return existing;
@@ -6702,11 +6790,12 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
 const CURRENT_OPERATIONAL_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   repository_registry: [
     'canonical_key', 'github_repository_id', 'name_with_owner', 'project_key', 'project_origin',
-    'active', 'first_seen_at', 'last_seen_at', 'last_good_at', 'updated_at',
+    'active', 'consecutive_missing_passes',
+    'first_seen_at', 'last_seen_at', 'last_good_at', 'updated_at',
   ],
   orca_repository_binding: [
     'orca_repository_id', 'canonical_key', 'project_key', 'origin', 'active',
-    'first_seen_at', 'last_seen_at', 'last_good_at', 'updated_at',
+    'consecutive_missing_passes', 'first_seen_at', 'last_seen_at', 'last_good_at', 'updated_at',
   ],
   repository_discovery_issue: [
     'issue_hash', 'category', 'active', 'occurrence_count', 'first_seen_at', 'last_seen_at',
@@ -6784,7 +6873,7 @@ function validateCurrentOperationalStore(db: DatabaseSync): void {
           : convertOptionalMapping(db.prepare(SELECT_RUN_COLLECTION_ROW).get() as RunCollectionMessageRow | undefined, toRunCollectionMessageRecord);
       if (intent.state === 'posted') {
         if (mapping === null || mapping.channelId !== intent.channelId ||
-            mapping.messageTs !== intent.messageTs || mapping.renderFingerprint !== intent.renderFingerprint) {
+            mapping.messageTs !== intent.messageTs) {
           operationalFail('OPERATIONAL_STORE_CORRUPT');
         }
       } else if (mapping !== null) {
