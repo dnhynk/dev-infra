@@ -347,25 +347,34 @@ fallback print하지 않는다.
 read-only connection과 `sqlite3_backup_*` scratch image로 읽는다. live WAL은 새 SQLite reader를 열지 않는다.
 mutable WAL의 logical read-only connection도 `-shm` read mark를 바꿀 수 있기 때문이다. 대신 daemon/store
 owner가 같은 event-loop ownership turn에서 O1-2 strict read API를 직렬로 읽어 versioned, aggregate-only
-snapshot cache를 갱신한다. daemon은 listener를 먼저 소유한 뒤 current-user-only capability를 atomic publish하고
+snapshot cache를 갱신한다. daemon은 listener를 먼저 소유한 뒤 current-user-only capability를 publish하고
 15초마다 secret/capability ID를 교체한다. capability는 state identity와 typed transport endpoint를 포함하며 30초가
 지나면 무효다. Windows는 `127.0.0.1`에 OS-assigned ephemeral port 하나만 bind하고 DACL이 상속되지 않는
 current-user-only directory/file에 endpoint를 둔다. parent와 file owner/DACL은 매 read/publish/remove에서 실제
 security descriptor로 다시 읽고, protected DACL의 current-user FullControl ACE 하나와 정확한 inheritance/
-propagation만 허용한다. PowerShell ACL/owner-claim helper에는 token-bearing daemon env 대신 SystemRoot와 bounded
-artifact path/kind 또는 machine-wide `Global\\` state digest mutex name만 전달한다. daemon은 capability lifecycle 전체에서 per-state
-exclusive owner claim을 잡고, publish/remove는 held claim과 expected document에 조건부다. 교체와 제거는 unknown
-path를 overwrite/unlink하지 않고 handle-pinned file identity, no-replace hard-link install, atomic
-quarantine/verify/restore를 함께 써 identical-content raced replacement도 보존한다.
-비-Windows는 state path digest로 이름 붙인 private local pipe와 0700/0600 capability/claim artifact를 쓴다.
+propagation만 허용한다. capability root는 `LOCALAPPDATA`/`APPDATA`가 아니라 trusted `GLOBALROOT` system-directory
+경로로 실행한 OS known-folder API에서 얻는다. helper에는 token-bearing daemon env 대신 그 trusted SystemRoot와
+bounded artifact path/kind 또는 machine-wide `Global\\` state digest mutex name만 전달한다. daemon은 capability
+lifecycle 전체에서 per-state exclusive owner claim을 잡고, publish/remove는 held claim과 expected document에
+조건부다. capability는 protected bootstrap hard link와 동일한 고정 inode의 두 bounded checksum slot을 번갈아
+fsync한 뒤 두 slot을 같은 최신 generation으로 덮는다. 따라서 crash 중 한 slot이 손상돼도 마지막 complete
+sequence만 선택하고, 정상 rotation/restart/remove는 pathname quarantine을 만들거나 unknown path를 unlink하지
+않으며 이전 secret도 고정 container에서 지운다. raced replacement는 pinned descriptor/path identity 불일치로
+보존한 채 실패한다. 비-Windows는 exact-UID 0700 runtime directory 안의 0600 pathname UDS를 쓰고 capability에
+exact device/inode를 넣어 accept/connect/refresh 때마다 재검증한다. claim은 randomized prepared 0600 inode를
+fsync/identity-check한 뒤 fixed name에 no-replace hard-link하고, 그 stable inode의 kernel `flock`과 descriptor bytes,
+pre/post pathname identity를 lifecycle 전체에서 유지한다. clean restart는 inode/entry를 재사용하며 crash socket
+residue는 삭제하지 않고 최대 8개까지만 격리한다.
 
 각 연결은 4-byte big-endian length prefix가 붙은 request 정확히 하나를 EOF까지 받은 다음 response 정확히 하나를
 EOF까지 보낸다. 두 방향 모두 partial/oversize/두 번째 frame/trailing bytes/timeout을 거부한다. HMAC transcript는
 request nonce·freshness·state/capability/transport identity·expected config/build를, response protocol/schema/version·
 capture freshness·complete aggregate snapshot을 함께 묶는다. 따라서 listener나 port만 먼저 차지하고 nonce를
 echo하는 process는 operational data를 만들 수 없다. server는 1초 idle timeout과 별도로 accept부터 2초의
-non-refreshing absolute deadline, 최대 8 connection을 적용한다. 인증된 request nonce는 capability generation당
-최대 2,048개를 원자적으로 reserve하고 5초 뒤 expire하며 rotation/shutdown에서 비워 cross-connection replay도
+non-refreshing monotonic absolute deadline, 최대 8 connection을 적용한다. Windows ACL helper는 비동기·취소
+가능하며 request 구조/HMAC 검증 뒤 실행되어 listener event loop와 deadline을 막지 않는다. 인증된 request nonce는
+capability generation당 최대 2,048개를 원자적으로 reserve하고 signed `sentAt + 5초`에 expire하며
+rotation/shutdown에서 비워 cross-connection replay도
 거부한다. response는 match state, finite job/error, timestamp와 bounded
 count만 포함한다. status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와 source directory
 entry가 그대로다. owner cache/capability가 absent/stale/malformed/permission-drift/raced이면 static

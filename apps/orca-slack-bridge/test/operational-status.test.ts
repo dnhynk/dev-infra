@@ -6,7 +6,7 @@ import {
   readdirSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { createConnection, createServer, type Socket } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../src/project/config.js';
@@ -15,6 +15,7 @@ import {
   fingerprintOperationalConfig,
   formatOperationalStatus,
   inspectOperationalStatus,
+  operationalStatusOwnerPipePath,
   OperationalStatusOwnerServer,
   OPERATIONAL_JOB_NAMES,
   projectOperationalStore,
@@ -23,11 +24,16 @@ import {
 import {
   activeOperationalStatusCapability,
   CurrentUserOperationalStatusCapabilityStore,
+  operationalStatusCapabilityPath,
+  operationalStatusPosixProtectionIsExact,
   operationalStatusStateIdentity,
   operationalStatusWindowsAclIsExact,
+  operationalStatusWindowsLocalPathIsCanonical,
+  operationalStatusWindowsKnownFolderEnvironment,
   operationalStatusWindowsOwnerClaimEnvironment,
   operationalStatusWindowsOwnerClaimName,
   operationalStatusWindowsPowerShellEnvironment,
+  operationalStatusWindowsTrustedPowerShell,
   retiredOperationalStatusCapability,
   STATUS_OWNER_CAPABILITY_MAX_AGE_MS,
   STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS,
@@ -36,6 +42,7 @@ import {
   type OperationalStatusCapabilityRead,
   type OperationalStatusCapabilityStore,
   type OperationalStatusOwnerClaim,
+  type OperationalStatusOwnerTransportIdentity,
   type RetiredOperationalStatusCapability,
 } from '../src/operational/status-capability.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
@@ -243,6 +250,7 @@ class MemoryCapabilityStore implements OperationalStatusCapabilityStore {
   protected = true;
   invalid = false;
   raceAfterPublish: OperationalStatusCapabilityDocument | null = null;
+  requestVerification: ((signal: AbortSignal) => Promise<void>) | null = null;
   private claimToken: symbol | null = null;
 
   async acquireOwnerClaim(
@@ -274,6 +282,11 @@ class MemoryCapabilityStore implements OperationalStatusCapabilityStore {
       : { kind: 'ready', value: structuredClone(this.document) };
   }
 
+  async readForRequest(path: string, signal: AbortSignal): Promise<OperationalStatusCapabilityRead> {
+    if (this.requestVerification !== null) await this.requestVerification(signal);
+    return signal.aborted ? { kind: 'invalid' } : this.read(path);
+  }
+
   publish(
     path: string,
     document: OperationalStatusCapabilityDocument,
@@ -302,6 +315,56 @@ class MemoryCapabilityStore implements OperationalStatusCapabilityStore {
       throw new Error('status.capability_remove_failed');
     }
     this.document = null;
+  }
+
+  prepareOwnerTransport(
+    path: string,
+    _stateIdentity: string,
+    claim: OperationalStatusOwnerClaim,
+  ): void {
+    claim.assertHeld();
+    if (existsSync(path)) renameSync(path, `${path}.stale-${Date.now()}`);
+  }
+
+  activateOwnerTransport(
+    path: string,
+    _stateIdentity: string,
+    claim: OperationalStatusOwnerClaim,
+  ): OperationalStatusOwnerTransportIdentity {
+    claim.assertHeld();
+    chmodSync(path, 0o600);
+    const value = lstatSync(path, { bigint: true });
+    if (!value.isSocket()) throw new Error('status.owner_transport_failed');
+    return { kind: 'pipe', path, device: String(value.dev), inode: String(value.ino) };
+  }
+
+  assertOwnerTransport(
+    transport: OperationalStatusOwnerTransportIdentity,
+    _stateIdentity: string,
+    claim: OperationalStatusOwnerClaim,
+  ): void {
+    claim.assertHeld();
+    if (!this.verifyOwnerTransport(transport)) throw new Error('status.owner_transport_lost');
+  }
+
+  retireOwnerTransport(
+    transport: OperationalStatusOwnerTransportIdentity,
+    stateIdentity: string,
+    claim: OperationalStatusOwnerClaim,
+  ): void {
+    this.assertOwnerTransport(transport, stateIdentity, claim);
+    renameSync(transport.path, `${transport.path}.retired-${transport.inode}`);
+  }
+
+  verifyOwnerTransport(transport: OperationalStatusOwnerTransportIdentity): boolean {
+    try {
+      const value = lstatSync(transport.path, { bigint: true });
+      const uid = typeof process.getuid === 'function' ? BigInt(process.getuid()) : value.uid;
+      return value.isSocket() && value.uid === uid && (value.mode & 0o777n) === 0o600n &&
+        String(value.dev) === transport.device && String(value.ino) === transport.inode;
+    } catch {
+      return false;
+    }
   }
 
   active(): ActiveOperationalStatusCapability {
@@ -905,6 +968,69 @@ describe('read-only operational status classification', () => {
     }
   });
 
+  it('cancels eight concurrent capability verifiers without blocking the absolute deadline', async () => {
+    const store = healthyStore();
+    let activeVerifiers = 0;
+    let startedVerifiers = 0;
+    capabilities.requestVerification = async (signal) => await new Promise<void>((resolve) => {
+      activeVerifiers += 1;
+      startedVerifiers += 1;
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        activeVerifiers -= 1;
+        resolve();
+      };
+      const timer = setTimeout(finish, 1_000);
+      timer.unref?.();
+      signal.addEventListener('abort', finish, { once: true });
+    });
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      requestIdleTimeoutMilliseconds: 150,
+      requestAbsoluteDeadlineMilliseconds: 160,
+      clock: () => new Date(TRANSPORT_AT),
+    });
+    const sockets: Socket[] = [];
+    try {
+      await owner.start();
+      const capability = capabilities.active();
+      const startedAt = process.hrtime.bigint();
+      const closes = Array.from({ length: 8 }, (_, index) => new Promise<void>((resolveClose) => {
+        const nonce = index.toString(16).padStart(32, '0');
+        const socket = capability.transport.kind === 'tcp'
+          ? createConnection({ ...capability.transport, allowHalfOpen: true })
+          : createConnection({ path: capability.transport.path, allowHalfOpen: true });
+        sockets.push(socket);
+        socket.once('connect', () => socket.end(validRawOwnerRequest(capability, nonce)));
+        socket.once('close', resolveClose);
+        socket.on('error', () => undefined);
+      }));
+      await Promise.race([
+        Promise.all(closes),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error('deadline leaked verifier sockets')),
+          400,
+        )),
+      ]);
+      const elapsedMilliseconds = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      expect(startedVerifiers).toBe(8);
+      expect(activeVerifiers).toBe(0);
+      expect(elapsedMilliseconds).toBeLessThan(300);
+    } finally {
+      capabilities.requestVerification = null;
+      for (const socket of sockets) socket.destroy();
+      await owner.stop();
+      store.close();
+    }
+  });
+
   it('accepts one split authenticated response only after EOF and rejects every trailing form', async () => {
     expect(await inspectThroughFakeOwner('valid-split')).toMatchObject({
       exitCode: 0,
@@ -1003,7 +1129,7 @@ describe('read-only operational status classification', () => {
     }
   });
 
-  it('fails closed on fresh squats, malformed metadata, publication races, and permission drift', async () => {
+  it('reclaims a verified fresh crash residue but fails closed on malformed metadata, races, and permission drift', async () => {
     const store = healthyStore();
     const now = new Date(TRANSPORT_AT);
     const makeOwner = () => new OperationalStatusOwnerServer({
@@ -1020,8 +1146,10 @@ describe('read-only operational status classification', () => {
       now.toISOString(),
     );
     capabilities.document = squat;
-    await expect(makeOwner().start()).rejects.toThrow('status.owner_start_failed');
-    expect(capabilities.document).toEqual(squat);
+    const restarted = makeOwner();
+    await restarted.start();
+    expect(capabilities.active().capabilityId).not.toBe(squat.capabilityId);
+    await restarted.stop();
 
     capabilities.document = null;
     capabilities.invalid = true;
@@ -1237,6 +1365,129 @@ describe('read-only operational status classification', () => {
     }
   });
 
+  it('prunes a near-expiry signed nonce before the replay-capacity check at exact expiry', async () => {
+    const store = healthyStore();
+    let transportTime = Date.parse(TRANSPORT_AT);
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      acceptedNonceLimit: 2,
+      clock: () => new Date(transportTime),
+    });
+    try {
+      await owner.start();
+      const capability = capabilities.active();
+      expect(await exchangeAuthenticatedOwnerFrame(validRawOwnerRequest(
+        capability,
+        '1'.repeat(32),
+        new Date(transportTime - 4_999).toISOString(),
+      ))).not.toBeNull();
+      expect(await exchangeAuthenticatedOwnerFrame(validRawOwnerRequest(
+        capability,
+        '2'.repeat(32),
+        new Date(transportTime).toISOString(),
+      ))).not.toBeNull();
+      expect(await exchangeAuthenticatedOwnerFrame(validRawOwnerRequest(
+        capability,
+        '3'.repeat(32),
+        new Date(transportTime).toISOString(),
+      ))).toBeNull();
+
+      transportTime += 1;
+      expect(await exchangeAuthenticatedOwnerFrame(validRawOwnerRequest(
+        capability,
+        '3'.repeat(32),
+        new Date(transportTime).toISOString(),
+      ))).not.toBeNull();
+    } finally {
+      await owner.stop();
+      store.close();
+    }
+  });
+
+  it('rejects unbounded Windows roots and derives PowerShell only through GLOBALROOT realpath', () => {
+    const accepted = String.raw`D:\Users\operator\AppData\Local`;
+    expect(operationalStatusWindowsLocalPathIsCanonical(accepted)).toBe(true);
+    for (const rejected of [
+      String.raw`\\server\share`,
+      String.raw`\\?\D:\Users\operator\AppData\Local`,
+      String.raw`\\.\D:\Users\operator\AppData\Local`,
+      String.raw`\??\D:\Users\operator\AppData\Local`,
+      String.raw`D:relative`,
+      String.raw`D:\Users\operator\..\escape`,
+      String.raw`D:\Users\operator\stream:secret`,
+      String.raw`D:\Users\operator\NUL`,
+      `D:\\Users\\operator\\bad${String.fromCharCode(1)}`,
+      `D:\\${'a'.repeat(241)}`,
+    ]) expect(operationalStatusWindowsLocalPathIsCanonical(rejected)).toBe(false);
+
+    const capability = operationalStatusCapabilityPath(
+      String.raw`D:\state\bridge.db`,
+      {
+        LOCALAPPDATA: String.raw`\\poisoned\local`,
+        APPDATA: String.raw`\\poisoned\roaming`,
+      },
+      'win32',
+      () => accepted,
+    );
+    expect(capability.startsWith(`${accepted}\\orca-slack-bridge-status-v2\\owner-`)).toBe(true);
+    for (const root of [
+      String.raw`\\server\share`,
+      String.raw`\\?\D:\local`,
+      String.raw`D:relative`,
+      String.raw`D:\local\..\escape`,
+      String.raw`D:\local\stream:secret`,
+    ]) {
+      expect(() => operationalStatusCapabilityPath(
+        String.raw`D:\state\bridge.db`,
+        { LOCALAPPDATA: root },
+        'win32',
+        () => root,
+      )).toThrow('status.capability_path_unavailable');
+    }
+    expect(operationalStatusCapabilityPath(
+      String.raw`D:\state\bridge.db`,
+      {
+        LOCALAPPDATA: String.raw`\\poisoned\local`,
+        APPDATA: String.raw`\\poisoned\roaming`,
+      },
+      'win32',
+      () => accepted,
+    )).toBe(capability);
+    const boundedStore = new CurrentUserOperationalStatusCapabilityStore(
+      'win32',
+      {
+        LOCALAPPDATA: String.raw`C:\poisoned-local-authority`,
+        APPDATA: String.raw`\\poisoned\roaming-authority`,
+      },
+      { windowsKnownLocalAppData: () => accepted },
+    );
+    expect(boundedStore.read(String.raw`C:\poisoned-local-authority\owner.json`))
+      .toEqual({ kind: 'invalid' });
+
+    const calls: string[] = [];
+    expect(operationalStatusWindowsTrustedPowerShell((path) => {
+      calls.push(path);
+      return calls.length === 1
+        ? String.raw`D:\Windows\System32`
+        : String.raw`D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    })).toEqual({
+      root: String.raw`D:\Windows`,
+      systemDirectory: String.raw`D:\Windows\System32`,
+      executable: String.raw`D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+    });
+    expect(calls[0]).toBe(String.raw`\\?\GLOBALROOT\SystemRoot\System32`);
+    expect(() => operationalStatusWindowsTrustedPowerShell(() => String.raw`\\server\System32`))
+      .toThrow('status.capability_permission_failed');
+    expect(operationalStatusWindowsKnownFolderEnvironment(String.raw`D:\Windows`)).toEqual({
+      SystemRoot: String.raw`D:\Windows`,
+      WINDIR: String.raw`D:\Windows`,
+    });
+  });
+
   it('accepts only the exact protected current-user Windows directory and file DACL shapes', () => {
     const rule = {
       currentUser: true,
@@ -1275,6 +1526,97 @@ describe('read-only operational status classification', () => {
     )).toBe(false);
   });
 
+  it('derives a bounded pathname UDS inside the private POSIX capability directory', () => {
+    const runtime = '/run/user/1234';
+    const capability = operationalStatusCapabilityPath(
+      '/srv/orca/state.db',
+      { XDG_RUNTIME_DIR: runtime },
+      'linux',
+    );
+    const socket = operationalStatusOwnerPipePath(
+      '/srv/orca/state.db',
+      { XDG_RUNTIME_DIR: runtime },
+      'linux',
+    );
+    expect(socket[0]).not.toBe('\0');
+    expect(socket.startsWith(`${posix.dirname(capability)}/`)).toBe(true);
+    expect(Buffer.byteLength(socket, 'utf8')).toBeLessThanOrEqual(103);
+    expect(operationalStatusPosixProtectionIsExact(
+      { uid: 1000n, mode: 0o140600n, type: 'socket' },
+      1000n,
+      'socket',
+    )).toBe(true);
+    for (const rejected of [
+      { uid: 1001n, mode: 0o140600n, type: 'socket' as const },
+      { uid: 1000n, mode: 0o140660n, type: 'socket' as const },
+      { uid: 1000n, mode: 0o100600n, type: 'file' as const },
+    ]) {
+      expect(operationalStatusPosixProtectionIsExact(rejected, 1000n, 'socket')).toBe(false);
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')(
+    'publishes and revalidates a real current-user 0700/0600 pathname UDS identity',
+    async () => {
+      const env = { ...process.env, XDG_RUNTIME_DIR: dir };
+      const nativeCapabilityPath = operationalStatusCapabilityPath(statePath, env, 'linux');
+      const native = new CurrentUserOperationalStatusCapabilityStore('linux', env);
+      const store = healthyStore();
+      const owner = new OperationalStatusOwnerServer({
+        statePath,
+        store,
+        capabilityPath: nativeCapabilityPath,
+        capabilityStore: native,
+        env,
+        platform: 'linux',
+        refreshMilliseconds: null,
+        clock: () => new Date(TRANSPORT_AT),
+      });
+      try {
+        await owner.start();
+        const observed = native.read(nativeCapabilityPath);
+        if (observed.kind !== 'ready' || observed.value.status !== 'active' ||
+            observed.value.transport.kind !== 'pipe') throw new Error('expected native UDS');
+        const transport = observed.value.transport;
+        const parent = statSync(posix.dirname(transport.path));
+        const socket = lstatSync(transport.path, { bigint: true });
+        const uid = process.getuid?.();
+        if (uid === undefined) throw new Error('expected POSIX uid');
+        expect(parent.mode & 0o777).toBe(0o700);
+        expect(parent.uid).toBe(uid);
+        expect(socket.isSocket()).toBe(true);
+        expect(socket.mode & 0o777n).toBe(0o600n);
+        expect(socket.uid).toBe(BigInt(uid));
+        expect({ device: String(socket.dev), inode: String(socket.ino) }).toEqual({
+          device: transport.device,
+          inode: transport.inode,
+        });
+        expect(native.verifyOwnerTransport(transport)).toBe(true);
+        await owner.stop();
+        const runtimeDirectory = posix.dirname(nativeCapabilityPath);
+        const baselineEntries = readdirSync(runtimeDirectory).sort();
+        for (let restart = 0; restart < 3; restart += 1) {
+          const rebound = new OperationalStatusOwnerServer({
+            statePath,
+            store,
+            capabilityPath: nativeCapabilityPath,
+            capabilityStore: native,
+            env,
+            platform: 'linux',
+            refreshMilliseconds: null,
+            clock: () => new Date(TRANSPORT_AT),
+          });
+          await rebound.start();
+          await rebound.stop();
+          expect(readdirSync(runtimeDirectory).sort()).toEqual(baselineEntries);
+        }
+      } finally {
+        await owner.stop();
+        store.close();
+      }
+    },
+  );
+
   it('holds the native per-state claim exclusively and releases it for a clean rebind', async () => {
     const nativePath = join(dir, 'native-claim', 'owner.json');
     const identity = operationalStatusStateIdentity(statePath);
@@ -1293,7 +1635,62 @@ describe('read-only operational status classification', () => {
     await rebound.release();
   }, 10_000);
 
-  it('uses a token-free PowerShell environment and atomically replaces stale protected files', async () => {
+  it('restarts immediately over a verified same-state fresh capability left after owner death', async () => {
+    const nativeEnv = process.platform === 'win32'
+      ? {
+        ...process.env,
+        LOCALAPPDATA: String.raw`C:\poisoned-local-authority`,
+        APPDATA: String.raw`\\poisoned\roaming-authority`,
+      }
+      : { ...process.env, XDG_RUNTIME_DIR: dir };
+    const nativePath = process.platform === 'win32'
+      ? join(dir, 'fresh-crash-capability', 'owner.json')
+      : operationalStatusCapabilityPath(statePath, nativeEnv, process.platform);
+    const native = new CurrentUserOperationalStatusCapabilityStore(
+      process.platform,
+      nativeEnv,
+      process.platform === 'win32' ? { windowsKnownLocalAppData: () => dir } : {},
+    );
+    const identity = operationalStatusStateIdentity(statePath);
+    const deadTransport = process.platform === 'win32'
+      ? { kind: 'tcp' as const, host: '127.0.0.1' as const, port: 42_109 }
+      : {
+        kind: 'pipe' as const,
+        path: posix.join(posix.dirname(nativePath), 'dead-owner.sock'),
+        device: '1',
+        inode: '2',
+      };
+    const dead = activeOperationalStatusCapability(identity, deadTransport, TRANSPORT_AT);
+    const deadClaim = await native.acquireOwnerClaim(nativePath, identity);
+    native.publish(nativePath, dead, null, deadClaim);
+    await deadClaim.release();
+
+    const store = healthyStore();
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath: nativePath,
+      capabilityStore: native,
+      env: nativeEnv,
+      platform: process.platform,
+      refreshMilliseconds: null,
+      clock: () => new Date(TRANSPORT_AT),
+    });
+    try {
+      await owner.start();
+      const current = native.read(nativePath);
+      expect(current.kind).toBe('ready');
+      if (current.kind === 'ready') {
+        expect(current.value.status).toBe('active');
+        expect(current.value.capabilityId).not.toBe(dead.capabilityId);
+      }
+    } finally {
+      await owner.stop();
+      store.close();
+    }
+  }, 25_000);
+
+  it('uses a token-free PowerShell environment and a crash-safe fixed protected capability', async () => {
     const sanitized = operationalStatusWindowsPowerShellEnvironment(
       String.raw`C:\Windows`,
       String.raw`C:\private\owner.json`,
@@ -1323,7 +1720,7 @@ describe('read-only operational status classification', () => {
     );
     const endpoint = process.platform === 'win32'
       ? { kind: 'tcp' as const, host: '127.0.0.1' as const, port: 42_100 }
-      : { kind: 'pipe' as const, path: '\0owner-test' };
+      : { kind: 'pipe' as const, path: '/tmp/owner-test.sock', device: '1', inode: '2' };
     const old = activeOperationalStatusCapability(
       operationalStatusStateIdentity(statePath), endpoint, AT0,
     );
@@ -1387,10 +1784,10 @@ describe('read-only operational status classification', () => {
     20_000,
   );
 
-  it('quarantines atomically and preserves an identical-content raced replacement identity', async () => {
+  it('updates through a pinned inode and preserves an identical-content raced replacement identity', async () => {
     const endpoint = process.platform === 'win32'
       ? { kind: 'tcp' as const, host: '127.0.0.1' as const, port: 42_102 }
-      : { kind: 'pipe' as const, path: '\0owner-race-test' };
+      : { kind: 'pipe' as const, path: '/tmp/owner-race-test.sock', device: '1', inode: '2' };
 
     const publishIdentity = operationalStatusStateIdentity(join(dir, 'publish-race.db'));
     const old = activeOperationalStatusCapability(publishIdentity, endpoint, AT0);
@@ -1443,20 +1840,34 @@ describe('read-only operational status classification', () => {
 
     let removeRace = false;
     const removePath = join(dir, 'remove-race', 'owner.json');
+    const removeCandidatePath = join(dir, 'remove-candidate', 'owner.json');
+    const removeIdentity = operationalStatusStateIdentity(join(dir, 'remove-race.db'));
+    const active = activeOperationalStatusCapability(removeIdentity, endpoint, AT0);
+    const retired = retiredOperationalStatusCapability(active, AT1);
+    const removeCandidateStore = new CurrentUserOperationalStatusCapabilityStore(
+      process.platform,
+      process.env,
+    );
+    const removeCandidateClaim = await removeCandidateStore.acquireOwnerClaim(
+      removeCandidatePath,
+      removeIdentity,
+    );
+    removeCandidateStore.publish(removeCandidatePath, active, null, removeCandidateClaim);
+    removeCandidateStore.publish(removeCandidatePath, retired, active, removeCandidateClaim);
+    await removeCandidateClaim.release();
+    const removeCandidateIdentity = lstatSync(removeCandidatePath, { bigint: true });
     const removeStore = new CurrentUserOperationalStatusCapabilityStore(
       process.platform,
       process.env,
       {
-        afterQuarantine: (operation, path, quarantine) => {
-          if (removeRace && operation === 'remove' && path === removePath) {
-            linkSync(quarantine, path);
+        afterInstall: (path) => {
+          if (removeRace && path === removePath) {
+            renameSync(path, `${path}.detached`);
+            renameSync(removeCandidatePath, path);
           }
         },
       },
     );
-    const removeIdentity = operationalStatusStateIdentity(join(dir, 'remove-race.db'));
-    const active = activeOperationalStatusCapability(removeIdentity, endpoint, AT0);
-    const retired = retiredOperationalStatusCapability(active, AT1);
     const removeClaim = await removeStore.acquireOwnerClaim(removePath, removeIdentity);
     try {
       removeStore.publish(removePath, active, null, removeClaim);
@@ -1465,13 +1876,67 @@ describe('read-only operational status classification', () => {
       expect(() => removeStore.remove(removePath, retired, removeClaim))
         .toThrow('status.capability_remove_failed');
       expect(removeStore.read(removePath)).toEqual({ kind: 'ready', value: retired });
+      const preserved = lstatSync(removePath, { bigint: true });
+      expect({ dev: preserved.dev, ino: preserved.ino }).toEqual({
+        dev: removeCandidateIdentity.dev,
+        ino: removeCandidateIdentity.ino,
+      });
     } finally {
       await removeClaim.release();
     }
   }, 25_000);
 
+  it('keeps one fixed bounded capability container through repeated rotation and retirement', async () => {
+    const endpoint = process.platform === 'win32'
+      ? { kind: 'tcp' as const, host: '127.0.0.1' as const, port: 42_110 }
+      : {
+        kind: 'pipe' as const,
+        path: '/tmp/owner-inner-race.sock',
+        device: '1',
+        inode: '2',
+      };
+    const identity = operationalStatusStateIdentity(join(dir, 'bounded-rotation.db'));
+    const targetPath = join(dir, 'bounded-rotation', 'owner.json');
+    const targetStore = new CurrentUserOperationalStatusCapabilityStore(process.platform, process.env);
+    let target = activeOperationalStatusCapability(identity, endpoint, AT0);
+    const targetClaim = await targetStore.acquireOwnerClaim(targetPath, identity);
+    try {
+      targetStore.publish(targetPath, target, null, targetClaim);
+      const parent = dirname(targetPath);
+      const baselineEntries = readdirSync(parent).sort();
+      const baselineIdentity = lstatSync(targetPath, { bigint: true });
+      const retiredSecrets: string[] = [];
+      for (let index = 1; index <= 4; index += 1) {
+        const previous = target;
+        retiredSecrets.push(previous.secret);
+        target = activeOperationalStatusCapability(
+          identity,
+          endpoint,
+          new Date(Date.parse(AT0) + index * 1_000).toISOString(),
+        );
+        targetStore.publish(targetPath, target, previous, targetClaim);
+        expect(readdirSync(parent).sort()).toEqual(baselineEntries);
+        const currentIdentity = lstatSync(targetPath, { bigint: true });
+        expect({ dev: currentIdentity.dev, ino: currentIdentity.ino }).toEqual({
+          dev: baselineIdentity.dev,
+          ino: baselineIdentity.ino,
+        });
+        const bytes = readFileSync(targetPath, 'utf8');
+        for (const oldSecret of retiredSecrets) expect(bytes).not.toContain(oldSecret);
+      }
+      const retired = retiredOperationalStatusCapability(target, AT2);
+      targetStore.publish(targetPath, retired, target, targetClaim);
+      targetStore.remove(targetPath, retired, targetClaim);
+      expect(targetStore.read(targetPath)).toEqual({ kind: 'absent' });
+      expect(readdirSync(parent).sort()).toEqual(baselineEntries);
+      expect(readFileSync(targetPath, 'utf8')).not.toContain(target.secret);
+    } finally {
+      await targetClaim.release();
+    }
+  }, 30_000);
+
   it.skipIf(process.platform !== 'linux')(
-    'rotates a protected stale POSIX claim and preserves a malformed raced claim',
+    'reuses one locked POSIX claim inode across stale, empty, partial, and repeated restarts',
     async () => {
       const nativePath = join(dir, 'posix-claim', 'owner.json');
       const parent = join(dir, 'posix-claim');
@@ -1479,6 +1944,12 @@ describe('read-only operational status classification', () => {
       chmodSync(parent, 0o700);
       const identity = operationalStatusStateIdentity(statePath, 'linux');
       const claimPath = `${nativePath}.claim`;
+      const emptyPrepared = join(parent, '.owner-claim-prepared-crash-empty');
+      const partialPrepared = join(parent, '.owner-claim-prepared-crash-partial');
+      writeFileSync(emptyPrepared, '', { mode: 0o600 });
+      writeFileSync(partialPrepared, '{"version":1', { mode: 0o600 });
+      chmodSync(emptyPrepared, 0o600);
+      chmodSync(partialPrepared, 0o600);
       const stale = {
         version: 1,
         stateIdentity: identity,
@@ -1496,13 +1967,21 @@ describe('read-only operational status classification', () => {
       } finally {
         await claim.release();
       }
-      expect(existsSync(claimPath)).toBe(false);
+      expect(existsSync(claimPath)).toBe(true);
+      expect(readFileSync(claimPath)).toHaveLength(0);
+      expect(readFileSync(emptyPrepared)).toHaveLength(0);
+      expect(readFileSync(partialPrepared, 'utf8')).toBe('{"version":1');
 
-      writeFileSync(claimPath, '{}\n', { mode: 0o600 });
+      writeFileSync(claimPath, '{"version":1', { mode: 0o600 });
       chmodSync(claimPath, 0o600);
-      await expect(native.acquireOwnerClaim(nativePath, identity))
-        .rejects.toThrow('status.owner_claim_failed');
-      expect(readFileSync(claimPath, 'utf8')).toBe('{}\n');
+      const baselineEntries = readdirSync(parent).sort();
+      for (let restart = 0; restart < 4; restart += 1) {
+        const rebound = await native.acquireOwnerClaim(nativePath, identity);
+        rebound.assertHeld();
+        await rebound.release();
+        expect(readFileSync(claimPath)).toHaveLength(0);
+        expect(readdirSync(parent).sort()).toEqual(baselineEntries);
+      }
     },
   );
 
@@ -1527,6 +2006,69 @@ describe('read-only operational status classification', () => {
       expect(hasDetachedDescriptor()).toBe(false);
       expect(readFileSync(claimPath, 'utf8')).toBe('{}\n');
       expect(existsSync(detachedPath)).toBe(true);
+    },
+  );
+
+  it.skipIf(process.platform !== 'linux')(
+    'detects an identical-byte POSIX claim swap between pre/post pathname identity checks',
+    async () => {
+      const nativePath = join(dir, 'post-check-posix-claim', 'owner.json');
+      const identity = operationalStatusStateIdentity(statePath, 'linux');
+      const claimPath = `${nativePath}.claim`;
+      const detachedPath = `${claimPath}.held`;
+      let armed = false;
+      const native = new CurrentUserOperationalStatusCapabilityStore('linux', process.env, {
+        duringPosixClaimAssertion: (path) => {
+          if (!armed) return;
+          armed = false;
+          const replacement = `${path}.replacement`;
+          writeFileSync(replacement, readFileSync(path), { mode: 0o600 });
+          chmodSync(replacement, 0o600);
+          renameSync(path, detachedPath);
+          renameSync(replacement, path);
+        },
+      });
+      const claim = await native.acquireOwnerClaim(nativePath, identity);
+      armed = true;
+      expect(() => claim.assertHeld()).toThrow('status.owner_claim_lost');
+      await expect(claim.release()).rejects.toThrow('status.owner_claim_release_failed');
+      expect(existsSync(claimPath)).toBe(true);
+      expect(existsSync(detachedPath)).toBe(true);
+    },
+  );
+
+  it.skipIf(process.platform !== 'linux')(
+    'closes the descriptor when the initial POSIX claim assertion detects a pathname swap',
+    async () => {
+      const nativePath = join(dir, 'initial-posix-claim-swap', 'owner.json');
+      const identity = operationalStatusStateIdentity(statePath, 'linux');
+      const claimPath = `${nativePath}.claim`;
+      const detachedPath = `${claimPath}.held`;
+      let armed = true;
+      const native = new CurrentUserOperationalStatusCapabilityStore('linux', process.env, {
+        duringPosixClaimAssertion: (path) => {
+          if (!armed) return;
+          armed = false;
+          const replacement = `${path}.replacement`;
+          writeFileSync(replacement, readFileSync(path), { mode: 0o600 });
+          chmodSync(replacement, 0o600);
+          renameSync(path, detachedPath);
+          renameSync(replacement, path);
+        },
+      });
+      const hasDetachedDescriptor = (): boolean => readdirSync('/proc/self/fd').some((entry) => {
+        try { return readlinkSync(`/proc/self/fd/${entry}`) === detachedPath; } catch { return false; }
+      });
+
+      await expect(native.acquireOwnerClaim(nativePath, identity))
+        .rejects.toThrow('status.owner_claim_failed');
+      expect(hasDetachedDescriptor()).toBe(false);
+      expect(existsSync(claimPath)).toBe(true);
+      expect(existsSync(detachedPath)).toBe(true);
+
+      const rebound = await native.acquireOwnerClaim(nativePath, identity);
+      rebound.assertHeld();
+      await rebound.release();
     },
   );
 

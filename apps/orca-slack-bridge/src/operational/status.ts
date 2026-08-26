@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { backup, DatabaseSync } from 'node:sqlite';
 import {
@@ -38,6 +38,7 @@ import {
   type ActiveOperationalStatusCapability,
   type OperationalStatusCapabilityStore,
   type OperationalStatusOwnerClaim,
+  type OperationalStatusOwnerTransportIdentity,
   type OperationalStatusTransportEndpoint,
   type RetiredOperationalStatusCapability,
 } from './status-capability.js';
@@ -509,7 +510,7 @@ function parseOwnerRequest(
         !FINGERPRINT_PATTERN.test(record['buildFingerprint'])))) return null;
   const age = now.getTime() - Date.parse(record['sentAt']);
   if (age < -STATUS_OWNER_CAPABILITY_FUTURE_TOLERANCE_MS ||
-      age > STATUS_OWNER_MESSAGE_MAX_AGE_MS) return null;
+      age >= STATUS_OWNER_MESSAGE_MAX_AGE_MS) return null;
   const unsigned: UnsignedOwnerRequest = {
     version: 2,
     stateIdentity: record['stateIdentity'] as string,
@@ -614,18 +615,29 @@ function transportNow(clock: () => Date): Date | null {
 
 export function operationalStatusOwnerPipePath(
   statePath: string,
+  env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): string {
   if (platform === 'win32') throw new TypeError('status.owner_transport_invalid');
   const key = operationalStatusStateIdentity(statePath, platform).slice(0, 24);
-  const user = typeof process.getuid === 'function' ? String(process.getuid()) : 'user';
-  return `\0orca-slack-bridge-status-v2-${user}-${key}`;
+  const capability = operationalStatusCapabilityPath(statePath, env, platform);
+  const path = ownerPipePathForCapability(capability, key);
+  return path;
+}
+
+function ownerPipePathForCapability(capabilityPath: string, stateKey: string): string {
+  const path = posix.join(posix.dirname(capabilityPath), `owner-${stateKey}.sock`);
+  if (!posix.isAbsolute(path) || path[0] === '\0' || Buffer.byteLength(path, 'utf8') > 103) {
+    throw new TypeError('status.owner_transport_invalid');
+  }
+  return path;
 }
 
 function expectedOwnerTransport(
   value: unknown,
   statePath: string,
   pipePath: string | undefined,
+  capabilityPath: string,
   platform: NodeJS.Platform,
 ): value is OperationalStatusTransportEndpoint {
   if (platform === 'win32') {
@@ -634,9 +646,12 @@ function expectedOwnerTransport(
       record['host'] === '127.0.0.1' && Number.isSafeInteger(record['port']) &&
       Number(record['port']) >= 1 && Number(record['port']) <= 65_535;
   }
-  const record = exactRecord(value, ['kind', 'path']);
+  const record = exactRecord(value, ['kind', 'path', 'device', 'inode']);
   return record !== null && record['kind'] === 'pipe' &&
-    record['path'] === (pipePath ?? operationalStatusOwnerPipePath(statePath, platform));
+    record['path'] === (pipePath ?? ownerPipePathForCapability(
+      capabilityPath,
+      operationalStatusStateIdentity(statePath, platform).slice(0, 24),
+    ));
 }
 
 export type OperationalStatusOwnerServerLike = {
@@ -661,8 +676,10 @@ export type OperationalStatusOwnerServerOptions = {
   readonly refreshMilliseconds?: number | null;
   /** Test seam for the refreshing inactivity timeout. */
   readonly requestIdleTimeoutMilliseconds?: number;
-  /** Test seam for the non-refreshing wall-clock request deadline. */
+  /** Test seam for the non-refreshing monotonic request deadline. */
   readonly requestAbsoluteDeadlineMilliseconds?: number;
+  /** Test seam for replay-capacity expiry without opening 2,049 sockets. */
+  readonly acceptedNonceLimit?: number;
   readonly beforeRefresh?: () => void;
   readonly afterDaemonCapture?: () => void;
 };
@@ -681,8 +698,10 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
   private readonly refreshMilliseconds: number | null;
   private readonly requestIdleTimeoutMilliseconds: number;
   private readonly requestAbsoluteDeadlineMilliseconds: number;
+  private readonly acceptedNonceLimit: number;
   private server: Server | null = null;
   private ownerClaim: OperationalStatusOwnerClaim | null = null;
+  private ownerTransport: OperationalStatusOwnerTransportIdentity | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private generation: OwnerGeneration | null = null;
   private readonly sockets = new Set<Socket>();
@@ -696,12 +715,15 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       throw new TypeError('status.owner_transport_invalid');
     }
     this.platform = platform;
-    this.pipePath = platform === 'win32'
-      ? null
-      : options.pipePath ?? operationalStatusOwnerPipePath(options.statePath, platform);
     this.stateIdentity = operationalStatusStateIdentity(options.statePath, platform);
     this.capabilityPath = options.capabilityPath ??
       operationalStatusCapabilityPath(options.statePath, env, platform);
+    this.pipePath = platform === 'win32'
+      ? null
+      : options.pipePath ?? ownerPipePathForCapability(
+        this.capabilityPath,
+        this.stateIdentity.slice(0, 24),
+      );
     this.capabilityStore = options.capabilityStore ??
       new CurrentUserOperationalStatusCapabilityStore(platform, env);
     this.clock = options.clock ?? (() => new Date());
@@ -722,6 +744,12 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     }
     this.requestIdleTimeoutMilliseconds = idleTimeout;
     this.requestAbsoluteDeadlineMilliseconds = absoluteDeadline;
+    const acceptedNonceLimit = options.acceptedNonceLimit ?? STATUS_OWNER_MAX_ACCEPTED_NONCES;
+    if (!Number.isSafeInteger(acceptedNonceLimit) || acceptedNonceLimit < 1 ||
+        acceptedNonceLimit > STATUS_OWNER_MAX_ACCEPTED_NONCES) {
+      throw new TypeError('status.owner_nonce_limit_invalid');
+    }
+    this.acceptedNonceLimit = acceptedNonceLimit;
   }
 
   refresh(): void {
@@ -732,6 +760,13 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         throw new Error('status.snapshot_unavailable');
       }
       claim.assertHeld();
+      if (this.ownerTransport !== null) {
+        this.capabilityStore.assertOwnerTransport(
+          this.ownerTransport,
+          this.stateIdentity,
+          claim,
+        );
+      }
       this.options.beforeRefresh?.();
       const captured = captureOperationalStore(this.options.store, this.options.afterDaemonCapture);
       const now = transportNow(this.clock);
@@ -783,6 +818,15 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       throw new Error('status.owner_start_failed');
     }
     this.ownerClaim = claim;
+    try {
+      if (this.pipePath !== null) {
+        this.capabilityStore.prepareOwnerTransport(this.pipePath, this.stateIdentity, claim);
+      }
+    } catch {
+      this.ownerClaim = null;
+      try { await claim.release(); } catch { /* preparation remains a failed start */ }
+      throw new Error('status.owner_start_failed');
+    }
     const server = createServer({ allowHalfOpen: true }, (socket) => this.accept(socket));
     this.server = server;
     let published: ActiveOperationalStatusCapability | null = null;
@@ -803,7 +847,14 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
           server.listen(this.pipePath!, ready);
         }
       });
-      const transport = this.boundTransport(server);
+      if (this.pipePath !== null) {
+        this.ownerTransport = this.capabilityStore.activateOwnerTransport(
+          this.pipePath,
+          this.stateIdentity,
+          claim,
+        );
+      }
+      const transport = this.boundTransport(server, this.ownerTransport);
       if (transport === null) throw new Error('status.owner_start_failed');
       this.options.beforeRefresh?.();
       const captured = captureOperationalStore(this.options.store, this.options.afterDaemonCapture);
@@ -820,9 +871,7 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       };
       const existing = this.capabilityStore.read(this.capabilityPath);
       if (existing.kind === 'invalid' ||
-          (existing.kind === 'ready' && existing.value.stateIdentity !== this.stateIdentity) ||
-          (existing.kind === 'ready' && existing.value.status === 'active' &&
-           operationalStatusCapabilityIsFresh(existing.value, now))) {
+          (existing.kind === 'ready' && existing.value.stateIdentity !== this.stateIdentity)) {
         throw new Error('status.owner_start_failed');
       }
       published = generation.capability;
@@ -847,6 +896,16 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       await new Promise<void>((resolveClose) => {
         try { server.close(() => resolveClose()); } catch { resolveClose(); }
       });
+      if (this.ownerTransport !== null) {
+        try {
+          this.capabilityStore.retireOwnerTransport(
+            this.ownerTransport,
+            this.stateIdentity,
+            claim,
+          );
+        } catch { /* identity drift is preserved and remains a failed start */ }
+        this.ownerTransport = null;
+      }
       if (published !== null) {
         try {
           const now = transportNow(this.clock);
@@ -874,9 +933,12 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     }
   }
 
-  private boundTransport(server: Server): OperationalStatusTransportEndpoint | null {
+  private boundTransport(
+    server: Server,
+    ownerTransport: OperationalStatusOwnerTransportIdentity | null,
+  ): OperationalStatusTransportEndpoint | null {
     if (this.platform !== 'win32') {
-      return this.pipePath === null ? null : { kind: 'pipe', path: this.pipePath };
+      return ownerTransport;
     }
     const address = server.address();
     return address !== null && typeof address !== 'string' && address.family === 'IPv4' &&
@@ -893,6 +955,8 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     this.server = null;
     const claim = this.ownerClaim;
     this.ownerClaim = null;
+    const ownerTransport = this.ownerTransport;
+    this.ownerTransport = null;
     const active = this.generation?.capability ?? null;
     this.generation = null;
     this.acceptedNonces.clear();
@@ -922,6 +986,12 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         try { server.close(() => resolveClose()); } catch { resolveClose(); }
       });
     }
+    if (ownerTransport !== null) {
+      try {
+        if (claim === null) throw new Error('status.owner_stop_failed');
+        this.capabilityStore.retireOwnerTransport(ownerTransport, this.stateIdentity, claim);
+      } catch { failed = true; }
+    }
     if (retired !== null) {
       try {
         if (claim === null) throw new Error('status.owner_stop_failed');
@@ -940,21 +1010,40 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       socket.destroy();
       return;
     }
+    try {
+      if (this.ownerTransport !== null) {
+        const claim = this.ownerClaim;
+        if (claim === null) throw new Error('status.owner_transport_lost');
+        this.capabilityStore.assertOwnerTransport(
+          this.ownerTransport,
+          this.stateIdentity,
+          claim,
+        );
+      }
+    } catch {
+      socket.destroy();
+      return;
+    }
     this.sockets.add(socket);
+    const verification = new AbortController();
     const acceptedAt = process.hrtime.bigint();
     const absoluteDeadlineNanoseconds =
       BigInt(this.requestAbsoluteDeadlineMilliseconds) * 1_000_000n;
     const absoluteDeadlinePassed = (): boolean =>
       process.hrtime.bigint() - acceptedAt >= absoluteDeadlineNanoseconds;
-    const absoluteTimer = setTimeout(
-      () => socket.destroy(),
-      this.requestAbsoluteDeadlineMilliseconds,
-    );
+    const absoluteTimer = setTimeout(() => {
+      verification.abort();
+      socket.destroy();
+    }, this.requestAbsoluteDeadlineMilliseconds);
     absoluteTimer.unref?.();
-    socket.setTimeout(this.requestIdleTimeoutMilliseconds, () => socket.destroy());
+    socket.setTimeout(this.requestIdleTimeoutMilliseconds, () => {
+      verification.abort();
+      socket.destroy();
+    });
     socket.on('error', () => undefined);
     socket.on('close', () => {
       clearTimeout(absoluteTimer);
+      verification.abort();
       this.sockets.delete(socket);
     });
     let input = Buffer.alloc(0);
@@ -973,22 +1062,19 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         socket.destroy();
       }
     });
-    socket.on('end', () => {
+    socket.on('end', () => { void (async () => {
       if (rejected || absoluteDeadlinePassed()) {
         socket.destroy();
         return;
       }
       const generation = this.generation;
       const now = transportNow(this.clock);
-      const persisted = this.capabilityStore.read(this.capabilityPath);
-      if (absoluteDeadlinePassed() || generation === null || now === null ||
-          !operationalStatusCapabilityIsFresh(generation.capability, now) ||
-          persisted.kind !== 'ready' || persisted.value.status !== 'active' ||
-          !sameCanonical(persisted.value, generation.capability)) {
+      if (generation === null || now === null ||
+          !operationalStatusCapabilityIsFresh(generation.capability, now)) {
         socket.destroy();
         return;
       }
-      const request = parseOwnerRequest(
+      let request = parseOwnerRequest(
         parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
         generation,
         now,
@@ -997,7 +1083,30 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         socket.destroy();
         return;
       }
-      if (!this.reserveAcceptedNonce(request.capabilityId, request.nonce, now)) {
+      const persisted = await this.capabilityStore.readForRequest(
+        this.capabilityPath,
+        verification.signal,
+      );
+      const verifiedAt = transportNow(this.clock);
+      if (verification.signal.aborted || socket.destroyed || absoluteDeadlinePassed() ||
+          verifiedAt === null || this.generation !== generation ||
+          !operationalStatusCapabilityIsFresh(generation.capability, verifiedAt) ||
+          persisted.kind !== 'ready' || persisted.value.status !== 'active' ||
+          !sameCanonical(persisted.value, generation.capability)) {
+        socket.destroy();
+        return;
+      }
+      request = parseOwnerRequest(
+        parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
+        generation,
+        verifiedAt,
+      );
+      if (request === null || !this.reserveAcceptedNonce(
+        request.capabilityId,
+        request.nonce,
+        request.sentAt,
+        verifiedAt,
+      )) {
         socket.destroy();
         return;
       }
@@ -1036,18 +1145,24 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         return;
       }
       socket.end(response);
-    });
+    })().catch(() => socket.destroy()); });
   }
 
-  private reserveAcceptedNonce(capabilityId: string, nonce: string, now: Date): boolean {
+  private reserveAcceptedNonce(
+    capabilityId: string,
+    nonce: string,
+    sentAt: string,
+    now: Date,
+  ): boolean {
     if (this.acceptedNonceCapabilityId !== capabilityId) return false;
-    const expiresBefore = now.getTime() - STATUS_OWNER_MESSAGE_MAX_AGE_MS;
-    for (const [acceptedNonce, acceptedAt] of this.acceptedNonces) {
-      if (acceptedAt <= expiresBefore) this.acceptedNonces.delete(acceptedNonce);
+    for (const [acceptedNonce, expiresAt] of this.acceptedNonces) {
+      if (expiresAt <= now.getTime()) this.acceptedNonces.delete(acceptedNonce);
     }
+    const expiresAt = Date.parse(sentAt) + STATUS_OWNER_MESSAGE_MAX_AGE_MS;
+    if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) return false;
     if (this.acceptedNonces.has(nonce) ||
-        this.acceptedNonces.size >= STATUS_OWNER_MAX_ACCEPTED_NONCES) return false;
-    this.acceptedNonces.set(nonce, now.getTime());
+        this.acceptedNonces.size >= this.acceptedNonceLimit) return false;
+    this.acceptedNonces.set(nonce, expiresAt);
     return true;
   }
 }
@@ -1070,7 +1185,7 @@ function parseOwnerResponse(
       !canonicalIso(response['capturedAt'])) return null;
   const age = now.getTime() - Date.parse(response['capturedAt']);
   if (age < -STATUS_OWNER_CAPABILITY_FUTURE_TOLERANCE_MS ||
-      age > STATUS_OWNER_MESSAGE_MAX_AGE_MS) return null;
+      age >= STATUS_OWNER_MESSAGE_MAX_AGE_MS) return null;
   const unsignedResponse = {
     version: response['version'],
     stateIdentity: response['stateIdentity'],
@@ -1114,10 +1229,32 @@ async function requestOwnedOperationalStatus(
     return null;
   }
   const store = capabilityStore ?? new CurrentUserOperationalStatusCapabilityStore(platform, env);
-  const observed = store.read(resolvedCapabilityPath);
+  const requestStartedAt = process.hrtime.bigint();
+  const capabilityVerification = new AbortController();
+  const verificationTimer = setTimeout(() => capabilityVerification.abort(), timeout);
+  verificationTimer.unref?.();
+  let observed: ReturnType<OperationalStatusCapabilityStore['read']>;
+  try {
+    observed = await store.readForRequest(resolvedCapabilityPath, capabilityVerification.signal);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(verificationTimer);
+  }
+  const elapsedMilliseconds = Number(process.hrtime.bigint() - requestStartedAt) / 1_000_000;
+  const remainingMilliseconds = Math.floor(timeout - elapsedMilliseconds);
   if (observed.kind !== 'ready' || observed.value.status !== 'active' ||
       observed.value.stateIdentity !== stateIdentity ||
-      !expectedOwnerTransport(observed.value.transport, statePath, pipePath, platform) ||
+      !expectedOwnerTransport(
+        observed.value.transport,
+        statePath,
+        pipePath,
+        resolvedCapabilityPath,
+        platform,
+      ) ||
+      (observed.value.transport.kind === 'pipe' &&
+       !store.verifyOwnerTransport(observed.value.transport)) ||
+      remainingMilliseconds < 1 ||
       !operationalStatusCapabilityIsFresh(observed.value, now)) return null;
   const capability = observed.value;
   const nonce = randomBytes(16).toString('hex');
@@ -1155,7 +1292,7 @@ async function requestOwnedOperationalStatus(
       socket.destroy();
       resolveRequest(value);
     };
-    const timer = setTimeout(() => finish(null), timeout);
+    const timer = setTimeout(() => finish(null), remainingMilliseconds);
     timer.unref?.();
     socket.on('connect', () => socket.end(request));
     socket.on('error', () => finish(null));
