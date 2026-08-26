@@ -263,6 +263,70 @@ describe('O1-3 effective Run routing', () => {
     expect(rendered).not.toContain('private-orca-two');
   });
 
+  it('preserves summary-first route-zero evidence at 16 repositories times 16 Orca IDs', async () => {
+    const projects = ['alpha', 'beta'].map((name, projectIndex) => ({
+      name,
+      repositories: Array.from({ length: 8 }, (_, index) =>
+        `acme/repo-${projectIndex * 8 + index}`),
+    }));
+    const bridgeConfig = config(projects);
+    const rows = Array.from({ length: 16 }, (_, repositoryIndex) =>
+      Array.from({ length: 16 }, (_, aliasIndex) => ({
+        id: `private-orca-${repositoryIndex}-${aliasIndex}`,
+        repository: `acme/repo-${repositoryIndex}`,
+        numeric: 1_000 + repositoryIndex,
+        project: repositoryIndex < 8 ? 'alpha' : 'beta',
+      }))).flat();
+    const routing = effective(bridgeConfig, rows);
+    const ids = rows.map((row) => row.id);
+    const render = async (repositoryIds: readonly string[]) => {
+      const result = await collectRunFacts(
+        new RunOrca(
+          [runRow('private-run-maximum', EVIDENCE_AT)],
+          new Map([['private-run-maximum', repositoryIds]]),
+        ),
+        routing,
+        { now: () => OBSERVED_AT },
+      );
+      expect(result.runs).toEqual([]);
+      const routeBlock = result.unregistered.runs[0]?.degraded.find((row) =>
+        row.kind === 'repository_route_blocked');
+      expect(routeBlock?.counts).toEqual({
+        observedRepositories: 256,
+        resolvedProjects: 2,
+        blockingReasons: 1,
+      });
+      const card = renderRunCollectionCard({
+        cards: result.runs.length,
+        collection: { degraded: result.degraded, unregistered: result.unregistered },
+      });
+      return { result, card };
+    };
+
+    const forward = await render(ids);
+    const reverse = await render([...ids].reverse());
+    expect(reverse.card).toEqual(forward.card);
+
+    const rendered = JSON.stringify(forward.card);
+    const refs = forward.result.unregistered.runs[0]?.repositoryRefs ?? [];
+    expect(new Set(refs).size).toBe(256);
+    for (const ref of refs) expect(rendered).toContain(ref);
+    expect(rendered).toContain('observedRepositories=256');
+    expect(rendered).toContain('resolvedProjects=2');
+    expect(rendered).toContain('blockingReasons=1');
+    expect(rendered).not.toContain('omittedRefs=');
+    expect(rendered.indexOf('observedRepositories=256')).toBeLessThan(
+      rendered.indexOf(refs[0]!),
+    );
+    expect(forward.card.blocks.length).toBeLessThanOrEqual(50);
+    for (const block of forward.card.blocks) {
+      const text = (block['text'] as { readonly text?: string } | undefined)?.text ?? '';
+      expect(text.length).toBeLessThanOrEqual(3_000);
+    }
+    expect(rendered).not.toContain('private-run-maximum');
+    for (const id of ids) expect(rendered).not.toContain(id);
+  });
+
   it.each([
     ['unknown', 'orca-unknown', undefined],
     ['capacity-deferred', 'orca-deferred', 'capacity_deferred'],

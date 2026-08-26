@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   bridgeConfigFingerprint,
   buildEffectiveBridgeConfig,
@@ -753,6 +754,57 @@ describe('O1-3 repository discovery reconciliation', () => {
       binding.status === 'blocked' && binding.reason === 'canonical_conflict')).toBe(false);
   });
 
+  it.each([
+    ['forward', ['orca-original', 'orca-reused']],
+    ['reverse', ['orca-reused', 'orca-original']],
+  ] as const)(
+    'keeps a renamed auto Project singleton when its old canonical name is reused: %s',
+    async (_order, ids) => {
+      const bridgeConfig = config();
+      await pass(
+        [repoRow('orca-original', 'acme/old')], bridgeConfig,
+        new FakeGithub(() => ({ id: 1, nameWithOwner: 'acme/old' })),
+      );
+      const renamed = await pass(
+        [repoRow('orca-original', 'acme/old')], bridgeConfig,
+        new FakeGithub(() => ({ id: 1, nameWithOwner: 'acme/new' })),
+        T1,
+      );
+      expect(renamed.snapshot.repositories).toMatchObject([{
+        canonicalKey: 'github.com/acme/new', githubRepositoryId: 1,
+        projectKey: 'auto:github.com/acme/old',
+      }]);
+
+      const rows = new Map([
+        ['orca-original', repoRow('orca-original', 'acme/new')],
+        ['orca-reused', repoRow('orca-reused', 'acme/old')],
+      ]);
+      const github = new FakeGithub((name) => name === 'acme/new'
+        ? { id: 1, nameWithOwner: 'acme/new' }
+        : { id: 2, nameWithOwner: 'acme/old' });
+      const reused = await pass(ids.map((id) => rows.get(id)!), bridgeConfig, github, T2);
+
+      expect(reused.status).toBe('succeeded');
+      expect(github.calls).toEqual(['acme/new', 'acme/old']);
+      expect(reused.effectiveConfig.projects).toHaveLength(2);
+      expect(reused.effectiveConfig.projects).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          key: 'auto:github.com/acme/old', origin: 'auto',
+          repositories: [expect.objectContaining({ canonicalKey: 'github.com/acme/new' })],
+          orcaRepositoryIds: ['orca-original'],
+        }),
+        expect.objectContaining({
+          key: 'auto:github-id:2', origin: 'auto',
+          repositories: [expect.objectContaining({ canonicalKey: 'github.com/acme/old' })],
+          orcaRepositoryIds: ['orca-reused'],
+        }),
+      ]));
+      expect(new Set(reused.effectiveConfig.projects.map((project) => project.key)).size).toBe(2);
+      expect(reused.effectiveConfig.projects.every((project) =>
+        project.repositories.length === 1 && project.orcaRepositoryIds.length === 1)).toBe(true);
+    },
+  );
+
   it('requires explicit fingerprint proof for LKG and preserves only a matching proof', async () => {
     const bridgeConfig = config();
     await pass(
@@ -873,6 +925,82 @@ describe('O1-3 repository discovery reconciliation', () => {
     expect(failure.effectiveConfig.projects.map((row) => row.key)).toEqual([
       'auto:github.com/acme/new',
     ]);
+  });
+
+  it('replaces a fully inactive incompatible generation atomically across rollback and restart', async () => {
+    const configA = config();
+    const configB = config([], { runsPerPass: 63 });
+    const proofA = bridgeConfigFingerprint(configA);
+    await pass([
+      repoRow('orca-one', 'acme/one'),
+      repoRow('orca-two', 'acme/two'),
+    ], configA, new FakeGithub((name) => ({
+      id: name === 'acme/one' ? 100 : 200,
+      nameWithOwner: name,
+    })));
+    await pass([], configA, new FakeGithub(() => new Error('not called')), T1);
+    await pass([], configA, new FakeGithub(() => new Error('not called')), T2);
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual({
+      repositories: [], bindings: [], issues: [],
+    });
+
+    const databasePath = join(directory, 'state.db');
+    store.close();
+    let raw = new DatabaseSync(databasePath, { readOnly: true });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM repository_registry').get())
+      .toEqual({ count: 2 });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM orca_repository_binding').get())
+      .toEqual({ count: 2 });
+    raw.close();
+
+    store = new SqliteDigestStore(databasePath, {
+      operationalFault: (point) => {
+        if (point === 'after_discovery_registry') throw new Error('private rollback marker');
+      },
+    });
+    const rolledBack = await pass(
+      [repoRow('orca-current', 'acme/two')], configB,
+      new FakeGithub(() => ({ id: 100, nameWithOwner: 'acme/two' })),
+      '2026-08-27T02:00:00.000Z',
+      { lastKnownGoodConfigFingerprint: proofA },
+    );
+    expect(rolledBack).toMatchObject({ status: 'failed', failure: 'config_drift' });
+    expect(rolledBack.snapshot).toEqual({ repositories: [], bindings: [], issues: [] });
+    store.close();
+
+    raw = new DatabaseSync(databasePath, { readOnly: true });
+    expect(raw.prepare('SELECT canonical_key, github_repository_id FROM repository_registry ORDER BY canonical_key').all())
+      .toEqual([
+        { canonical_key: 'github.com/acme/one', github_repository_id: 100 },
+        { canonical_key: 'github.com/acme/two', github_repository_id: 200 },
+      ]);
+    raw.close();
+
+    store = new SqliteDigestStore(databasePath);
+    const transitioned = await pass(
+      [repoRow('orca-current', 'acme/two')], configB,
+      new FakeGithub(() => ({ id: 100, nameWithOwner: 'acme/two' })),
+      '2026-08-27T02:00:00.000Z',
+      { lastKnownGoodConfigFingerprint: proofA },
+    );
+    expect(transitioned).toMatchObject({ status: 'succeeded' });
+    expect(transitioned.snapshot.repositories).toMatchObject([{
+      canonicalKey: 'github.com/acme/two', githubRepositoryId: 100,
+      projectKey: 'auto:github.com/acme/two', active: true,
+    }]);
+    expect(transitioned.snapshot.bindings).toMatchObject([{
+      orcaRepositoryId: 'orca-current', canonicalKey: 'github.com/acme/two', active: true,
+    }]);
+    store.close();
+
+    raw = new DatabaseSync(databasePath, { readOnly: true });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM repository_registry').get())
+      .toEqual({ count: 1 });
+    expect(raw.prepare('SELECT COUNT(*) AS count FROM orca_repository_binding').get())
+      .toEqual({ count: 1 });
+    raw.close();
+    store = new SqliteDigestStore(databasePath);
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual(transitioned.snapshot);
   });
 
   it('excludes an incompatible explicit Project from current conflict inference', async () => {
@@ -1045,6 +1173,51 @@ describe('O1-3 repository discovery reconciliation', () => {
     expect(Object.isFrozen(first)).toBe(true);
     expect(Object.isFrozen(first.projects)).toBe(true);
     expect(Object.isFrozen(first.projects[0])).toBe(true);
+  });
+
+  it('fails closed on a legacy snapshot whose auto key has two numeric owners', () => {
+    const record = (name: 'acme/new' | 'acme/old', numeric: number) => ({
+      canonicalKey: `github.com/${name}` as const,
+      nameWithOwner: name,
+      githubRepositoryId: numeric,
+      projectKey: 'auto:github.com/acme/old',
+      projectOrigin: 'auto' as const,
+      active: true,
+      consecutiveMissingPasses: 0,
+      firstSeenAt: T0,
+      lastSeenAt: T0,
+      lastGoodAt: T0,
+      updatedAt: T0,
+    });
+    const binding = (id: string, name: 'acme/new' | 'acme/old') => ({
+      orcaRepositoryId: id,
+      canonicalKey: `github.com/${name}` as const,
+      projectKey: 'auto:github.com/acme/old',
+      origin: 'discovered' as const,
+      active: true,
+      consecutiveMissingPasses: 0,
+      firstSeenAt: T0,
+      lastSeenAt: T0,
+      lastGoodAt: T0,
+      updatedAt: T0,
+    });
+    const effective = buildEffectiveBridgeConfig(config(), {
+      repositories: [record('acme/new', 1), record('acme/old', 2)],
+      bindings: [binding('orca-original', 'acme/new'), binding('orca-reused', 'acme/old')],
+      issues: [],
+    });
+
+    expect(effective.routing).toEqual({ status: 'blocked', reason: 'project_conflict' });
+    expect(effective.projects).toEqual([]);
+    expect(effective.bindings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        status: 'blocked', reason: 'project_conflict', orcaRepositoryIds: ['orca-original'],
+      }),
+      expect.objectContaining({
+        status: 'blocked', reason: 'project_conflict', orcaRepositoryIds: ['orca-reused'],
+      }),
+    ]));
+    expect(effective.bindings.some((row) => row.status === 'bound')).toBe(false);
   });
 
   it('fails closed without merging an auto repository into a colliding hand-built explicit key', async () => {

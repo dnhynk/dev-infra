@@ -183,6 +183,11 @@ function autoProjectKey(identity: CanonicalGithubRepository): string {
   return `${AUTO_PROJECT_KEY_PREFIX}${identity.canonicalKey}`;
 }
 
+/** Collision-only key. Base-36 is a short one-to-one discriminator for the numeric owner. */
+function numericAutoProjectKey(githubRepositoryId: number): string {
+  return `${AUTO_PROJECT_KEY_PREFIX}github-id:${githubRepositoryId.toString(36)}`;
+}
+
 async function confirmBeforeDeadline(
   confirmer: RepositoryIdentityConfirmer,
   candidate: CanonicalCandidate,
@@ -259,7 +264,9 @@ export async function runRepositoryDiscoveryPass(
   const lkgProof = options.lastKnownGoodConfigFingerprint as string | null | undefined;
   const lkgCompatible = typeof lkgProof === 'string' && lkgProof === fingerprint;
   const previous = options.store.readEffectiveDiscoverySnapshot();
-  const hasDurableLkg = previous.repositories.length > 0 || previous.bindings.length > 0;
+  // The effective snapshot intentionally hides inactive rows. Generation isolation must not: an
+  // incompatible proof has to replace every routing row, including rows beyond the active view.
+  const hasDurableLkg = options.store.hasDiscoveryRoutingRows();
   const lkgProofFailed = lkgProof === undefined || (hasDurableLkg && !lkgCompatible);
   const prior = lkgCompatible ? previous : EMPTY_SNAPSHOT;
 
@@ -333,6 +340,17 @@ export async function runRepositoryDiscoveryPass(
     previousBindingsByCanonical.set(binding.canonicalKey, [...rows, binding]);
   }
   const previousBindingById = new Map(prior.bindings.map((row) => [row.orcaRepositoryId, row]));
+  const autoProjectOwners = new Map<string, number>();
+  const conflictingAutoProjectKeys = new Set<string>();
+  for (const repository of prior.repositories) {
+    if (repository.projectOrigin !== 'auto' || repository.githubRepositoryId === null) continue;
+    const owner = autoProjectOwners.get(repository.projectKey);
+    if (owner !== undefined && owner !== repository.githubRepositoryId) {
+      conflictingAutoProjectKeys.add(repository.projectKey);
+      continue;
+    }
+    autoProjectOwners.set(repository.projectKey, repository.githubRepositoryId);
+  }
   const idsForCanonical = (
     canonicalKey: CanonicalGithubRepository['canonicalKey'],
     extra: readonly string[] = [],
@@ -782,11 +800,23 @@ export async function runRepositoryDiscoveryPass(
     }
     const observedCanonicalKeys = new Set(rows.map((row) => row.observed.canonicalKey));
     const firstObservedCanonical = [...observedCanonicalKeys].sort(compareText)[0]!;
-    const projectKey = [...explicitProjects][0] ??
+    let projectKey = [...explicitProjects][0] ??
       (numericLkg?.projectOrigin === 'auto'
         ? numericLkg.projectKey
         : `${AUTO_PROJECT_KEY_PREFIX}${firstObservedCanonical}`);
     const projectOrigin: EffectiveProjectOrigin = explicitProjects.size === 0 ? 'auto' : 'explicit';
+    if (projectOrigin === 'auto') {
+      const preferredOwner = autoProjectOwners.get(projectKey);
+      if (numericLkg === undefined && preferredOwner !== undefined && preferredOwner !== numeric) {
+        projectKey = numericAutoProjectKey(numeric);
+      }
+      const owner = autoProjectOwners.get(projectKey);
+      if (conflictingAutoProjectKeys.has(projectKey) || (owner !== undefined && owner !== numeric)) {
+        markNumericConflict(new Set([numeric]), 'project_conflict', rowIndex, identity);
+        continue;
+      }
+      autoProjectOwners.set(projectKey, numeric);
+    }
     const currentIds = [...new Set(rows.flatMap((row) => row.orcaRepositoryIds))].sort();
     const allIds = idsForNumeric(numeric, currentIds);
     if (allIds.length > idLimit) {
@@ -930,7 +960,9 @@ export async function runRepositoryDiscoveryPass(
   try {
     durable = options.store.replaceDiscoverySnapshot({
       passOutcome: 'succeeded',
-      routingMode: hasDurableLkg && !lkgCompatible ? 'replace' : 'reconcile',
+      // Absence is also an incompatible proof. Always enter the store's atomic replace path so
+      // inactive rows cannot survive merely because the active snapshot happened to be empty.
+      routingMode: lkgCompatible ? 'reconcile' : 'replace',
       repositories: [...repositoryInputs.values()].sort((a, b) =>
         compareText(a.canonicalKey, b.canonicalKey)),
       bindings: [...bindingInputs.values()].sort((a, b) =>

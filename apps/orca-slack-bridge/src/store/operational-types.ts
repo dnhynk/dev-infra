@@ -287,6 +287,8 @@ export type SlackRootPostedInput = {
 
 export interface OperationalStore {
   replaceDiscoverySnapshot(input: ReplaceDiscoverySnapshotInput): EffectiveDiscoverySnapshot;
+  /** Includes inactive rows so config-generation decisions cannot be made from the active view. */
+  hasDiscoveryRoutingRows(): boolean;
   readEffectiveDiscoverySnapshot(): EffectiveDiscoverySnapshot;
 
   recordDaemonStart(input: DaemonStartInput): DaemonHealthRecord;

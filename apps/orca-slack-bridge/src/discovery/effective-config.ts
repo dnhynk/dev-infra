@@ -160,9 +160,29 @@ export function buildEffectiveBridgeConfig(
     readonly projectOrigin: EffectiveProjectOrigin;
   }>();
 
+  // Defense in depth for stores written before numeric auto-key ownership was enforced. Never
+  // turn two positive GitHub identities into one Project merely because they share an old alias.
+  const autoProjectOwners = new Map<string, number>();
+  for (const repository of snapshot.repositories) {
+    if (repository.projectOrigin !== 'auto' || repository.githubRepositoryId === null) continue;
+    const owner = autoProjectOwners.get(repository.projectKey);
+    if (owner !== undefined && owner !== repository.githubRepositoryId) {
+      projectNamespaceConflict = true;
+      for (const candidate of snapshot.repositories) {
+        if (candidate.projectOrigin === 'auto' &&
+            candidate.projectKey === repository.projectKey) {
+          namespaceConflictCanonicals.add(candidate.canonicalKey);
+        }
+      }
+      continue;
+    }
+    autoProjectOwners.set(repository.projectKey, repository.githubRepositoryId);
+  }
+
   for (const repository of [...snapshot.repositories].sort((a, b) =>
     compareText(a.canonicalKey, b.canonicalKey))) {
     if (repository.githubRepositoryId === null) continue;
+    if (namespaceConflictCanonicals.has(repository.canonicalKey)) continue;
     const override = options.repositoryProjects?.get(repository.canonicalKey);
     const explicit = explicitByCanonical.get(repository.canonicalKey);
     let assignment: { projectKey: string; projectOrigin: EffectiveProjectOrigin } | null = null;

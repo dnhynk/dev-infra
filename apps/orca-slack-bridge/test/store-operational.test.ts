@@ -346,6 +346,7 @@ describe('additive v13 operational schema', () => {
 describe('discovery registry transactions', () => {
   it('replaces one effective snapshot, aggregates issues, and preserves LKG across rollback', () => {
     const store = new SqliteDigestStore(path);
+    expect(store.hasDiscoveryRoutingRows()).toBe(false);
     expect(store.replaceDiscoverySnapshot({
       passOutcome: 'succeeded',
       repositories: [repository], bindings: [binding], issues: [issue], at: AT0,
@@ -354,6 +355,7 @@ describe('discovery registry transactions', () => {
       bindings: [{ orcaRepositoryId: binding.orcaRepositoryId, active: true }],
       issues: [{ issueHash: issue.issueHash, occurrenceCount: 1, active: true }],
     });
+    expect(store.hasDiscoveryRoutingRows()).toBe(true);
     store.replaceDiscoverySnapshot({
       passOutcome: 'succeeded',
       repositories: [repository],
@@ -468,6 +470,68 @@ describe('discovery registry transactions', () => {
     store.close();
   });
 
+  it('reserves auto Project keys for one numeric identity across inactive rows', () => {
+    const autoOriginal = {
+      ...repository,
+      canonicalKey: 'github.com/acme/new' as const,
+      nameWithOwner: 'acme/new' as const,
+      projectKey: 'auto:github.com/acme/old',
+      projectOrigin: 'auto' as const,
+    };
+    const originalBinding = {
+      ...binding,
+      canonicalKey: autoOriginal.canonicalKey,
+      projectKey: autoOriginal.projectKey,
+    };
+    const store = new SqliteDigestStore(path);
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [autoOriginal], bindings: [originalBinding],
+      issues: [], at: AT0,
+    });
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [], bindings: [], issues: [],
+      at: '2026-08-26T01:00:00.000Z',
+    });
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', repositories: [], bindings: [], issues: [],
+      at: '2026-08-27T01:00:01.000Z',
+    });
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual({
+      repositories: [], bindings: [], issues: [],
+    });
+    expect(store.hasDiscoveryRoutingRows()).toBe(true);
+
+    const reused = {
+      ...autoOriginal,
+      canonicalKey: 'github.com/acme/old' as const,
+      nameWithOwner: 'acme/old' as const,
+      githubRepositoryId: 202,
+    };
+    const reusedBinding = {
+      ...originalBinding,
+      orcaRepositoryId: 'orca-reused',
+      canonicalKey: reused.canonicalKey,
+    };
+    expect(() => store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'reconcile',
+      repositories: [reused], bindings: [reusedBinding], issues: [],
+      at: '2026-08-27T02:00:00.000Z',
+    })).toThrowError(new OperationalStoreError('OPERATIONAL_CONFLICT'));
+    expect(store.readEffectiveDiscoverySnapshot()).toEqual({
+      repositories: [], bindings: [], issues: [],
+    });
+
+    expect(store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'replace',
+      repositories: [reused], bindings: [reusedBinding], issues: [],
+      at: '2026-08-27T02:00:00.000Z',
+    })).toMatchObject({
+      repositories: [{ githubRepositoryId: 202, projectKey: autoOriginal.projectKey }],
+      bindings: [{ orcaRepositoryId: 'orca-reused' }],
+    });
+    store.close();
+  });
+
   it('renames by numeric identity through the FK and applies consecutive-pass plus 24h grace', () => {
     let store = new SqliteDigestStore(path);
     store.replaceDiscoverySnapshot({
@@ -546,6 +610,7 @@ describe('discovery registry transactions', () => {
       .toEqual({ count: 1 });
     raw.close();
     const reopened = new SqliteDigestStore(path);
+    expect(reopened.hasDiscoveryRoutingRows()).toBe(true);
     expect(reopened.readEffectiveDiscoverySnapshot()).toEqual({
       repositories: [], bindings: [], issues: [],
     });
