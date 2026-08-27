@@ -438,6 +438,15 @@ class FailingThread implements ThreadPoster {
   }
 }
 
+class NeverSettlingThread implements ThreadPoster {
+  readonly replies: ThreadReplyInput[] = [];
+
+  reply(input: ThreadReplyInput): Promise<PostedMessage> {
+    this.replies.push(input);
+    return new Promise(() => undefined);
+  }
+}
+
 /** 결정적 대역. 같은 사실이 같은 카드를 내는지 보려면 모델 출력이 흔들리면 안 된다. */
 class StubProvider implements SummaryProvider {
   readonly calls: SummaryFacts[] = [];
@@ -483,6 +492,8 @@ type Once = {
   /** 참이면 `deps`·reviewer_result shape·`options`·`payload`의 깨진 row도 함께 섞인다(OD-079). */
   readonly brokenFields?: boolean;
   readonly gh?: GhOver;
+  readonly slackTimeoutMs?: number;
+  readonly signal?: AbortSignal;
 };
 
 /** 매 실행이 store 파일을 새로 연다. 재시작 뒤에도 매핑을 찾는지 함께 본다. */
@@ -508,6 +519,8 @@ async function digestOnce(opts: Once = {}): Promise<DigestReport> {
         prLimit: 50,
         onlyPr: opts.onlyPr ?? null,
         now: () => new Date('2026-08-22T02:00:00Z'),
+        ...(opts.slackTimeoutMs === undefined ? {} : { slackTimeoutMs: opts.slackTimeoutMs }),
+        ...(opts.signal === undefined ? {} : { signal: opts.signal }),
       },
     );
   } finally {
@@ -1214,6 +1227,29 @@ describe('runDigest 전이', () => {
     ]);
     expect(thread.replies).toHaveLength(1);
     expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000001.000001']);
+  });
+
+  it('bounds a cancellation-ignoring transition reply and keeps the event retryable', async () => {
+    await digestOnce({ verdict: null, prs: [prRow(OPEN_ROW)] });
+    const hanging = new NeverSettlingThread();
+    const began = Date.now();
+
+    await expect(digestOnce({
+      thread: hanging,
+      verdict: 'approve',
+      prs: [prRow(OPEN_ROW)],
+      slackTimeoutMs: 10,
+    })).rejects.toThrow(/thread reply deadline/);
+
+    expect(Date.now() - began).toBeLessThan(1_000);
+    expect(hanging.replies).toHaveLength(1);
+    expect(hanging.replies[0]?.signal?.aborted).toBe(true);
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const recovered = new FakeThread();
+    await digestOnce({ thread: recovered, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+    expect(recovered.replies).toHaveLength(1);
+    expect(readThreadEvents(PR_KEY)).toHaveLength(1);
   });
 
   /**

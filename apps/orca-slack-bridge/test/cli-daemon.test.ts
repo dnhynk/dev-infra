@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { parseArgs, runDaemonCommand as runDaemonCommandWithNativeStatus } from '../src/cli.js';
+import {
+  fairDigestCycle,
+  parseArgs,
+  runDaemonCommand as runDaemonCommandWithNativeStatus,
+} from '../src/cli.js';
+import type { EffectiveBridgeConfig } from '../src/discovery/types.js';
 import type {
   ChannelPipeErrorCode,
   ChannelProductionDeliveryHandlers,
@@ -342,6 +347,7 @@ class ObserverOrca implements OrcaRunner {
       readonly discovery?: boolean;
       readonly discoverySchema?: boolean;
       readonly runs?: boolean;
+      readonly runsSchema?: boolean;
     } = {},
   ) {}
   run(args: readonly string[]): Promise<string> {
@@ -358,6 +364,11 @@ class ObserverOrca implements OrcaRunner {
     if (args[0] === 'orchestration' && args[1] === 'run-list') {
       this.events.push('orca:run-list');
       if (this.failures.runs === true) return Promise.reject(new Error('runs unavailable'));
+      if (this.failures.runsSchema === true) {
+        return Promise.resolve(JSON.stringify({
+          id: 'run-list', ok: true, result: { runs: {} },
+        }));
+      }
       return Promise.resolve(JSON.stringify({ id: 'run-list', ok: true, result: { runs: [] } }));
     }
     if (args[0] === 'orchestration' && args[1] === 'inbox') {
@@ -534,6 +545,176 @@ describe('daemon production wiring', () => {
       state: 'failed', errorCode: 'discovery.schema_drift', consecutiveFailures: 1,
     });
     reopened.close();
+  });
+
+  it('treats a discovery store mutation failure as fatal before Socket ingress', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    let socketStarts = 0;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      openStore: (path) => new SqliteDigestStore(path, {
+        operationalFault: (point) => {
+          if (point === 'after_discovery_registry') throw new Error('injected store fault');
+        },
+      }),
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => {
+          socketStarts += 1;
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-store-invariant-test',
+    });
+
+    expect(code).toBe(1);
+    expect(socketStarts).toBe(0);
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')).toMatchObject({
+      state: 'failed', errorCode: 'schema.drift', consecutiveFailures: 1,
+    });
+    expect(reopened.readDaemonHealth()).toMatchObject({
+      state: 'running', cleanStoppedAt: null,
+    });
+    reopened.close();
+  });
+
+  it('treats malformed Run rows as a fatal invariant after draining Socket ingress', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events, { runsSchema: true }),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => {
+          events.push('socket:start');
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => {
+          events.push('socket:close');
+          return Promise.resolve();
+        },
+      }),
+      waitForStop: () => new Promise<void>(() => undefined),
+      installationSeed: 'daemon-run-schema-test',
+    });
+
+    expect(code).toBe(1);
+    expect(events).toContain('socket:start');
+    expect(events).toContain('socket:close');
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('run-observer')).toMatchObject({
+      state: 'failed', errorCode: 'run.schema_drift', consecutiveFailures: 1,
+    });
+    expect(reopened.readDaemonHealth()).toMatchObject({
+      state: 'running', cleanStoppedAt: null,
+    });
+    reopened.close();
+  });
+
+  it('durably claims and executes a mandated startup pass despite a future persisted schedule', async () => {
+    const seeded = new SqliteDigestStore(statePath);
+    const now = Date.now();
+    const first = seeded.startDaemonJob(
+      'pr-digest', new Date(now - 5_000).toISOString(),
+    );
+    if (first === null) throw new Error('initial digest claim failed');
+    seeded.completeDaemonJobSuccess({
+      claim: first,
+      at: new Date(now - 4_000).toISOString(),
+      nextRunAt: new Date(now + 60 * 60_000).toISOString(),
+      durationMs: 1_000,
+      checkpoint: 0,
+    });
+    seeded.close();
+
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    let liveStore: SqliteDigestStore | null = null;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      openStore: (path) => {
+        liveStore = new SqliteDigestStore(path);
+        return liveStore;
+      },
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      digestStartupDelayMs: 10,
+      waitForStop: async () => {
+        await waitFor(() => {
+          const outcome = liveStore?.findDaemonJobOutcome('pr-digest');
+          return outcome?.attempt === 2 && outcome.state === 'succeeded';
+        });
+      },
+      installationSeed: 'daemon-startup-takeover-test',
+    });
+
+    const reopened = new SqliteDigestStore(statePath);
+    const digestOutcome = reopened.findDaemonJobOutcome('pr-digest');
+    const diagnostic = JSON.stringify({
+      discovery: reopened.findDaemonJobOutcome('repository-discovery'),
+      runs: reopened.findDaemonJobOutcome('run-observer'),
+      digestOutcome,
+      health: reopened.readDaemonHealth(),
+      events,
+    });
+    reopened.close();
+    expect(code, diagnostic).toBe(0);
+    expect(digestOutcome).toMatchObject({
+      state: 'succeeded', attempt: 2, consecutiveFailures: 0,
+    });
+  });
+
+  it('uses code-point repository order so fair checkpoints ignore the host locale', () => {
+    const effective: EffectiveBridgeConfig = {
+      base: {
+        ...ENABLED_CONFIG,
+        automation: {
+          ...ENABLED_CONFIG.automation,
+          prDigest: {
+            ...ENABLED_CONFIG.automation.prDigest,
+            prLimit: 1,
+            globalPrBudget: 1,
+          },
+        },
+      },
+      configFingerprint: 'f'.repeat(64),
+      revision: 1,
+      projects: [{
+        key: 'project', name: 'project', origin: 'explicit', orcaRepositoryIds: [],
+        repositories: [
+          { canonicalKey: 'github.com/owner/alpha', nameWithOwner: 'owner/alpha' },
+          { canonicalKey: 'github.com/owner/beta', nameWithOwner: 'owner/beta' },
+        ],
+      }],
+      bindings: [],
+      diagnostics: [],
+      routing: { status: 'ready' },
+    };
+    const localeCompare = vi.spyOn(String.prototype, 'localeCompare')
+      .mockImplementation(() => { throw new Error('host locale must not participate'); });
+    try {
+      expect(fairDigestCycle(effective, 0)).toMatchObject({
+        repositories: ['owner/alpha'], checkpoint: 1,
+      });
+      expect(fairDigestCycle(effective, 1)).toMatchObject({
+        repositories: ['owner/beta'], checkpoint: 0,
+      });
+    } finally {
+      localeCompare.mockRestore();
+    }
   });
 
   it('keeps the legacy reconciliation cadence independent while startup discovery is pending', async () => {

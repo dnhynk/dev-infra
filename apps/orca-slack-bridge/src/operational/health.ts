@@ -23,7 +23,11 @@ export interface DaemonOperationalHealthWriter {
   daemonStarted(input: DaemonStartInput): Promise<DaemonHealthRecord>;
   daemonHeartbeat(instanceId: string, at: string): Promise<DaemonHealthRecord | null>;
   daemonCleanStopped(instanceId: string, at: string): Promise<DaemonHealthRecord | null>;
-  jobStarted(job: DaemonJobName, at: string): Promise<DaemonJobClaim | null>;
+  jobStarted(
+    job: DaemonJobName,
+    at: string,
+    options?: { readonly startupTakeover?: boolean },
+  ): Promise<DaemonJobClaim | null>;
   jobSucceeded(input: DaemonJobSuccessCompletion): Promise<DaemonJobOutcomeRecord | null>;
   jobFailed(
     input: DaemonJobCompletion & { readonly errorCode: OperationalFailureCode },
@@ -77,8 +81,12 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
     return record;
   }
 
-  async jobStarted(job: DaemonJobName, at: string): Promise<DaemonJobClaim | null> {
-    const claim = this.store.startDaemonJob(job, at);
+  async jobStarted(
+    job: DaemonJobName,
+    at: string,
+    options: { readonly startupTakeover?: boolean } = {},
+  ): Promise<DaemonJobClaim | null> {
+    const claim = this.store.startDaemonJob(job, at, options);
     this.afterMutation();
     if (claim !== null) await this.event({
       level: 'info', event: 'job.started', job, outcome: 'started',

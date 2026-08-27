@@ -46,7 +46,7 @@ type MutableProject = {
   orcaRepositoryIds: Set<string>;
 };
 
-function compareText(a: string, b: string): number {
+export function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 

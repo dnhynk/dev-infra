@@ -5988,7 +5988,11 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     }
   }
 
-  startDaemonJob(jobName: DaemonJobName, at: string): DaemonJobClaim | null {
+  startDaemonJob(
+    jobName: DaemonJobName,
+    at: string,
+    options: { readonly startupTakeover?: boolean } = {},
+  ): DaemonJobClaim | null {
     const safeJob = operationalJobName(jobName);
     const safeAt = operationalIso(at, true);
     try {
@@ -5998,7 +6002,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       if (existingRow !== undefined) {
         const existing = toDaemonJobOutcome(existingRow);
         if (existing.state === 'running' || existing.updatedAt > safeAt ||
-            (existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
+            (options.startupTakeover !== true &&
+             existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
           this.db.exec('COMMIT');
           return null;
         }

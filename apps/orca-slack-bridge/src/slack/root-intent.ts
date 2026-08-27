@@ -55,6 +55,14 @@ export class SlackRootSimulatedCrash extends Error {
   }
 }
 
+/** Cancellation observed before the injected transport boundary was invoked. */
+export class SlackRootPreInvocationAbortError extends Error {
+  constructor() {
+    super('root post aborted before transport invocation');
+    this.name = 'SlackRootPreInvocationAbortError';
+  }
+}
+
 const PROCESS_ROOT_INSTANCE_ID = `root-${process.pid}-${randomUUID()}`;
 
 export function processRootIntentRuntime(): SlackRootIntentRuntime {
@@ -94,16 +102,21 @@ function safeRetry(error: unknown, postInvoked: boolean): boolean {
     (error.code === 'rate_limited' || error.code === 'ratelimited');
 }
 
+function rootPostAborted(runtime: SlackRootIntentRuntime): boolean {
+  return runtime.signal?.aborted === true;
+}
+
 async function boundedRootPost(
   slack: SlackPoster,
   input: PostMessageInput,
   runtime: SlackRootIntentRuntime,
+  onInvoke: () => void,
 ): Promise<PostedMessage> {
   const timeoutMs = runtime.timeoutMs ?? DEFAULT_ROOT_POST_TIMEOUT_MS;
   if (!Number.isFinite(timeoutMs) || timeoutMs < 10 || timeoutMs > 60_000) {
     throw new TypeError('root post timeout must be a finite number between 10 and 60000');
   }
-  if (runtime.signal?.aborted === true) throw new Error('root post aborted');
+  if (rootPostAborted(runtime)) throw new SlackRootPreInvocationAbortError();
   const controller = new AbortController();
   const signal = runtime.signal === undefined
     ? controller.signal
@@ -116,7 +129,11 @@ async function boundedRootPost(
     rejectAbort(new Error('root post aborted'));
   };
   runtime.signal?.addEventListener('abort', onAbort, { once: true });
-  const operation = Promise.resolve().then(() => slack.post({ ...input, signal }));
+  const operation = Promise.resolve().then(() => {
+    if (rootPostAborted(runtime)) throw new SlackRootPreInvocationAbortError();
+    onInvoke();
+    return slack.post({ ...input, signal });
+  });
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       controller.abort();
@@ -183,13 +200,14 @@ export async function postSlackRootAtMostOnce(input: {
   try {
     await runtime.hooks?.afterClaim?.(claim);
     await runtime.hooks?.beforePost?.(claim);
-    postInvoked = true;
     const posted = await boundedRootPost(input.slack, {
       channel: input.channel,
       text: input.message.text,
       blocks: input.message.blocks,
-    }, runtime);
+    }, runtime, () => { postInvoked = true; });
+    if (rootPostAborted(runtime)) throw new Error('root post aborted after response');
     await runtime.hooks?.afterPostResponse?.(posted);
+    if (rootPostAborted(runtime)) throw new Error('root post aborted after response');
     if (posted.channel !== input.channel) {
       store.markSlackRootIntentUncertain(
         claim, 'slack.commit_unknown', input.now().toISOString(),
@@ -198,6 +216,7 @@ export async function postSlackRootAtMostOnce(input: {
       return { kind: 'blocked', state: 'uncertain', messageTs: null };
     }
     await runtime.hooks?.beforeCommit?.(posted);
+    if (rootPostAborted(runtime)) throw new Error('root post aborted before commit');
     let committed: SlackRootIntentRecord | null;
     try {
       committed = store.markSlackRootIntentPosted({

@@ -14,6 +14,7 @@ import {
 } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
 import {
+  boundedSlackReply,
   boundedSlackUpdate,
   DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
   type SlackPoster,
@@ -25,6 +26,7 @@ import {
 } from '../slack/root-intent.js';
 import { buildCorrelationView, collectRuns } from '../snapshot/snapshot.js';
 import type { DigestStore } from '../store/schema.js';
+import { OperationalStoreError, SchemaVersionError } from '../store/sqlite.js';
 import { factsFingerprint } from '../summarize/fingerprint.js';
 import type { SummaryProvider } from '../summarize/openai.js';
 import {
@@ -256,7 +258,14 @@ export type DigestOptions = {
   readonly isolateRepositoryFailures?: boolean;
   readonly rootIntent?: SlackRootIntentRuntime;
   readonly slackTimeoutMs?: number;
+  /** Observer deadline/shutdown fence carried through every Slack write. */
+  readonly signal?: AbortSignal;
 };
+
+function isDigestInvariantError(error: unknown): boolean {
+  return error instanceof OperationalStoreError || error instanceof SchemaVersionError ||
+    error instanceof TypeError || error instanceof SyntaxError || error instanceof RangeError;
+}
 
 export async function runDigest(
   orca: OrcaRunner,
@@ -284,6 +293,7 @@ export async function runDigest(
       sources = await listPullRequests(gh, repository, options.prLimit);
     } catch (error) {
       if (options.isolateRepositoryFailures !== true) throw error;
+      if (isDigestInvariantError(error)) throw error;
       const named = error instanceof Error ? error.name : '';
       repositoryFailures.push({
         repository: name,
@@ -361,6 +371,7 @@ async function digestOne(
   tasks: readonly OrcaTask[],
   options: DigestOptions,
 ): Promise<DigestResult> {
+  const signal = options.signal ?? options.rootIntent?.signal;
   // 직전 관측을 먼저 읽는다. 없으면 null이고 그것은 "이 PR을 처음 본다"는 정상 출력이다.
   // 이 값이 `reconcileTerminal`의 `previous`이며, 그 함수의 프로덕션 호출자는 여기 하나다.
   const previousState = options.store.findPrState(observed.key);
@@ -483,12 +494,13 @@ async function digestOne(
         continue;
       }
       const event = renderThreadEvent({ pr, transition: t, observedAt: at });
-      const posted = await options.thread.reply({
+      const posted = await boundedSlackReply(options.thread, {
         channel: options.channel,
         threadTs,
         text: event.text,
         blocks: event.blocks,
-      });
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
       options.store.recordThreadEvent({
         prKey: pr.key,
         dedupeKey: t.dedupeKey,
@@ -565,7 +577,7 @@ async function digestOne(
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
-    ...(options.rootIntent?.signal === undefined ? {} : { signal: options.rootIntent.signal }),
+    ...(signal === undefined ? {} : { signal }),
   }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateObservation(pr.key, record, at);
   return {

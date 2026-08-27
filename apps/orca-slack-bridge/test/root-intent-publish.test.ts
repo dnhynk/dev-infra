@@ -31,8 +31,10 @@ class FakeSlack implements SlackPoster {
   failTransport = false;
   failDefinite = false;
   hang = false;
+  onPost: (() => void) | null = null;
   async post(input: { readonly channel: string }): Promise<PostedMessage> {
     this.attempts += 1;
+    this.onPost?.();
     if (this.failDefinite) throw new SlackApiError('chat.postMessage', 'ratelimited');
     if (this.failTransport) throw new Error('response lost after possible transport write');
     if (this.hang) return await new Promise<PostedMessage>(() => undefined);
@@ -54,6 +56,7 @@ async function attempt(
   clock: Clock,
   hooks?: SlackRootIntentHooks,
   timeoutMs?: number,
+  signal?: AbortSignal,
 ) {
   return await postSlackRootAtMostOnce({
     store,
@@ -68,6 +71,7 @@ async function attempt(
       instanceId: 'instance-a',
       ...(hooks === undefined ? {} : { hooks }),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(signal === undefined ? {} : { signal }),
     },
   });
 }
@@ -159,6 +163,55 @@ describe('at-most-once Slack root intent', () => {
     expect(store.findSlackRootIntent(PR)?.state).toBe('posted');
     store.close();
   });
+
+  it('keeps a pre-aborted zero-attempt intent pending and retryable', async () => {
+    const clock = new Clock();
+    const slack = new FakeSlack();
+    const store = new SqliteDigestStore(path);
+    const abort = new AbortController();
+    abort.abort();
+
+    expect(await attempt(store, slack, clock, undefined, undefined, abort.signal)).toMatchObject({
+      kind: 'blocked', state: 'pending',
+    });
+    expect(slack.attempts).toBe(0);
+    expect(store.findSlackRootIntent(PR)?.state).toBe('pending');
+    expect(await attempt(store, slack, clock)).toMatchObject({ kind: 'posted' });
+    expect(slack.attempts).toBe(1);
+    store.close();
+  });
+
+  it.each(['during-send', 'after-response', 'before-commit'] as const)(
+    'keeps a possible-effect %s abort uncertain and permanently fenced',
+    async (stage) => {
+      const clock = new Clock();
+      const slack = new FakeSlack();
+      const store = new SqliteDigestStore(path);
+      const abort = new AbortController();
+      let hooks: SlackRootIntentHooks | undefined;
+      if (stage === 'during-send') {
+        slack.hang = true;
+        slack.onPost = () => abort.abort();
+      } else if (stage === 'after-response') {
+        hooks = { afterPostResponse: () => abort.abort() };
+      } else {
+        hooks = { beforeCommit: () => abort.abort() };
+      }
+
+      expect(await attempt(store, slack, clock, hooks, undefined, abort.signal)).toMatchObject({
+        kind: 'blocked', state: 'uncertain',
+      });
+      expect(slack.attempts).toBe(1);
+      expect(store.findSlackRootIntent(PR)?.state).toBe('uncertain');
+      slack.hang = false;
+      slack.onPost = null;
+      expect(await attempt(store, slack, clock)).toMatchObject({
+        kind: 'blocked', state: 'uncertain',
+      });
+      expect(slack.attempts).toBe(1);
+      store.close();
+    },
+  );
 
   it('rolls back a mapping fault, records commit uncertainty, and never retries the post', async () => {
     const clock = new Clock();

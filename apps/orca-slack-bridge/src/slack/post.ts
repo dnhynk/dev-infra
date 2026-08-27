@@ -35,6 +35,8 @@ export type ThreadReplyInput = {
   readonly threadTs: string;
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /** Cooperative cancellation for an at-most-once thread attempt. Never serialized to Slack. */
+  readonly signal?: AbortSignal;
 };
 
 export type UpdateMessageInput = {
@@ -162,6 +164,65 @@ export async function boundedSlackUpdate(
     if (timer !== undefined) clearTimeout(timer);
     input.signal?.removeEventListener('abort', onExternalAbort);
     // An injected client may ignore AbortSignal. Drain its eventual rejection without awaiting it.
+    void operation.catch(() => undefined);
+  }
+}
+
+export class SlackThreadReplyTimeoutError extends Error {
+  constructor() {
+    super('Slack thread reply deadline exceeded');
+    this.name = 'SlackThreadReplyTimeoutError';
+  }
+}
+
+/**
+ * Bounds even a non-cooperative injected ThreadPoster and carries the observer fence into the
+ * production fetch path. A caller-facing timeout never records the reply's durable dedupe key.
+ */
+export async function boundedSlackReply(
+  thread: ThreadPoster,
+  input: ThreadReplyInput,
+  timeoutMs = DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+): Promise<PostedMessage> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 10 || timeoutMs > DEFAULT_SLACK_UPDATE_TIMEOUT_MS) {
+    throw new TypeError(
+      `Slack thread reply timeout must be a finite number between 10 and ${DEFAULT_SLACK_UPDATE_TIMEOUT_MS}`,
+    );
+  }
+  if (input.signal?.aborted) throw new Error('Slack thread reply aborted');
+  const deadline = Math.trunc(timeoutMs);
+  const abort = new AbortController();
+  const signal = input.signal === undefined
+    ? abort.signal
+    : AbortSignal.any([input.signal, abort.signal]);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectExternalAbort!: (error: Error) => void;
+  const externalAbort = new Promise<never>((_resolve, reject) => {
+    rejectExternalAbort = reject;
+  });
+  const onExternalAbort = (): void => {
+    abort.abort();
+    rejectExternalAbort(new Error('Slack thread reply aborted'));
+  };
+  input.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  if (input.signal?.aborted) onExternalAbort();
+  const operation = Promise.resolve().then(() => thread.reply({ ...input, signal }));
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      abort.abort();
+      reject(new SlackThreadReplyTimeoutError());
+    }, deadline);
+  });
+  try {
+    return await Promise.race([operation, timeout, externalAbort]);
+  } catch (error) {
+    if (timedOut) throw new SlackThreadReplyTimeoutError();
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    input.signal?.removeEventListener('abort', onExternalAbort);
     void operation.catch(() => undefined);
   }
 }
@@ -343,6 +404,7 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
         blocks: input.blocks,
       },
       false,
+      input.signal,
     );
   }
 

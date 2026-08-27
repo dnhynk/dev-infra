@@ -21,6 +21,7 @@ class FakeGh implements GhRunner {
   graphql = 5_000;
   body = '{}';
   wait = false;
+  ignoreAbort = false;
   delayMs = 0;
   private releases: (() => void)[] = [];
 
@@ -37,7 +38,9 @@ class FakeGh implements GhRunner {
       if (this.wait) {
         await new Promise<void>((resolve, reject) => {
           this.releases.push(resolve);
-          options.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          if (!this.ignoreAbort) {
+            options.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          }
         });
       }
       return this.body;
@@ -97,6 +100,38 @@ describe('BackgroundGithub', () => {
     const work = [github.run(['one']), github.run(['two']), github.run(['three'])];
     await Promise.all(work);
     expect(raw.maximumActive).toBe(2);
+  });
+
+  it('quarantines timed-out permits until non-cooperative commands actually settle', async () => {
+    const raw = new FakeGh();
+    const github = new BackgroundGithub(raw, {
+      commandBudgetPerHour: 2_000,
+      rateLimitFloor: 1_000,
+      commandTimeoutMs: 10,
+    });
+    await github.run(['warm']);
+    raw.maximumActive = 0;
+    raw.wait = true;
+    raw.ignoreAbort = true;
+
+    await Promise.all([
+      expect(github.run(['one'])).rejects.toBeInstanceOf(GithubDeadlineDeferredError),
+      expect(github.run(['two'])).rejects.toBeInstanceOf(GithubDeadlineDeferredError),
+    ]);
+    expect(raw.active).toBe(2);
+    expect(github.snapshot().active).toBe(2);
+
+    const third = github.run(['three']);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(raw.calls.some((call) => call[0] === 'three')).toBe(false);
+    expect(raw.maximumActive).toBe(2);
+
+    raw.releaseAll();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(raw.calls.some((call) => call[0] === 'three')).toBe(true);
+    expect(raw.maximumActive).toBe(2);
+    raw.releaseAll();
+    await expect(third).resolves.toBe('{}');
   });
 
   it('bounds every command deadline and response size', async () => {

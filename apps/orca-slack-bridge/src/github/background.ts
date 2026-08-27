@@ -204,6 +204,11 @@ export class BackgroundGithub implements GhRunner {
     const timeoutMs = Math.min(this.timeoutMs, Math.max(1, Math.trunc(requested)));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const operation = Promise.resolve().then(() => this.runner.run(args, { signal, timeoutMs }));
+    // A wrapper deadline does not prove that an injected runner (or a child still terminating)
+    // has settled. Keep this permit quarantined until the real operation completes so `active`
+    // continues to describe underlying commands rather than caller-facing wrapper promises.
+    const settled = operation.finally(() => this.release());
+    void settled.catch(() => undefined);
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         controller.abort();
@@ -212,7 +217,7 @@ export class BackgroundGithub implements GhRunner {
       timer.unref?.();
     });
     try {
-      const output = await Promise.race([operation, timeout]);
+      const output = await Promise.race([settled, timeout]);
       if (Buffer.byteLength(output, 'utf8') > this.maximumResponseBytes) {
         throw new RangeError('background GitHub response exceeded the byte bound');
       }
@@ -225,7 +230,6 @@ export class BackgroundGithub implements GhRunner {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       void operation.catch(() => undefined);
-      this.release();
     }
   }
 }

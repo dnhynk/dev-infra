@@ -23,6 +23,7 @@ import {
   runRunObserver,
   type RunObserveOptions,
 } from './run/publish.js';
+import { RunCollectionContractError } from './run/collect.js';
 import { appToken, verifySlack, formatVerify, maskToken } from './slack/verify.js';
 import {
   SlackSocketTransport,
@@ -38,7 +39,13 @@ import {
   type SlackPoster,
   type ThreadPoster,
 } from './slack/post.js';
-import { ReadOnlyDigestStore, SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
+import {
+  OperationalStoreError,
+  ReadOnlyDigestStore,
+  SchemaVersionError,
+  SqliteDigestStore,
+  resolveStatePath,
+} from './store/sqlite.js';
 import type { DigestStore, GateStore, RunStore } from './store/schema.js';
 import type { SummaryProvider } from './summarize/openai.js';
 import { GateActionHandler } from './gate/action-handler.js';
@@ -103,6 +110,7 @@ import {
 import {
   bridgeConfigFingerprint,
   buildEffectiveBridgeConfig,
+  compareText,
 } from './discovery/effective-config.js';
 import { runRepositoryDiscoveryPass } from './discovery/reconcile.js';
 import type { EffectiveBridgeConfig } from './discovery/types.js';
@@ -1019,7 +1027,7 @@ function digestBridgeConfig(effective: EffectiveBridgeConfig): BridgeConfig {
   };
 }
 
-function fairDigestCycle(
+export function fairDigestCycle(
   effective: EffectiveBridgeConfig,
   checkpoint: number,
 ): {
@@ -1034,8 +1042,9 @@ function fairDigestCycle(
   const automation = effective.base.automation;
   const unique = [...new Map(effective.projects
     .flatMap((project) => project.repositories)
-    .map((repository) => [repository.canonicalKey, repository.nameWithOwner])).values()]
-    .sort((a, b) => a.localeCompare(b));
+    .map((repository) => [repository.canonicalKey, repository.nameWithOwner])).entries()]
+    .sort(([a], [b]) => compareText(a, b))
+    .map(([, nameWithOwner]) => nameWithOwner);
   if (effective.routing.status === 'blocked') {
     return {
       repositories: [], checkpoint, deferred: unique.length * perRepository, prLimit,
@@ -1065,8 +1074,15 @@ function discoveryFailureCode(failure: string | undefined): OperationalFailureCo
     case 'config_drift': return 'config.drift';
     case 'github_unavailable': return 'discovery.github_unavailable';
     case 'query_failed': return 'discovery.query_failed';
+    case 'store_failed': return 'schema.drift';
     default: return 'validation.failed';
   }
+}
+
+function observerInvariantError(error: unknown): boolean {
+  return error instanceof OperationalStoreError || error instanceof SchemaVersionError ||
+    error instanceof RunCollectionContractError || error instanceof TypeError ||
+    error instanceof SyntaxError || error instanceof RangeError;
 }
 
 /** Production D2+D3 path: strict v12 startup → delivery/resume reconcile → existing-card projection. */
@@ -1444,39 +1460,50 @@ export async function runDaemonCommand(
           timeoutMs: automation.repositoryDiscovery.timeoutSeconds * 1_000,
           backoffCapMs: 5 * 60_000,
           run: async (signal: AbortSignal) => {
-            const result = await runRepositoryDiscoveryPass({
-              orca: scopedOrcaRunner(orca, signal),
-              github: repositoryIdentityConfirmer(backgroundGithub.scoped(signal)),
-              store: daemonStore,
-              config: daemonConfig,
-              configFingerprint: discoveryConfigFingerprint,
-              lastKnownGoodConfigFingerprint: lkgProof,
-              signal,
-              deadlineAt: observerClock.wallNow().getTime() +
-                automation.repositoryDiscovery.timeoutSeconds * 1_000,
-              now: observerClock.wallNow,
-            });
-            effectiveConfig = result.effectiveConfig;
-            const counts = {
-              processedCount: result.counts.effectiveBindings,
-              deferredCount: result.counts.deferredRepositories + result.counts.blockedBindings,
-            };
-            if (result.status === 'failed') {
+            try {
+              const result = await runRepositoryDiscoveryPass({
+                orca: scopedOrcaRunner(orca, signal),
+                github: repositoryIdentityConfirmer(backgroundGithub.scoped(signal)),
+                store: daemonStore,
+                config: daemonConfig,
+                configFingerprint: discoveryConfigFingerprint,
+                lastKnownGoodConfigFingerprint: lkgProof,
+                signal,
+                deadlineAt: observerClock.wallNow().getTime() +
+                  automation.repositoryDiscovery.timeoutSeconds * 1_000,
+                now: observerClock.wallNow,
+              });
+              effectiveConfig = result.effectiveConfig;
+              const counts = {
+                processedCount: result.counts.effectiveBindings,
+                deferredCount: result.counts.deferredRepositories + result.counts.blockedBindings,
+              };
+              if (result.status === 'failed') {
+                throw new ObserverJobFailure(
+                  discoveryFailureCode(result.failure),
+                  counts,
+                  result.failure === 'schema_drift' || result.failure === 'config_drift' ||
+                    result.failure === 'store_failed',
+                );
+              }
+              lkgProof = discoveryConfigFingerprint;
+              await health!.event({
+                level: 'info', event: 'discovery.completed', outcome: 'succeeded',
+                counts: {
+                  processed: result.counts.effectiveBindings,
+                  deferred: result.counts.deferredRepositories,
+                },
+              });
+              return counts;
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              if (observerInvariantError(error)) {
+                throw new ObserverJobFailure('schema.drift', {}, true);
+              }
               throw new ObserverJobFailure(
-                discoveryFailureCode(result.failure),
-                counts,
-                result.failure === 'schema_drift' || result.failure === 'config_drift',
+                signal.aborted ? 'scheduler.timeout' : 'discovery.query_failed',
               );
             }
-            lkgProof = discoveryConfigFingerprint;
-            await health!.event({
-              level: 'info', event: 'discovery.completed', outcome: 'succeeded',
-              counts: {
-                processed: result.counts.effectiveBindings,
-                deferred: result.counts.deferredRepositories,
-              },
-            });
-            return counts;
           },
         },
         {
@@ -1494,6 +1521,7 @@ export async function runDaemonCommand(
                 thread: threadPoster,
                 now: observerClock.wallNow,
                 rootIntent: rootRuntime(signal),
+                signal,
                 ...(dependencies.slackTimeoutMs === undefined
                   ? {}
                   : { slackTimeoutMs: dependencies.slackTimeoutMs }),
@@ -1502,7 +1530,11 @@ export async function runDaemonCommand(
                 processedCount: report.published.runs.length + 1,
                 deferredCount: report.facts.unregistered.count,
               };
-            } catch {
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              if (observerInvariantError(error)) {
+                throw new ObserverJobFailure('run.schema_drift', {}, true);
+              }
               throw new ObserverJobFailure(
                 signal.aborted ? 'run.timeout' : 'run.query_failed',
               );
@@ -1515,17 +1547,19 @@ export async function runDaemonCommand(
           timeoutMs: automation.prDigest.timeoutSeconds * 1_000,
           backoffCapMs: 2 * 60 * 60_000,
           run: async (signal: AbortSignal) => {
-            const priorCheckpoint = daemonStore.findDaemonJobOutcome('pr-digest')?.checkpoint ?? 0;
-            const cycle = fairDigestCycle(effectiveConfig, priorCheckpoint);
-            if (effectiveConfig.routing.status === 'blocked') {
-              const invariant = effectiveConfig.routing.reason !== 'capacity_conflict';
-              throw new ObserverJobFailure(
-                invariant ? 'config.drift' : 'digest.capacity_deferred',
-                { deferredCount: cycle.deferred, checkpoint: cycle.checkpoint },
-                invariant,
-              );
-            }
+            let progress: { readonly deferredCount?: number; readonly checkpoint?: number } = {};
             try {
+              const priorCheckpoint = daemonStore.findDaemonJobOutcome('pr-digest')?.checkpoint ?? 0;
+              const cycle = fairDigestCycle(effectiveConfig, priorCheckpoint);
+              progress = { deferredCount: cycle.deferred, checkpoint: cycle.checkpoint };
+              if (effectiveConfig.routing.status === 'blocked') {
+                const invariant = effectiveConfig.routing.reason !== 'capacity_conflict';
+                throw new ObserverJobFailure(
+                  invariant ? 'config.drift' : 'digest.capacity_deferred',
+                  progress,
+                  invariant,
+                );
+              }
               const report = await runDigest(
                 scopedOrcaRunner(orca, signal),
                 backgroundGithub.scoped(signal),
@@ -1542,6 +1576,7 @@ export async function runDaemonCommand(
                   repositories: cycle.repositories,
                   isolateRepositoryFailures: true,
                   rootIntent: rootRuntime(signal),
+                  signal,
                   ...(dependencies.slackTimeoutMs === undefined
                     ? {}
                     : { slackTimeoutMs: dependencies.slackTimeoutMs }),
@@ -1566,14 +1601,20 @@ export async function runDaemonCommand(
               return result;
             } catch (error) {
               if (error instanceof ObserverJobFailure) throw error;
+              if (observerInvariantError(error)) {
+                throw new ObserverJobFailure('schema.drift', progress, true);
+              }
               throw new ObserverJobFailure(
                 signal.aborted ? 'digest.timeout' : 'digest.query_failed',
-                { deferredCount: cycle.deferred, checkpoint: cycle.checkpoint },
+                progress,
               );
             }
           },
         },
       ] as const;
+      const startupClaims = new Set<ObserverJobName>([
+        'repository-discovery', 'run-observer', 'pr-digest',
+      ]);
       observerSupervisor = new ObserverSupervisor({
         installationSeed: dependencies.installationSeed ?? resolvedStatePath,
         jitterRatio: automation.scheduler.jitterRatio,
@@ -1589,11 +1630,11 @@ export async function runDaemonCommand(
           }];
         })),
         onStarted: async (name, at) => {
-          const claim = await health!.jobStarted(name, at);
-          // A clean prior daemon may have persisted a future completion schedule. Startup still
-          // performs the mandated immediate pass, but it must not forge a claim timestamp or
-          // overwrite that durable row. The first completion-based recurrence will claim normally.
-          if (claim !== null) claims.set(name, claim);
+          const claim = await health!.jobStarted(name, at, {
+            startupTakeover: startupClaims.delete(name),
+          });
+          if (claim === null) throw new Error('daemon_job_claim_rejected');
+          claims.set(name, claim);
         },
         onCompleted: async (completion: ObserverCompletion) => {
           const claim = claims.get(completion.name);

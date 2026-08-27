@@ -118,6 +118,8 @@ export type RunPublishOptions = {
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
   readonly rootIntent?: SlackRootIntentRuntime;
+  /** Observer deadline/shutdown fence carried through Run and Gate publication. */
+  readonly signal?: AbortSignal;
 };
 
 /**
@@ -143,6 +145,7 @@ export async function publishRunCard(
   options: RunPublishOptions,
   input: RunCardInput,
 ): Promise<RunPublishResult> {
+  const signal = options.signal ?? options.rootIntent?.signal;
   const card = renderRunCard(input);
   const fingerprint = renderFingerprint(card);
   const runKey = input.run.identity.key;
@@ -199,7 +202,7 @@ export async function publishRunCard(
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
-    ...(options.rootIntent?.signal === undefined ? {} : { signal: options.rootIntent.signal }),
+    ...(signal === undefined ? {} : { signal }),
   }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateRunObservation(runKey, fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
@@ -218,6 +221,7 @@ export async function publishRunCollectionCard(
   options: RunPublishOptions,
   collection: RunCollection,
 ): Promise<RunPublishOutcome> {
+  const signal = options.signal ?? options.rootIntent?.signal;
   const card = renderRunCollectionCard({
     cards: collection.runs.length,
     collection: { degraded: collection.degraded, unregistered: collection.unregistered },
@@ -273,7 +277,7 @@ export async function publishRunCollectionCard(
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
-    ...(options.rootIntent?.signal === undefined ? {} : { signal: options.rootIntent.signal }),
+    ...(signal === undefined ? {} : { signal }),
   }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateRunCollectionObservation(fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
@@ -323,6 +327,7 @@ export async function publishRunCollection(
             thread: options.thread,
             channel: options.channel,
             now: options.now,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.slackTimeoutMs === undefined
               ? {}
               : { slackTimeoutMs: options.slackTimeoutMs }),
@@ -356,6 +361,8 @@ export type RunObserveOptions = {
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
   readonly rootIntent?: SlackRootIntentRuntime;
+  /** Observer deadline/shutdown fence carried through Run and Gate publication. */
+  readonly signal?: AbortSignal;
 };
 
 /**
