@@ -132,6 +132,48 @@ function notFound(message: string): GhCommandError {
 }
 
 describe('fetchBranchRequiredRules', () => {
+  it('reads explicit REST pages and keeps required rules from the final short page', async () => {
+    const ruleCalls: string[][] = [];
+    const gh: GhRunner = {
+      run: async (args) => {
+        const joined = args.join(' ');
+        if (joined.includes('/protection/required_status_checks')) {
+          throw notFound('Branch not protected');
+        }
+        ruleCalls.push([...args]);
+        if (args[1]?.endsWith('page=1') === true) {
+          return JSON.stringify(Array.from({ length: 100 }, () => ({ type: 'creation' })));
+        }
+        return JSON.stringify([{
+          type: 'required_status_checks',
+          parameters: { required_status_checks: [{ context: 'page-two' }] },
+        }]);
+      },
+    };
+    const result = await fetchBranchRequiredRules(gh, REPO, 'main');
+    expect(ruleCalls).toHaveLength(2);
+    expect(result.contexts).toEqual([
+      { context: 'page-two', sources: ['repositoryRuleset'], appId: null },
+    ]);
+  });
+
+  it('fails closed before requesting a 101st repository-rules page', async () => {
+    const ruleCalls: string[][] = [];
+    const gh: GhRunner = {
+      run: async (args) => {
+        const joined = args.join(' ');
+        if (joined.includes('/protection/required_status_checks')) {
+          throw notFound('Branch not protected');
+        }
+        ruleCalls.push([...args]);
+        return JSON.stringify(Array.from({ length: 100 }, () => ({ type: 'creation' })));
+      },
+    };
+    await expect(fetchBranchRequiredRules(gh, REPO, 'main')).rejects.toThrow(/100 pages/);
+    expect(ruleCalls).toHaveLength(100);
+    expect(ruleCalls.at(-1)?.join(' ')).toContain('page=100');
+  });
+
   it('classic protection과 ruleset의 required context를 합집합으로 만든다', async () => {
     const gh = new FakeGh({ protection: PROTECTION_JSON, rules: RULES_JSON });
     const rules = await fetchBranchRequiredRules(gh, REPO, 'main');

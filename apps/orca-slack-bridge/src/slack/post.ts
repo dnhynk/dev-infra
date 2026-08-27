@@ -25,6 +25,8 @@ export type PostMessageInput = {
   /** blocks를 그리지 못하는 자리(알림, 검색 결과)용 대체 텍스트. 비우지 않는다. */
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /** Cooperative cancellation for an at-most-once root attempt. Never serialized to Slack. */
+  readonly signal?: AbortSignal;
 };
 
 export type ThreadReplyInput = {
@@ -301,6 +303,7 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
       'chat.postMessage',
       { channel: input.channel, text: input.text, blocks: input.blocks },
       false,
+      input.signal,
     );
   }
 

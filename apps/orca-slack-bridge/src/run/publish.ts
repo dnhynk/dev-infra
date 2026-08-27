@@ -1,15 +1,18 @@
 import { renderFingerprint, type RenderedCard } from '../digest/render.js';
 import { publishGateCard, type GatePublishResult } from '../gate/publish.js';
 import type { OrcaRunner } from '../orca/client.js';
-import type { BridgeConfig } from '../project/config.js';
 import {
   boundedSlackUpdate,
   DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
   type SlackPoster,
   type ThreadPoster,
 } from '../slack/post.js';
+import {
+  postSlackRootAtMostOnce,
+  type SlackRootIntentRuntime,
+} from '../slack/root-intent.js';
 import type { GateStore, RunStore } from '../store/schema.js';
-import { collectRunFacts } from './collect.js';
+import { collectRunFacts, type RunRoutingConfig } from './collect.js';
 import {
   renderRunCard,
   renderRunCollectionCard,
@@ -58,7 +61,13 @@ import type { RunCollection, RunFacts } from './types.js';
  *
  * `skip`은 실패가 아니다. 렌더 지문이 같아 게시할 것이 없다는 뜻이며 Slack을 부르지 않는다.
  */
-export type RunPublishAction = 'create' | 'update' | 'skip' | 'channel_mismatch';
+export type RunPublishAction =
+  | 'create'
+  | 'update'
+  | 'skip'
+  | 'channel_mismatch'
+  | 'deferred'
+  | 'uncertain';
 
 /**
  * 카드 한 장에 대한 결정과 그 결정이 만든 값.
@@ -108,6 +117,7 @@ export type RunPublishOptions = {
   readonly channel: string;
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
+  readonly rootIntent?: SlackRootIntentRuntime;
 };
 
 /**
@@ -163,20 +173,25 @@ export async function publishRunCard(
 
   const at = options.now().toISOString();
   if (existing === null) {
-    const posted = await options.slack.post({
+    const created = await postSlackRootAtMostOnce({
+      store: options.store,
+      entity: { kind: 'run', key: runKey },
       channel: options.channel,
-      text: card.text,
-      blocks: card.blocks,
-    });
-    // channel은 Slack이 돌려준 값을 쓴다. 그것이 이후 update가 쓸 canonical ID다.
-    options.store.insertRunMessage({
-      runKey,
-      channelId: posted.channel,
-      messageTs: posted.ts,
       renderFingerprint: fingerprint,
-      at,
+      message: { text: card.text, blocks: card.blocks },
+      mapping: { kind: 'run' },
+      slack: options.slack,
+      now: options.now,
+      ...(options.rootIntent === undefined ? {} : { runtime: options.rootIntent }),
     });
-    return { ...base, action: 'create', messageTs: posted.ts };
+    if (created.kind === 'blocked') {
+      return {
+        ...base,
+        action: created.state === 'pending' ? 'deferred' : 'uncertain',
+        messageTs: created.messageTs,
+      };
+    }
+    return { ...base, action: 'create', messageTs: created.message.ts };
   }
 
   const updated = await boundedSlackUpdate(options.slack, {
@@ -184,6 +199,7 @@ export async function publishRunCard(
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
+    ...(options.rootIntent?.signal === undefined ? {} : { signal: options.rootIntent.signal }),
   }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateRunObservation(runKey, fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
@@ -231,18 +247,25 @@ export async function publishRunCollectionCard(
 
   const at = options.now().toISOString();
   if (existing === null) {
-    const posted = await options.slack.post({
+    const created = await postSlackRootAtMostOnce({
+      store: options.store,
+      entity: { kind: 'run_collection', key: 'run_collection' },
       channel: options.channel,
-      text: card.text,
-      blocks: card.blocks,
-    });
-    options.store.insertRunCollectionMessage({
-      channelId: posted.channel,
-      messageTs: posted.ts,
       renderFingerprint: fingerprint,
-      at,
+      message: { text: card.text, blocks: card.blocks },
+      mapping: { kind: 'run_collection' },
+      slack: options.slack,
+      now: options.now,
+      ...(options.rootIntent === undefined ? {} : { runtime: options.rootIntent }),
     });
-    return { ...base, action: 'create', messageTs: posted.ts };
+    if (created.kind === 'blocked') {
+      return {
+        ...base,
+        action: created.state === 'pending' ? 'deferred' : 'uncertain',
+        messageTs: created.messageTs,
+      };
+    }
+    return { ...base, action: 'create', messageTs: created.message.ts };
   }
 
   const updated = await boundedSlackUpdate(options.slack, {
@@ -250,6 +273,7 @@ export async function publishRunCollectionCard(
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
+    ...(options.rootIntent?.signal === undefined ? {} : { signal: options.rootIntent.signal }),
   }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateRunCollectionObservation(fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
@@ -321,7 +345,7 @@ export async function publishRunCollection(
  * 한쪽만 고쳐진다.
  */
 export type RunObserveOptions = {
-  readonly config: BridgeConfig;
+  readonly config: RunRoutingConfig;
   /** 게시 대상 채널 ID. 설정의 `slack.channels.agentRuns`에서만 온다. 여기서 만들지 않는다. */
   readonly channel: string;
   readonly store: RunStore & GateStore;
@@ -331,6 +355,7 @@ export type RunObserveOptions = {
   readonly thread: ThreadPoster | null;
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
+  readonly rootIntent?: SlackRootIntentRuntime;
 };
 
 /**

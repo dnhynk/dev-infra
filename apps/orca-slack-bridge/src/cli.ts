@@ -1,12 +1,20 @@
 #!/usr/bin/env node
-import { loadConfig, defaultConfigPath, type BridgeConfig } from './project/config.js';
+import {
+  DEFAULT_AUTOMATION_CONFIG,
+  loadConfig,
+  defaultConfigPath,
+  type BridgeConfig,
+  type ParsedBridgeConfig,
+} from './project/config.js';
 import {
   persistGateMetadata,
   readGateRegistrationDocument,
   validateGateRegistrationIdentity,
   type GateRegistrationResult,
 } from './gate/register.js';
-import { GhCli } from './github/runner.js';
+import { GhCli, type GhRunner } from './github/runner.js';
+import { BackgroundGithub } from './github/background.js';
+import { repositoryIdentityConfirmer } from './github/repository.js';
 import { boundedOrcaRunner, OrcaCli, type OrcaRunner } from './orca/client.js';
 import { takeSnapshot, summarize } from './snapshot/snapshot.js';
 import { formatRunCollection } from './run/collect.js';
@@ -32,13 +40,7 @@ import {
 } from './slack/post.js';
 import { ReadOnlyDigestStore, SqliteDigestStore, resolveStatePath } from './store/sqlite.js';
 import type { DigestStore, GateStore, RunStore } from './store/schema.js';
-import {
-  MemorySummaryCache,
-  OpenAiSummaryProvider,
-  OPENAI_KEY_VAR,
-  SummaryProviderError,
-  type SummaryProvider,
-} from './summarize/index.js';
+import type { SummaryProvider } from './summarize/openai.js';
 import { GateActionHandler } from './gate/action-handler.js';
 import {
   GateDirectInputHandler,
@@ -67,6 +69,7 @@ import {
 } from './channel/pipe-server.js';
 import type { Readable, Writable } from 'node:stream';
 import type { DaemonJobName } from './store/operational-types.js';
+import type { DaemonJobClaim, OperationalFailureCode } from './store/operational-types.js';
 import {
   formatOperationalStatus,
   inspectOperationalStatus,
@@ -86,7 +89,33 @@ import {
   formatOperationalLogRecord,
   readOperationalLogTail,
 } from './operational/logs.js';
-import { OPERATIONAL_JOB_NAMES, resolveOperationalLogDir } from './operational/logger.js';
+import {
+  OPERATIONAL_JOB_NAMES,
+  OperationalNdjsonLogger,
+  resolveOperationalLogDir,
+  type OperationalTelemetrySink,
+} from './operational/logger.js';
+import { OperationalHealthTelemetry } from './operational/health.js';
+import {
+  fingerprintOperationalBuild,
+  fingerprintOperationalConfig,
+} from './operational/status.js';
+import {
+  bridgeConfigFingerprint,
+  buildEffectiveBridgeConfig,
+} from './discovery/effective-config.js';
+import { runRepositoryDiscoveryPass } from './discovery/reconcile.js';
+import type { EffectiveBridgeConfig } from './discovery/types.js';
+import {
+  ObserverJobFailure,
+  ObserverSupervisor,
+  SYSTEM_OBSERVER_CLOCK,
+  type ObserverClock,
+  type ObserverCompletion,
+  type ObserverJobName,
+} from './observer/supervisor.js';
+import type { SlackRootIntentRuntime } from './slack/root-intent.js';
+import { randomUUID } from 'node:crypto';
 
 export type Command =
   | 'snapshot'
@@ -505,7 +534,12 @@ channel-adapter는 옵션이 없다.`;
  * `kind: 'failed'`로 바꾸므로 카드는 요약 없이 사실만 담은 축소 카드로 게시된다(OD-035).
  * 여기서 던지면 요약 실패 하나가 GitHub·Orca 관찰과 Slack 게시를 통째로 막는다.
  */
-function summaryProvider(env: NodeJS.ProcessEnv): SummaryProvider {
+async function summaryProvider(env: NodeJS.ProcessEnv): Promise<SummaryProvider> {
+  const {
+    OPENAI_KEY_VAR,
+    OpenAiSummaryProvider,
+    SummaryProviderError,
+  } = await import('./summarize/index.js');
   const key = env[OPENAI_KEY_VAR]?.trim();
   if (!key) {
     return {
@@ -731,13 +765,14 @@ async function runDigestCommand(parsed: RunArgs, config: BridgeConfig): Promise<
   const orcaBin = parsed.orcaBin ?? process.env['ORCA_BIN'] ?? 'orca';
   const store = openDigestStore(resolveStatePath(parsed.statePath), parsed.dryRun);
   try {
+    const { MemorySummaryCache } = await import('./summarize/result.js');
     const report = await runDigest(new OrcaCli(orcaBin), new GhCli(), {
       config,
       channel,
       store,
       // 루트와 thread write 경계. dry-run이면 둘 다 null이다.
       ...digestPosters(parsed.dryRun, process.env),
-      provider: summaryProvider(process.env),
+      provider: await summaryProvider(process.env),
       cache: new MemorySummaryCache(),
       prLimit: parsed.prLimit,
       onlyPr: parsed.pr,
@@ -896,6 +931,7 @@ export type ChannelDeliveryRuntime = {
 
 export type DaemonDependencies = {
   readonly orca?: OrcaRunner;
+  readonly gh?: GhRunner;
   readonly slack?: SlackPoster;
   readonly viewOpener?: SlackViewOpener;
   readonly connectionFactory?: SocketConnectionFactory;
@@ -919,6 +955,13 @@ export type DaemonDependencies = {
     orca: OrcaRunner,
     transport: ChannelDaemonServer,
   ) => ChannelDeliveryRuntime;
+  /** Test seam; production creates the O1-4 bounded NDJSON logger. */
+  readonly telemetry?: OperationalTelemetrySink;
+  readonly observerClock?: ObserverClock;
+  readonly observerDrainTimeoutMs?: number;
+  readonly digestStartupDelayMs?: number;
+  readonly buildIdentity?: string;
+  readonly installationSeed?: string;
 };
 
 type ProcessStopLatch = {
@@ -946,6 +989,86 @@ function processStop(): ProcessStopLatch {
   return { promise, dispose: () => dispose() };
 }
 
+function parsedDaemonConfig(config: BridgeConfig): ParsedBridgeConfig {
+  return {
+    ...config,
+    // Parsed production configs always carry automation. Missing means a legacy hand-built caller
+    // (including the D2/D3 regression fixtures), for which silently starting new jobs is unsafe.
+    automation: config.automation ?? { ...DEFAULT_AUTOMATION_CONFIG, enabled: false },
+  };
+}
+
+function scopedOrcaRunner(runner: OrcaRunner, signal: AbortSignal): OrcaRunner {
+  return {
+    run: (args, options = {}) => runner.run(args, {
+      signal: options.signal === undefined
+        ? signal
+        : AbortSignal.any([signal, options.signal]),
+    }),
+  };
+}
+
+function digestBridgeConfig(effective: EffectiveBridgeConfig): BridgeConfig {
+  return {
+    ...effective.base,
+    projects: effective.projects.map((project) => ({
+      name: project.name,
+      repositories: project.repositories.map((repository) => repository.nameWithOwner),
+      orcaRepositoryIds: project.orcaRepositoryIds,
+    })),
+  };
+}
+
+function fairDigestCycle(
+  effective: EffectiveBridgeConfig,
+  checkpoint: number,
+): {
+  readonly repositories: readonly string[];
+  readonly checkpoint: number;
+  readonly deferred: number;
+  readonly prLimit: number;
+} {
+  const perRepository = effective.base.automation.prDigest.prLimit;
+  const globalBudget = effective.base.automation.prDigest.globalPrBudget;
+  const prLimit = Math.min(perRepository, globalBudget);
+  const automation = effective.base.automation;
+  const unique = [...new Map(effective.projects
+    .flatMap((project) => project.repositories)
+    .map((repository) => [repository.canonicalKey, repository.nameWithOwner])).values()]
+    .sort((a, b) => a.localeCompare(b));
+  if (effective.routing.status === 'blocked') {
+    return {
+      repositories: [], checkpoint, deferred: unique.length * perRepository, prLimit,
+    };
+  }
+  if (unique.length === 0) {
+    return { repositories: [], checkpoint: 0, deferred: 0, prLimit };
+  }
+  const repositoryBudget = Math.max(1,
+    Math.floor(automation.prDigest.globalPrBudget / prLimit));
+  const count = Math.min(unique.length, repositoryBudget);
+  const start = checkpoint % unique.length;
+  const selected = Array.from({ length: count }, (_unused, offset) =>
+    unique[(start + offset) % unique.length]!);
+  return {
+    repositories: selected,
+    checkpoint: (start + count) % unique.length,
+    deferred: (unique.length - count) * perRepository + count * (perRepository - prLimit),
+    prLimit,
+  };
+}
+
+function discoveryFailureCode(failure: string | undefined): OperationalFailureCode {
+  switch (failure) {
+    case 'schema_drift': return 'discovery.schema_drift';
+    case 'capacity_conflict': return 'discovery.capacity_conflict';
+    case 'config_drift': return 'config.drift';
+    case 'github_unavailable': return 'discovery.github_unavailable';
+    case 'query_failed': return 'discovery.query_failed';
+    default: return 'validation.failed';
+  }
+}
+
 /** Production D2+D3 path: strict v12 startup → delivery/resume reconcile → existing-card projection. */
 export async function runDaemonCommand(
   parsed: RunArgs,
@@ -961,6 +1084,9 @@ export async function runDaemonCommand(
     process.stderr.write('daemon은 ORCA_SLACK_BRIDGE_APP_TOKEN xapp token이 필요하다\n');
     return 2;
   }
+  const daemonConfig = parsedDaemonConfig(config);
+  const automation = daemonConfig.automation;
+  const observerClock = dependencies.observerClock ?? SYSTEM_OBSERVER_CLOCK;
   const processStopLatch = dependencies.waitForStop === undefined ? processStop() : null;
   let store: SqliteDigestStore | null = null;
   let transport: SlackSocketTransport | null = null;
@@ -970,6 +1096,16 @@ export async function runDaemonCommand(
   let writableStoreOpenAttempted = false;
   let failureReported = false;
   let channelDelivery: ChannelDeliveryRuntime | null = null;
+  let observerSupervisor: ObserverSupervisor | null = null;
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  let telemetry: OperationalTelemetrySink | null = null;
+  let ownsTelemetry = false;
+  let health: OperationalHealthTelemetry | null = null;
+  const instanceId = `daemon-${process.pid}-${randomUUID()}`;
+  let daemonHealthStarted = false;
+  let observerDrainTimedOut = false;
+  let fatalOperationalFailure = false;
+  let commandFailed = false;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
   let deliveryReconciliation: Promise<void> | null = null;
@@ -997,16 +1133,42 @@ export async function runDaemonCommand(
   }
   let acceptingInbound = false;
   const drainAcceptedWork = async (): Promise<void> => {
-    await Promise.allSettled([...inbound]);
-    inboundAbort.abort();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    if (!acceptedWorkAbort.signal.aborted) {
-      timer = setTimeout(() => acceptedWorkAbort.abort(), 20_000);
-      timer.unref?.();
+    const settle = async (
+      work: readonly Promise<void>[],
+      onTimeout: () => void,
+    ): Promise<boolean> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timed = new Promise<false>((resolve) => {
+        timer = setTimeout(() => { onTimeout(); resolve(false); }, 20_000);
+        timer.unref?.();
+      });
+      const drained = await Promise.race([Promise.allSettled(work).then(() => true), timed]);
+      if (timer !== undefined) clearTimeout(timer);
+      return drained;
+    };
+    // First let every already-accepted envelope finish ACK/CAS and enqueue its post-ACK work.
+    // Only then snapshot the durable work set; taking both snapshots together loses that handoff.
+    if (!await settle([...inbound], () => inboundAbort.abort())) {
+      observerDrainTimedOut = true;
+      acceptedWorkAbort.abort();
+      return;
     }
-    await Promise.allSettled([...pending]);
-    if (timer !== undefined) clearTimeout(timer);
+    inboundAbort.abort();
+    if (!await settle([...pending], () => acceptedWorkAbort.abort())) {
+      observerDrainTimedOut = true;
+    }
     acceptedWorkAbort.abort();
+  };
+  const stopObserverWork = async (): Promise<void> => {
+    if (heartbeatTimer !== null) {
+      observerClock.clearTimer(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+    if (observerSupervisor !== null) {
+      const drained = await observerSupervisor.stop(dependencies.observerDrainTimeoutMs ?? 20_000);
+      if (!drained) observerDrainTimedOut = true;
+      observerSupervisor = null;
+    }
   };
   try {
     const resolvedStatePath = resolveStatePath(parsed.statePath);
@@ -1023,6 +1185,7 @@ export async function runDaemonCommand(
     statusSnapshotLease.assertHeld();
     writableStoreOpenAttempted = true;
     store = (dependencies.openStore ?? ((path) => new SqliteDigestStore(path)))(resolvedStatePath);
+    const daemonStore = store;
     statusOwnerServer = dependencies.statusOwnerServer ?? new OperationalStatusOwnerServer({
       statePath: resolvedStatePath,
       store,
@@ -1045,6 +1208,9 @@ export async function runDaemonCommand(
       ? (dependencies.slack === undefined ? botToken(process.env) : null)
       : null;
     const slack = dependencies.slack ?? new SlackWebApiPoster({ token: productionBotToken! });
+    const threadPoster = typeof (slack as Partial<ThreadPoster>).reply === 'function'
+      ? slack as SlackPoster & ThreadPoster
+      : null;
     const viewOpener = dependencies.viewOpener ?? (
       productionBotToken === null
         ? { open: () => Promise.reject(new Error('Slack modal opener is not injected')) }
@@ -1120,10 +1286,72 @@ export async function runDaemonCommand(
       );
     }
 
+    const previousHealth = store.readDaemonHealth();
+    const configFingerprint = fingerprintOperationalConfig(daemonConfig);
+    const discoveryConfigFingerprint = bridgeConfigFingerprint(daemonConfig);
+    const buildIdentity = dependencies.buildIdentity ??
+      process.env['ORCA_SLACK_BRIDGE_BUILD'] ?? 'development';
+    const buildFingerprint = fingerprintOperationalBuild(buildIdentity);
+    if (dependencies.telemetry !== undefined) {
+      telemetry = dependencies.telemetry;
+    } else {
+      ownsTelemetry = true;
+      telemetry = await OperationalNdjsonLogger.create({
+        logDir: resolveOperationalLogDir(parsed.logDir),
+        buildIdentity,
+        maxFileMiB: automation.logging.maxFileMiB,
+        backupCount: automation.logging.backupCount,
+        clock: observerClock.wallNow,
+        onFailure: (notice) => {
+          if (!notice.fatal) return;
+          fatalOperationalFailure = true;
+          requestStop('requested');
+        },
+      });
+    }
+    health = new OperationalHealthTelemetry(store, telemetry, () => statusOwnerServer?.refresh());
+    await health.daemonStarted({
+      instanceId,
+      buildFingerprint,
+      configFingerprint,
+      at: observerClock.wallNow().toISOString(),
+    });
+    daemonHealthStarted = true;
+    if (fatalOperationalFailure) throw new Error('logger_fatal');
+
     // No Slack Socket event can race schema validation or startup recovery.
     await engine.reconcile(reconciliationAbort.signal);
     await channelDelivery.reconcile(reconciliationAbort.signal);
+    const recoveredRoots = store.recoverSlackRootIntents(
+      instanceId,
+      observerClock.wallNow().toISOString(),
+    );
+    statusOwnerServer.refresh();
+    if (recoveredRoots > 0) {
+      await health.event({
+        level: 'warn', event: 'root_intent.changed', outcome: 'uncertain',
+        counts: { uncertain: recoveredRoots },
+      });
+    }
+    for (const name of [
+      'repository-discovery', 'run-observer', 'pr-digest',
+    ] as const satisfies readonly ObserverJobName[]) {
+      const orphan = store.findDaemonJobOutcome(name);
+      if (orphan?.state !== 'running') continue;
+      store.completeDaemonJobFailure({
+        claim: { jobName: name, revision: orphan.revision, startedAt: orphan.startedAt },
+        at: observerClock.wallNow().toISOString(),
+        durationMs: orphan.durationMs ?? 0,
+        errorCode: 'scheduler.aborted',
+        processedCount: orphan.processedCount,
+        deferredCount: orphan.deferredCount,
+        checkpoint: orphan.checkpoint,
+      });
+      statusOwnerServer.refresh();
+    }
+    if (store.readDaemonHealth()?.desiredState === 'stopped') requestStop('requested');
     if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
+
     const configuredInterval = dependencies.reconcileIntervalMs ?? 5_000;
     if (!Number.isFinite(configuredInterval) || configuredInterval < 10) {
       throw new TypeError('reconcileIntervalMs must be a finite number >= 10');
@@ -1152,13 +1380,270 @@ export async function runDaemonCommand(
         });
       }
     };
-    // Startup may see a live owner that crashes immediately afterward. Rechecking durable pending
-    // work lets this daemon take over once that owner is no longer live, without stealing it early.
+    // D2/D3 retain their independent five-second cadence while the bounded observer startup
+    // discovery is running. They are deliberately outside the serial observer lane.
     reconciliationTimer = setInterval(
       scheduleReconciliation,
       Math.trunc(configuredInterval),
     );
     reconciliationTimer.unref?.();
+
+    const heartbeatMilliseconds = automation.health.heartbeatSeconds * 1_000;
+    const armHeartbeat = (): void => {
+      if (stopReason !== null || health === null) return;
+      heartbeatTimer = observerClock.setTimer(() => {
+        heartbeatTimer = null;
+        void health!.daemonHeartbeat(instanceId, observerClock.wallNow().toISOString())
+          .then((record) => {
+            if (record === null) {
+              fatalOperationalFailure = true;
+              requestStop('requested');
+              return;
+            }
+            if (record.desiredState === 'stopped') requestStop('requested');
+            else armHeartbeat();
+          })
+          .catch(() => {
+            fatalOperationalFailure = true;
+            requestStop('requested');
+          });
+      }, heartbeatMilliseconds);
+      heartbeatTimer.unref?.();
+    };
+    armHeartbeat();
+
+    if (automation.enabled) {
+      const lkgCompatible = previousHealth?.configFingerprint === configFingerprint;
+      let lkgProof: string | null = lkgCompatible ? discoveryConfigFingerprint : null;
+      let effectiveConfig = buildEffectiveBridgeConfig(
+        daemonConfig,
+        lkgCompatible
+          ? store.readEffectiveDiscoverySnapshot()
+          : { repositories: [], bindings: [], issues: [] },
+        { configFingerprint: discoveryConfigFingerprint },
+      );
+      const backgroundGithub = new BackgroundGithub(
+        dependencies.gh ?? new GhCli(),
+        {
+          commandBudgetPerHour: automation.github.commandBudgetPerHour,
+          rateLimitFloor: automation.github.rateLimitFloor,
+          nowMs: observerClock.monotonicMs,
+        },
+      );
+      const claims = new Map<ObserverJobName, DaemonJobClaim>();
+      const rootRuntime = (signal: AbortSignal): SlackRootIntentRuntime => ({
+        instanceId,
+        telemetry: telemetry!,
+        signal,
+        timeoutMs: dependencies.slackTimeoutMs ?? 15_000,
+      });
+      const observerJobs = [
+        {
+          name: 'repository-discovery' as const,
+          intervalMs: automation.repositoryDiscovery.intervalSeconds * 1_000,
+          timeoutMs: automation.repositoryDiscovery.timeoutSeconds * 1_000,
+          backoffCapMs: 5 * 60_000,
+          run: async (signal: AbortSignal) => {
+            const result = await runRepositoryDiscoveryPass({
+              orca: scopedOrcaRunner(orca, signal),
+              github: repositoryIdentityConfirmer(backgroundGithub.scoped(signal)),
+              store: daemonStore,
+              config: daemonConfig,
+              configFingerprint: discoveryConfigFingerprint,
+              lastKnownGoodConfigFingerprint: lkgProof,
+              signal,
+              deadlineAt: observerClock.wallNow().getTime() +
+                automation.repositoryDiscovery.timeoutSeconds * 1_000,
+              now: observerClock.wallNow,
+            });
+            effectiveConfig = result.effectiveConfig;
+            const counts = {
+              processedCount: result.counts.effectiveBindings,
+              deferredCount: result.counts.deferredRepositories + result.counts.blockedBindings,
+            };
+            if (result.status === 'failed') {
+              throw new ObserverJobFailure(
+                discoveryFailureCode(result.failure),
+                counts,
+                result.failure === 'schema_drift' || result.failure === 'config_drift',
+              );
+            }
+            lkgProof = discoveryConfigFingerprint;
+            await health!.event({
+              level: 'info', event: 'discovery.completed', outcome: 'succeeded',
+              counts: {
+                processed: result.counts.effectiveBindings,
+                deferred: result.counts.deferredRepositories,
+              },
+            });
+            return counts;
+          },
+        },
+        {
+          name: 'run-observer' as const,
+          intervalMs: automation.runObserver.intervalSeconds * 1_000,
+          timeoutMs: automation.runObserver.timeoutSeconds * 1_000,
+          backoffCapMs: 15 * 60_000,
+          run: async (signal: AbortSignal) => {
+            try {
+              const report = await runRunObserver(scopedOrcaRunner(orca, signal), {
+                config: effectiveConfig,
+                channel: config.slack!.channels.agentRuns,
+                store: daemonStore,
+                slack,
+                thread: threadPoster,
+                now: observerClock.wallNow,
+                rootIntent: rootRuntime(signal),
+                ...(dependencies.slackTimeoutMs === undefined
+                  ? {}
+                  : { slackTimeoutMs: dependencies.slackTimeoutMs }),
+              });
+              return {
+                processedCount: report.published.runs.length + 1,
+                deferredCount: report.facts.unregistered.count,
+              };
+            } catch {
+              throw new ObserverJobFailure(
+                signal.aborted ? 'run.timeout' : 'run.query_failed',
+              );
+            }
+          },
+        },
+        {
+          name: 'pr-digest' as const,
+          intervalMs: automation.prDigest.intervalSeconds * 1_000,
+          timeoutMs: automation.prDigest.timeoutSeconds * 1_000,
+          backoffCapMs: 2 * 60 * 60_000,
+          run: async (signal: AbortSignal) => {
+            const priorCheckpoint = daemonStore.findDaemonJobOutcome('pr-digest')?.checkpoint ?? 0;
+            const cycle = fairDigestCycle(effectiveConfig, priorCheckpoint);
+            if (effectiveConfig.routing.status === 'blocked') {
+              const invariant = effectiveConfig.routing.reason !== 'capacity_conflict';
+              throw new ObserverJobFailure(
+                invariant ? 'config.drift' : 'digest.capacity_deferred',
+                { deferredCount: cycle.deferred, checkpoint: cycle.checkpoint },
+                invariant,
+              );
+            }
+            try {
+              const report = await runDigest(
+                scopedOrcaRunner(orca, signal),
+                backgroundGithub.scoped(signal),
+                {
+                  config: digestBridgeConfig(effectiveConfig),
+                  channel: config.slack!.channels.prDigest,
+                  store: daemonStore,
+                  slack,
+                  thread: threadPoster,
+                  summaryMode: 'facts_only',
+                  prLimit: cycle.prLimit,
+                  onlyPr: null,
+                  now: observerClock.wallNow,
+                  repositories: cycle.repositories,
+                  isolateRepositoryFailures: true,
+                  rootIntent: rootRuntime(signal),
+                  ...(dependencies.slackTimeoutMs === undefined
+                    ? {}
+                    : { slackTimeoutMs: dependencies.slackTimeoutMs }),
+                },
+              );
+              const failures = report.repositoryFailures ?? [];
+              const deferredCount = cycle.deferred + failures.length * cycle.prLimit;
+              const result = {
+                processedCount: report.results.length,
+                deferredCount,
+                checkpoint: cycle.checkpoint,
+              };
+              if (failures.length > 0) {
+                const code: OperationalFailureCode = failures.some((row) =>
+                  row.reason === 'deadline_deferred')
+                  ? 'digest.timeout'
+                  : failures.some((row) => row.reason === 'budget_deferred')
+                    ? 'digest.capacity_deferred'
+                    : 'digest.github_unavailable';
+                throw new ObserverJobFailure(code, result);
+              }
+              return result;
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              throw new ObserverJobFailure(
+                signal.aborted ? 'digest.timeout' : 'digest.query_failed',
+                { deferredCount: cycle.deferred, checkpoint: cycle.checkpoint },
+              );
+            }
+          },
+        },
+      ] as const;
+      observerSupervisor = new ObserverSupervisor({
+        installationSeed: dependencies.installationSeed ?? resolvedStatePath,
+        jitterRatio: automation.scheduler.jitterRatio,
+        jobs: observerJobs,
+        clock: observerClock,
+        initialState: Object.fromEntries([
+          'repository-discovery', 'run-observer', 'pr-digest',
+        ].map((name) => {
+          const prior = daemonStore.findDaemonJobOutcome(name as ObserverJobName);
+          return [name, {
+            consecutiveFailures: prior?.consecutiveFailures ?? 0,
+            executionBucket: prior?.attempt ?? 0,
+          }];
+        })),
+        onStarted: async (name, at) => {
+          const claim = await health!.jobStarted(name, at);
+          // A clean prior daemon may have persisted a future completion schedule. Startup still
+          // performs the mandated immediate pass, but it must not forge a claim timestamp or
+          // overwrite that durable row. The first completion-based recurrence will claim normally.
+          if (claim !== null) claims.set(name, claim);
+        },
+        onCompleted: async (completion: ObserverCompletion) => {
+          const claim = claims.get(completion.name);
+          claims.delete(completion.name);
+          if (claim === undefined) return;
+          const at = observerClock.wallNow().toISOString();
+          const common = {
+            claim,
+            at,
+            durationMs: completion.durationMs,
+            ...(completion.processedCount === undefined
+              ? {}
+              : { processedCount: completion.processedCount }),
+            ...(completion.deferredCount === undefined
+              ? {}
+              : { deferredCount: completion.deferredCount }),
+            ...(completion.checkpoint === undefined
+              ? {}
+              : { checkpoint: completion.checkpoint }),
+          };
+          if (completion.status === 'succeeded') {
+            if (await health!.jobSucceeded({ ...common, nextRunAt: completion.nextRunAt }) === null) {
+              throw new Error('daemon_job_success_rejected');
+            }
+            return;
+          }
+          const failed = await health!.jobFailed({
+            ...common,
+            errorCode: completion.errorCode ?? 'validation.failed',
+          }, completion.retryable);
+          if (failed === null) throw new Error('daemon_job_failure_rejected');
+          if (!completion.retryable) return;
+          if (await health!.jobBackoff(
+            completion.name,
+            failed.revision,
+            completion.nextRunAt,
+            at,
+          ) === null) {
+            throw new Error('daemon_job_backoff_rejected');
+          }
+        },
+        onFatal: () => {
+          fatalOperationalFailure = true;
+          requestStop('requested');
+        },
+      });
+      await observerSupervisor.runStartupDiscovery();
+      if (fatalOperationalFailure) throw new Error('observer_supervisor_fatal');
+    }
+    if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
     transport = new SlackSocketTransport({
       ...(config.slack.apiAppId === undefined ? {} : { expectedApiAppId: config.slack.apiAppId }),
       connectionFactory: dependencies.connectionFactory ?? slackSdkConnectionFactory(token),
@@ -1188,15 +1673,17 @@ export async function runDaemonCommand(
       reconciliationTimer = null;
       reconciliationAbort.abort();
       channelServer.quiesce?.();
+      await stopObserverWork();
       await transport.shutdown();
       await starting;
       transport = null;
       await drainAcceptedWork();
       await channelServer.stop();
       channelServer = null;
-      return stopReason === 'pipe_failure' ? 1 : 0;
+      return stopReason === 'pipe_failure' || observerDrainTimedOut || fatalOperationalFailure ? 1 : 0;
     }
     if (startupOutcome === 'failed') throw new Error('socket_start_failed');
+    observerSupervisor?.startAfterSocket(dependencies.digestStartupDelayMs ?? 60_000);
 
     if (dependencies.waitForStop !== undefined) {
       const injectedStop = dependencies.waitForStop().then(
@@ -1217,6 +1704,7 @@ export async function runDaemonCommand(
     reconciliationTimer = null;
     reconciliationAbort.abort();
     channelServer.quiesce?.();
+    await stopObserverWork();
     // Keep the fixed pipe bound until Socket ingress and all already-accepted work are quiescent.
     // A contender therefore remains failed closed throughout the entire external-work drain.
     await transport.shutdown();
@@ -1224,8 +1712,9 @@ export async function runDaemonCommand(
     await drainAcceptedWork();
     await channelServer.stop();
     channelServer = null;
-    return stopReason === 'pipe_failure' ? 1 : 0;
+    return stopReason === 'pipe_failure' || observerDrainTimedOut || fatalOperationalFailure ? 1 : 0;
   } catch {
+    commandFailed = true;
     reportFailure();
     return 1;
   } finally {
@@ -1233,6 +1722,7 @@ export async function runDaemonCommand(
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
     reconciliationAbort.abort();
     channelServer?.quiesce?.();
+    await stopObserverWork();
     if (transport !== null) {
       try {
         await transport.shutdown();
@@ -1250,11 +1740,35 @@ export async function runDaemonCommand(
         // Pipe shutdown failure cannot authorize a second daemon or a different external write.
       }
     }
+    if (daemonHealthStarted && !commandFailed && !observerDrainTimedOut &&
+        stopReason !== 'pipe_failure' && !fatalOperationalFailure && health !== null) {
+      let cleanStopped = false;
+      for (let attempt = 0; attempt < 4 && !cleanStopped; attempt += 1) {
+        try {
+          cleanStopped = await health.daemonCleanStopped(
+            instanceId,
+            observerClock.wallNow().toISOString(),
+          ) !== null;
+        } catch {
+          if (attempt < 3) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+          }
+        }
+      }
+      if (!cleanStopped) fatalOperationalFailure = true;
+    }
     if (statusOwnerServer !== null) {
       try {
         await statusOwnerServer.stop();
       } catch {
         // The store remains the owner until the bounded local status listener has been retired.
+      }
+    }
+    if (ownsTelemetry && telemetry !== null) {
+      try {
+        await telemetry.close();
+      } catch {
+        fatalOperationalFailure = true;
       }
     }
     let writableStoreClosureUncertain = writableStoreOpenAttempted && store === null;
@@ -1275,7 +1789,7 @@ export async function runDaemonCommand(
       statusSnapshotLease = null;
     }
     processStopLatch?.dispose();
-    if (writableStoreClosureUncertain) {
+    if (writableStoreClosureUncertain || observerDrainTimedOut || fatalOperationalFailure) {
       // Do not release or discard the descriptor/mutex when the writable handle may still be live.
       // The CLI entrypoint exits nonzero immediately after this bounded static diagnostic.
       reportFailure();

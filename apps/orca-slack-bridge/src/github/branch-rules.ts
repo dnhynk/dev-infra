@@ -1,4 +1,5 @@
 import type { RepositoryIdentity } from '../identity/repository.js';
+import { BACKGROUND_GITHUB_MAX_PAGES } from './background.js';
 import { ghJson, httpStatusOf, type GhRunner } from './runner.js';
 
 /**
@@ -132,8 +133,9 @@ function parseBranchProtection(raw: unknown): readonly RuleContext[] {
  */
 function parseRepositoryRules(raw: unknown): readonly RuleContext[] {
   if (!Array.isArray(raw)) return [];
+  const pages = raw.every((row) => Array.isArray(row)) ? raw as readonly unknown[][] : [raw];
   const out: RuleContext[] = [];
-  for (const rule of raw) {
+  for (const rule of pages.flat()) {
     const r = (rule ?? {}) as Record<string, unknown>;
     if (r['type'] !== 'required_status_checks') continue;
     const params = (r['parameters'] ?? {}) as Record<string, unknown>;
@@ -148,6 +150,38 @@ function parseRepositoryRules(raw: unknown): readonly RuleContext[] {
   return out;
 }
 
+/** Explicit page numbers make the 100-page bound effective before `gh` follows an unbounded Link chain. */
+async function readRepositoryRules(
+  runner: GhRunner,
+  repo: RepositoryIdentity,
+  branch: string,
+): Promise<SourceResult> {
+  const pages: unknown[][] = [];
+  try {
+    for (let page = 1; page <= BACKGROUND_GITHUB_MAX_PAGES; page += 1) {
+      const raw = await ghJson<unknown>(runner, [
+        'api',
+        `repos/${repo.nameWithOwner}/rules/branches/${branch}?per_page=100&page=${page}`,
+      ]);
+      if (!Array.isArray(raw)) {
+        throw new TypeError('repository rules page is not an array');
+      }
+      pages.push(raw);
+      if (raw.length < 100) {
+        return { status: 'present', contexts: parseRepositoryRules(pages) };
+      }
+    }
+    throw new RangeError(
+      `repository rules exceeded ${BACKGROUND_GITHUB_MAX_PAGES} pages`,
+    );
+  } catch (error) {
+    const status = httpStatusOf(error);
+    if (status === 404) return { status: 'absent', contexts: [] };
+    if (status === 403) return { status: 'forbidden', contexts: [] };
+    throw error;
+  }
+}
+
 export async function fetchBranchRequiredRules(
   runner: GhRunner,
   repo: RepositoryIdentity,
@@ -158,14 +192,9 @@ export async function fetchBranchRequiredRules(
     ['api', `repos/${repo.nameWithOwner}/branches/${branch}/protection/required_status_checks`],
     parseBranchProtection,
   );
-  // `rules/branches/{branch}`는 paginated다. 실측(2026-08-23): ruleset 2개가 적용된 branch에
-  // `?per_page=1`을 붙이면 `Link: ...rel="next"`가 왔고 두 번째 rule의 required context는
-  // 요청이 성공한 채로 응답에서 사라졌다. `--paginate` 없이는 그 유실이 오류로 드러나지 않는다.
-  const rules = await readSource(
-    runner,
-    ['api', '--paginate', `repos/${repo.nameWithOwner}/rules/branches/${branch}`],
-    parseRepositoryRules,
-  );
+  // `rules/branches/{branch}`는 paginated다. page를 명시해 101번째부터의 조용한 유실과
+  // `--paginate`의 unbounded Link traversal을 둘 다 피한다.
+  const rules = await readRepositoryRules(runner, repo, branch);
 
   // 같은 이름이라도 app 바인딩이 다르면 GitHub이 따로 강제하는 별개의 rule이다. 합치지 않는다.
   const merged = new Map<string, { rule: RuleContext; sources: RequiredCheckSource[] }>();

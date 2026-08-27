@@ -252,6 +252,16 @@ set에서 reserve한다. disabled observer job은 opt-out으로 분류하며, lo
 identity·verified chain epoch·initial append/unterminated handoff·retained multi-rotation drain·
 content-witness truncate detection을 보장한다.
 
+O1-5는 O1-2 store, O1-3 effective routing, O1-4 health/logger를 production daemon에 연결했다. discovery,
+Run observer, facts-only PR digest는 coalescing/fairness가 있는 단일 execution lane과 completion-based
+jitter/backoff를 공유하고 Gate/Channel reconcile과 heartbeat는 독립적으로 유지된다. GitHub daemon work는
+hourly command bucket, cached REST+GraphQL floor, repository/global PR budget, timeout/response/page/concurrency
+bound를 적용하며 repository-local 실패는 부분 게시 없이 다음 repository와 후속 cycle로 격리된다. 모든 PR,
+Run, Run-collection root create는 durable prepare/claim과 atomic mapping+posted commit을 거치고 possible-effect
+실패는 uncertain으로 고정해 restart 뒤에도 post attempt가 1회를 넘지 않는다. graceful shutdown은 child abort와
+bounded accepted-work drain 뒤 clean stop 및 owner release를 수행하고 drain timeout은 nonzero다. Windows Task
+설치·제거와 실제 boot success 판정은 O1-6/7에 남는다.
+
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
 ## 11. 별도 후속 workstream

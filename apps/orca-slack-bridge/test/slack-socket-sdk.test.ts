@@ -38,6 +38,10 @@ const TEST_STATUS_OWNER_SERVER = {
   refresh: () => undefined,
   stop: () => Promise.resolve(),
 };
+const TEST_TELEMETRY = {
+  log: async () => ({ ok: true as const }),
+  close: async () => undefined,
+};
 
 async function runDaemonCommand(
   ...args: Parameters<typeof runDaemonCommandWithNativeStatus>
@@ -46,6 +50,7 @@ async function runDaemonCommand(
   return await runDaemonCommandWithNativeStatus(parsed, config, {
     ...(dependencies ?? {}),
     statusOwnerServer: dependencies?.statusOwnerServer ?? TEST_STATUS_OWNER_SERVER,
+    telemetry: dependencies?.telemetry ?? TEST_TELEMETRY,
   });
 }
 
