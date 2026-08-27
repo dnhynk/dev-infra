@@ -36,6 +36,11 @@ export type ManagedTaskLaunch = {
   readonly releaseDigest: string;
 };
 
+export type ManagedTaskLaunchAuthority = {
+  readonly launch: ManagedTaskLaunch;
+  readonly manifestBytes: Buffer;
+};
+
 export type ReleaseHealthObservation = {
   readonly scheduler: ManagedWindowsTaskSnapshot;
   readonly report: OperationalStatusReport;
@@ -122,8 +127,18 @@ export async function extractManagedTaskLaunch(
   snapshot: ManagedWindowsTaskSnapshot,
   store: WindowsRuntimeManifestStore = new CurrentUserWindowsRuntimeManifestStore(),
 ): Promise<ManagedTaskLaunch> {
+  return (await extractManagedTaskLaunchAuthority(snapshot, store)).launch;
+}
+
+export async function extractManagedTaskLaunchAuthority(
+  snapshot: ManagedWindowsTaskSnapshot,
+  store: WindowsRuntimeManifestStore = new CurrentUserWindowsRuntimeManifestStore(),
+): Promise<ManagedTaskLaunchAuthority> {
   const reference = managedTaskReference(snapshot);
-  const { manifest } = await readValidatedWindowsRuntimeManifest(store, reference.runtimeManifestPath);
+  const { manifest, bytes } = await readValidatedWindowsRuntimeManifest(
+    store,
+    reference.runtimeManifestPath,
+  );
   if (manifest.releaseDigest !== reference.releaseDigest ||
       manifest.releaseRoot.toLowerCase() !== reference.appRoot.toLowerCase() ||
       manifest.launcherPath.toLowerCase() !== reference.launcherPath.toLowerCase() ||
@@ -131,16 +146,19 @@ export async function extractManagedTaskLaunch(
     throw new Error('windows.run_now.runtime_manifest_drift');
   }
   return {
-    nodePath: manifest.nodeExe,
-    cliPath: manifest.distCli,
-    appRoot: manifest.releaseRoot,
-    launcherPath: reference.launcherPath,
-    runtimeManifestPath: reference.runtimeManifestPath,
-    configPath: manifest.config,
-    statePath: manifest.state,
-    orcaPath: manifest.orcaExe,
-    logDir: manifest.logDirectory,
-    releaseDigest: manifest.releaseDigest,
+    launch: {
+      nodePath: manifest.nodeExe,
+      cliPath: manifest.distCli,
+      appRoot: manifest.releaseRoot,
+      launcherPath: reference.launcherPath,
+      runtimeManifestPath: reference.runtimeManifestPath,
+      configPath: manifest.config,
+      statePath: manifest.state,
+      orcaPath: manifest.orcaExe,
+      logDir: manifest.logDirectory,
+      releaseDigest: manifest.releaseDigest,
+    },
+    manifestBytes: Buffer.from(bytes),
   };
 }
 

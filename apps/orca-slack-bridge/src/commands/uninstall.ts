@@ -17,13 +17,14 @@ import {
 } from '../windows/task-scheduler.js';
 import {
   DEFAULT_WINDOWS_WAIT_SECONDS,
-  extractManagedTaskLaunch,
+  extractManagedTaskLaunchAuthority,
   managedTaskStatusObservation,
   validateWindowsWaitSeconds,
   type ManagedTaskLaunch,
 } from './run-now.js';
 import {
   CurrentUserWindowsRuntimeManifestStore,
+  readValidatedWindowsRuntimeManifest,
   type WindowsRuntimeManifestStore,
 } from '../windows/runtime-manifest.js';
 
@@ -123,6 +124,27 @@ function shutdownComplete(observation: UninstallShutdownObservation): boolean {
   return taskReady && cleanHealth && observation.pipeReleased;
 }
 
+async function verifyForceReleaseAuthority(
+  launch: ManagedTaskLaunch,
+  expectedManifestBytes: Buffer,
+  manifestStore: WindowsRuntimeManifestStore,
+  verifyRelease: (launch: ManagedTaskLaunch) => boolean | Promise<boolean>,
+): Promise<void> {
+  let currentManifest;
+  try {
+    currentManifest = await readValidatedWindowsRuntimeManifest(
+      manifestStore,
+      launch.runtimeManifestPath,
+    );
+  } catch {
+    throw new Error('windows.uninstall.runtime_manifest_drift');
+  }
+  if (!currentManifest.bytes.equals(expectedManifestBytes)) {
+    throw new Error('windows.uninstall.runtime_manifest_drift');
+  }
+  if (!await verifyRelease(launch)) throw new Error('windows.uninstall.release_drift');
+}
+
 /** Disable -> durable stop intent -> bounded clean-stop/pipe/Ready wait -> unregister. */
 export async function uninstallWindowsTask(
   waitSeconds = DEFAULT_WINDOWS_WAIT_SECONDS,
@@ -139,12 +161,15 @@ export async function uninstallWindowsTask(
   if (initial.ownership !== 'owned' || initial.integrity !== 'matched' || initial.marker === null) {
     throw new Error('windows.uninstall.task_not_owned');
   }
-  const launch = await extractManagedTaskLaunch(
+  const manifestStore = dependencies.manifestStore ?? new CurrentUserWindowsRuntimeManifestStore();
+  const authority = await extractManagedTaskLaunchAuthority(
     initial,
-    dependencies.manifestStore ?? new CurrentUserWindowsRuntimeManifestStore(),
+    manifestStore,
   );
-  if (!await (dependencies.verifyRelease ?? ((value) =>
-    verifyCanonicalWindowsRelease(value.appRoot, value.releaseDigest)))(launch)) {
+  const launch = authority.launch;
+  const verifyRelease = dependencies.verifyRelease ?? ((value: ManagedTaskLaunch) =>
+    verifyCanonicalWindowsRelease(value.appRoot, value.releaseDigest));
+  if (!await verifyRelease(launch)) {
     throw new Error('windows.uninstall.release_drift');
   }
   const releaseDigest = initial.marker.releaseDigest;
@@ -228,6 +253,12 @@ export async function uninstallWindowsTask(
   if (!exactSameOwnedTask(forceTarget, releaseDigest, semanticFingerprint)) {
     throw new Error('windows.uninstall.task_drift');
   }
+  await verifyForceReleaseAuthority(
+    launch,
+    authority.manifestBytes,
+    manifestStore,
+    verifyRelease,
+  );
   await scheduler.stop(forceTarget.xml);
   const forceDeadline = monotonicNow() + waitSeconds * 1_000;
   while (monotonicNow() <= forceDeadline) {
@@ -241,6 +272,12 @@ export async function uninstallWindowsTask(
       if (!exactSameOwnedTask(unregisterTarget, releaseDigest, semanticFingerprint)) {
         throw new Error('windows.uninstall.task_drift');
       }
+      await verifyForceReleaseAuthority(
+        launch,
+        authority.manifestBytes,
+        manifestStore,
+        verifyRelease,
+      );
       await scheduler.unregister(unregisterTarget.xml);
       if ((await scheduler.inspect()).kind !== 'absent') {
         throw new Error('windows.uninstall.unregister_verification_failed');

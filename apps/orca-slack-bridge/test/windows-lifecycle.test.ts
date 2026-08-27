@@ -197,6 +197,7 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
 
 function runtimeManifestBytes(
   taskSemanticFingerprint = fingerprintWindowsTask(taskDefinition()),
+  overrides: Partial<Parameters<typeof createWindowsRuntimeManifest>[0]> = {},
 ): Buffer {
   return serializeWindowsRuntimeManifest(createWindowsRuntimeManifest({
     releaseRoot: paths.appRoot,
@@ -210,6 +211,7 @@ function runtimeManifestBytes(
     state: paths.statePath,
     orcaExe: paths.orcaPath,
     logDirectory: paths.logDir,
+    ...overrides,
   }));
 }
 
@@ -651,6 +653,72 @@ describe('Windows current-user lifecycle', () => {
     expect(daemonState.desiredState()).toBe('stopped');
     expect(runner.operations.indexOf('stop')).toBeGreaterThan(runner.operations.indexOf('disable'));
     expect(runner.operations.indexOf('unregister')).toBeGreaterThan(runner.operations.indexOf('stop'));
+  });
+
+  it('fails closed on protected manifest drift at the force pre-stop boundary', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.state = 'Running';
+    runner.hasRun = true;
+    const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const manifestStore = new FakeManifestStore().seed();
+    const daemonState = realDaemonState();
+    let now = 0;
+    await expect(uninstallWindowsTask(1, {
+      platform: 'win32', scheduler, force: true, manifestStore,
+      verifyStateIdentity: daemonState.verifyStateIdentity,
+      setDesiredStopped: daemonState.setDesiredStopped,
+      verifyRelease: () => true,
+      nowMilliseconds: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+      inspectShutdown: async () => {
+        manifestStore.bytes = runtimeManifestBytes(
+          fingerprintWindowsTask(taskDefinition()),
+          { logDirectory: String.raw`C:\drifted\logs` },
+        );
+        return {
+          scheduler: await scheduler.inspect(),
+          report: report({ heartbeatAgeSeconds: 91 }),
+          pipeReleased: false,
+        };
+      },
+      onForceWarning: () => undefined,
+    })).rejects.toThrow('windows.uninstall.runtime_manifest_drift');
+    expect(runner.operations).not.toContain('stop');
+    expect(runner.operations).not.toContain('unregister');
+  });
+
+  it('fails closed on release drift at the force pre-unregister boundary', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.state = 'Running';
+    runner.hasRun = true;
+    const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const daemonState = realDaemonState();
+    let now = 0;
+    let releaseChecks = 0;
+    await expect(uninstallWindowsTask(1, {
+      platform: 'win32', scheduler, force: true,
+      manifestStore: new FakeManifestStore().seed(),
+      verifyStateIdentity: daemonState.verifyStateIdentity,
+      setDesiredStopped: daemonState.setDesiredStopped,
+      verifyRelease: () => {
+        releaseChecks += 1;
+        return releaseChecks < 3;
+      },
+      nowMilliseconds: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+      inspectShutdown: async () => ({
+        scheduler: await scheduler.inspect(),
+        report: report({ heartbeatAgeSeconds: 91 }),
+        pipeReleased: false,
+      }),
+      probePipeReleased: async () => runner.state === 'Ready',
+      onForceWarning: () => undefined,
+    })).rejects.toThrow('windows.uninstall.release_drift');
+    expect(releaseChecks).toBe(3);
+    expect(runner.operations).toContain('stop');
+    expect(runner.operations).not.toContain('unregister');
   });
 
   it('treats an absent uninstall as success without writing desired state', async () => {
