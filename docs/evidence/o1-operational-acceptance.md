@@ -1,11 +1,18 @@
 # O1 operational acceptance evidence
 
-Status: **disposable Windows and local hermetic aggregate PASS; exact-head CI and production deployment pending**
+Status: **disposable Windows and local hermetic aggregate PASS; canonical-export hotfix CI and fixed-merge production deployment pending**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
 audits before this branch started. No production Slack, GitHub, Orca, Scheduled Task, state, or
-credential was used. D3 remains `LIVE_CHANNEL_UNVERIFIED` and is not changed by O1 evidence.
+credential was used by the disposable acceptance. D3 remains `LIVE_CHANNEL_UNVERIFIED` and is not
+changed by O1 evidence.
+
+The first production install from exact merged `main` at
+`8d857f94c0ad44617071aaa97a4756cd9e114b42` exposed a Windows registered-export
+canonicalization and absent-create rollback gap and ended with
+`windows.install.rollback_failed`. The exact owned residual task was safely removed and no manifest
+or daemon process remained; production installation is pending the fixed merge.
 
 ## Operational failure matrix
 
@@ -75,7 +82,7 @@ requests daemon stop, so the repetition cannot create new work after the shutdow
 Rollback means selecting the prior immutable staged release and running that release's `install`
 command with the same six absolute operator inputs; task XML and protected manifest replacement are
 CAS checked and rolled back on post-registration mismatch. Do not delete state, config, logs, or
-release roots as part of rollback. Production installation remains pending until this PR is merged,
+release roots as part of rollback. Production installation remains pending until this hotfix is merged,
 the merged-main release is deployed, and its local startup/status smoke passes.
 
 ## Privacy boundary
@@ -97,5 +104,5 @@ retains its generated task name, paths, XML, process command line, or mock state
 - Disposable Windows Task post-repair aggregate: PASS — non-admin create, semantic export, demand
   start, IgnoreNew, observed action exit 23, PT1M OS repetition relaunch, clean exit 0, and residual
   task/process/file `0/0/0`; external writes `0`; failure code `null`.
-- Pre-merge `stage:windows` and production install were not run and created no release digest. They
-  remain a single audited exact-main action after merge.
+- The first exact merged-main stage/install exposed the canonical registered-export/rollback gap
+  above. The fixed-merge production stage/install and local startup/status smoke remain pending.

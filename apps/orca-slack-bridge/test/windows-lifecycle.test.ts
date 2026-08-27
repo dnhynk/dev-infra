@@ -39,6 +39,7 @@ import {
 } from '../src/windows/task-scheduler.js';
 
 const SID = 'S-1-5-21-100-200-300-1001';
+const ACCOUNT = String.raw`WORKSTATION\operator`;
 const DIGEST = 'b'.repeat(64);
 const lifecycleTemporaryRoots: string[] = [];
 const RELEASE_ROOT = win32.join(
@@ -133,6 +134,9 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
   hasRun = false;
   lastTaskResult = 0;
   corruptNextRegister = false;
+  failNextRegisterAfterEffect = false;
+  nextRegisteredExportTransform: ((value: string) => string) | null = null;
+  private registeredExportOverride: string | null = null;
   validateFailure = false;
   readonly operations: string[] = [];
 
@@ -144,7 +148,8 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
       if (this.definition === null) return { exists: false };
       return {
         exists: true,
-        xml: xml(this.definition),
+        xml: this.registeredExportOverride ?? xml(this.definition),
+        triggerUserSid: SID,
         state: this.state,
         enabled: this.definition.enabled,
         lastTaskResult: this.lastTaskResult,
@@ -164,14 +169,21 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
       this.definition = this.corruptNextRegister
         ? { ...desired, action: { ...desired.action, workingDirectory: String.raw`C:\corrupt` } }
         : desired;
+      this.registeredExportOverride = this.nextRegisteredExportTransform?.(xml(this.definition)) ?? null;
+      this.nextRegisteredExportTransform = null;
       this.state = 'Ready';
       this.corruptNextRegister = false;
+      if (this.failNextRegisterAfterEffect) {
+        this.failNextRegisterAfterEffect = false;
+        throw new Error('windows.task_scheduler.command_failed');
+      }
       return { ok: true };
     }
     if (operation === 'restoreXml') {
       const restored = parseWindowsTaskXml(String(record['xml']));
       if (restored === null) throw new Error('invalid fixture XML');
       this.definition = restored;
+      this.registeredExportOverride = null;
       return { ok: true };
     }
     if (operation === 'disable') {
@@ -189,6 +201,7 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
     }
     if (operation === 'unregister') {
       this.definition = null;
+      this.registeredExportOverride = null;
       return { ok: true };
     }
     throw new Error('unsupported fake operation');
@@ -455,6 +468,45 @@ describe('Windows current-user lifecycle', () => {
     })).rejects.toThrow('windows.install.task_update_failed');
     expect(runner.operations).toContain('restoreXml');
     expect(runner.definition).toEqual(drifted);
+  });
+
+  it.each([
+    ['post-registration verification failure', false],
+    ['register possible-effect failure', true],
+  ])('removes an absent-created exact-marker task after %s and restores the manifest', async (
+    _scenario,
+    failAfterEffect,
+  ) => {
+    const runner = new FakePowerShellRunner();
+    runner.failNextRegisterAfterEffect = failAfterEffect;
+    runner.nextRegisteredExportTransform = (registered) => registered
+      .replace(`<UserId>${SID}</UserId>`, `<UserId>${ACCOUNT}</UserId>`)
+      .replace('<StopAtDurationEnd>false</StopAtDurationEnd>', '')
+      .replace('<Enabled>true</Enabled><UserId>', '<UserId>')
+      .replace('<RunLevel>LeastPrivilege</RunLevel>', '')
+      .replace('<AllowHardTerminate>true</AllowHardTerminate>', '')
+      .replace('<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>', '')
+      .replace('<AllowStartOnDemand>true</AllowStartOnDemand>', '')
+      .replace('<Enabled>true</Enabled><Hidden>false</Hidden>', '<Hidden>false</Hidden>')
+      .replace('<Hidden>false</Hidden>', '')
+      .replace('<RunOnlyIfIdle>false</RunOnlyIfIdle>', '')
+      .replace('<WakeToRun>false</WakeToRun>', '')
+      .replace('<Priority>7</Priority>', '')
+      .replace('<Count>3</Count>', '<Count>4</Count>');
+    const manifestStore = new FakeManifestStore();
+
+    await expect(installWindowsTask({ ...paths, runNow: false }, {
+      platform: 'win32',
+      scheduler: new CurrentUserWindowsTaskScheduler(runner),
+      manifestStore,
+      validateDeployment: async () => deployment(),
+      prepareState: async () => ({ backupPath: null, release: async () => undefined }),
+    })).rejects.toThrow('windows.install.task_update_failed');
+
+    expect(runner.operations).toContain('unregister');
+    expect(runner.definition).toBeNull();
+    expect(manifestStore.bytes).toBeNull();
+    expect(manifestStore.operations.filter((operation) => operation === 'replace')).toHaveLength(2);
   });
 
   it('does not spawn a second process when running is stale, and starts a stopped task until exact heartbeat', async () => {

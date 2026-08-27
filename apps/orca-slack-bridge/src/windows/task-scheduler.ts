@@ -104,6 +104,7 @@ export type ManagedWindowsTaskSnapshot =
 export type PowerShellTaskRecord = {
   readonly exists: boolean;
   readonly xml?: string;
+  readonly triggerUserSid?: string | null;
   readonly state?: string;
   readonly enabled?: boolean;
   readonly lastTaskResult?: number | null;
@@ -142,6 +143,19 @@ $inputObject = if ([String]::IsNullOrWhiteSpace($raw)) { $null } else { $raw | C
 
 function Write-Result([object]$value) {
   [Console]::Out.Write(($value | ConvertTo-Json -Compress -Depth 12))
+}
+
+function Resolve-AccountSid([string]$account) {
+  if ([String]::IsNullOrWhiteSpace($account)) { return $null }
+  try {
+    return ([Security.Principal.SecurityIdentifier]::new($account)).Value
+  } catch [ArgumentException] {
+    try {
+      return ([Security.Principal.NTAccount]::new($account)).Translate(
+        [Security.Principal.SecurityIdentifier]
+      ).Value
+    } catch [Security.Principal.IdentityNotMappedException] { return $null }
+  }
 }
 
 function Assert-ExpectedTaskXml([string]$taskName, [string]$expectedXml) {
@@ -209,11 +223,25 @@ switch ($operation) {
       break
     }
     $info = Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName $inputObject.taskName
+    $xml = Export-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName
+    $document = [xml]$xml
+    $namespace = [Xml.XmlNamespaceManager]::new($document.NameTable)
+    $namespace.AddNamespace('task', $document.DocumentElement.NamespaceURI)
+    $triggerUser = $document.SelectSingleNode(
+      '/task:Task/task:Triggers/task:LogonTrigger/task:UserId',
+      $namespace
+    )
+    $triggerUserSid = if ($null -eq $triggerUser) {
+      $null
+    } else {
+      Resolve-AccountSid ([string]$triggerUser.InnerText)
+    }
     $lastRun = if ($info.LastTaskResult -eq 267011 -or $info.LastRunTime.Year -le 2000) { $null } else { $info.LastRunTime.ToUniversalTime().ToString('o') }
     $nextRun = if ($info.NextRunTime.Year -le 2000) { $null } else { $info.NextRunTime.ToUniversalTime().ToString('o') }
     Write-Result @{
       exists = $true
-      xml = (Export-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName)
+      xml = $xml
+      triggerUserSid = $triggerUserSid
       state = [String]$task.State
       enabled = [bool]$task.Settings.Enabled
       lastTaskResult = [int64]$info.LastTaskResult
@@ -487,6 +515,8 @@ function childInteger(children: ReadonlyMap<string, Element>, name: string): num
 
 type TaskXmlIdentity = { readonly description: string; readonly principalUser: string };
 
+const WINDOWS_SID_PATTERN = /^S-[0-9]+(?:-[0-9]+)+$/u;
+
 function parseTaskXmlIdentity(xml: string, hostHighestSchemaVersion?: string): TaskXmlIdentity | null {
   const root = taskDocumentElement(xml);
   if (root === null || taskSchemaVersion(root, hostHighestSchemaVersion) === null) return null;
@@ -505,10 +535,18 @@ function parseTaskXmlIdentity(xml: string, hostHighestSchemaVersion?: string): T
   if (registration === null || principals === null || principals.length !== 1 ||
       principals[0]?.localName !== 'Principal' ||
       !exactAttributes(principals[0], { id: 'Author' })) return null;
-  const principalChildren = exactChildren(principals[0], ['UserId', 'LogonType', 'RunLevel']);
+  const principalChildren = exactChildren(
+    principals[0],
+    ['UserId', 'LogonType'],
+    ['RunLevel'],
+  );
   const description = childText(registration, 'Description');
   const principalUser = principalChildren === null ? null : childText(principalChildren, 'UserId');
-  return description === null || principalUser === null ? null : { description, principalUser };
+  if (description === null || principalUser === null || !WINDOWS_SID_PATTERN.test(principalUser) ||
+      principalChildren === null || childText(principalChildren, 'LogonType') !== 'InteractiveToken' ||
+      (principalChildren.has('RunLevel') &&
+       childText(principalChildren, 'RunLevel') !== 'LeastPrivilege')) return null;
+  return { description, principalUser };
 }
 
 /** Quotes one argv element according to CommandLineToArgvW backslash/quote rules. */
@@ -693,6 +731,7 @@ export function createWindowsTaskDefinition(input: {
 export function parseWindowsTaskXml(
   xml: string,
   hostHighestSchemaVersion?: string,
+  resolvedTriggerUserSid?: string | null,
 ): WindowsTaskDefinition | null {
   const root = taskDocumentElement(xml);
   if (root === null || taskSchemaVersion(root, hostHighestSchemaVersion) === null) return null;
@@ -719,14 +758,23 @@ export function parseWindowsTaskXml(
       !exactAttributes(triggers[0]) ||
       actions === null || actions.length !== 1 || actions[0]?.localName !== 'Exec' ||
       !exactAttributes(actionsElement, { Context: 'Author' }) || !exactAttributes(actions[0])) return null;
-  const principal = exactChildren(principals[0], ['UserId', 'LogonType', 'RunLevel']);
-  const logonTrigger = exactChildren(triggers[0], ['Enabled', 'UserId', 'Repetition']);
+  const principal = exactChildren(
+    principals[0],
+    ['UserId', 'LogonType'],
+    ['RunLevel'],
+  );
+  const logonTrigger = exactChildren(
+    triggers[0],
+    ['UserId', 'Repetition'],
+    ['Enabled'],
+  );
   const settings = exactChildren(rootChildren.get('Settings')!, [
     'MultipleInstancesPolicy', 'DisallowStartIfOnBatteries', 'StopIfGoingOnBatteries',
-    'AllowHardTerminate', 'StartWhenAvailable', 'RunOnlyIfNetworkAvailable', 'IdleSettings',
-    'Enabled', 'Hidden', 'RunOnlyIfIdle', 'WakeToRun',
-    'ExecutionTimeLimit', 'Priority', 'RestartOnFailure',
-  ], ['AllowStartOnDemand']);
+    'StartWhenAvailable', 'IdleSettings', 'ExecutionTimeLimit', 'RestartOnFailure',
+  ], [
+    'AllowHardTerminate', 'RunOnlyIfNetworkAvailable', 'AllowStartOnDemand', 'Enabled',
+    'Hidden', 'RunOnlyIfIdle', 'WakeToRun', 'Priority',
+  ]);
   const exec = exactChildren(actions[0], ['Command', 'Arguments', 'WorkingDirectory']);
   if (principal === null || logonTrigger === null || settings === null || exec === null) return null;
   const repetition = exactChildren(
@@ -745,34 +793,43 @@ export function parseWindowsTaskXml(
   const description = childText(registration, 'Description');
   const principalUser = childText(principal, 'UserId');
   const triggerUser = childText(logonTrigger, 'UserId');
-  const enabled = childBoolean(settings, 'Enabled');
+  const enabled = settings.has('Enabled') ? childBoolean(settings, 'Enabled') : true;
   const execute = childText(exec, 'Command');
   const args = childText(exec, 'Arguments');
   const workingDirectory = childText(exec, 'WorkingDirectory');
-  if (description === null || principalUser === null || triggerUser === null || enabled === null ||
-      execute === null || args === null || workingDirectory === null ||
+  const canonicalTriggerUser = principalUser !== null && triggerUser === principalUser
+    ? principalUser
+    : principalUser !== null && triggerUser !== null && !WINDOWS_SID_PATTERN.test(triggerUser) &&
+      resolvedTriggerUserSid === principalUser
+      ? principalUser
+      : null;
+  if (description === null || principalUser === null || !WINDOWS_SID_PATTERN.test(principalUser) ||
+      triggerUser === null || canonicalTriggerUser === null ||
+      enabled === null || execute === null || args === null || workingDirectory === null ||
       childText(principal, 'LogonType') !== 'InteractiveToken' ||
-      childText(principal, 'RunLevel') !== 'LeastPrivilege' ||
-      childBoolean(logonTrigger, 'Enabled') !== true ||
+      (principal.has('RunLevel') && childText(principal, 'RunLevel') !== 'LeastPrivilege') ||
+      (logonTrigger.has('Enabled') && childBoolean(logonTrigger, 'Enabled') !== true) ||
       childText(repetition, 'Interval') !== WINDOWS_TASK_REPETITION_INTERVAL ||
       (repetition.has('StopAtDurationEnd') &&
        childBoolean(repetition, 'StopAtDurationEnd') !== false) ||
       childText(settings, 'MultipleInstancesPolicy') !== 'IgnoreNew' ||
       childBoolean(settings, 'DisallowStartIfOnBatteries') !== false ||
       childBoolean(settings, 'StopIfGoingOnBatteries') !== false ||
-      childBoolean(settings, 'AllowHardTerminate') !== true ||
+      (settings.has('AllowHardTerminate') &&
+       childBoolean(settings, 'AllowHardTerminate') !== true) ||
       childBoolean(settings, 'StartWhenAvailable') !== true ||
-      childBoolean(settings, 'RunOnlyIfNetworkAvailable') !== false ||
+      (settings.has('RunOnlyIfNetworkAvailable') &&
+       childBoolean(settings, 'RunOnlyIfNetworkAvailable') !== false) ||
       childText(idle, 'Duration') !== WINDOWS_TASK_IDLE_DURATION ||
       childText(idle, 'WaitTimeout') !== WINDOWS_TASK_IDLE_WAIT_TIMEOUT ||
       childBoolean(idle, 'StopOnIdleEnd') !== true ||
       childBoolean(idle, 'RestartOnIdle') !== false ||
       (settings.has('AllowStartOnDemand') && childBoolean(settings, 'AllowStartOnDemand') !== true) ||
-      childBoolean(settings, 'Hidden') !== false ||
-      childBoolean(settings, 'RunOnlyIfIdle') !== false ||
-      childBoolean(settings, 'WakeToRun') !== false ||
+      (settings.has('Hidden') && childBoolean(settings, 'Hidden') !== false) ||
+      (settings.has('RunOnlyIfIdle') && childBoolean(settings, 'RunOnlyIfIdle') !== false) ||
+      (settings.has('WakeToRun') && childBoolean(settings, 'WakeToRun') !== false) ||
       childText(settings, 'ExecutionTimeLimit') !== WINDOWS_TASK_EXECUTION_TIME_LIMIT ||
-      childInteger(settings, 'Priority') !== WINDOWS_TASK_PRIORITY ||
+      (settings.has('Priority') && childInteger(settings, 'Priority') !== WINDOWS_TASK_PRIORITY) ||
       childText(restart, 'Interval') !== WINDOWS_TASK_RESTART_INTERVAL ||
       childInteger(restart, 'Count') !== WINDOWS_TASK_RESTART_COUNT) return null;
   return {
@@ -782,7 +839,7 @@ export function parseWindowsTaskXml(
     principal: { userId: principalUser, logonType: 'InteractiveToken', runLevel: 'Limited' },
     trigger: {
       kind: 'AtLogOn',
-      userId: triggerUser,
+      userId: canonicalTriggerUser,
       enabled: true,
       repetition: {
         interval: WINDOWS_TASK_REPETITION_INTERVAL,
@@ -910,11 +967,14 @@ function taskRecord(value: unknown): PowerShellTaskRecord {
     return { exists: false };
   }
   const allowed = new Set([
-    'exists', 'xml', 'state', 'enabled', 'lastTaskResult', 'lastRunTime',
+    'exists', 'xml', 'triggerUserSid', 'state', 'enabled', 'lastTaskResult', 'lastRunTime',
     'nextRunTime', 'missedRuns', 'observedAt',
   ]);
   if (Object.keys(record).some((key) => !allowed.has(key)) ||
       typeof record['xml'] !== 'string' || record['xml'].length === 0 ||
+      (record['triggerUserSid'] !== null &&
+       (typeof record['triggerUserSid'] !== 'string' ||
+        !WINDOWS_SID_PATTERN.test(record['triggerUserSid']))) ||
       typeof record['state'] !== 'string' || typeof record['enabled'] !== 'boolean' ||
       (record['lastTaskResult'] !== null &&
        (typeof record['lastTaskResult'] !== 'number' || !Number.isSafeInteger(record['lastTaskResult']))) ||
@@ -927,7 +987,7 @@ function taskRecord(value: unknown): PowerShellTaskRecord {
 }
 
 function sidResult(value: unknown): string {
-  if (typeof value !== 'string' || !/^S-[0-9]+(?:-[0-9]+)+$/u.test(value)) {
+  if (typeof value !== 'string' || !WINDOWS_SID_PATTERN.test(value)) {
     throw new Error('windows.task_scheduler.invalid_sid');
   }
   return value;
@@ -961,7 +1021,7 @@ export class CurrentUserWindowsTaskScheduler {
     const record = taskRecord(await this.runner.run('inspect', { taskName: WINDOWS_TASK_NAME }));
     if (!record.exists) return { kind: 'absent', currentSid };
     if (typeof record.xml !== 'string') throw new Error('windows.task_scheduler.invalid_response');
-    const definition = parseWindowsTaskXml(record.xml, schemaVersion);
+    const definition = parseWindowsTaskXml(record.xml, schemaVersion, record.triggerUserSid);
     const identity = definition === null ? parseTaskXmlIdentity(record.xml, schemaVersion) : null;
     const description = definition?.description ?? identity?.description ?? null;
     const marker = description === null ? null : parseWindowsTaskMarker(description);
