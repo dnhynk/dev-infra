@@ -1,6 +1,6 @@
 # O1 operational acceptance evidence
 
-Status: **O1-7 production acceptance reopened — Task supervisor evidence remains valid; status capability-rotation repair awaits merge and fixed-release production verification**
+Status: **O1-7 production acceptance reopened — Task supervisor evidence remains valid; Windows status-liveness repair awaits merge and fixed-release production verification**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
@@ -17,9 +17,41 @@ an empty rejection after the owner rotated before authenticating that socket req
 repair retains one original deadline and permits one retry only after a second protected read proves
 a fresh, policy-matched capability with a new ID and secret; malformed or unauthenticated responses,
 stable/stale metadata, transport or state-identity mismatch, and deadline exhaustion remain closed.
-Focused local regression and typecheck evidence can qualify the merge, but final O1 production
-acceptance remains pending until the merged fixed release is installed and status succeeds across
-repeated rotation boundaries.
+Focused local regression and typecheck evidence qualified that repair for merge, while final O1
+production acceptance remained pending on a merged fixed release and repeated rotation-boundary
+status sampling.
+
+The capability-rotation retry was present on exact merged `main`
+`4fe4d8f005440f61affb0dd0e814b06ce4519499`, but the next production sample still returned
+unavailable status for 7 of 18 calls over 50.2 seconds. The Scheduled Task, direct PowerShell/Node
+PIDs, and heartbeat stayed stable during that sampling window; after the last healthy heartbeat the
+Task ended with result `1`. These are observed facts, but they do not directly prove one causal chain.
+The code supports a narrower Windows deadline-starvation diagnosis: the client-wide deadline and
+owner socket idle timeout were each one second while either protected PowerShell read could run for
+up to 1.5 seconds. Separately, a status refresh exception after a committed production health
+mutation could propagate back into heartbeat or observer control flow. Either mechanism is
+consistent with the observations, but the production run did not directly capture the particular
+timeout or refresh exception.
+
+An independent audit then invalidated the first Windows regression as production-cadence evidence:
+it configured a five-second owner refresh instead of the production one-second cadence. Every
+snapshot-only `refresh()` replaces the immutable `OwnerGeneration` object even when its canonical
+active capability does not rotate, so the post-verification object-identity fence rejected a request
+whose 1.1-second owner protected read crossed that tick. The earlier 80-pass local result therefore
+did not qualify this interleaving.
+
+The repair gives only the Windows default client one shared five-second deadline; the non-Windows
+one-second default, explicit timeout bounds, and at most one verified new-generation retry remain.
+The owner disables request inactivity immediately after complete EOF while retaining its two-second
+absolute deadline. Only the production health `afterMutation` adapter contains refresh failures so
+the committed mutation survives and the existing one-second owner timer retries; explicit startup
+refresh failures remain fatal. After protected verification, an in-flight request may now cross only
+a snapshot refresh whose current generation still exists with the exact same canonical active
+capability as the captured generation; actual rotation, a removed/stale generation, persisted
+mismatch, deadline/abort, and every existing authentication, nonce, and transport failure remain
+closed. The response is still built and authenticated from the captured immutable generation. Final
+O1 production acceptance remains pending until an exact merged fixed release passes repeated status
+sampling together with Task/PID/heartbeat liveness.
 
 The first production install from exact merged `main` at
 `8d857f94c0ad44617071aaa97a4756cd9e114b42` exposed a Windows registered-export
@@ -67,7 +99,7 @@ specific console-close source caused the historical failure.
 | auto discovery and routing | `discovery-reconcile` and `run-effective-routing` focused files | aliases and exact Orca IDs coalesce by canonical repository; multi-repository consensus routes once; cross-Project, contradictory, unreadable, or over-capacity facts route zero |
 | shutdown fence | `cli-daemon` and supervisor focused files | intake closes first; accepted work drains boundedly; no timer, queued completion, or late dependency starts new external work after the fence |
 | daemon LLM boundary | `digest` facts-only regression plus daemon wiring | O1 background jobs always select deterministic `facts_only`; the trap summary provider receives zero calls |
-| privacy and operability | `operational-logger` and `operational-status` focused files, including the capability-rotation interleaving | allowlisted NDJSON only, hashed refs, bounded rotation, read-only status, and at most one fresh-generation retry inside the original deadline without weakening identity, transport, nonce, or response authentication |
+| privacy and operability | `operational-logger`, `operational-status`, and `cli-daemon` focused files, including capability rotation, Windows protected-read latency, and post-mutation refresh failure | allowlisted NDJSON only, hashed refs, bounded rotation, platform-bounded read-only status, and at most one fresh-generation retry without weakening identity, transport, nonce, or response authentication; committed health mutations survive cache-refresh failure |
 | current-user Scheduled Task | `o1-7-windows-scheduled-task-acceptance.ps1` under a process-wide mutex | unique exact target, non-admin create, hidden PowerShell action, demand start, IgnoreNew, bounded PT1M TimeTrigger relaunch after exit 23, exactly one direct PowerShell→Node pair still Task-owned for 245s, clean exit 0, exact unregister, and residual task/process/file counts all zero |
 
 The hermetic entry point is `pnpm acceptance:o1-7`. Because the repository has one workspace package,
@@ -86,6 +118,7 @@ call Task Scheduler.
 | GitHub budget | 2,000 commands/hour | defer before work below REST or GraphQL floor 1,000; at most two commands concurrently |
 | daemon health | heartbeat 15s; stale after 90s | exact instance/revision ownership |
 | status owner capability | rotate after 15s; stale after 30s | one protected initial read plus at most one protected re-read/retry for a new capability ID and secret under the original request deadline |
+| status local RPC | owner snapshot refresh 1s; Windows client total 5s; non-Windows client total 1s; owner idle 1s; owner absolute 2s | undefined selects the refresh default and explicit null disables it; one client deadline across reads/attempts; owner idle disabled only after complete EOF; same-capability snapshot refresh may complete only from the captured generation; explicit client timeout remains 10..5,000ms |
 | capacity | 16 repositories; 64 Runs; 16 Orca IDs per canonical | hard maxima 64 / 256 / 64; overflow fails closed without truncation |
 | operational logs | 5 MiB active file; 5 backups | 16 KiB canonical NDJSON line; allowlisted fields and 12-hex SHA-256 refs only |
 | Windows Task | current-user interactive, Limited, AtLogOn | hidden Windows PowerShell action; indefinite PT1M LogonTrigger repetition for an exited daemon; `IgnoreNew` overlap fence; demand start; `StartWhenAvailable`; PT0S execution limit |
@@ -145,6 +178,17 @@ retains its generated task name, paths, XML, process command line, or mock state
 
 ## Recorded results
 
+- Post-audit Windows status-liveness local qualification from exact base
+  `4fe4d8f005440f61affb0dd0e814b06ce4519499`: focused production-cadence
+  `test/operational-status.test.ts` plus `test/cli-daemon.test.ts` passed 2 files, 82 tests passed and
+  9 platform-skipped (91 total); workspace typecheck PASS. This proves the client and owner protected
+  reads each last 1.1 seconds, at least one same-capability one-second refresh completes during the
+  owner read, and the response retains its captured snapshot; it also preserves explicit-null timer
+  disable, real-rotation rejection, and the bounded fresh-generation retry.
+  This is merge qualification only; fixed-release production acceptance remains pending.
+- Superseded pre-audit Windows status-liveness result: the same focused files passed 80 tests with
+  9 platform-skipped, but its five-second test refresh masked the production one-second generation
+  replacement and therefore did not qualify the repaired liveness path.
 - Status capability-rotation hotfix local qualification: focused
   `test/operational-status.test.ts` passed 1 file, 51 tests passed and 9 platform-skipped (60 total);
   workspace typecheck PASS. This is merge qualification only; fixed-release production acceptance
@@ -193,3 +237,8 @@ retains its generated task name, paths, XML, process command line, or mock state
   observed intermittent `state.snapshot_unavailable` aligned with the 15-second capability rotation
   while Task/process ownership and heartbeat stayed healthy. This reopens final O1 production
   acceptance until the merged fixed release passes repeated rotation-boundary status sampling.
+- Production sampling on exact `main` `4fe4d8f005440f61affb0dd0e814b06ce4519499` then observed
+  7 unavailable results in 18 status calls over 50.2 seconds while Task/PIDs/heartbeat remained
+  stable, followed by Task result `1` after the last healthy heartbeat. The deadline-starvation and
+  post-mutation refresh-propagation explanations above remain qualified source-supported diagnoses;
+  final acceptance awaits the exact merged repair in production.

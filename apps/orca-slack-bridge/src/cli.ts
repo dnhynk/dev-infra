@@ -1426,7 +1426,14 @@ export async function runDaemonCommand(
         },
       });
     }
-    health = new OperationalHealthTelemetry(store, telemetry, () => statusOwnerServer?.refresh());
+    health = new OperationalHealthTelemetry(store, telemetry, () => {
+      try {
+        statusOwnerServer?.refresh();
+      } catch {
+        // The store mutation is already committed. Keep the daemon alive and let the owner's
+        // existing one-second refresh timer rebuild the fail-closed status cache.
+      }
+    });
     await health.daemonStarted({
       instanceId,
       buildFingerprint,

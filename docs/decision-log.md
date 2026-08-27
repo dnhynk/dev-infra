@@ -574,3 +574,38 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 기존 current-user DACL/owner 검증, exact transport binding, response authentication, nonce replay set과
   frame/EOF bounds는 완화하지 않는다. focused regression과 typecheck 뒤 merge할 수 있지만, final O1
   production acceptance는 merged fixed release가 반복 rotation boundary status를 통과할 때까지 pending이다.
+
+### DL-060 · Windows status liveness는 platform별 client deadline과 mutation/refresh 격리로 복구한다
+
+- exact merged `main` `4fe4d8f005440f61affb0dd0e814b06ce4519499` production에서 50.2초 동안
+  read-only status 18회 중 7회가 unavailable이었다. 그 관측 구간에는 Task, direct PowerShell/Node PID,
+  heartbeat가 안정적이었지만 마지막 healthy heartbeat 뒤 Task는 result `1`로 끝났다. 전자는 직접 관측된
+  status-path 장애이고 후자는 그 뒤의 daemon 종료 관측이며, 둘 사이의 단일 인과는 직접 포착되지 않았다.
+- 코드에는 Windows liveness를 고갈시킬 수 있는 두 경로가 있었다. client의 전체 deadline과 owner의 socket
+  idle timeout은 각각 1초인 반면 protected PowerShell read 하나는 1.5초까지 허용된다. 또한 store mutation이
+  commit된 뒤 실행되는 production `OperationalHealthTelemetry` callback이 `statusOwnerServer.refresh()` 예외를
+  그대로 전파해 heartbeat 또는 job mutation caller를 실패시킬 수 있다. 이는 실측과 일치하는 코드상 가능한
+  진단이지만 production에서 특정 timeout/예외를 직접 계측한 인과 증명은 아니다.
+- client는 하나의 최초 monotonic deadline을 계속 공유하되 Windows 기본값만 5초, 비-Windows 기본값은
+  1초로 분리한다. 명시적 timeout의 기존 10..5,000ms bound와 최초 빈 실패 뒤 새 capability ID와 secret이
+  모두 검증된 경우에만 허용하는 최대 1회 retry는 유지한다. stable generation retry를 추가하지 않는다.
+- owner는 complete request EOF를 받은 즉시 1초 socket inactivity timeout을 해제하지만 accept부터 2초인
+  non-refreshing absolute deadline은 유지한다. production health `afterMutation` adapter만 refresh 예외를
+  삼켜 이미 commit된 mutation과 daemon을 보존하고, 기존 1초 owner timer가 다음 refresh를 시도하게 한다.
+  명시적 startup refresh는 계속 fatal이며 DACL/identity/HMAC/nonce/frame/EOF 검증은 완화하지 않는다.
+- 독립 감사에서 최초 Windows regression이 owner refresh를 production 1초가 아닌 5초로 설정해 cadence를
+  가린 것이 확인됐다. production `refresh()`는 capability가 rotate하지 않아도 immutable snapshot을 담은
+  `OwnerGeneration` 객체를 매번 교체했고, 1.1초 owner protected read 뒤의 참조 동일성 검사는 canonical
+  active capability가 그대로인 요청까지 거절했다. 따라서 최초 80-pass local qualification은 이 interleaving을
+  증명하지 못한 superseded evidence다.
+- 최소 후속 수리는 protected verification 뒤 current generation이 존재하고 captured generation과 canonical
+  active capability가 정확히 같을 때만 snapshot-only refresh를 가로질러 완료한다. persisted active capability,
+  freshness, deadline/abort 검증은 그대로이고 실제 rotation·removed generation·persisted mismatch는 계속
+  거절한다. response snapshot과 HMAC은 요청이 포착한 immutable generation으로만 만든다.
+- 수정 regression은 production 1초 cadence에서 client와 owner protected read를 각각 1.1초 지연하고, owner
+  read 중 같은 capability refresh가 적어도 한 번 완료됐음과 response가 captured snapshot을 사용했음을
+  결정적으로 확인한다. Windows 기본 client deadline 5초와 owner 기본 absolute deadline 2초는 override하지
+  않는다. undefined는 production 1초 default를 선택하고 explicit null은 timer disable로 보존한다. focused
+  2 files 82 pass/9 platform-skip와 workspace typecheck는 merge 자격만 증명하며, final O1
+  production acceptance는 merged fixed release에서 반복 status와 heartbeat/Task liveness를 다시 관측할
+  때까지 pending이다.

@@ -299,6 +299,28 @@ exhaustion은 계속 fail closed한다. focused operational-status regression과
 증명하며, final O1 production acceptance는 merged fixed release의 반복 rotation-boundary status 관측까지
 pending이다.
 
+rotation retry가 포함된 exact merged `main` `4fe4d8f005440f61affb0dd0e814b06ce4519499`의 다음
+production 표본에서도 50.2초 동안 status 18회 중 7회가 unavailable이었다. 관측 중 Task, direct
+PowerShell/Node PID, heartbeat는 안정적이었고 마지막 healthy heartbeat 뒤 Task가 result `1`로 끝났다.
+코드상 Windows client 전체 deadline과 owner socket idle이 각각 1초인데 protected PowerShell read는
+1.5초까지 실행될 수 있고, commit 뒤 status refresh 예외가 production health mutation caller로 전파될 수
+있어 이 두 현상을 설명할 수 있다. 다만 어떤 timeout 또는 refresh 예외가 production 종료를 일으켰는지는
+직접 계측되지 않아 qualified diagnosis로 남긴다. 최소 수리는 Windows client의 단일 전체 deadline만 5초로
+늘리고 비-Windows 기본 1초와 명시적 bound를 유지하며, complete EOF 뒤 owner idle timeout만 해제해 2초
+absolute deadline을 보존한다. production health `afterMutation` refresh만 격리하고 명시적 startup refresh는
+fatal로 유지한다. 새-generation 1회 retry/security boundary는 바꾸지 않으며, final O1 production acceptance는
+merged fixed release의 반복 status와 heartbeat/Task liveness 확인까지 pending이다.
+
+독립 감사에서는 이 Windows regression이 owner refresh를 5초로 늦춰 production 1초 cadence를 가린 결함을
+찾았다. 실제 `refresh()`는 capability가 유지되는 snapshot-only tick에도 `OwnerGeneration`을 교체하므로,
+1.1초 owner protected read 뒤의 객체 참조 비교가 같은 canonical active capability의 요청을 거절했다. 최소
+후속 수리는 current generation이 존재하고 captured generation과 canonical capability가 정확히 같은 경우만
+기존 요청을 완료하며, response는 계속 captured immutable snapshot으로 만든다. 실제 capability rotation,
+removed/stale generation, persisted mismatch, deadline/abort와 기존 auth/nonce/transport failure는 모두
+fail closed한다. 수정 regression은 production 1초 refresh, 양쪽 1.1초 protected read, Windows 기본 client
+deadline과 owner 기본 2초 absolute deadline으로 same-capability refresh interleaving을 직접 증명한다. 이는
+local merge qualification일 뿐 live acceptance가 아니며, final O1 production acceptance는 여전히 pending이다.
+
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
 ## 11. 별도 후속 workstream

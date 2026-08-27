@@ -829,6 +829,125 @@ describe('read-only operational status classification', () => {
     }
   });
 
+  it('allows both Windows protected reads across a same-capability production refresh', async () => {
+    const store = healthyStore();
+    const protectedReadDelayMilliseconds = 1_100;
+    const refreshedHeartbeat = '2026-08-26T00:00:20.000Z';
+    const completedReadDurations: number[] = [];
+    const capabilitiesDuringOwnerRead: ActiveOperationalStatusCapability[] = [];
+    type TestOwnerGeneration = { readonly capability: ActiveOperationalStatusCapability };
+    const generationsAtOwnerReadBoundary: TestOwnerGeneration[] = [];
+    let ownerProtectedReadActive = false;
+    let refreshHeartbeatRecorded = false;
+    capabilities.requestVerification = async (signal) => {
+      const ownerProtectedRead = capabilities.requestReads === 2;
+      if (ownerProtectedRead) {
+        ownerProtectedReadActive = true;
+        const generation = (owner as unknown as {
+          readonly generation: TestOwnerGeneration | null;
+        }).generation;
+        if (generation !== null) generationsAtOwnerReadBoundary.push(generation);
+      }
+      const startedAt = process.hrtime.bigint();
+      try {
+        await new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout>;
+          const finish = (): void => {
+            clearTimeout(timer);
+            signal.removeEventListener('abort', finish);
+            resolve();
+          };
+          timer = setTimeout(finish, protectedReadDelayMilliseconds);
+          timer.unref?.();
+          signal.addEventListener('abort', finish, { once: true });
+          if (signal.aborted) finish();
+        });
+        completedReadDurations.push(
+          Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+        );
+      } finally {
+        if (ownerProtectedRead) {
+          const generation = (owner as unknown as {
+            readonly generation: TestOwnerGeneration | null;
+          }).generation;
+          if (generation !== null) generationsAtOwnerReadBoundary.push(generation);
+          ownerProtectedReadActive = false;
+        }
+      }
+    };
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      platform: 'win32',
+      clock: () => new Date(TRANSPORT_AT),
+      beforeRefresh: () => {
+        if (!ownerProtectedReadActive) return;
+        capabilitiesDuringOwnerRead.push(capabilities.active());
+        if (!refreshHeartbeatRecorded) {
+          refreshHeartbeatRecorded =
+            store.recordDaemonHeartbeat(INSTANCE, refreshedHeartbeat) !== null;
+        }
+      },
+    });
+    try {
+      await owner.start();
+      const initialCapability = capabilities.active();
+      const report = await inspect({ platform: 'win32' });
+      expect({
+        report,
+        requestReads: capabilities.requestReads,
+        completedReadDurations,
+      }).toMatchObject({
+        report: { exitCode: 0, codes: ['status.healthy'] },
+        requestReads: 2,
+      });
+      // The client verifies first; after request EOF the owner verifies the same protected artifact.
+      expect(completedReadDurations).toHaveLength(2);
+      expect(completedReadDurations.every((duration) => duration >= 1_000)).toBe(true);
+      expect(capabilitiesDuringOwnerRead.length).toBeGreaterThanOrEqual(1);
+      expect(generationsAtOwnerReadBoundary).toHaveLength(2);
+      const generationAtOwnerReadStart = generationsAtOwnerReadBoundary[0];
+      const generationAtOwnerReadEnd = generationsAtOwnerReadBoundary[1];
+      expect(generationAtOwnerReadEnd).not.toBe(generationAtOwnerReadStart);
+      expect(generationAtOwnerReadStart?.capability).toEqual(initialCapability);
+      expect(generationAtOwnerReadEnd?.capability).toEqual(initialCapability);
+      expect(capabilitiesDuringOwnerRead.every(
+        (capability) => JSON.stringify(capability) === JSON.stringify(initialCapability),
+      )).toBe(true);
+      expect(capabilities.active()).toEqual(initialCapability);
+      expect(refreshHeartbeatRecorded).toBe(true);
+      expect(store.readDaemonHealth()?.heartbeatAt).toBe(refreshedHeartbeat);
+      expect(report.daemon?.heartbeatAgeSeconds).toBe(30);
+    } finally {
+      capabilities.requestVerification = null;
+      await owner.stop();
+      store.close();
+    }
+  }, 10_000);
+
+  it('preserves explicit null as the owner refresh timer disable sentinel', async () => {
+    const store = healthyStore();
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      clock: () => new Date(TRANSPORT_AT),
+    });
+    try {
+      await owner.start();
+      expect((owner as unknown as {
+        readonly timer: ReturnType<typeof setInterval> | null;
+      }).timer).toBeNull();
+    } finally {
+      await owner.stop();
+      store.close();
+    }
+  });
+
   it('retains a fresh owner snapshot across an exact commit/checkpoint refresh interleaving', async () => {
     const store = healthyStore();
     const checkpoint = new DatabaseSync(statePath);
@@ -1228,6 +1347,46 @@ describe('read-only operational status classification', () => {
     }
   });
 
+  it('rejects rotation after owner verification before one fresh-generation retry', async () => {
+    const store = healthyStore();
+    let transportTime = Date.parse(TRANSPORT_AT);
+    let rotated = false;
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      clock: () => new Date(transportTime),
+    });
+    try {
+      await owner.start();
+      const first = capabilities.active();
+      capabilities.afterRequestRead = (observed) => {
+        if (rotated || capabilities.requestReads !== 2 || observed.kind !== 'ready' ||
+            observed.value.capabilityId !== first.capabilityId) return;
+        rotated = true;
+        capabilities.afterRequestRead = null;
+        transportTime += STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS;
+        owner.refresh();
+      };
+
+      expect(await inspect({
+        ownerTransportClock: () => new Date(transportTime),
+      })).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
+      const replacement = capabilities.active();
+      expect(rotated).toBe(true);
+      expect(replacement.capabilityId).not.toBe(first.capabilityId);
+      expect(replacement.secret).not.toBe(first.secret);
+      // Initial client/owner reads reject the old generation; the protected re-read/retry adds two.
+      expect(capabilities.requestReads).toBe(4);
+    } finally {
+      capabilities.afterRequestRead = null;
+      await owner.stop();
+      store.close();
+    }
+  });
+
   it('does not retry an empty stable-capability failure', async () => {
     const store = healthyStore();
     const sockets = new Set<Socket>();
@@ -1327,7 +1486,37 @@ describe('read-only operational status classification', () => {
     }
   });
 
-  it('does not re-read or retry after the original owner-request deadline expires', async () => {
+  it('keeps the non-Windows default owner-request deadline bounded to one second', async () => {
+    const store = healthyStore();
+    const nonWindowsCapabilities = new MemoryCapabilityStore();
+    nonWindowsCapabilities.requestVerification = async (signal) => {
+      if (signal.aborted) return;
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), {
+        once: true,
+      }));
+    };
+    let claim: OperationalStatusOwnerClaim | null = null;
+    try {
+      const stateIdentity = operationalStatusStateIdentity(statePath, 'linux');
+      claim = await nonWindowsCapabilities.acquireOwnerClaim(capabilityPath, stateIdentity);
+      const startedAt = process.hrtime.bigint();
+
+      expect(await inspect({
+        platform: 'linux',
+        ownerCapabilityStore: nonWindowsCapabilities,
+        snapshotLeaseStore: nonWindowsCapabilities,
+      })).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
+      const elapsedMilliseconds = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      expect(elapsedMilliseconds).toBeLessThan(3_000);
+      expect(nonWindowsCapabilities.requestReads).toBe(1);
+    } finally {
+      nonWindowsCapabilities.requestVerification = null;
+      await claim?.release();
+      store.close();
+    }
+  }, 7_500);
+
+  it('keeps an explicit Windows timeout bounded without re-read or retry', async () => {
     const store = healthyStore();
     const sockets = new Set<Socket>();
     let connections = 0;

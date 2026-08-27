@@ -437,7 +437,9 @@ const STATUS_OWNER_PROTOCOL_VERSION = 2;
 const STATUS_OWNER_MAX_REQUEST_BYTES = 1_024;
 const STATUS_OWNER_MAX_RESPONSE_BYTES = 64 * 1024;
 const STATUS_OWNER_MAX_CONNECTIONS = 8;
-const STATUS_OWNER_DEFAULT_TIMEOUT_MS = 1_000;
+const STATUS_OWNER_DEFAULT_REQUEST_IDLE_TIMEOUT_MS = 1_000;
+const STATUS_OWNER_DEFAULT_CLIENT_TIMEOUT_MS = 1_000;
+const STATUS_OWNER_WINDOWS_DEFAULT_CLIENT_TIMEOUT_MS = 5_000;
 const STATUS_OWNER_DEFAULT_ABSOLUTE_REQUEST_DEADLINE_MS = 2_000;
 const STATUS_OWNER_DEFAULT_REFRESH_MS = 1_000;
 const STATUS_OWNER_MESSAGE_MAX_AGE_MS = 5_000;
@@ -789,14 +791,17 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     this.capabilityStore = options.capabilityStore ??
       new CurrentUserOperationalStatusCapabilityStore(platform, env);
     this.clock = options.clock ?? (() => new Date());
-    const refreshMilliseconds = options.refreshMilliseconds ?? STATUS_OWNER_DEFAULT_REFRESH_MS;
+    const refreshMilliseconds = options.refreshMilliseconds === undefined
+      ? STATUS_OWNER_DEFAULT_REFRESH_MS
+      : options.refreshMilliseconds;
     if (refreshMilliseconds !== null &&
         (!Number.isSafeInteger(refreshMilliseconds) || refreshMilliseconds < 100 ||
          refreshMilliseconds > STATUS_OWNER_CAPABILITY_MAX_AGE_MS)) {
       throw new TypeError('status.owner_refresh_invalid');
     }
     this.refreshMilliseconds = refreshMilliseconds;
-    const idleTimeout = options.requestIdleTimeoutMilliseconds ?? STATUS_OWNER_DEFAULT_TIMEOUT_MS;
+    const idleTimeout = options.requestIdleTimeoutMilliseconds ??
+      STATUS_OWNER_DEFAULT_REQUEST_IDLE_TIMEOUT_MS;
     const absoluteDeadline = options.requestAbsoluteDeadlineMilliseconds ??
       STATUS_OWNER_DEFAULT_ABSOLUTE_REQUEST_DEADLINE_MS;
     if (!Number.isSafeInteger(idleTimeout) || idleTimeout < 10 || idleTimeout > 5_000 ||
@@ -1099,10 +1104,11 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       socket.destroy();
     }, this.requestAbsoluteDeadlineMilliseconds);
     absoluteTimer.unref?.();
-    socket.setTimeout(this.requestIdleTimeoutMilliseconds, () => {
+    const destroyOnIdle = (): void => {
       verification.abort();
       socket.destroy();
-    });
+    };
+    socket.setTimeout(this.requestIdleTimeoutMilliseconds, destroyOnIdle);
     socket.on('error', () => undefined);
     socket.on('close', () => {
       clearTimeout(absoluteTimer);
@@ -1125,90 +1131,98 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
         socket.destroy();
       }
     });
-    socket.on('end', () => { void (async () => {
-      if (rejected || absoluteDeadlinePassed()) {
-        socket.destroy();
-        return;
-      }
-      const generation = this.generation;
-      const now = transportNow(this.clock);
-      if (generation === null || now === null ||
-          !operationalStatusCapabilityIsFresh(generation.capability, now)) {
-        socket.destroy();
-        return;
-      }
-      let request = parseOwnerRequest(
-        parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
-        generation,
-        now,
-      );
-      if (request === null) {
-        socket.destroy();
-        return;
-      }
-      const persisted = await this.capabilityStore.readForRequest(
-        this.capabilityPath,
-        verification.signal,
-      );
-      const verifiedAt = transportNow(this.clock);
-      if (verification.signal.aborted || socket.destroyed || absoluteDeadlinePassed() ||
-          verifiedAt === null || this.generation !== generation ||
-          !operationalStatusCapabilityIsFresh(generation.capability, verifiedAt) ||
-          persisted.kind !== 'ready' || persisted.value.status !== 'active' ||
-          !sameCanonical(persisted.value, generation.capability)) {
-        socket.destroy();
-        return;
-      }
-      request = parseOwnerRequest(
-        parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
-        generation,
-        verifiedAt,
-      );
-      if (request === null || !this.reserveAcceptedNonce(
-        request.capabilityId,
-        request.nonce,
-        request.sentAt,
-        verifiedAt,
-      )) {
-        socket.destroy();
-        return;
-      }
-      const unsignedRequest: UnsignedOwnerRequest = {
-        version: request.version,
-        stateIdentity: request.stateIdentity,
-        capabilityId: request.capabilityId,
-        transportBinding: request.transportBinding,
-        nonce: request.nonce,
-        sentAt: request.sentAt,
-        configFingerprint: request.configFingerprint,
-        buildFingerprint: request.buildFingerprint,
-      };
-      const unsignedResponse = {
-        version: STATUS_OWNER_PROTOCOL_VERSION,
-        stateIdentity: request.stateIdentity,
-        capabilityId: request.capabilityId,
-        transportBinding: request.transportBinding,
-        nonce: request.nonce,
-        capturedAt: generation.capturedAt,
-        schemaVersion: SCHEMA_VERSION,
-        snapshot: projectCapturedOperationalStore(generation.captured, {
+    socket.on('end', () => {
+      // Complete EOF closes the request-ingress inactivity window. The protected verification may
+      // legitimately outlive it on Windows, while the non-refreshing absolute deadline remains.
+      socket.setTimeout(0);
+      socket.off('timeout', destroyOnIdle);
+      void (async () => {
+        if (rejected || absoluteDeadlinePassed()) {
+          socket.destroy();
+          return;
+        }
+        const generation = this.generation;
+        const now = transportNow(this.clock);
+        if (generation === null || now === null ||
+            !operationalStatusCapabilityIsFresh(generation.capability, now)) {
+          socket.destroy();
+          return;
+        }
+        let request = parseOwnerRequest(
+          parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
+          generation,
+          now,
+        );
+        if (request === null) {
+          socket.destroy();
+          return;
+        }
+        const persisted = await this.capabilityStore.readForRequest(
+          this.capabilityPath,
+          verification.signal,
+        );
+        const verifiedAt = transportNow(this.clock);
+        const currentGeneration = this.generation;
+        if (verification.signal.aborted || socket.destroyed || absoluteDeadlinePassed() ||
+            verifiedAt === null || currentGeneration === null ||
+            !sameCanonical(currentGeneration.capability, generation.capability) ||
+            !operationalStatusCapabilityIsFresh(generation.capability, verifiedAt) ||
+            persisted.kind !== 'ready' || persisted.value.status !== 'active' ||
+            !sameCanonical(persisted.value, generation.capability)) {
+          socket.destroy();
+          return;
+        }
+        request = parseOwnerRequest(
+          parseExactOwnerFrame(input, STATUS_OWNER_MAX_REQUEST_BYTES),
+          generation,
+          verifiedAt,
+        );
+        if (request === null || !this.reserveAcceptedNonce(
+          request.capabilityId,
+          request.nonce,
+          request.sentAt,
+          verifiedAt,
+        )) {
+          socket.destroy();
+          return;
+        }
+        const unsignedRequest: UnsignedOwnerRequest = {
+          version: request.version,
+          stateIdentity: request.stateIdentity,
+          capabilityId: request.capabilityId,
+          transportBinding: request.transportBinding,
+          nonce: request.nonce,
+          sentAt: request.sentAt,
           configFingerprint: request.configFingerprint,
           buildFingerprint: request.buildFingerprint,
-        }),
-      };
-      const response = encodeOwnerFrame({
-        ...unsignedResponse,
-        authenticator: ownerAuthenticator(generation.capability.secret, 'response', {
-          request: unsignedRequest,
-          response: unsignedResponse,
-        }),
-      }, STATUS_OWNER_MAX_RESPONSE_BYTES);
-      if (response === null || absoluteDeadlinePassed()) {
-        socket.destroy();
-        return;
-      }
-      socket.end(response);
-    })().catch(() => socket.destroy()); });
+        };
+        const unsignedResponse = {
+          version: STATUS_OWNER_PROTOCOL_VERSION,
+          stateIdentity: request.stateIdentity,
+          capabilityId: request.capabilityId,
+          transportBinding: request.transportBinding,
+          nonce: request.nonce,
+          capturedAt: generation.capturedAt,
+          schemaVersion: SCHEMA_VERSION,
+          snapshot: projectCapturedOperationalStore(generation.captured, {
+            configFingerprint: request.configFingerprint,
+            buildFingerprint: request.buildFingerprint,
+          }),
+        };
+        const response = encodeOwnerFrame({
+          ...unsignedResponse,
+          authenticator: ownerAuthenticator(generation.capability.secret, 'response', {
+            request: unsignedRequest,
+            response: unsignedResponse,
+          }),
+        }, STATUS_OWNER_MAX_RESPONSE_BYTES);
+        if (response === null || absoluteDeadlinePassed()) {
+          socket.destroy();
+          return;
+        }
+        socket.end(response);
+      })().catch(() => socket.destroy());
+    });
   }
 
   private reserveAcceptedNonce(
@@ -1299,7 +1313,9 @@ async function requestOwnedOperationalStatus(
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
 ): Promise<OperationalStatusSnapshot | null> {
-  const timeout = timeoutMilliseconds ?? STATUS_OWNER_DEFAULT_TIMEOUT_MS;
+  const timeout = timeoutMilliseconds ?? (platform === 'win32'
+    ? STATUS_OWNER_WINDOWS_DEFAULT_CLIENT_TIMEOUT_MS
+    : STATUS_OWNER_DEFAULT_CLIENT_TIMEOUT_MS);
   if (!Number.isSafeInteger(timeout) || timeout < 10 || timeout > 5_000) return null;
   if (transportNow(clock) === null) return null;
   const stateIdentity = operationalStatusStateIdentity(statePath, platform);
