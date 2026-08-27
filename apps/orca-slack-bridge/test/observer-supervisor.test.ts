@@ -17,7 +17,7 @@ class FakeClock implements ObserverClock {
   readonly wallNow = (): Date => new Date(Date.UTC(2026, 7, 27) + this.now);
   readonly setTimer = (callback: () => void, milliseconds: number): ReturnType<typeof setTimeout> => {
     const id = ++this.sequence;
-    this.timers.set(id, { at: this.now + milliseconds, callback });
+    this.timers.set(id, { at: this.now + Math.trunc(milliseconds), callback });
     return id as unknown as ReturnType<typeof setTimeout>;
   };
   readonly clearTimer = (timer: ReturnType<typeof setTimeout>): void => {
@@ -254,6 +254,43 @@ describe('ObserverSupervisor', () => {
     expect(runObserverStarts[1]).toBe(Date.parse(firstCompletion.nextRunAt) -
       Date.UTC(2026, 7, 27, 0, 0, 0));
 
+    await supervisor.stop(100);
+  });
+
+  it('does not truncate a fractional delay into a one-millisecond-early durable claim', async () => {
+    const clock = new FakeClock();
+    const discoveryStarts: string[] = [];
+    const completions: ObserverCompletion[] = [];
+    let delayedFirstCompletion = false;
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-a', jitterRatio: 0, clock,
+      jobs: definitions({
+        'repository-discovery': async () => {
+          discoveryStarts.push(clock.wallNow().toISOString());
+          return {};
+        },
+      }),
+      onCompleted: (completion) => {
+        completions.push(completion);
+        if (completion.name === 'repository-discovery' && !delayedFirstCompletion) {
+          delayedFirstCompletion = true;
+          clock.now += 0.5;
+        }
+      },
+    });
+
+    await supervisor.runStartupDiscovery();
+    const durableNextRunAt = completions[0]!.nextRunAt;
+    supervisor.startAfterSocket(60_000);
+
+    await clock.advance(299_999);
+    expect(discoveryStarts).toEqual([new Date(Date.UTC(2026, 7, 27)).toISOString()]);
+
+    await clock.advance(1);
+    expect(discoveryStarts).toEqual([
+      new Date(Date.UTC(2026, 7, 27)).toISOString(),
+      durableNextRunAt,
+    ]);
     await supervisor.stop(100);
   });
 

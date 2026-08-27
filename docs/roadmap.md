@@ -254,7 +254,8 @@ content-witness truncate detection을 보장한다.
 
 O1-5는 O1-2 store, O1-3 effective routing, O1-4 health/logger를 production daemon에 연결했다. discovery,
 Run observer, facts-only PR digest는 coalescing/fairness가 있는 단일 execution lane과 completion-based
-jitter/backoff를 공유하고 Gate/Channel reconcile과 heartbeat는 독립적으로 유지된다. GitHub daemon work는
+jitter/backoff를 공유한다. recurring timer는 positive fractional remainder를 올림해 durable `nextRunAt`보다
+claim이 먼저 시작되지 않게 하고, Gate/Channel reconcile과 heartbeat는 독립적으로 유지된다. GitHub daemon work는
 hourly command bucket, cached REST+GraphQL floor, repository/global PR budget, timeout/response/page/concurrency
 bound를 적용하며 repository-local 실패는 부분 게시 없이 다음 repository와 후속 cycle로 격리된다. 모든 PR,
 Run, Run-collection root create는 durable prepare/claim과 atomic mapping+posted commit을 거치고 possible-effect
@@ -320,6 +321,17 @@ removed/stale generation, persisted mismatch, deadline/abort와 기존 auth/nonc
 fail closed한다. 수정 regression은 production 1초 refresh, 양쪽 1.1초 protected read, Windows 기본 client
 deadline과 owner 기본 2초 absolute deadline으로 same-capability refresh interleaving을 직접 증명한다. 이는
 local merge qualification일 뿐 live acceptance가 아니며, final O1 production acceptance는 여전히 pending이다.
+
+그 status-liveness repair는 exact merged `main` `0865beffd7f1556599210c4c3581c6e95332c1d0`에
+포함됐다. 이후 최근 unclean production log epoch들은 persisted observer `nextRunAt` 직전에 끝났고
+`job.started`, `daemon.failed`, `daemon.stopped`를 남기지 않았다. supervisor가 durable wall schedule과 함께
+만든 monotonic deadline의 fractional remainder를 Node timer가 내림하면 wall time으로 1ms 이른 callback이
+가능하고, SQLite due fence의 null claim을 CLI가 fatal exit `1`로 처리하는 경로가 이 signature를 설명한다.
+최소 수리는 timer 설치 경계의 nonnegative remainder만 올림하며 store/CLI fence, overdue enqueue,
+jitter/backoff는 유지한다. Node-truncating clock regression을 포함한 focused 2 files 36 tests와 workspace
+typecheck는 통과했지만 local merge qualification일 뿐이다. final O1 production acceptance는 이 repair의
+merged fixed release에서 observer job과 반복 status 및 Task/PID/heartbeat liveness를 함께 확인할 때까지
+pending이다.
 
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
