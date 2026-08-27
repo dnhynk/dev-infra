@@ -264,8 +264,10 @@ O1-6의 current-user 설치·제거 lifecycle은 merged됐다. O1-7은 exact fix
 outage/backoff, no-repost, multi-repository fail-closed, shutdown, privacy/status를 하나의 hermetic CI
 gate로 묶었다. 단일 workspace package의 complete bridge Vitest suite는 `acceptance:o1-7`에서 CI당
 한 번만 실행하고 typecheck는 별도 job으로 유지한다. 실제 Windows restart 표본 결과와 production 설치 성공 판정은
-[O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 따르며, merged-main
-배포·startup smoke 전에는 production 설치 완료를 주장하지 않는다. D3의
+[O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 따른다. hotfix exact head
+`73ebddcca7c6584e9b197caef2103ab43821181f`가 CI와 독립 감사를 통과해
+`da76bf3cd76b4979154ee8dcd6706ce3627f2a5e`로 merge됐고, 해당 merged-main release가 startup smoke와
+beyond-boundary ownership 관측을 통과했으므로 O1 production 설치를 완료로 닫는다. D3의
 `LIVE_CHANNEL_UNVERIFIED`는 이 O1 상태와 독립적으로 그대로 유지한다.
 
 O1-7 실측에서 `RestartOnFailure`가 이미 시작된 Exec의 exit 23을 재실행하지 않는 O1-6 gap이
@@ -278,9 +280,11 @@ SID binding을 통과해 daemon이 시작됐지만, interactive Task action의 W
 동일 release/workload는 240초 동안 parent-owned였으므로, 최소 hotfix는 task action의
 `-WindowStyle Hidden`을 생성·semantic fingerprint·launcher binding·dynamic `run-now` parsing에 고정한다.
 disposable registered-task 표본은 하나의 PowerShell parent와 direct Node child 및 Task `Running` 상태를
-245초 동안 유지하고 clean exit 뒤 residual `0/0/0`을 확인했다. 이 repair가 merge된 exact release로 같은
-beyond-boundary production 관측을 통과하기 전까지 O1 production 설치 완료 상태는 열어 두며, 건강한 orphan
-daemon만으로 완료를 주장하지 않는다.
+245초 동안 유지하고 clean exit 뒤 residual `0/0/0`을 확인했다. repair가 merge된 immutable release
+`1eb41697c6c22f51893adbf4e89fdd864bb399d4a6e0fdba8ed4a978cd93fd38`도 production에서 동일 direct pair와
+Task `Running`/result `267009`, fresh heartbeat, matched build/config/schema를 332초 동안 유지하고 O1의 세
+background job을 모두 성공시켰다. 따라서 O1 production supervisor는 accepted다. 이 control은 repair를
+검증하지만 과거 `0xC000013A`의 특정 console-close 원인을 직접 증명한 것으로 소급 해석하지 않는다.
 
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
