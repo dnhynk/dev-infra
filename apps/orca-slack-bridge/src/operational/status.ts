@@ -175,6 +175,8 @@ export type InspectOperationalStatusOptions = {
   readonly taskFacet?: () => TaskStatusObservation | Promise<TaskStatusObservation>;
   /** Safe projected test/adapter seam; production validates the same aggregate-only shape. */
   readonly snapshot?: OperationalStatusSnapshot;
+  /** Deterministic test seam for asserting the exact closed-snapshot backup operation. */
+  readonly sqliteBackup?: typeof backup;
   /** Deterministic test seam; production never exposes the read-only source connection. */
   readonly afterSqliteBackupStep?: () => void;
   /** Deterministic transition seam immediately after a negative closed-WAL classification. */
@@ -1430,6 +1432,7 @@ function sameClosedDatabaseWitness(
 async function readStoredStatus(
   path: string,
   expectations: OperationalStatusExpectations,
+  sqliteBackup: typeof backup,
   afterSqliteBackupStep: (() => void) | undefined,
   afterClosedWalClassification: (() => void) | undefined,
   beforeClosedSourceOpen: (() => void) | undefined,
@@ -1548,9 +1551,9 @@ async function readStoredStatus(
     // sqlite3_backup_* takes one transactionally consistent image. If a writer commits or
     // checkpoints concurrently, SQLite restarts the backup rather than combining file epochs.
     if (afterSqliteBackupStep === undefined) {
-      await backup(source, copy, { rate: STATUS_CLOSED_BACKUP_MAX_PAGES });
+      await sqliteBackup(source, copy, { rate: STATUS_CLOSED_BACKUP_MAX_PAGES });
     }
-    else await backup(source, copy, { rate: 1, progress: afterSqliteBackupStep });
+    else await sqliteBackup(source, copy, { rate: 1, progress: afterSqliteBackupStep });
     source.close();
     source = null;
     try {
@@ -1759,6 +1762,7 @@ export async function inspectOperationalStatus(
     ? await readStoredStatus(
       statePath,
       expectations,
+      options.sqliteBackup ?? backup,
       options.afterSqliteBackupStep,
       options.afterClosedWalClassification,
       options.beforeClosedSourceOpen,
