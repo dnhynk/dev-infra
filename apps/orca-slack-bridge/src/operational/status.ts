@@ -36,6 +36,7 @@ import {
   STATUS_OWNER_CAPABILITY_MAX_AGE_MS,
   STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS,
   type ActiveOperationalStatusCapability,
+  type OperationalStatusCapabilityRead,
   type OperationalStatusCapabilityStore,
   type OperationalStatusOwnerClaim,
   type OperationalStatusOwnerTransportIdentity,
@@ -1268,6 +1269,25 @@ function parseOwnerResponse(
   return parseOperationalStatusSnapshot(response['snapshot']);
 }
 
+type OwnerRequestAttempt =
+  | { readonly kind: 'ready'; readonly value: OperationalStatusSnapshot }
+  | { readonly kind: 'retryable' }
+  | { readonly kind: 'terminal' };
+
+function remainingOwnerRequestMilliseconds(deadline: bigint): number {
+  const remainingNanoseconds = deadline - process.hrtime.bigint();
+  return remainingNanoseconds <= 0n
+    ? 0
+    : Math.floor(Number(remainingNanoseconds) / 1_000_000);
+}
+
+function isNewOwnerCapabilityGeneration(
+  previous: ActiveOperationalStatusCapability,
+  next: ActiveOperationalStatusCapability,
+): boolean {
+  return previous.capabilityId !== next.capabilityId && previous.secret !== next.secret;
+}
+
 async function requestOwnedOperationalStatus(
   statePath: string,
   expectations: OperationalStatusExpectations,
@@ -1281,8 +1301,7 @@ async function requestOwnedOperationalStatus(
 ): Promise<OperationalStatusSnapshot | null> {
   const timeout = timeoutMilliseconds ?? STATUS_OWNER_DEFAULT_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeout) || timeout < 10 || timeout > 5_000) return null;
-  const now = transportNow(clock);
-  if (now === null) return null;
+  if (transportNow(clock) === null) return null;
   const stateIdentity = operationalStatusStateIdentity(statePath, platform);
   let resolvedCapabilityPath: string;
   try {
@@ -1291,106 +1310,149 @@ async function requestOwnedOperationalStatus(
     return null;
   }
   const store = capabilityStore ?? new CurrentUserOperationalStatusCapabilityStore(platform, env);
-  const requestStartedAt = process.hrtime.bigint();
-  const capabilityVerification = new AbortController();
-  const verificationTimer = setTimeout(() => capabilityVerification.abort(), timeout);
-  verificationTimer.unref?.();
-  let observed: ReturnType<OperationalStatusCapabilityStore['read']>;
-  try {
-    observed = await store.readForRequest(resolvedCapabilityPath, capabilityVerification.signal);
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(verificationTimer);
-  }
-  const elapsedMilliseconds = Number(process.hrtime.bigint() - requestStartedAt) / 1_000_000;
-  const remainingMilliseconds = Math.floor(timeout - elapsedMilliseconds);
-  if (observed.kind !== 'ready' || observed.value.status !== 'active' ||
-      observed.value.stateIdentity !== stateIdentity ||
-      !expectedOwnerTransport(
-        observed.value.transport,
-        statePath,
-        pipePath,
-        resolvedCapabilityPath,
-        platform,
-      ) ||
-      (observed.value.transport.kind === 'pipe' &&
-       !store.verifyOwnerTransport(observed.value.transport)) ||
-      remainingMilliseconds < 1 ||
-      !operationalStatusCapabilityIsFresh(observed.value, now)) return null;
-  const capability = observed.value;
-  const nonce = randomBytes(16).toString('hex');
-  const unsignedRequest: UnsignedOwnerRequest = {
-    version: STATUS_OWNER_PROTOCOL_VERSION,
-    stateIdentity,
-    capabilityId: capability.capabilityId,
-    transportBinding: ownerTransportBinding(capability.transport),
-    nonce,
-    sentAt: now.toISOString(),
-    configFingerprint: expectations.configFingerprint,
-    buildFingerprint: expectations.buildFingerprint,
-  };
-  const request = encodeOwnerFrame({
-    ...unsignedRequest,
-    authenticator: ownerAuthenticator(capability.secret, 'request', unsignedRequest),
-  }, STATUS_OWNER_MAX_REQUEST_BYTES);
-  if (request === null) return null;
+  const requestDeadline = process.hrtime.bigint() + BigInt(timeout) * 1_000_000n;
 
-  return await new Promise<OperationalStatusSnapshot | null>((resolveRequest) => {
-    const socket = capability.transport.kind === 'tcp'
-      ? createConnection({
-        host: capability.transport.host,
-        port: capability.transport.port,
-        allowHalfOpen: true,
-      })
-      : createConnection({ path: capability.transport.path, allowHalfOpen: true });
-    let settled = false;
-    let input = Buffer.alloc(0);
-    let receivedEnd = false;
-    const finish = (value: OperationalStatusSnapshot | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolveRequest(value);
+  const readCapability = async (): Promise<ActiveOperationalStatusCapability | null> => {
+    const remainingMilliseconds = remainingOwnerRequestMilliseconds(requestDeadline);
+    if (remainingMilliseconds < 1) return null;
+    const capabilityVerification = new AbortController();
+    const verificationTimer = setTimeout(
+      () => capabilityVerification.abort(),
+      remainingMilliseconds,
+    );
+    verificationTimer.unref?.();
+    let observed: OperationalStatusCapabilityRead;
+    try {
+      observed = await store.readForRequest(
+        resolvedCapabilityPath,
+        capabilityVerification.signal,
+      );
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(verificationTimer);
+    }
+    if (capabilityVerification.signal.aborted ||
+        remainingOwnerRequestMilliseconds(requestDeadline) < 1) return null;
+    const verifiedAt = transportNow(clock);
+    try {
+      if (verifiedAt === null || observed.kind !== 'ready' ||
+          observed.value.status !== 'active' || observed.value.stateIdentity !== stateIdentity ||
+          !expectedOwnerTransport(
+            observed.value.transport,
+            statePath,
+            pipePath,
+            resolvedCapabilityPath,
+            platform,
+          ) ||
+          (observed.value.transport.kind === 'pipe' &&
+           !store.verifyOwnerTransport(observed.value.transport)) ||
+          !operationalStatusCapabilityIsFresh(observed.value, verifiedAt)) return null;
+      return observed.value;
+    } catch {
+      return null;
+    }
+  };
+
+  const requestCapability = async (
+    capability: ActiveOperationalStatusCapability,
+  ): Promise<OwnerRequestAttempt> => {
+    const sentAt = transportNow(clock);
+    if (sentAt === null || !operationalStatusCapabilityIsFresh(capability, sentAt) ||
+        remainingOwnerRequestMilliseconds(requestDeadline) < 1) return { kind: 'terminal' };
+    const nonce = randomBytes(16).toString('hex');
+    const unsignedRequest: UnsignedOwnerRequest = {
+      version: STATUS_OWNER_PROTOCOL_VERSION,
+      stateIdentity,
+      capabilityId: capability.capabilityId,
+      transportBinding: ownerTransportBinding(capability.transport),
+      nonce,
+      sentAt: sentAt.toISOString(),
+      configFingerprint: expectations.configFingerprint,
+      buildFingerprint: expectations.buildFingerprint,
     };
-    const timer = setTimeout(() => finish(null), remainingMilliseconds);
-    timer.unref?.();
-    socket.on('connect', () => socket.end(request));
-    socket.on('error', () => finish(null));
-    socket.on('close', () => {
-      if (!receivedEnd) finish(null);
-    });
-    socket.on('data', (chunk: Buffer) => {
-      if (input.length + chunk.length > STATUS_OWNER_MAX_RESPONSE_BYTES) {
-        finish(null);
-        return;
-      }
-      input = Buffer.concat([input, chunk]);
-      const declared = declaredOwnerFrameLength(input, STATUS_OWNER_MAX_RESPONSE_BYTES);
-      if (declared !== null && (declared < 0 || input.length > declared + 4)) {
-        finish(null);
-      }
-    });
-    socket.on('end', () => {
-      receivedEnd = true;
-      try {
-        const responseNow = transportNow(clock);
-        if (responseNow === null) {
-          finish(null);
+    const request = encodeOwnerFrame({
+      ...unsignedRequest,
+      authenticator: ownerAuthenticator(capability.secret, 'request', unsignedRequest),
+    }, STATUS_OWNER_MAX_REQUEST_BYTES);
+    if (request === null) return { kind: 'terminal' };
+    const remainingMilliseconds = remainingOwnerRequestMilliseconds(requestDeadline);
+    if (remainingMilliseconds < 1) return { kind: 'terminal' };
+
+    return await new Promise<OwnerRequestAttempt>((resolveRequest) => {
+      const socket = capability.transport.kind === 'tcp'
+        ? createConnection({
+          host: capability.transport.host,
+          port: capability.transport.port,
+          allowHalfOpen: true,
+        })
+        : createConnection({ path: capability.transport.path, allowHalfOpen: true });
+      let settled = false;
+      let input = Buffer.alloc(0);
+      let receivedEnd = false;
+      const failedWithoutResponse = (): OwnerRequestAttempt =>
+        input.length === 0 ? { kind: 'retryable' } : { kind: 'terminal' };
+      const finish = (value: OwnerRequestAttempt): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolveRequest(value);
+      };
+      const timer = setTimeout(() => finish(failedWithoutResponse()), remainingMilliseconds);
+      timer.unref?.();
+      socket.on('connect', () => socket.end(request));
+      socket.on('error', () => finish(failedWithoutResponse()));
+      socket.on('close', () => {
+        if (!receivedEnd) finish(failedWithoutResponse());
+      });
+      socket.on('data', (chunk: Buffer) => {
+        if (input.length + chunk.length > STATUS_OWNER_MAX_RESPONSE_BYTES) {
+          finish({ kind: 'terminal' });
           return;
         }
-        finish(parseOwnerResponse(
-          parseExactOwnerFrame(input, STATUS_OWNER_MAX_RESPONSE_BYTES),
-          unsignedRequest,
-          capability,
-          responseNow,
-        ));
-      } catch {
-        finish(null);
-      }
+        input = Buffer.concat([input, chunk]);
+        const declared = declaredOwnerFrameLength(input, STATUS_OWNER_MAX_RESPONSE_BYTES);
+        if (declared !== null && (declared < 0 || input.length > declared + 4)) {
+          finish({ kind: 'terminal' });
+        }
+      });
+      socket.on('end', () => {
+        receivedEnd = true;
+        if (input.length === 0) {
+          finish({ kind: 'retryable' });
+          return;
+        }
+        try {
+          const responseNow = transportNow(clock);
+          const snapshot = responseNow === null
+            ? null
+            : parseOwnerResponse(
+              parseExactOwnerFrame(input, STATUS_OWNER_MAX_RESPONSE_BYTES),
+              unsignedRequest,
+              capability,
+              responseNow,
+            );
+          finish(snapshot === null
+            ? { kind: 'terminal' }
+            : { kind: 'ready', value: snapshot });
+        } catch {
+          finish({ kind: 'terminal' });
+        }
+      });
     });
-  });
+  };
+
+  const capability = await readCapability();
+  if (capability === null) return null;
+  const first = await requestCapability(capability);
+  if (first.kind === 'ready') return first.value;
+  if (first.kind === 'terminal' ||
+      remainingOwnerRequestMilliseconds(requestDeadline) < 1) return null;
+  const replacement = await readCapability();
+  if (replacement === null || !isNewOwnerCapabilityGeneration(capability, replacement)) return null;
+  const second = await requestCapability(replacement);
+  return second.kind === 'ready' ? second.value : null;
 }
 
 function immutableDatabaseUrl(path: string): URL {

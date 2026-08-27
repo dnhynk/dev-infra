@@ -1,12 +1,25 @@
 # O1 operational acceptance evidence
 
-Status: **O1-7 PASS — exact-head CI and independent audit passed; merged-main immutable release installed; production Task supervisor remained healthy beyond the prior failure boundary**
+Status: **O1-7 production acceptance reopened — Task supervisor evidence remains valid; status capability-rotation repair awaits merge and fixed-release production verification**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
 audits before this branch started. No production Slack, GitHub, Orca, Scheduled Task, state, or
 credential was used by the disposable acceptance. D3 remains `LIVE_CHANNEL_UNVERIFIED` and is not
 changed by O1 evidence.
+
+After the accepted supervisor release, production status sampling from exact merged `main`
+`e56d9d79beccb4eb639fc4b1b638c92e51957ef5` intermittently returned
+`state.snapshot_unavailable` at the 15-second operational-status capability rotation boundary. The
+Scheduled Task, its direct PowerShell/Node pair, and daemon heartbeat remained healthy, isolating the
+observation to the read-only status path: a client could read one protected generation and receive
+an empty rejection after the owner rotated before authenticating that socket request. The narrow
+repair retains one original deadline and permits one retry only after a second protected read proves
+a fresh, policy-matched capability with a new ID and secret; malformed or unauthenticated responses,
+stable/stale metadata, transport or state-identity mismatch, and deadline exhaustion remain closed.
+Focused local regression and typecheck evidence can qualify the merge, but final O1 production
+acceptance remains pending until the merged fixed release is installed and status succeeds across
+repeated rotation boundaries.
 
 The first production install from exact merged `main` at
 `8d857f94c0ad44617071aaa97a4756cd9e114b42` exposed a Windows registered-export
@@ -54,7 +67,7 @@ specific console-close source caused the historical failure.
 | auto discovery and routing | `discovery-reconcile` and `run-effective-routing` focused files | aliases and exact Orca IDs coalesce by canonical repository; multi-repository consensus routes once; cross-Project, contradictory, unreadable, or over-capacity facts route zero |
 | shutdown fence | `cli-daemon` and supervisor focused files | intake closes first; accepted work drains boundedly; no timer, queued completion, or late dependency starts new external work after the fence |
 | daemon LLM boundary | `digest` facts-only regression plus daemon wiring | O1 background jobs always select deterministic `facts_only`; the trap summary provider receives zero calls |
-| privacy and operability | `operational-logger` and `operational-status` focused files | allowlisted NDJSON only, hashed refs, bounded rotation, read-only status, and exact pending/uncertain/dead aggregates without identities |
+| privacy and operability | `operational-logger` and `operational-status` focused files, including the capability-rotation interleaving | allowlisted NDJSON only, hashed refs, bounded rotation, read-only status, and at most one fresh-generation retry inside the original deadline without weakening identity, transport, nonce, or response authentication |
 | current-user Scheduled Task | `o1-7-windows-scheduled-task-acceptance.ps1` under a process-wide mutex | unique exact target, non-admin create, hidden PowerShell action, demand start, IgnoreNew, bounded PT1M TimeTrigger relaunch after exit 23, exactly one direct PowerShell→Node pair still Task-owned for 245s, clean exit 0, exact unregister, and residual task/process/file counts all zero |
 
 The hermetic entry point is `pnpm acceptance:o1-7`. Because the repository has one workspace package,
@@ -72,6 +85,7 @@ call Task Scheduler.
 | PR digest | every 900s; 300s timeout | first pass 60s after Socket; 10 PR/repository; 100 PR global pass budget |
 | GitHub budget | 2,000 commands/hour | defer before work below REST or GraphQL floor 1,000; at most two commands concurrently |
 | daemon health | heartbeat 15s; stale after 90s | exact instance/revision ownership |
+| status owner capability | rotate after 15s; stale after 30s | one protected initial read plus at most one protected re-read/retry for a new capability ID and secret under the original request deadline |
 | capacity | 16 repositories; 64 Runs; 16 Orca IDs per canonical | hard maxima 64 / 256 / 64; overflow fails closed without truncation |
 | operational logs | 5 MiB active file; 5 backups | 16 KiB canonical NDJSON line; allowlisted fields and 12-hex SHA-256 refs only |
 | Windows Task | current-user interactive, Limited, AtLogOn | hidden Windows PowerShell action; indefinite PT1M LogonTrigger repetition for an exited daemon; `IgnoreNew` overlap fence; demand start; `StartWhenAvailable`; PT0S execution limit |
@@ -115,10 +129,11 @@ reject an omitted or non-hidden value as action drift.
 Rollback means selecting the prior immutable staged release and running that release's `install`
 command with the same six absolute operator inputs; task XML and protected manifest replacement are
 CAS checked and rolled back on post-registration mismatch. Do not delete state, config, logs, or
-release roots as part of rollback. The pre-hotfix production Task is not accepted merely because its
-orphaned daemon was healthy. The repaired exact merged-main release satisfied the production
-installation condition: Task state and direct parent/child ownership remained healthy past the
-observed boundary.
+release roots as part of rollback. The pre-supervisor-hotfix production Task is not accepted merely
+because its orphaned daemon was healthy. The repaired exact merged-main release satisfied the Task
+supervisor condition: Task state and direct parent/child ownership remained healthy past the
+observed boundary. Final O1 acceptance is nevertheless reopened for the later status-rotation race
+and requires a merged fixed release production check.
 
 ## Privacy boundary
 
@@ -130,6 +145,10 @@ retains its generated task name, paths, XML, process command line, or mock state
 
 ## Recorded results
 
+- Status capability-rotation hotfix local qualification: focused
+  `test/operational-status.test.ts` passed 1 file, 49 tests passed and 9 platform-skipped (58 total);
+  workspace typecheck PASS. This is merge qualification only; fixed-release production acceptance
+  remains pending.
 - Node 26.8.1 focused hard-crash acceptance: 1 file, 2/2 tests passed; bridge typecheck PASS.
 - Supervisor hotfix focused Windows suite: 4 files, 60/60 tests passed. Full O1-7 hermetic gate:
   75 files passed, 1,666 tests passed, 9 platform-skipped; workspace typecheck and bridge build PASS.
@@ -168,4 +187,9 @@ retains its generated task name, paths, XML, process command line, or mock state
   `work.pending`. The absent Gate/Channel jobs correspond to the separately preserved D3
   `LIVE_CHANNEL_UNVERIFIED` state; the registry/work backlog is reported as existing state rather
   than hidden. None indicates a failed O1 supervisor, stale heartbeat, failed O1 background job, or
-  build/config/schema/task mismatch, so these separate conditions do not revoke this acceptance.
+  build/config/schema/task mismatch, so these separate conditions do not revoke the supervisor
+  evidence.
+- Later production sampling on exact `main` `e56d9d79beccb4eb639fc4b1b638c92e51957ef5`
+  observed intermittent `state.snapshot_unavailable` aligned with the 15-second capability rotation
+  while Task/process ownership and heartbeat stayed healthy. This reopens final O1 production
+  acceptance until the merged fixed release passes repeated rotation-boundary status sampling.

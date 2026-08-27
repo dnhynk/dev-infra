@@ -555,3 +555,22 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - production O1 완료 조건은 hotfix merge 뒤 exact release에서 같은 beyond-boundary ownership을 다시
   관측하는 것이었고, 위 control로 충족됐다. Task가 끝난 뒤 건강한 daemon만 남은 상태는 여전히
   acceptance가 아니다.
+
+### DL-059 · status capability rotation은 원래 deadline 안의 단일 재검증으로만 복구한다
+
+- exact merged `main` `e56d9d79beccb4eb639fc4b1b638c92e51957ef5`의 production Task,
+  direct PowerShell/Node pair, heartbeat는 건강한데 read-only status가 15초 capability rotation
+  경계에서 간헐적으로 `state.snapshot_unavailable`을 반환했다. client가 보호된 capability 한 세대를
+  읽은 뒤 owner가 socket request 인증 전에 다음 세대로 rotate하면 old authenticator가 빈 응답으로
+  거절되지만 client에는 재검증 경로가 없었다.
+- 최초 protected read, socket attempt, 후속 protected re-read와 선택적 두 번째 attempt는 하나의 최초
+  monotonic deadline을 공유한다. 첫 attempt가 authenticated response 없이 실패한 경우에만 store를 다시
+  읽고, active capability의 state identity, transport policy, freshness와 owner transport identity를 모두
+  다시 검증한 뒤 capability ID와 secret이 모두 바뀐 새 generation에 한해 정확히 한 번 재시도한다.
+- 각 attempt는 별도 random nonce와 해당 generation HMAC을 사용한다. stable capability, ID/secret 중 하나만
+  바뀐 metadata, stale/retired/malformed document, state/transport mismatch, 확인되지 않은 pipe identity,
+  deadline exhaustion은 재시도하지 않는다. nonempty malformed frame, signed malformed snapshot과
+  unauthenticated loopback squatter도 terminal failure이므로 protected re-read를 retry oracle로 사용하지 않는다.
+- 기존 current-user DACL/owner 검증, exact transport binding, response authentication, nonce replay set과
+  frame/EOF bounds는 완화하지 않는다. focused regression과 typecheck 뒤 merge할 수 있지만, final O1
+  production acceptance는 merged fixed release가 반복 rotation boundary status를 통과할 때까지 pending이다.
