@@ -143,7 +143,8 @@ describe('Windows Scheduled Task semantic contract', () => {
       restartInterval: 'PT1M',
     });
     expect(parseWindowsArguments(parsed!.action.arguments)).toEqual([
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+      '-ExecutionPolicy', 'Bypass',
       '-File', String.raw`C:\릴리스 공간\bridge 1\windows\launch-daemon.ps1`,
       '-SettingsPath', String.raw`C:\사용자 데이터\runtime.json`,
     ]);
@@ -300,6 +301,12 @@ describe('Windows Scheduled Task semantic contract', () => {
     }, '1.6')).toBe(false);
     expect(windowsTaskXmlMatchesLaunchBinding(
       exported.replace('-SettingsPath', '-DifferentSettingsPath'), binding, '1.6',
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      exported.replace('&quot;Hidden&quot;', '&quot;Normal&quot;'), binding, '1.6',
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      exported.replace('&quot;-WindowStyle&quot; &quot;Hidden&quot; ', ''), binding, '1.6',
     )).toBe(false);
     expect(windowsTaskXmlMatchesLaunchBinding(
       exported.replace(`release=${DIGEST}`, `release=${'b'.repeat(64)}`), binding, '1.6',

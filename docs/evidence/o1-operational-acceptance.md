@@ -1,6 +1,6 @@
 # O1 operational acceptance evidence
 
-Status: **disposable Windows and local hermetic aggregate PASS; launcher SID hotfix CI and fixed-merge production deployment pending**
+Status: **disposable Windows supervisor repair and local hermetic aggregate PASS; production Task supervisor not yet accepted; hotfix CI, merge, and redeployment pending**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
@@ -18,8 +18,26 @@ The second production install from exact merged `main` at
 `a3e018bffef633e8d55d3e2dc2dc1c50f8a846b2` left the owned Task and protected manifest
 semantically matched, but the Task ended with last result `2` and produced no new daemon log or
 heartbeat. The launcher rejected the canonical exported account name before daemon start because
-its dynamic binding verifier did not receive the trusted resolved LogonTrigger SID; deployment of
-this second hotfix remains pending its fixed merge.
+its dynamic binding verifier did not receive the trusted resolved LogonTrigger SID.
+
+The next exact merged `main` at `533a4a9530fdd6f6ddc20ba6a265ded3e7a0d3e6` fixed that SID
+boundary. Its production release (reported digest prefix `eaa22f`) started one Windows PowerShell
+Task action and one healthy Node daemon, but after roughly two to four minutes the PowerShell action
+exited with `0xC000013A` while Node remained orphaned. The same immutable launcher, manifest,
+configuration, state, and workload stayed parent-owned for 240 seconds when PowerShell was started
+outside Task Scheduler with a hidden window. Exact-setting and simple parent/child disposable
+controls also survived beyond 130 seconds, excluding battery, idle, execution-time, and generic
+child-wait limits. Production O1 acceptance therefore remains open even though the orphaned daemon
+itself was healthy.
+
+The narrow differentiator is the Task action's exposed interactive console: the registered action
+omitted Windows PowerShell `-WindowStyle Hidden`, while its Node child uses `CreateNoWindow`. A
+console-close control event can therefore terminate the PowerShell host with
+`STATUS_CONTROL_C_EXIT` without reaching Node. The repair pins `-WindowStyle Hidden` into task
+creation, the semantic fingerprint, the launcher binding verifier, and the dynamic `run-now`
+caller. It intentionally does not introduce a broader control handler or process wrapper; the
+acceptance criterion is that the Task remains `Running` with one direct daemon child past the
+observed boundary, then both exit without an orphan.
 
 ## Operational failure matrix
 
@@ -34,7 +52,7 @@ this second hotfix remains pending its fixed merge.
 | shutdown fence | `cli-daemon` and supervisor focused files | intake closes first; accepted work drains boundedly; no timer, queued completion, or late dependency starts new external work after the fence |
 | daemon LLM boundary | `digest` facts-only regression plus daemon wiring | O1 background jobs always select deterministic `facts_only`; the trap summary provider receives zero calls |
 | privacy and operability | `operational-logger` and `operational-status` focused files | allowlisted NDJSON only, hashed refs, bounded rotation, read-only status, and exact pending/uncertain/dead aggregates without identities |
-| current-user Scheduled Task | `o1-7-windows-scheduled-task-acceptance.ps1` under a process-wide mutex | unique exact target, non-admin create, semantic export, demand start, IgnoreNew, bounded PT1M TimeTrigger relaunch after exit 23, clean exit 0, exact unregister, and residual task/process/file counts all zero |
+| current-user Scheduled Task | `o1-7-windows-scheduled-task-acceptance.ps1` under a process-wide mutex | unique exact target, non-admin create, hidden PowerShell action, demand start, IgnoreNew, bounded PT1M TimeTrigger relaunch after exit 23, exactly one direct PowerShell→Node pair still Task-owned for 245s, clean exit 0, exact unregister, and residual task/process/file counts all zero |
 
 The hermetic entry point is `pnpm acceptance:o1-7`. Because the repository has one workspace package,
 it invokes that bridge package's complete Vitest suite once and does not contact an LLM or a
@@ -53,7 +71,7 @@ call Task Scheduler.
 | daemon health | heartbeat 15s; stale after 90s | exact instance/revision ownership |
 | capacity | 16 repositories; 64 Runs; 16 Orca IDs per canonical | hard maxima 64 / 256 / 64; overflow fails closed without truncation |
 | operational logs | 5 MiB active file; 5 backups | 16 KiB canonical NDJSON line; allowlisted fields and 12-hex SHA-256 refs only |
-| Windows Task | current-user interactive, Limited, AtLogOn | indefinite PT1M LogonTrigger repetition for an exited daemon; `IgnoreNew` overlap fence; demand start; `StartWhenAvailable`; PT0S execution limit |
+| Windows Task | current-user interactive, Limited, AtLogOn | hidden Windows PowerShell action; indefinite PT1M LogonTrigger repetition for an exited daemon; `IgnoreNew` overlap fence; demand start; `StartWhenAvailable`; PT0S execution limit |
 | Windows launch failure | Task Scheduler `RestartOnFailure` | 3 attempts at PT1M for unmet start conditions or action-start failure; not process-exit recovery |
 | Windows lifecycle wait | 90s | positive bounded override only; force is uninstall-only and follows graceful timeout |
 
@@ -86,11 +104,18 @@ the next repetition. `RestartOnFailure` remains an independent three-attempt PT1
 to satisfy start conditions or start the action. Uninstall disables the exact owned task before it
 requests daemon stop, so the repetition cannot create new work after the shutdown fence.
 
+The task action invokes the absolute System32 Windows PowerShell with
+`-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass`. The hidden style
+is part of the protected semantic fingerprint and both the launcher and `run-now` dynamic readers
+reject an omitted or non-hidden value as action drift.
+
 Rollback means selecting the prior immutable staged release and running that release's `install`
 command with the same six absolute operator inputs; task XML and protected manifest replacement are
 CAS checked and rolled back on post-registration mismatch. Do not delete state, config, logs, or
-release roots as part of rollback. Production installation remains pending until this hotfix is merged,
-the merged-main release is deployed, and its local startup/status smoke passes.
+release roots as part of rollback. The pre-hotfix production Task is not accepted merely because its
+orphaned daemon is healthy. Production installation remains pending until this repair is merged, a
+new exact merged-main release is deployed, and Task state plus direct parent/child ownership remain
+healthy past the observed boundary.
 
 ## Privacy boundary
 
@@ -103,6 +128,8 @@ retains its generated task name, paths, XML, process command line, or mock state
 ## Recorded results
 
 - Node 26.8.1 focused hard-crash acceptance: 1 file, 2/2 tests passed; bridge typecheck PASS.
+- Supervisor hotfix focused Windows suite: 4 files, 60/60 tests passed. Full O1-7 hermetic gate:
+  75 files passed, 1,666 tests passed, 9 platform-skipped; workspace typecheck and bridge build PASS.
 - Exact-head CI: pending PR validation. The named O1-7 step runs the complete bridge Vitest suite once;
   the separate typecheck job is the only other code-validation invocation.
 - The pre-repair disposable sample proved that an already-started Exec exiting 23 does not activate
@@ -111,8 +138,15 @@ retains its generated task name, paths, XML, process command line, or mock state
 - Disposable Windows Task post-repair aggregate: PASS — non-admin create, semantic export, demand
   start, IgnoreNew, observed action exit 23, PT1M OS repetition relaunch, clean exit 0, and residual
   task/process/file `0/0/0`; external writes `0`; failure code `null`.
+- Disposable Windows Task supervisor hotfix aggregate: PASS — hidden action export, dynamic demand
+  start, one PowerShell parent with one direct Node child, Task state `Running` and attempt count `1`
+  for 247 seconds against the 245-second minimum, clean child/parent exit, and residual
+  task/process/file `0/0/0`; external writes `0`; failure code `null`.
 - The first exact merged-main stage/install exposed the canonical registered-export/rollback gap
   above. The fixed-merge production stage/install and local startup/status smoke remain pending.
 - The second exact merged-main install retained a matched Task/manifest but ended with Task result
-  `2` and no new daemon log/heartbeat; the launcher SID-forwarding repair is pending fixed-merge
-  deployment.
+  `2` and no new daemon log/heartbeat; the following merged-main SID repair reached daemon startup.
+- The release from exact `533a4a9530fdd6f6ddc20ba6a265ded3e7a0d3e6` then exposed the
+  `0xC000013A` Task-console boundary and orphaned one healthy daemon. No production acceptance is
+  claimed until the hidden-action hotfix is merged and the fixed release passes the same
+  beyond-boundary ownership observation.

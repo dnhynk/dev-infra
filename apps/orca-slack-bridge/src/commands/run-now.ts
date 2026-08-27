@@ -102,14 +102,15 @@ function managedTaskReference(
     throw new Error('windows.run_now.task_not_owned');
   }
   const values = parseWindowsArguments(snapshot.definition.action.arguments);
-  if (values === null || values.length !== 9 || values[0] !== '-NoLogo' ||
+  if (values === null || values.length !== 11 || values[0] !== '-NoLogo' ||
       values[1] !== '-NoProfile' || values[2] !== '-NonInteractive' ||
-      values[3] !== '-ExecutionPolicy' || values[4] !== 'Bypass' ||
-      values[5] !== '-File' || values[7] !== '-SettingsPath') {
+      values[3] !== '-WindowStyle' || values[4] !== 'Hidden' ||
+      values[5] !== '-ExecutionPolicy' || values[6] !== 'Bypass' ||
+      values[7] !== '-File' || values[9] !== '-SettingsPath') {
     throw new Error('windows.run_now.action_drift');
   }
-  const launcherPath = values[6]!;
-  const runtimeManifestPath = values[8]!;
+  const launcherPath = values[8]!;
+  const runtimeManifestPath = values[10]!;
   const appRoot = snapshot.definition.action.workingDirectory;
   if (![snapshot.definition.action.execute, appRoot, launcherPath, runtimeManifestPath]
     .every((value) => win32.isAbsolute(value)) ||

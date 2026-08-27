@@ -292,7 +292,10 @@ Windows 표본과 merged-main deployment smoke 전에는 PC 자동 시작이나 
 Windows process-exit recovery는 AtLogOn trigger의 duration 없는 PT1M repetition이 소유한다.
 `IgnoreNew`가 이미 실행 중인 daemon과의 overlap을 막고, `RestartOnFailure` 3회/PT1M은 unmet start
 condition/action-start failure에만 남는다. disable이 shutdown보다 먼저이므로 stop fence 뒤 repetition은
-새 daemon work를 만들 수 없다.
+새 daemon work를 만들 수 없다. current-user `InteractiveToken` Task action은 absolute Windows
+PowerShell을 `-WindowStyle Hidden`으로 실행한다. 이 flag는 semantic fingerprint와 launcher 및
+`run-now`의 registered-action 검증에 포함되어, console-close로 PowerShell supervisor만 끝나고
+`CreateNoWindow` daemon이 orphan으로 남은 production 경로를 닫는다.
 
 ### O1 automation config contract (O1-1)
 
