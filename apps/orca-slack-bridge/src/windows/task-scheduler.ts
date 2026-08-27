@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { DOMParser, type Element, type Node } from '@xmldom/xmldom';
 import {
   operationalStatusWindowsTrustedPowerShell,
 } from '../operational/status-capability.js';
@@ -9,6 +10,10 @@ export const WINDOWS_TASK_DESCRIPTION_PREFIX = 'ORCA_SLACK_BRIDGE_MANAGED_V1';
 export const WINDOWS_TASK_RESTART_COUNT = 3;
 export const WINDOWS_TASK_RESTART_INTERVAL = 'PT1M';
 export const WINDOWS_TASK_EXECUTION_TIME_LIMIT = 'PT0S';
+export const WINDOWS_TASK_IDLE_DURATION = 'PT10M';
+export const WINDOWS_TASK_IDLE_WAIT_TIMEOUT = 'PT1H';
+export const WINDOWS_TASK_PRIORITY = 7;
+export const WINDOWS_TASK_RESTART_INTERVAL_SECONDS = 60;
 const WINDOWS_TASK_RESULT_NOT_YET_RUN = 267011;
 const WINDOWS_TASK_INFORMATIONAL_RESULT_MIN = 267008;
 const WINDOWS_TASK_INFORMATIONAL_RESULT_MAX = 267015;
@@ -32,7 +37,20 @@ export type WindowsTaskDefinition = {
     readonly multipleInstances: 'IgnoreNew';
     readonly allowStartOnBatteries: true;
     readonly dontStopOnBatteries: true;
+    readonly allowHardTerminate: true;
+    readonly runOnlyIfNetworkAvailable: false;
+    readonly idle: {
+      readonly duration: typeof WINDOWS_TASK_IDLE_DURATION;
+      readonly waitTimeout: typeof WINDOWS_TASK_IDLE_WAIT_TIMEOUT;
+      readonly stopOnIdleEnd: true;
+      readonly restartOnIdle: false;
+    };
+    readonly allowDemandStart: true;
+    readonly hidden: false;
+    readonly runOnlyIfIdle: false;
+    readonly wakeToRun: false;
     readonly executionTimeLimit: typeof WINDOWS_TASK_EXECUTION_TIME_LIMIT;
+    readonly priority: typeof WINDOWS_TASK_PRIORITY;
     readonly restartCount: typeof WINDOWS_TASK_RESTART_COUNT;
     readonly restartInterval: typeof WINDOWS_TASK_RESTART_INTERVAL;
   };
@@ -50,6 +68,12 @@ export type WindowsTaskRuntime = {
   readonly enabled: boolean;
   readonly hasRun: boolean;
   readonly lastTaskResult: number | null;
+  readonly observedAt: string;
+  readonly lastRunTime: string | null;
+  readonly nextRunTime: string | null;
+  readonly missedRuns: number;
+  readonly restartCount: typeof WINDOWS_TASK_RESTART_COUNT;
+  readonly restartIntervalSeconds: typeof WINDOWS_TASK_RESTART_INTERVAL_SECONDS;
 };
 
 export type WindowsTaskMarker = {
@@ -77,15 +101,20 @@ export type PowerShellTaskRecord = {
   readonly enabled?: boolean;
   readonly lastTaskResult?: number | null;
   readonly lastRunTime?: string | null;
+  readonly nextRunTime?: string | null;
+  readonly missedRuns?: number;
+  readonly observedAt?: string;
 };
 
 export type TaskSchedulerPowerShellOperation =
   | 'currentSid'
   | 'inspect'
+  | 'validate'
   | 'register'
   | 'restoreXml'
   | 'disable'
   | 'start'
+  | 'stop'
   | 'unregister';
 
 export interface TaskSchedulerPowerShellRunner {
@@ -112,6 +141,45 @@ function Assert-ExpectedTaskXml([string]$taskName, [string]$expectedXml) {
   if ($null -eq $current -or (Export-ScheduledTask -TaskPath $taskPath -TaskName $taskName) -cne $expectedXml) { throw 'task changed before mutation' }
 }
 
+function New-DesiredTaskDefinition([object]$d) {
+  $service = New-Object -ComObject 'Schedule.Service'
+  $service.Connect()
+  $definition = $service.NewTask(0)
+  $definition.RegistrationInfo.Description = [string]$d.description
+  $definition.Principal.Id = 'Author'
+  $definition.Principal.UserId = [string]$d.principal.userId
+  $definition.Principal.LogonType = 3
+  $definition.Principal.RunLevel = 0
+  $trigger = $definition.Triggers.Create(9)
+  $trigger.UserId = [string]$d.trigger.userId
+  $trigger.Enabled = $true
+  $definition.Settings.Enabled = [bool]$d.enabled
+  $definition.Settings.StartWhenAvailable = $true
+  $definition.Settings.MultipleInstances = 2
+  $definition.Settings.DisallowStartIfOnBatteries = $false
+  $definition.Settings.StopIfGoingOnBatteries = $false
+  $definition.Settings.AllowHardTerminate = $true
+  $definition.Settings.RunOnlyIfNetworkAvailable = $false
+  $definition.Settings.IdleSettings.IdleDuration = 'PT10M'
+  $definition.Settings.IdleSettings.WaitTimeout = 'PT1H'
+  $definition.Settings.IdleSettings.StopOnIdleEnd = $true
+  $definition.Settings.IdleSettings.RestartOnIdle = $false
+  $definition.Settings.AllowDemandStart = $true
+  $definition.Settings.Hidden = $false
+  $definition.Settings.RunOnlyIfIdle = $false
+  $definition.Settings.WakeToRun = $false
+  $definition.Settings.ExecutionTimeLimit = 'PT0S'
+  $definition.Settings.Priority = 7
+  $definition.Settings.RestartCount = 3
+  $definition.Settings.RestartInterval = 'PT1M'
+  $definition.Actions.Context = 'Author'
+  $action = $definition.Actions.Create(0)
+  $action.Path = [string]$d.action.execute
+  $action.Arguments = [string]$d.action.arguments
+  $action.WorkingDirectory = [string]$d.action.workingDirectory
+  return @{ service = $service; definition = $definition }
+}
+
 switch ($operation) {
   'currentSid' {
     Write-Result ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
@@ -124,6 +192,7 @@ switch ($operation) {
     }
     $info = Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName $inputObject.taskName
     $lastRun = if ($info.LastTaskResult -eq 267011 -or $info.LastRunTime.Year -le 2000) { $null } else { $info.LastRunTime.ToUniversalTime().ToString('o') }
+    $nextRun = if ($info.NextRunTime.Year -le 2000) { $null } else { $info.NextRunTime.ToUniversalTime().ToString('o') }
     Write-Result @{
       exists = $true
       xml = (Export-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName)
@@ -131,22 +200,35 @@ switch ($operation) {
       enabled = [bool]$task.Settings.Enabled
       lastTaskResult = [int64]$info.LastTaskResult
       lastRunTime = $lastRun
+      nextRunTime = $nextRun
+      missedRuns = [int64]$info.NumberOfMissedRuns
+      observedAt = [DateTime]::UtcNow.ToString('o')
     }
+  }
+  'validate' {
+    $built = New-DesiredTaskDefinition $inputObject.definition
+    $folder = $built.service.GetFolder($taskPath)
+    [void]$folder.RegisterTaskDefinition(
+      $inputObject.definition.taskName,
+      $built.definition,
+      1,
+      $inputObject.definition.principal.userId,
+      $null,
+      3,
+      $null
+    )
+    Write-Result @{ ok = $true }
   }
   'register' {
     $d = $inputObject.definition
-    $action = New-ScheduledTaskAction -Execute $d.action.execute -Argument $d.action.arguments -WorkingDirectory $d.action.workingDirectory
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $d.trigger.userId
-    $principal = New-ScheduledTaskPrincipal -UserId $d.principal.userId -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    $current = Get-ScheduledTask -TaskPath $taskPath -TaskName $d.taskName -ErrorAction SilentlyContinue
     if ([bool]$inputObject.replace) {
-      $current = Get-ScheduledTask -TaskPath $taskPath -TaskName $d.taskName -ErrorAction SilentlyContinue
       if ($null -eq $current -or (Export-ScheduledTask -TaskPath $taskPath -TaskName $d.taskName) -cne [String]$inputObject.expectedXml) { throw 'task changed before replace' }
-      Register-ScheduledTask -TaskPath $taskPath -TaskName $d.taskName -Description $d.description -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    } else {
-      Register-ScheduledTask -TaskPath $taskPath -TaskName $d.taskName -Description $d.description -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-    }
-    if (-not [bool]$d.enabled) { Disable-ScheduledTask -TaskPath $taskPath -TaskName $d.taskName | Out-Null }
+    } elseif ($null -ne $current) { throw 'task appeared before create' }
+    $built = New-DesiredTaskDefinition $d
+    $folder = $built.service.GetFolder($taskPath)
+    $flags = if ([bool]$inputObject.replace) { 6 } else { 2 }
+    [void]$folder.RegisterTaskDefinition($d.taskName, $built.definition, $flags, $d.principal.userId, $null, 3, $null)
     Write-Result @{ ok = $true }
   }
   'restoreXml' {
@@ -162,6 +244,14 @@ switch ($operation) {
   'start' {
     Assert-ExpectedTaskXml $inputObject.taskName $inputObject.expectedXml
     Start-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName
+    Write-Result @{ ok = $true }
+  }
+  'stop' {
+    Assert-ExpectedTaskXml $inputObject.taskName $inputObject.expectedXml
+    $current = Get-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName
+    if ($current.State -eq 'Running' -or $current.State -eq 'Queued') {
+      Stop-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName
+    }
     Write-Result @{ ok = $true }
   }
   'unregister' {
@@ -252,58 +342,131 @@ function encodeXmlText(value: string): string {
     .replaceAll("'", '&apos;');
 }
 
-function decodeXmlText(value: string): string {
-  return value
-    .replaceAll('&lt;', '<')
-    .replaceAll('&gt;', '>')
-    .replaceAll('&quot;', '"')
-    .replaceAll('&apos;', "'")
-    .replaceAll('&amp;', '&');
+const TASK_XML_NAMESPACE = 'http://schemas.microsoft.com/windows/2004/02/mit/task';
+const XMLNS_NAMESPACE = 'http://www.w3.org/2000/xmlns/';
+
+function taskDocumentElement(xml: string): Element | null {
+  if (xml.length === 0 || xml.length > 1024 * 1024 ||
+      xml.toUpperCase().includes('<!DOCTYPE') || xml.toUpperCase().includes('<!ENTITY')) return null;
+  try {
+    const document = new DOMParser({
+      onError: () => { throw new Error('invalid XML'); },
+    }).parseFromString(xml, 'application/xml');
+    const root = document.documentElement;
+    if (root === null || root.localName !== 'Task' || root.namespaceURI !== TASK_XML_NAMESPACE) return null;
+    for (let index = 0; index < document.childNodes.length; index += 1) {
+      const child = document.childNodes.item(index);
+      const xmlDeclaration = index === 0 && child?.nodeType === 7 && child.nodeName === 'xml';
+      if (child === null || (child !== root && !xmlDeclaration &&
+          !(child.nodeType === 3 && (child.nodeValue ?? '').trim().length === 0))) return null;
+    }
+    return root;
+  } catch { return null; }
 }
 
-function xmlBlocks(xml: string, tag: string): readonly string[] {
-  const safe = tag.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  return [...xml.matchAll(new RegExp(`<${safe}(?:\\s[^>]*)?>([\\s\\S]*?)</${safe}>`, 'giu'))]
-    .map((match) => match[1] ?? '');
+function childElements(parent: Element): readonly Element[] | null {
+  const result: Element[] = [];
+  for (let index = 0; index < parent.childNodes.length; index += 1) {
+    const child = parent.childNodes.item(index);
+    if (child === null) return null;
+    if (child.nodeType === 1) {
+      const element = child as Element;
+      if (element.namespaceURI !== TASK_XML_NAMESPACE) return null;
+      result.push(element);
+    } else if (child.nodeType === 3) {
+      if ((child.nodeValue ?? '').trim().length !== 0) return null;
+    } else return null;
+  }
+  return result;
 }
 
-function oneXmlBlock(xml: string, tag: string): string | null {
-  const blocks = xmlBlocks(xml, tag);
-  return blocks.length === 1 ? blocks[0] ?? null : null;
+function exactChildren(
+  parent: Element,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): ReadonlyMap<string, Element> | null {
+  const children = childElements(parent);
+  if (children === null) return null;
+  const allowed = new Set([...required, ...optional]);
+  const result = new Map<string, Element>();
+  for (const child of children) {
+    const name = child.localName;
+    if (name === null || !allowed.has(name) || result.has(name)) return null;
+    result.set(name, child);
+  }
+  if (required.some((name) => !result.has(name))) return null;
+  return result;
 }
 
-function oneXmlElement(xml: string, tag: string): { readonly attributes: string; readonly body: string } | null {
-  const safe = tag.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  const matches = [...xml.matchAll(
-    new RegExp(`<${safe}(\\s[^>]*)?>([\\s\\S]*?)</${safe}>`, 'giu'),
-  )];
-  return matches.length === 1 ? {
-    attributes: matches[0]?.[1] ?? '',
-    body: matches[0]?.[2] ?? '',
-  } : null;
+function exactAttributes(
+  element: Element,
+  expected: Readonly<Record<string, string>> = {},
+): boolean {
+  const seen = new Set<string>();
+  for (let index = 0; index < element.attributes.length; index += 1) {
+    const attribute = element.attributes.item(index);
+    if (attribute === null) return false;
+    if (attribute.namespaceURI === XMLNS_NAMESPACE || attribute.name === 'xmlns') continue;
+    const name = attribute.localName;
+    if (name === null || attribute.namespaceURI !== null || !(name in expected) ||
+        attribute.value !== expected[name] || seen.has(name)) return false;
+    seen.add(name);
+  }
+  return Object.keys(expected).every((name) => seen.has(name));
 }
 
-function xmlAttribute(attributes: string, name: string): string | null {
-  const safe = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  const match = new RegExp(`(?:^|\\s)${safe}\\s*=\\s*"([^"]*)"`, 'iu').exec(attributes);
-  return match === null ? null : decodeXmlText(match[1] ?? '');
+function elementText(element: Element): string | null {
+  if (!exactAttributes(element)) return null;
+  let value = '';
+  for (let index = 0; index < element.childNodes.length; index += 1) {
+    const child: Node | null = element.childNodes.item(index);
+    if (child === null || (child.nodeType !== 3 && child.nodeType !== 4)) return null;
+    value += child.nodeValue ?? '';
+  }
+  return value;
 }
 
-function xmlText(xml: string, tag: string): string | null {
-  const value = oneXmlBlock(xml, tag);
-  return value === null ? null : decodeXmlText(value.trim());
+function childText(children: ReadonlyMap<string, Element>, name: string): string | null {
+  const element = children.get(name);
+  return element === undefined ? null : elementText(element);
 }
 
-function xmlBoolean(xml: string, tag: string): boolean | null {
-  const value = xmlText(xml, tag)?.toLowerCase();
+function childBoolean(children: ReadonlyMap<string, Element>, name: string): boolean | null {
+  const value = childText(children, name);
   return value === 'true' ? true : value === 'false' ? false : null;
 }
 
-function xmlInteger(xml: string, tag: string): number | null {
-  const value = xmlText(xml, tag);
-  if (value === null || !/^[0-9]+$/u.test(value)) return null;
+function childInteger(children: ReadonlyMap<string, Element>, name: string): number | null {
+  const value = childText(children, name);
+  if (value === null || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+type TaskXmlIdentity = { readonly description: string; readonly principalUser: string };
+
+function parseTaskXmlIdentity(xml: string): TaskXmlIdentity | null {
+  const root = taskDocumentElement(xml);
+  if (root === null || !exactAttributes(root, { version: '1.2' })) return null;
+  const rootChildren = exactChildren(
+    root,
+    ['RegistrationInfo', 'Triggers', 'Principals', 'Settings', 'Actions'],
+  );
+  if (rootChildren === null || !exactAttributes(rootChildren.get('RegistrationInfo')!) ||
+      !exactAttributes(rootChildren.get('Principals')!)) return null;
+  const registration = exactChildren(
+    rootChildren.get('RegistrationInfo')!,
+    ['Description'],
+    ['Author', 'Date', 'URI'],
+  );
+  const principals = childElements(rootChildren.get('Principals')!);
+  if (registration === null || principals === null || principals.length !== 1 ||
+      principals[0]?.localName !== 'Principal' ||
+      !exactAttributes(principals[0], { id: 'Author' })) return null;
+  const principalChildren = exactChildren(principals[0], ['UserId', 'LogonType', 'RunLevel']);
+  const description = childText(registration, 'Description');
+  const principalUser = principalChildren === null ? null : childText(principalChildren, 'UserId');
+  return description === null || principalUser === null ? null : { description, principalUser };
 }
 
 /** Quotes one argv element according to CommandLineToArgvW backslash/quote rules. */
@@ -416,12 +579,9 @@ export function parseWindowsTaskMarker(description: string): WindowsTaskMarker |
 export function createWindowsTaskDefinition(input: {
   readonly currentSid: string;
   readonly releaseDigest: string;
-  readonly nodePath: string;
-  readonly cliPath: string;
-  readonly configPath: string;
-  readonly statePath: string;
-  readonly orcaPath: string;
-  readonly logDir: string;
+  readonly powerShellPath: string;
+  readonly launcherPath: string;
+  readonly runtimeManifestPath: string;
   readonly workingDirectory: string;
 }): WindowsTaskDefinition {
   const withoutDescription: WindowsTaskDefinition = {
@@ -439,19 +599,32 @@ export function createWindowsTaskDefinition(input: {
       multipleInstances: 'IgnoreNew',
       allowStartOnBatteries: true,
       dontStopOnBatteries: true,
+      allowHardTerminate: true,
+      runOnlyIfNetworkAvailable: false,
+      idle: {
+        duration: WINDOWS_TASK_IDLE_DURATION,
+        waitTimeout: WINDOWS_TASK_IDLE_WAIT_TIMEOUT,
+        stopOnIdleEnd: true,
+        restartOnIdle: false,
+      },
+      allowDemandStart: true,
+      hidden: false,
+      runOnlyIfIdle: false,
+      wakeToRun: false,
       executionTimeLimit: WINDOWS_TASK_EXECUTION_TIME_LIMIT,
+      priority: WINDOWS_TASK_PRIORITY,
       restartCount: WINDOWS_TASK_RESTART_COUNT,
       restartInterval: WINDOWS_TASK_RESTART_INTERVAL,
     },
     action: {
-      execute: input.nodePath,
+      execute: input.powerShellPath,
       arguments: joinWindowsArguments([
-        input.cliPath,
-        'daemon',
-        '--config', input.configPath,
-        '--state', input.statePath,
-        '--orca', input.orcaPath,
-        '--log-dir', input.logDir,
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', input.launcherPath,
+        '-SettingsPath', input.runtimeManifestPath,
       ]),
       workingDirectory: input.workingDirectory,
     },
@@ -465,51 +638,79 @@ export function createWindowsTaskDefinition(input: {
   };
 }
 
-/** Parses the exported Task Scheduler XML and rejects duplicate/missing semantic components. */
+/** Namespace-aware semantic normalizer for the one allowed Task Scheduler definition. */
 export function parseWindowsTaskXml(xml: string): WindowsTaskDefinition | null {
-  const registration = oneXmlBlock(xml, 'RegistrationInfo');
-  const principals = oneXmlBlock(xml, 'Principals');
-  const principalElement = principals === null ? null : oneXmlElement(principals, 'Principal');
-  const principal = principalElement?.body ?? null;
-  const triggers = oneXmlBlock(xml, 'Triggers');
-  const logonTrigger = triggers === null ? null : oneXmlBlock(triggers, 'LogonTrigger');
-  const settings = oneXmlBlock(xml, 'Settings');
-  const restart = settings === null ? null : oneXmlBlock(settings, 'RestartOnFailure');
-  const actionsElement = oneXmlElement(xml, 'Actions');
-  const actions = actionsElement?.body ?? null;
-  const exec = actions === null ? null : oneXmlBlock(actions, 'Exec');
-  if (registration === null || principal === null || logonTrigger === null || settings === null ||
-      restart === null || exec === null) return null;
-  const description = xmlText(registration, 'Description');
-  const principalId = principalElement === null ? null : xmlAttribute(principalElement.attributes, 'id');
-  const actionContext = actionsElement === null ? null : xmlAttribute(actionsElement.attributes, 'Context');
-  const principalUser = xmlText(principal, 'UserId');
-  const logonType = xmlText(principal, 'LogonType');
-  const runLevel = xmlText(principal, 'RunLevel');
-  const triggerUser = xmlText(logonTrigger, 'UserId');
-  const triggerEnabled = xmlBoolean(logonTrigger, 'Enabled');
-  const enabled = xmlBoolean(settings, 'Enabled');
-  const startWhenAvailable = xmlBoolean(settings, 'StartWhenAvailable');
-  const multipleInstances = xmlText(settings, 'MultipleInstancesPolicy');
-  const disallowBattery = xmlBoolean(settings, 'DisallowStartIfOnBatteries');
-  const stopBattery = xmlBoolean(settings, 'StopIfGoingOnBatteries');
-  const executionLimit = xmlText(settings, 'ExecutionTimeLimit');
-  const restartCount = xmlInteger(restart, 'Count');
-  const restartInterval = xmlText(restart, 'Interval');
-  const execute = xmlText(exec, 'Command');
-  const args = xmlText(exec, 'Arguments');
-  const workingDirectory = xmlText(exec, 'WorkingDirectory');
-  if (description === null || principalId === null || actionContext !== principalId ||
-      principalUser === null || triggerUser === null || execute === null ||
-      args === null || workingDirectory === null || enabled === null ||
-      logonType !== 'InteractiveToken' || runLevel !== 'LeastPrivilege' || triggerEnabled !== true ||
-      startWhenAvailable !== true || multipleInstances !== 'IgnoreNew' || disallowBattery !== false ||
-      stopBattery !== false || executionLimit !== WINDOWS_TASK_EXECUTION_TIME_LIMIT ||
-      restartCount !== WINDOWS_TASK_RESTART_COUNT || restartInterval !== WINDOWS_TASK_RESTART_INTERVAL ||
-      /<(?:BootTrigger|CalendarTrigger|EventTrigger|IdleTrigger|RegistrationTrigger|SessionStateChangeTrigger|TimeTrigger)\b/iu.test(triggers ?? '') ||
-      /<(?:ComHandler|SendEmail|ShowMessage)\b/iu.test(actions ?? '')) {
-    return null;
-  }
+  const root = taskDocumentElement(xml);
+  if (root === null || !exactAttributes(root, { version: '1.2' })) return null;
+  const rootChildren = exactChildren(
+    root,
+    ['RegistrationInfo', 'Triggers', 'Principals', 'Settings', 'Actions'],
+  );
+  if (rootChildren === null || [...rootChildren.values()].some((element) =>
+    element.localName !== 'Actions' && !exactAttributes(element))) return null;
+  const registration = exactChildren(
+    rootChildren.get('RegistrationInfo')!,
+    ['Description'],
+    ['Author', 'Date', 'URI'],
+  );
+  if (registration === null || [...registration.values()].some((element) =>
+    elementText(element) === null)) return null;
+  const principals = childElements(rootChildren.get('Principals')!);
+  const triggers = childElements(rootChildren.get('Triggers')!);
+  const actionsElement = rootChildren.get('Actions')!;
+  const actions = childElements(actionsElement);
+  if (principals === null || principals.length !== 1 || principals[0]?.localName !== 'Principal' ||
+      !exactAttributes(principals[0], { id: 'Author' }) ||
+      triggers === null || triggers.length !== 1 || triggers[0]?.localName !== 'LogonTrigger' ||
+      !exactAttributes(triggers[0]) ||
+      actions === null || actions.length !== 1 || actions[0]?.localName !== 'Exec' ||
+      !exactAttributes(actionsElement, { Context: 'Author' }) || !exactAttributes(actions[0])) return null;
+  const principal = exactChildren(principals[0], ['UserId', 'LogonType', 'RunLevel']);
+  const logonTrigger = exactChildren(triggers[0], ['Enabled', 'UserId']);
+  const settings = exactChildren(rootChildren.get('Settings')!, [
+    'MultipleInstancesPolicy', 'DisallowStartIfOnBatteries', 'StopIfGoingOnBatteries',
+    'AllowHardTerminate', 'StartWhenAvailable', 'RunOnlyIfNetworkAvailable', 'IdleSettings',
+    'Enabled', 'Hidden', 'RunOnlyIfIdle', 'WakeToRun',
+    'ExecutionTimeLimit', 'Priority', 'RestartOnFailure',
+  ], ['AllowStartOnDemand']);
+  const exec = exactChildren(actions[0], ['Command', 'Arguments', 'WorkingDirectory']);
+  if (principal === null || logonTrigger === null || settings === null || exec === null) return null;
+  const idle = exactChildren(settings.get('IdleSettings')!, [
+    'Duration', 'WaitTimeout', 'StopOnIdleEnd', 'RestartOnIdle',
+  ]);
+  const restart = exactChildren(settings.get('RestartOnFailure')!, ['Interval', 'Count']);
+  if (idle === null || restart === null || !exactAttributes(settings.get('IdleSettings')!) ||
+      !exactAttributes(settings.get('RestartOnFailure')!)) return null;
+  const description = childText(registration, 'Description');
+  const principalUser = childText(principal, 'UserId');
+  const triggerUser = childText(logonTrigger, 'UserId');
+  const enabled = childBoolean(settings, 'Enabled');
+  const execute = childText(exec, 'Command');
+  const args = childText(exec, 'Arguments');
+  const workingDirectory = childText(exec, 'WorkingDirectory');
+  if (description === null || principalUser === null || triggerUser === null || enabled === null ||
+      execute === null || args === null || workingDirectory === null ||
+      childText(principal, 'LogonType') !== 'InteractiveToken' ||
+      childText(principal, 'RunLevel') !== 'LeastPrivilege' ||
+      childBoolean(logonTrigger, 'Enabled') !== true ||
+      childText(settings, 'MultipleInstancesPolicy') !== 'IgnoreNew' ||
+      childBoolean(settings, 'DisallowStartIfOnBatteries') !== false ||
+      childBoolean(settings, 'StopIfGoingOnBatteries') !== false ||
+      childBoolean(settings, 'AllowHardTerminate') !== true ||
+      childBoolean(settings, 'StartWhenAvailable') !== true ||
+      childBoolean(settings, 'RunOnlyIfNetworkAvailable') !== false ||
+      childText(idle, 'Duration') !== WINDOWS_TASK_IDLE_DURATION ||
+      childText(idle, 'WaitTimeout') !== WINDOWS_TASK_IDLE_WAIT_TIMEOUT ||
+      childBoolean(idle, 'StopOnIdleEnd') !== true ||
+      childBoolean(idle, 'RestartOnIdle') !== false ||
+      (settings.has('AllowStartOnDemand') && childBoolean(settings, 'AllowStartOnDemand') !== true) ||
+      childBoolean(settings, 'Hidden') !== false ||
+      childBoolean(settings, 'RunOnlyIfIdle') !== false ||
+      childBoolean(settings, 'WakeToRun') !== false ||
+      childText(settings, 'ExecutionTimeLimit') !== WINDOWS_TASK_EXECUTION_TIME_LIMIT ||
+      childInteger(settings, 'Priority') !== WINDOWS_TASK_PRIORITY ||
+      childText(restart, 'Interval') !== WINDOWS_TASK_RESTART_INTERVAL ||
+      childInteger(restart, 'Count') !== WINDOWS_TASK_RESTART_COUNT) return null;
   return {
     taskName: WINDOWS_TASK_NAME,
     description,
@@ -521,7 +722,20 @@ export function parseWindowsTaskXml(xml: string): WindowsTaskDefinition | null {
       multipleInstances: 'IgnoreNew',
       allowStartOnBatteries: true,
       dontStopOnBatteries: true,
+      allowHardTerminate: true,
+      runOnlyIfNetworkAvailable: false,
+      idle: {
+        duration: WINDOWS_TASK_IDLE_DURATION,
+        waitTimeout: WINDOWS_TASK_IDLE_WAIT_TIMEOUT,
+        stopOnIdleEnd: true,
+        restartOnIdle: false,
+      },
+      allowDemandStart: true,
+      hidden: false,
+      runOnlyIfIdle: false,
+      wakeToRun: false,
       executionTimeLimit: WINDOWS_TASK_EXECUTION_TIME_LIMIT,
+      priority: WINDOWS_TASK_PRIORITY,
       restartCount: WINDOWS_TASK_RESTART_COUNT,
       restartInterval: WINDOWS_TASK_RESTART_INTERVAL,
     },
@@ -552,7 +766,20 @@ function parseRuntime(record: PowerShellTaskRecord, definition: WindowsTaskDefin
     hasRun: record.lastRunTime !== null && record.lastRunTime !== undefined &&
       record.lastTaskResult !== WINDOWS_TASK_RESULT_NOT_YET_RUN,
     lastTaskResult,
+    observedAt: record.observedAt!,
+    lastRunTime: record.lastRunTime ?? null,
+    nextRunTime: record.nextRunTime ?? null,
+    missedRuns: record.missedRuns!,
+    restartCount: WINDOWS_TASK_RESTART_COUNT,
+    restartIntervalSeconds: WINDOWS_TASK_RESTART_INTERVAL_SECONDS,
   };
+}
+
+function canonicalSchedulerTimestamp(value: unknown, nullable: boolean): value is string | null {
+  if (value === null) return nullable;
+  return typeof value === 'string' &&
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3,7}Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value));
 }
 
 function taskRecord(value: unknown): PowerShellTaskRecord {
@@ -561,6 +788,26 @@ function taskRecord(value: unknown): PowerShellTaskRecord {
   }
   const record = value as Record<string, unknown>;
   if (typeof record['exists'] !== 'boolean') throw new Error('windows.task_scheduler.invalid_response');
+  if (!record['exists']) {
+    if (Object.keys(record).some((key) => key !== 'exists')) {
+      throw new Error('windows.task_scheduler.invalid_response');
+    }
+    return { exists: false };
+  }
+  const allowed = new Set([
+    'exists', 'xml', 'state', 'enabled', 'lastTaskResult', 'lastRunTime',
+    'nextRunTime', 'missedRuns', 'observedAt',
+  ]);
+  if (Object.keys(record).some((key) => !allowed.has(key)) ||
+      typeof record['xml'] !== 'string' || record['xml'].length === 0 ||
+      typeof record['state'] !== 'string' || typeof record['enabled'] !== 'boolean' ||
+      (record['lastTaskResult'] !== null &&
+       (typeof record['lastTaskResult'] !== 'number' || !Number.isSafeInteger(record['lastTaskResult']))) ||
+      !canonicalSchedulerTimestamp(record['lastRunTime'], true) ||
+      !canonicalSchedulerTimestamp(record['nextRunTime'], true) ||
+      !canonicalSchedulerTimestamp(record['observedAt'], false) ||
+      typeof record['missedRuns'] !== 'number' || !Number.isSafeInteger(record['missedRuns']) ||
+      record['missedRuns'] < 0) throw new Error('windows.task_scheduler.invalid_response');
   return record as PowerShellTaskRecord;
 }
 
@@ -569,6 +816,14 @@ function sidResult(value: unknown): string {
     throw new Error('windows.task_scheduler.invalid_sid');
   }
   return value;
+}
+
+function assertOkResult(value: unknown): void {
+  if (value === null || typeof value !== 'object' ||
+      JSON.stringify(Object.keys(value)) !== JSON.stringify(['ok']) ||
+      (value as { readonly ok?: unknown }).ok !== true) {
+    throw new Error('windows.task_scheduler.invalid_response');
+  }
 }
 
 export class CurrentUserWindowsTaskScheduler {
@@ -584,18 +839,12 @@ export class CurrentUserWindowsTaskScheduler {
     if (!record.exists) return { kind: 'absent', currentSid };
     if (typeof record.xml !== 'string') throw new Error('windows.task_scheduler.invalid_response');
     const definition = parseWindowsTaskXml(record.xml);
-    const description = definition?.description ?? (() => {
-      const registration = oneXmlBlock(record.xml!, 'RegistrationInfo');
-      return registration === null ? null : xmlText(registration, 'Description');
-    })();
+    const identity = definition === null ? parseTaskXmlIdentity(record.xml) : null;
+    const description = definition?.description ?? identity?.description ?? null;
     const marker = description === null ? null : parseWindowsTaskMarker(description);
     const managedDescription = description === WINDOWS_TASK_DESCRIPTION_PREFIX ||
       description?.startsWith(`${WINDOWS_TASK_DESCRIPTION_PREFIX};`) === true;
-    const principalUser = definition?.principal.userId ?? (() => {
-      const principals = oneXmlBlock(record.xml!, 'Principals');
-      const principal = principals === null ? null : oneXmlBlock(principals, 'Principal');
-      return principal === null ? null : xmlText(principal, 'UserId');
-    })();
+    const principalUser = definition?.principal.userId ?? identity?.principalUser ?? null;
     const ownership = !managedDescription
       ? 'foreign'
       : principalUser !== currentSid
@@ -613,23 +862,35 @@ export class CurrentUserWindowsTaskScheduler {
   }
 
   async register(definition: WindowsTaskDefinition, replace: boolean, expectedXml?: string): Promise<void> {
-    await this.runner.run('register', { definition, replace, expectedXml: expectedXml ?? null });
+    assertOkResult(await this.runner.run(
+      'register', { definition, replace, expectedXml: expectedXml ?? null },
+    ));
+  }
+
+  async validate(definition: WindowsTaskDefinition): Promise<void> {
+    assertOkResult(await this.runner.run('validate', { definition }));
   }
 
   async restore(xml: string, expectedCurrentXml: string): Promise<void> {
-    await this.runner.run('restoreXml', { taskName: WINDOWS_TASK_NAME, xml, expectedCurrentXml });
+    assertOkResult(await this.runner.run(
+      'restoreXml', { taskName: WINDOWS_TASK_NAME, xml, expectedCurrentXml },
+    ));
   }
 
   async disable(expectedXml: string): Promise<void> {
-    await this.runner.run('disable', { taskName: WINDOWS_TASK_NAME, expectedXml });
+    assertOkResult(await this.runner.run('disable', { taskName: WINDOWS_TASK_NAME, expectedXml }));
   }
 
   async start(expectedXml: string): Promise<void> {
-    await this.runner.run('start', { taskName: WINDOWS_TASK_NAME, expectedXml });
+    assertOkResult(await this.runner.run('start', { taskName: WINDOWS_TASK_NAME, expectedXml }));
+  }
+
+  async stop(expectedXml: string): Promise<void> {
+    assertOkResult(await this.runner.run('stop', { taskName: WINDOWS_TASK_NAME, expectedXml }));
   }
 
   async unregister(expectedXml: string): Promise<void> {
-    await this.runner.run('unregister', { taskName: WINDOWS_TASK_NAME, expectedXml });
+    assertOkResult(await this.runner.run('unregister', { taskName: WINDOWS_TASK_NAME, expectedXml }));
   }
 
   definitionsMatch(actual: WindowsTaskDefinition | null, expected: WindowsTaskDefinition): boolean {

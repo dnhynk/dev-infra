@@ -1,17 +1,21 @@
 import { DatabaseSync } from 'node:sqlite';
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep, win32 } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  computeReleaseBuildDigest,
   prepareDeploymentState,
   setDeploymentDesiredStopped,
   validateWindowsDeployment,
@@ -19,17 +23,23 @@ import {
   type WindowsDeploymentPathAccess,
   type WindowsDeploymentPaths,
 } from '../src/windows/deployment.js';
-import { APP_TOKEN_VAR, BOT_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import {
   operationalStatusStateIdentity,
   type OperationalStatusSnapshotLeaseStore,
 } from '../src/operational/status-capability.js';
+import {
+  createWindowsRuntimeManifest,
+  parseWindowsRuntimeManifest,
+  serializeWindowsRuntimeManifest,
+} from '../src/windows/runtime-manifest.js';
 
 let root: string;
+let releaseSequence: number;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'orca-windows-deploy-한글-'));
+  releaseSequence = 0;
 });
 
 afterEach(() => rmSync(root, { recursive: true, force: true }));
@@ -64,61 +74,68 @@ function windowsPathAccess(
 
 function createRelease(): {
   readonly input: WindowsDeploymentPaths;
-  readonly env: NodeJS.ProcessEnv;
   readonly pathAccess: WindowsDeploymentPathAccess;
+  readonly localAppData: string;
+  readonly powerShellPath: string;
 } {
+  const sequence = releaseSequence++;
   const windowsRoot = String.raw`C:\Orca 배포 테스트`;
   const pathAccess = windowsPathAccess(root, windowsRoot);
-  const appRoot = win32.join(windowsRoot, 'release with spaces', 'bridge-2026.08.27');
+  const localAppData = win32.join(windowsRoot, 'Local AppData 한글');
+  const releasesRoot = win32.join(localAppData, 'OrcaSlackBridge', 'releases');
+  const stagingRoot = win32.join(releasesRoot, '.staging release with spaces');
   const data = win32.join(windowsRoot, '사용자 데이터');
-  mkdirSync(pathAccess.toNativePath(win32.join(appRoot, 'dist')), { recursive: true });
+  mkdirSync(pathAccess.toNativePath(win32.join(stagingRoot, 'dist')), { recursive: true });
+  mkdirSync(pathAccess.toNativePath(win32.join(stagingRoot, 'windows')), { recursive: true });
   mkdirSync(pathAccess.toNativePath(data), { recursive: true });
   const dependencies = {
     '@modelcontextprotocol/sdk': '1.30.0',
     '@slack/socket-mode': '3.0.0',
     '@slack/web-api': '8.0.0',
+    '@xmldom/xmldom': '0.9.12',
     undici: '^7.29.0',
   };
-  writeFileSync(pathAccess.toNativePath(win32.join(appRoot, 'package.json')), JSON.stringify({
+  writeFileSync(pathAccess.toNativePath(win32.join(stagingRoot, 'package.json')), JSON.stringify({
     name: '@dev-infra/orca-slack-bridge',
     version: '1.2.3',
     type: 'module',
-    files: ['dist'],
+    files: ['dist', 'windows/launch-daemon.ps1'],
     bin: { 'orca-slack-bridge': './dist/cli.js' },
     dependencies,
   }));
   writeFileSync(
-    pathAccess.toNativePath(win32.join(appRoot, 'dist', 'cli.js')),
-    '#!/usr/bin/env node\n',
+    pathAccess.toNativePath(win32.join(stagingRoot, 'dist', 'cli.js')),
+    `#!/usr/bin/env node\n// fixture ${sequence}\n`,
+  );
+  writeFileSync(
+    pathAccess.toNativePath(win32.join(stagingRoot, 'windows', 'launch-daemon.ps1')),
+    '# immutable launcher fixture\n',
   );
   for (const dependency of Object.keys(dependencies)) {
-    const directory = win32.join(appRoot, 'node_modules', ...dependency.split('/'));
+    const directory = win32.join(stagingRoot, 'node_modules', ...dependency.split('/'));
     mkdirSync(pathAccess.toNativePath(directory), { recursive: true });
     writeFileSync(
       pathAccess.toNativePath(win32.join(directory, 'package.json')),
       JSON.stringify({ name: dependency }),
     );
   }
+  const digest = computeReleaseBuildDigest(stagingRoot, pathAccess);
+  const appRoot = win32.join(releasesRoot, digest);
+  renameSync(pathAccess.toNativePath(stagingRoot), pathAccess.toNativePath(appRoot));
   const nodePath = win32.join(windowsRoot, 'runtime', 'node.exe');
   const orcaPath = win32.join(windowsRoot, 'tools', 'Orca CLI.exe');
+  const powerShellPath = win32.join(windowsRoot, 'Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   mkdirSync(pathAccess.toNativePath(win32.dirname(nodePath)), { recursive: true });
   mkdirSync(pathAccess.toNativePath(win32.dirname(orcaPath)), { recursive: true });
+  mkdirSync(pathAccess.toNativePath(win32.dirname(powerShellPath)), { recursive: true });
   writeFileSync(pathAccess.toNativePath(nodePath), 'synthetic node');
   writeFileSync(pathAccess.toNativePath(orcaPath), 'synthetic orca');
+  writeFileSync(pathAccess.toNativePath(powerShellPath), 'synthetic powershell');
   const configPath = win32.join(data, 'bridge config.json');
   writeFileSync(
     pathAccess.toNativePath(configPath),
     readFileSync(join(process.cwd(), 'config.example.json')),
   );
-  const env: NodeJS.ProcessEnv = {};
-  Object.defineProperty(env, BOT_TOKEN_VAR, {
-    enumerable: true,
-    get: () => { throw new Error('TOKEN_SENTINEL_WAS_READ'); },
-  });
-  Object.defineProperty(env, APP_TOKEN_VAR, {
-    enumerable: true,
-    get: () => { throw new Error('TOKEN_SENTINEL_WAS_READ'); },
-  });
   return {
     input: {
       appRoot,
@@ -128,8 +145,20 @@ function createRelease(): {
       statePath: win32.join(data, 'state.db'),
       logDir: win32.join(data, '운영 로그'),
     },
-    env,
     pathAccess,
+    localAppData,
+    powerShellPath,
+  };
+}
+
+function validationOptions(fixture: ReturnType<typeof createRelease>) {
+  return {
+    platform: 'win32' as const,
+    versionProbe: { readVersion: async () => 'v26.3.0' },
+    environmentPresenceProbe: { requiredBridgeEnvironmentPresent: async () => true },
+    pathAccess: fixture.pathAccess,
+    knownLocalAppData: () => fixture.localAppData,
+    trustedPowerShell: () => ({ executable: fixture.powerShellPath }),
   };
 }
 
@@ -177,23 +206,118 @@ function schemaVersion(path: string): number {
 }
 
 describe('prebuilt Windows deployment preflight', () => {
-  it('preserves Windows drive/backslash semantics over native host fixture storage', async () => {
+  it('uses one canonical non-secret runtime manifest encoding and rejects semantic drift', () => {
     const fixture = createRelease();
-    const result = await validateWindowsDeployment(fixture.input, {
-      platform: 'win32',
-      env: fixture.env,
-      versionProbe: { readVersion: async () => 'v26.3.0' },
-      pathAccess: fixture.pathAccess,
+    const digest = win32.basename(fixture.input.appRoot);
+    const manifest = createWindowsRuntimeManifest({
+      releaseRoot: fixture.input.appRoot,
+      releaseDigest: digest,
+      nodeExe: fixture.input.nodePath,
+      distCli: win32.join(fixture.input.appRoot, 'dist', 'cli.js'),
+      config: fixture.input.configPath,
+      state: fixture.input.statePath,
+      orcaExe: fixture.input.orcaPath,
+      logDirectory: fixture.input.logDir,
     });
+    const bytes = serializeWindowsRuntimeManifest(manifest);
+    expect(parseWindowsRuntimeManifest(bytes)).toEqual(manifest);
+    expect(bytes.toString('utf8')).not.toMatch(/xox|token|secret|password|authorization/iu);
+    expect(parseWindowsRuntimeManifest(Buffer.from(' ' + bytes.toString('utf8')))).toBeNull();
+    expect(parseWindowsRuntimeManifest(Buffer.from(JSON.stringify({ ...manifest, extra: true }) + '\n')))
+      .toBeNull();
+    expect(parseWindowsRuntimeManifest(Buffer.from(JSON.stringify({
+      ...manifest,
+      distCli: win32.join(fixture.input.appRoot, 'other.js'),
+    }) + '\n'))).toBeNull();
+  });
+
+  it('preserves Windows paths and keeps mutable state/log preparation read-only', async () => {
+    const fixture = createRelease();
+    expect(existsSync(fixture.pathAccess.toNativePath(fixture.input.statePath))).toBe(false);
+    expect(existsSync(fixture.pathAccess.toNativePath(fixture.input.logDir))).toBe(false);
+    const result = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     expect(fixture.input.appRoot).toMatch(/^[A-Z]:\\/u);
     expect(fixture.input.appRoot).not.toContain('/');
     expect(fixture.pathAccess.toNativePath(fixture.input.appRoot)).toBe(
-      join(root, 'release with spaces', 'bridge-2026.08.27'),
+      join(
+        root,
+        'Local AppData 한글',
+        'OrcaSlackBridge',
+        'releases',
+        win32.basename(fixture.input.appRoot),
+      ),
     );
     expect(result.paths).toMatchObject(fixture.input);
     expect(result.paths.cliPath).toBe(win32.join(fixture.input.appRoot, 'dist', 'cli.js'));
+    expect(result.paths.launcherPath).toBe(
+      win32.join(fixture.input.appRoot, 'windows', 'launch-daemon.ps1'),
+    );
+    expect(result.paths.powerShellPath).toBe(fixture.powerShellPath);
+    expect(result.paths.runtimeManifestPath).toBe(
+      win32.join(fixture.localAppData, 'OrcaSlackBridge', 'runtime.json'),
+    );
+    expect(win32.basename(result.paths.appRoot)).toBe(result.buildDigest);
     expect(result.buildDigest).toMatch(/^[a-f0-9]{64}$/u);
-    expect(existsSync(fixture.pathAccess.toNativePath(result.paths.logDir))).toBe(true);
+    expect(existsSync(fixture.pathAccess.toNativePath(result.paths.statePath))).toBe(false);
+    expect(existsSync(fixture.pathAccess.toNativePath(result.paths.logDir))).toBe(false);
+  });
+
+  it('hashes every dependency byte and rejects arbitrary roots, digest drift, and external reparse points', async () => {
+    const dependencyFixture = createRelease();
+    const before = computeReleaseBuildDigest(dependencyFixture.input.appRoot, dependencyFixture.pathAccess);
+    writeFileSync(
+      dependencyFixture.pathAccess.toNativePath(win32.join(
+        dependencyFixture.input.appRoot,
+        'node_modules', 'undici', 'package.json',
+      )),
+      JSON.stringify({ name: 'undici', changed: true }),
+    );
+    expect(computeReleaseBuildDigest(dependencyFixture.input.appRoot, dependencyFixture.pathAccess))
+      .not.toBe(before);
+    await expect(validateWindowsDeployment(
+      dependencyFixture.input,
+      validationOptions(dependencyFixture),
+    )).rejects.toThrow('windows.deploy.noncanonical_release_root');
+
+    const arbitraryFixture = createRelease();
+    await expect(validateWindowsDeployment({
+      ...arbitraryFixture.input,
+      appRoot: win32.dirname(arbitraryFixture.input.appRoot),
+    }, validationOptions(arbitraryFixture))).rejects.toThrow(/windows\.deploy\./u);
+
+    const linkFixture = createRelease();
+    const external = win32.join(win32.dirname(linkFixture.input.appRoot), 'external dependency');
+    mkdirSync(linkFixture.pathAccess.toNativePath(external), { recursive: true });
+    writeFileSync(linkFixture.pathAccess.toNativePath(win32.join(external, 'package.json')), '{}');
+    symlinkSync(
+      linkFixture.pathAccess.toNativePath(external),
+      linkFixture.pathAccess.toNativePath(win32.join(linkFixture.input.appRoot, 'node_modules', 'escape')),
+      'junction',
+    );
+    expect(() => computeReleaseBuildDigest(linkFixture.input.appRoot, linkFixture.pathAccess))
+      .toThrow('windows.deploy.release_reparse_point');
+
+    const hardLinkFixture = createRelease();
+    linkSync(
+      hardLinkFixture.pathAccess.toNativePath(win32.join(
+        hardLinkFixture.input.appRoot, 'dist', 'cli.js',
+      )),
+      hardLinkFixture.pathAccess.toNativePath(win32.join(
+        hardLinkFixture.input.appRoot, 'dist', 'cli-hard-link.js',
+      )),
+    );
+    expect(() => computeReleaseBuildDigest(hardLinkFixture.input.appRoot, hardLinkFixture.pathAccess))
+      .toThrow('windows.deploy.release_hard_link');
+
+    const unicodeFixture = createRelease();
+    writeFileSync(
+      unicodeFixture.pathAccess.toNativePath(win32.join(
+        unicodeFixture.input.appRoot, 'dist', 'e\u0301.js',
+      )),
+      'non-normalized path',
+    );
+    expect(() => computeReleaseBuildDigest(unicodeFixture.input.appRoot, unicodeFixture.pathAccess))
+      .toThrow('windows.deploy.invalid_release_name');
   });
 
   it('rejects credential-shaped config fields and unsupported Node/platform with static errors', async () => {
@@ -203,34 +327,32 @@ describe('prebuilt Windows deployment preflight', () => {
     config['botToken'] = 'TOKEN_SENTINEL_NEVER_PRINT';
     writeFileSync(nativeConfigPath, JSON.stringify(config));
     await expect(validateWindowsDeployment(fixture.input, {
-      platform: 'win32', env: fixture.env,
+      ...validationOptions(fixture),
       versionProbe: { readVersion: async () => 'v26.0.0' },
-      pathAccess: fixture.pathAccess,
     })).rejects.toThrow('windows.deploy.config_contains_credentials');
     await expect(validateWindowsDeployment(fixture.input, {
-      platform: 'linux', env: fixture.env,
+      ...validationOptions(fixture),
+      platform: 'linux',
       versionProbe: { readVersion: async () => 'v26.0.0' },
-      pathAccess: fixture.pathAccess,
     })).rejects.toThrow('windows.deploy.unsupported_platform');
     writeFileSync(
       nativeConfigPath,
       readFileSync(join(process.cwd(), 'config.example.json')),
     );
     await expect(validateWindowsDeployment(fixture.input, {
-      platform: 'win32', env: fixture.env,
+      ...validationOptions(fixture),
       versionProbe: { readVersion: async () => 'v25.9.0' },
-      pathAccess: fixture.pathAccess,
     })).rejects.toThrow('windows.deploy.unsupported_node');
+    await expect(validateWindowsDeployment(fixture.input, {
+      ...validationOptions(fixture),
+      environmentPresenceProbe: { requiredBridgeEnvironmentPresent: async () => false },
+    })).rejects.toThrow('windows.deploy.required_environment_absent');
   });
 
   // node:sqlite backup is one libuv work item and can wait behind unrelated parallel test workers.
   it('checkpoints and verifies a timestamped backup outside the release before first v13 migration', async () => {
     const fixture = createRelease();
-    const deployment = await validateWindowsDeployment(fixture.input, {
-      platform: 'win32', env: fixture.env,
-      versionProbe: { readVersion: async () => 'v26.0.0' },
-      pathAccess: fixture.pathAccess,
-    });
+    const deployment = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     downgradeToV12(fixture.pathAccess.toNativePath(deployment.paths.statePath));
     const order: string[] = [];
     const prepared = await prepareDeploymentState(deployment, {
@@ -255,11 +377,7 @@ describe('prebuilt Windows deployment preflight', () => {
 
   it('fails before migration when the state lease is not available', async () => {
     const fixture = createRelease();
-    const deployment = await validateWindowsDeployment(fixture.input, {
-      platform: 'win32', env: fixture.env,
-      versionProbe: { readVersion: async () => 'v26.0.0' },
-      pathAccess: fixture.pathAccess,
-    });
+    const deployment = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     await expect(prepareDeploymentState(deployment, {
       platform: 'win32',
       leaseStore: { tryAcquireSnapshotLease: async () => null },
@@ -279,7 +397,16 @@ describe('prebuilt Windows deployment preflight', () => {
       at: '2026-08-27T00:00:00.000Z',
     });
     store.close();
-    setDeploymentDesiredStopped(statePath, () => new Date('2026-08-27T00:00:01.000Z'));
+    expect(() => setDeploymentDesiredStopped(
+      statePath,
+      'c'.repeat(64),
+      () => new Date('2026-08-27T00:00:01.000Z'),
+    )).toThrow('windows.uninstall.state_identity_mismatch');
+    setDeploymentDesiredStopped(
+      statePath,
+      'a'.repeat(64),
+      () => new Date('2026-08-27T00:00:01.000Z'),
+    );
     const reopened = new SqliteDigestStore(statePath);
     try {
       expect(reopened.readDaemonHealth()?.desiredState).toBe('stopped');

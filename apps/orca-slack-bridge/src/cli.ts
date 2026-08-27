@@ -187,6 +187,8 @@ export type ParsedArgs =
       readonly runNow: boolean;
       /** Bounded health/clean-stop wait for Windows lifecycle commands. */
       readonly waitSeconds: number;
+      /** Explicit post-timeout owned-task force recovery; uninstall only. */
+      readonly force: boolean;
     };
 
 type RunArgs = Extract<ParsedArgs, { readonly kind: 'run' }>;
@@ -435,10 +437,13 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     return { kind: 'error', message: `${command}가 모르는 인자다: --wait-seconds` };
   }
   if (command === 'uninstall' || command === 'run-now') {
-    const unknown = unknownExactArg(argv, ['--wait-seconds'], []);
+    const unknown = unknownExactArg(argv, ['--wait-seconds'], command === 'uninstall' ? ['--force'] : []);
     if (unknown !== null) return { kind: 'error', message: `${command}이 모르는 인자다` };
-    const repeated = repeatedExactArg(argv, ['--wait-seconds']);
+    const repeated = repeatedExactArg(argv, command === 'uninstall' ? ['--wait-seconds', '--force'] : ['--wait-seconds']);
     if (repeated !== null) return { kind: 'error', message: `${command}은 ${repeated}을 한 번만 받는다` };
+  }
+  if (command !== 'uninstall' && argv.includes('--force')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --force` };
   }
   if (command === 'status') {
     const flags = ['--config', '--state', '--log-dir', '--json'];
@@ -542,6 +547,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     nodePath: arg(argv, '--node') ?? null,
     runNow: command === 'install' && argv.includes('--run-now'),
     waitSeconds,
+    force: command === 'uninstall' && argv.includes('--force'),
   };
 }
 
@@ -597,7 +603,7 @@ status 전용:
 
 install 전용:
 
-  --app-root <path> prebuilt pnpm deploy release root (절대경로, 필수)
+  --app-root <path> stage:windows가 만든 LocalAppData digest release root (절대경로, 필수)
   --node <path>     Node 26+ node.exe (절대경로, 필수)
   --orca <path>     orca 실행 파일 (절대경로, 필수)
   --config <path>   strict credential-free config (절대경로, 필수)
@@ -609,6 +615,10 @@ install 전용:
 uninstall·run-now 전용:
 
   --wait-seconds N  clean stop 또는 heartbeat 제한시간 (1..300, 기본 90)
+
+uninstall 전용:
+
+  --force           clean-stop timeout 뒤 exact-owned task만 강제 중지하고 bounded release를 기다린다
 
 logs 전용:
 
@@ -2099,7 +2109,10 @@ export async function main(
 
   if (parsed.command === 'uninstall') {
     try {
-      const result = await uninstallWindowsTask(parsed.waitSeconds, dependencies.uninstall);
+      const result = await uninstallWindowsTask(parsed.waitSeconds, {
+        ...dependencies.uninstall,
+        force: parsed.force,
+      });
       process.stdout.write(`uninstall task=${result.task}\n`);
       return 0;
     } catch (error) {

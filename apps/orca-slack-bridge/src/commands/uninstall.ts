@@ -4,7 +4,7 @@ import {
   inspectOperationalStatus,
   type OperationalStatusReport,
 } from '../operational/status.js';
-import { setDeploymentDesiredStopped } from '../windows/deployment.js';
+import { setDeploymentDesiredStopped, verifyCanonicalWindowsRelease } from '../windows/deployment.js';
 import {
   CurrentUserTaskSchedulerPowerShellRunner,
   CurrentUserWindowsTaskScheduler,
@@ -17,6 +17,10 @@ import {
   validateWindowsWaitSeconds,
   type ManagedTaskLaunch,
 } from './run-now.js';
+import {
+  CurrentUserWindowsRuntimeManifestStore,
+  type WindowsRuntimeManifestStore,
+} from '../windows/runtime-manifest.js';
 
 export type UninstallShutdownObservation = {
   readonly scheduler: ManagedWindowsTaskSnapshot;
@@ -27,12 +31,19 @@ export type UninstallShutdownObservation = {
 export type UninstallCommandDependencies = {
   readonly platform?: NodeJS.Platform;
   readonly scheduler?: CurrentUserWindowsTaskScheduler;
-  readonly setDesiredStopped?: (statePath: string) => void | Promise<void>;
+  readonly setDesiredStopped?: (
+    statePath: string,
+    expectedBuildIdentity: string,
+  ) => void | Promise<void>;
   readonly inspectShutdown?: (launch: ManagedTaskLaunch) => Promise<UninstallShutdownObservation>;
   readonly probePipeReleased?: () => Promise<boolean>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly nowMilliseconds?: () => number;
   readonly pollMilliseconds?: number;
+  readonly force?: boolean;
+  readonly onForceWarning?: () => void;
+  readonly manifestStore?: WindowsRuntimeManifestStore;
+  readonly verifyRelease?: (launch: ManagedTaskLaunch) => boolean | Promise<boolean>;
 };
 
 export type UninstallCommandResult = { readonly task: 'absent' | 'removed' };
@@ -118,7 +129,14 @@ export async function uninstallWindowsTask(
   if (initial.ownership !== 'owned' || initial.integrity !== 'matched' || initial.marker === null) {
     throw new Error('windows.uninstall.task_not_owned');
   }
-  const launch = extractManagedTaskLaunch(initial);
+  const launch = await extractManagedTaskLaunch(
+    initial,
+    dependencies.manifestStore ?? new CurrentUserWindowsRuntimeManifestStore(),
+  );
+  if (!await (dependencies.verifyRelease ?? ((value) =>
+    verifyCanonicalWindowsRelease(value.appRoot, value.releaseDigest)))(launch)) {
+    throw new Error('windows.uninstall.release_drift');
+  }
   const releaseDigest = initial.marker.releaseDigest;
   const semanticFingerprint = initial.marker.semanticFingerprint;
   await scheduler.disable(initial.xml);
@@ -126,7 +144,10 @@ export async function uninstallWindowsTask(
   if (!exactSameOwnedTask(disabled, releaseDigest, semanticFingerprint) || disabled.runtime.enabled) {
     throw new Error('windows.uninstall.disable_verification_failed');
   }
-  await (dependencies.setDesiredStopped ?? setDeploymentDesiredStopped)(launch.statePath);
+  await (dependencies.setDesiredStopped ?? setDeploymentDesiredStopped)(
+    launch.statePath,
+    launch.releaseDigest,
+  );
 
   const pipeProbe = dependencies.probePipeReleased ?? channelPipeIsReleased;
   const inspectShutdown = dependencies.inspectShutdown ?? defaultShutdownInspector(scheduler, pipeProbe);
@@ -162,6 +183,40 @@ export async function uninstallWindowsTask(
     if (remaining <= 0) break;
     await sleep(Math.min(pollMilliseconds, remaining));
   }
-  // Timeout deliberately preserves the disabled registered task and every deployment/data path.
-  throw new Error('windows.uninstall.clean_stop_timeout');
+  if (dependencies.force !== true) {
+    // Default timeout deliberately preserves the disabled registered task and every deployment/data path.
+    throw new Error('windows.uninstall.clean_stop_timeout');
+  }
+
+  (dependencies.onForceWarning ?? (() => {
+    process.stderr.write('windows.uninstall.force_warning\n');
+  }))();
+  const forceTarget = await scheduler.inspect();
+  if (!exactSameOwnedTask(forceTarget, releaseDigest, semanticFingerprint)) {
+    throw new Error('windows.uninstall.task_drift');
+  }
+  await scheduler.stop(forceTarget.xml);
+  const forceDeadline = monotonicNow() + waitSeconds * 1_000;
+  while (monotonicNow() <= forceDeadline) {
+    const [task, pipeReleased] = await Promise.all([scheduler.inspect(), pipeProbe()]);
+    if (!exactSameOwnedTask(task, releaseDigest, semanticFingerprint)) {
+      throw new Error('windows.uninstall.task_drift');
+    }
+    if (task.runtime.executionState !== 'running' && task.runtime.executionState !== 'queued' &&
+        pipeReleased) {
+      const unregisterTarget = await scheduler.inspect();
+      if (!exactSameOwnedTask(unregisterTarget, releaseDigest, semanticFingerprint)) {
+        throw new Error('windows.uninstall.task_drift');
+      }
+      await scheduler.unregister(unregisterTarget.xml);
+      if ((await scheduler.inspect()).kind !== 'absent') {
+        throw new Error('windows.uninstall.unregister_verification_failed');
+      }
+      return { task: 'removed' };
+    }
+    const remaining = forceDeadline - monotonicNow();
+    if (remaining <= 0) break;
+    await sleep(Math.min(pollMilliseconds, remaining));
+  }
+  throw new Error('windows.uninstall.force_stop_timeout');
 }

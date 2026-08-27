@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import {
   closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -22,9 +23,15 @@ import {
   CurrentUserOperationalStatusCapabilityStore,
   operationalStatusCapabilityPath,
   operationalStatusStateIdentity,
+  operationalStatusWindowsKnownLocalAppData,
+  operationalStatusWindowsTrustedPowerShell,
   type OperationalStatusSnapshotLease,
   type OperationalStatusSnapshotLeaseStore,
 } from '../operational/status-capability.js';
+import {
+  windowsReleaseLauncherPath,
+  windowsRuntimeManifestPath,
+} from './runtime-manifest.js';
 
 export const REQUIRED_BRIDGE_ENVIRONMENT_VARIABLES = [BOT_TOKEN_VAR, APP_TOKEN_VAR] as const;
 export const REQUIRED_NODE_MAJOR = 26;
@@ -39,13 +46,22 @@ export type WindowsDeploymentPaths = {
 };
 
 export type ValidatedWindowsDeployment = {
-  readonly paths: WindowsDeploymentPaths & { readonly cliPath: string };
+  readonly paths: WindowsDeploymentPaths & {
+    readonly cliPath: string;
+    readonly launcherPath: string;
+    readonly powerShellPath: string;
+    readonly runtimeManifestPath: string;
+  };
   readonly buildDigest: string;
   readonly config: ParsedBridgeConfig;
 };
 
 export interface ExecutableVersionProbe {
   readVersion(executable: string): Promise<string>;
+}
+
+export interface CurrentUserEnvironmentPresenceProbe {
+  requiredBridgeEnvironmentPresent(): Promise<boolean>;
 }
 
 /**
@@ -100,11 +116,76 @@ export class SpawnExecutableVersionProbe implements ExecutableVersionProbe {
   }
 }
 
+const USER_ENVIRONMENT_PRESENCE_POWERSHELL = String.raw`
+$ErrorActionPreference = 'Stop'
+$bot = [Environment]::GetEnvironmentVariable('ORCA_SLACK_BRIDGE_BOT_TOKEN', [EnvironmentVariableTarget]::User)
+$app = [Environment]::GetEnvironmentVariable('ORCA_SLACK_BRIDGE_APP_TOKEN', [EnvironmentVariableTarget]::User)
+$present = -not [String]::IsNullOrWhiteSpace($bot) -and -not [String]::IsNullOrWhiteSpace($app)
+[Console]::Out.Write((@{ present = $present } | ConvertTo-Json -Compress))
+`;
+
+/** Reads presence only from Windows User scope and never returns or renders either value. */
+export class WindowsUserEnvironmentPresenceProbe implements CurrentUserEnvironmentPresenceProbe {
+  async requiredBridgeEnvironmentPresent(): Promise<boolean> {
+    if (process.platform !== 'win32') throw staticFailure('windows.deploy.unsupported_platform');
+    let trusted: ReturnType<typeof operationalStatusWindowsTrustedPowerShell>;
+    try { trusted = operationalStatusWindowsTrustedPowerShell(); } catch {
+      throw staticFailure('windows.deploy.user_environment_unavailable');
+    }
+    const encoded = Buffer.from(USER_ENVIRONMENT_PRESENCE_POWERSHELL, 'utf16le').toString('base64');
+    return await new Promise<boolean>((resolve, reject) => {
+      const child = spawn(trusted.executable, [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-EncodedCommand', encoded,
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: { SystemRoot: trusted.root, WINDIR: trusted.root },
+      });
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error !== undefined) { reject(error); return; }
+        try {
+          const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+          if (value === null || typeof value !== 'object' ||
+              typeof (value as { present?: unknown }).present !== 'boolean') throw new Error('invalid');
+          resolve((value as { present: boolean }).present);
+        } catch { reject(staticFailure('windows.deploy.user_environment_unavailable')); }
+      };
+      const timer = setTimeout(() => {
+        child.kill();
+        finish(staticFailure('windows.deploy.user_environment_unavailable'));
+      }, 5_000);
+      timer.unref?.();
+      child.stdout.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > 256) {
+          child.kill();
+          finish(staticFailure('windows.deploy.user_environment_unavailable'));
+        } else chunks.push(chunk);
+      });
+      child.stderr.resume();
+      child.once('error', () => finish(staticFailure('windows.deploy.user_environment_unavailable')));
+      child.once('exit', (code) => {
+        if (code === 0) finish();
+        else finish(staticFailure('windows.deploy.user_environment_unavailable'));
+      });
+    });
+  }
+}
+
 export type ValidateWindowsDeploymentOptions = {
   readonly platform?: NodeJS.Platform;
-  readonly env?: NodeJS.ProcessEnv;
   readonly versionProbe?: ExecutableVersionProbe;
+  readonly environmentPresenceProbe?: CurrentUserEnvironmentPresenceProbe;
   readonly pathAccess?: WindowsDeploymentPathAccess;
+  readonly knownLocalAppData?: () => string;
+  readonly trustedPowerShell?: () => { readonly executable: string };
 };
 
 function staticFailure(code: string): Error {
@@ -150,18 +231,65 @@ function canonicalCreatableDirectory(
   }
 }
 
-function canonicalStatePath(value: string, pathAccess: WindowsDeploymentPathAccess): string {
-  requireWindowsAbsolute(value, 'state');
+/** Resolves an existing prefix without creating the absent suffix. */
+function canonicalFuturePath(
+  value: string,
+  field: string,
+  kind: 'file' | 'directory',
+  pathAccess: WindowsDeploymentPathAccess,
+): string {
+  requireWindowsAbsolute(value, field);
   try {
     if (existsSync(pathAccess.toNativePath(value))) {
-      return canonicalExisting(value, 'state', 'file', pathAccess);
+      return canonicalExisting(value, field, kind, pathAccess);
     }
-    const parent = canonicalCreatableDirectory(win32.dirname(value), 'state_parent', pathAccess);
-    const name = win32.basename(value);
-    if (name.length === 0 || name === '.' || name === '..') throw new Error('invalid name');
-    return win32.join(parent, name);
+    const suffix: string[] = [];
+    let cursor = value;
+    while (!existsSync(pathAccess.toNativePath(cursor))) {
+      const name = win32.basename(cursor);
+      const parent = win32.dirname(cursor);
+      if (name.length === 0 || name === '.' || name === '..' || sameWindowsPath(parent, cursor)) {
+        throw new Error('invalid future path');
+      }
+      suffix.unshift(name);
+      cursor = parent;
+    }
+    const ancestor = canonicalExisting(cursor, `${field}_ancestor`, 'directory', pathAccess);
+    const canonical = win32.join(ancestor, ...suffix);
+    if (!sameWindowsPath(canonical, win32.normalize(value))) throw new Error('noncanonical path');
+    return canonical;
   } catch {
-    throw staticFailure('windows.deploy.invalid_state');
+    throw staticFailure(`windows.deploy.invalid_${field}`);
+  }
+}
+
+function prepareMutableDeploymentPaths(
+  deployment: ValidatedWindowsDeployment,
+  pathAccess: WindowsDeploymentPathAccess,
+): void {
+  try {
+    mkdirSync(pathAccess.toNativePath(win32.dirname(deployment.paths.statePath)), { recursive: true });
+    mkdirSync(pathAccess.toNativePath(deployment.paths.logDir), { recursive: true });
+    const stateParent = canonicalExisting(
+      win32.dirname(deployment.paths.statePath),
+      'state_parent',
+      'directory',
+      pathAccess,
+    );
+    const logDir = canonicalExisting(deployment.paths.logDir, 'log_dir', 'directory', pathAccess);
+    if (!sameWindowsPath(
+      win32.join(stateParent, win32.basename(deployment.paths.statePath)),
+      deployment.paths.statePath,
+    ) || !sameWindowsPath(logDir, deployment.paths.logDir)) throw new Error('path raced');
+    if (existsSync(pathAccess.toNativePath(deployment.paths.statePath))) {
+      const state = canonicalExisting(deployment.paths.statePath, 'state', 'file', pathAccess);
+      if (!sameWindowsPath(state, deployment.paths.statePath)) throw new Error('state raced');
+    }
+    verifyWritableDirectory(stateParent, 'state_directory', pathAccess);
+    verifyWritableDirectory(logDir, 'log_directory', pathAccess);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('windows.deploy.')) throw error;
+    throw staticFailure('windows.deploy.mutable_path_preparation_failed');
   }
 }
 
@@ -214,12 +342,6 @@ function configHasNoCredentialFields(
   if (containsSecretKey(parsed)) throw staticFailure('windows.deploy.config_contains_credentials');
 }
 
-function environmentHasRequiredNames(env: NodeJS.ProcessEnv): boolean {
-  return REQUIRED_BRIDGE_ENVIRONMENT_VARIABLES.every(
-    (name) => Object.prototype.hasOwnProperty.call(env, name),
-  );
-}
-
 function packageManifest(
   appRoot: string,
   pathAccess: WindowsDeploymentPathAccess,
@@ -246,59 +368,266 @@ function verifyDeployedDependencies(
   const dependencies = manifest['dependencies'];
   if (manifest['name'] !== '@dev-infra/orca-slack-bridge' || !Array.isArray(files) ||
       !files.some((entry) => entry === 'dist' || entry === 'dist/**/*') ||
+      !files.some((entry) => entry === 'windows/launch-daemon.ps1') ||
       bin === null || typeof bin !== 'object' ||
       (bin as Record<string, unknown>)['orca-slack-bridge'] !== './dist/cli.js' ||
       dependencies === null || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
     throw staticFailure('windows.deploy.invalid_release_manifest');
   }
-  for (const dependency of Object.keys(dependencies as Record<string, unknown>)) {
-    const dependencyManifest = win32.join(appRoot, 'node_modules', ...dependency.split('/'), 'package.json');
-    try {
-      if (!statSync(pathAccess.toNativePath(dependencyManifest)).isFile()) throw new Error('not a file');
-    } catch {
-      throw staticFailure('windows.deploy.incomplete_dependencies');
+  verifyProductionDependencyClosure(appRoot, manifest, pathAccess);
+}
+
+export function canonicalWindowsReleaseRoot(
+  digest: string,
+  knownLocalAppData: () => string = operationalStatusWindowsKnownLocalAppData,
+): string {
+  if (!/^[a-f0-9]{64}$/u.test(digest)) throw staticFailure('windows.deploy.invalid_release_digest');
+  const base = knownLocalAppData();
+  requireWindowsAbsolute(base, 'local_app_data');
+  if (win32.normalize(base) !== base) throw staticFailure('windows.deploy.local_app_data_unavailable');
+  return win32.join(base, 'OrcaSlackBridge', 'releases', digest);
+}
+
+export function verifyCanonicalWindowsRelease(
+  appRoot: string,
+  digest: string,
+  knownLocalAppData: () => string = operationalStatusWindowsKnownLocalAppData,
+): boolean {
+  try {
+    return sameWindowsPath(realpathSync.native(appRoot), canonicalWindowsReleaseRoot(digest, knownLocalAppData)) &&
+      win32.basename(appRoot) === digest && computeReleaseBuildDigest(appRoot) === digest;
+  } catch { return false; }
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function dependencyNames(value: unknown): readonly string[] {
+  if (value === undefined) return [];
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw staticFailure('windows.deploy.invalid_release_manifest');
+  }
+  const dependencies = value as Record<string, unknown>;
+  for (const [name, range] of Object.entries(dependencies)) {
+    if (!/^(?:@[a-z0-9_.-]+\/[a-z0-9_.-]+|[a-z0-9_.-]+)$/iu.test(name) ||
+        typeof range !== 'string' || range.length === 0) {
+      throw staticFailure('windows.deploy.invalid_release_manifest');
+    }
+  }
+  return Object.keys(dependencies).sort();
+}
+
+function resolveDependencyManifest(
+  appRoot: string,
+  packageRoot: string,
+  dependency: string,
+  pathAccess: WindowsDeploymentPathAccess,
+): string | null {
+  let current = packageRoot;
+  while (isWithin(appRoot, current)) {
+    const candidate = win32.join(current, 'node_modules', ...dependency.split('/'), 'package.json');
+    if (existsSync(pathAccess.toNativePath(candidate))) return candidate;
+    if (sameWindowsPath(current, appRoot)) break;
+    current = win32.dirname(current);
+  }
+  return null;
+}
+
+function verifyProductionDependencyClosure(
+  appRoot: string,
+  rootManifest: Record<string, unknown>,
+  pathAccess: WindowsDeploymentPathAccess,
+): void {
+  const pending: { readonly root: string; readonly manifest: Record<string, unknown> }[] = [
+    { root: appRoot, manifest: rootManifest },
+  ];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const required = dependencyNames(current.manifest['dependencies']);
+    const optional = dependencyNames(current.manifest['optionalDependencies']);
+    for (const dependency of [...required, ...optional]) {
+      const manifestPath = resolveDependencyManifest(appRoot, current.root, dependency, pathAccess);
+      if (manifestPath === null) {
+        if (optional.includes(dependency)) continue;
+        throw staticFailure('windows.deploy.incomplete_dependencies');
+      }
+      let canonical: string;
+      let parsed: unknown;
+      try {
+        canonical = pathAccess.canonicalize(manifestPath);
+        if (!sameWindowsPath(canonical, manifestPath) || !isWithin(appRoot, canonical) ||
+            !lstatSync(pathAccess.toNativePath(canonical)).isFile()) throw new Error('invalid dependency');
+        parsed = JSON.parse(readFileSync(pathAccess.toNativePath(canonical), 'utf8')) as unknown;
+      } catch {
+        throw staticFailure('windows.deploy.incomplete_dependencies');
+      }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw staticFailure('windows.deploy.incomplete_dependencies');
+      }
+      const key = canonical.toLowerCase();
+      if (visited.has(key)) continue;
+      visited.add(key);
+      pending.push({ root: win32.dirname(canonical), manifest: parsed as Record<string, unknown> });
     }
   }
 }
 
-function hashReleaseDirectory(
-  hash: ReturnType<typeof createHash>,
+type ReleaseEntry = {
+  readonly kind: 'directory' | 'file';
+  readonly relative: string;
+  readonly nativePath: string;
+  readonly identity: string;
+  readonly size: bigint;
+};
+
+function releaseIdentity(path: string): {
+  readonly identity: string;
+  readonly file: boolean;
+  readonly directory: boolean;
+  readonly size: bigint;
+} {
+  const stats = lstatSync(path, { bigint: true });
+  if (stats.isSymbolicLink()) throw staticFailure('windows.deploy.release_reparse_point');
+  if (stats.isFile() && stats.nlink !== 1n) throw staticFailure('windows.deploy.release_hard_link');
+  return {
+    file: stats.isFile(),
+    directory: stats.isDirectory(),
+    size: stats.size,
+    identity: [stats.dev, stats.ino, stats.size, stats.nlink, stats.mtimeNs, stats.ctimeNs]
+      .map((value) => value.toString()).join(':'),
+  };
+}
+
+function releaseDescriptorIdentity(descriptor: number): ReturnType<typeof releaseIdentity> {
+  const stats = fstatSync(descriptor, { bigint: true });
+  if (stats.isFile() && stats.nlink !== 1n) throw staticFailure('windows.deploy.release_hard_link');
+  return {
+    file: stats.isFile(),
+    directory: stats.isDirectory(),
+    size: stats.size,
+    identity: [stats.dev, stats.ino, stats.size, stats.nlink, stats.mtimeNs, stats.ctimeNs]
+      .map((value) => value.toString()).join(':'),
+  };
+}
+
+function collectReleaseEntries(
   root: string,
-  relative: string,
   pathAccess: WindowsDeploymentPathAccess,
-): void {
-  const directory = win32.join(root, relative);
-  const entries = readdirSync(pathAccess.toNativePath(directory), { withFileTypes: true })
-    .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-  for (const entry of entries) {
-    const childRelative = win32.join(relative, entry.name);
-    const child = win32.join(root, childRelative);
-    const nativeChild = pathAccess.toNativePath(child);
-    const stats = lstatSync(nativeChild);
-    if (stats.isSymbolicLink()) throw staticFailure('windows.deploy.release_symlink');
-    if (stats.isDirectory()) {
-      hashReleaseDirectory(hash, root, childRelative, pathAccess);
-      continue;
+): readonly ReleaseEntry[] {
+  const result: ReleaseEntry[] = [];
+  const normalizedPaths = new Set<string>();
+  const visit = (directory: string, relative: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(pathAccess.toNativePath(directory), { encoding: 'utf8' }).sort();
+    } catch { throw staticFailure('windows.deploy.invalid_release_tree'); }
+    for (const entry of entries) {
+      if (entry.normalize('NFC') !== entry || /[\0\\/]/u.test(entry) || /[. ]$/u.test(entry)) {
+        throw staticFailure('windows.deploy.invalid_release_name');
+      }
+      const childRelative = win32.join(relative, entry);
+      const child = win32.join(root, childRelative);
+      const nativeChild = pathAccess.toNativePath(child);
+      let identity: ReturnType<typeof releaseIdentity>;
+      try {
+        identity = releaseIdentity(nativeChild);
+        const canonical = pathAccess.canonicalize(child);
+        if (!sameWindowsPath(canonical, child) || !isWithin(root, canonical)) {
+          throw new Error('release escape');
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('windows.deploy.')) throw error;
+        throw staticFailure('windows.deploy.release_reparse_point');
+      }
+      if (!identity.file && !identity.directory) {
+        throw staticFailure('windows.deploy.invalid_release_file');
+      }
+      const relativeForDigest = childRelative.replaceAll('\\', '/');
+      const normalizedKey = relativeForDigest.normalize('NFC').toLowerCase();
+      if (normalizedPaths.has(normalizedKey)) {
+        throw staticFailure('windows.deploy.release_path_collision');
+      }
+      normalizedPaths.add(normalizedKey);
+      result.push({
+        kind: identity.directory ? 'directory' : 'file',
+        relative: relativeForDigest,
+        nativePath: nativeChild,
+        identity: identity.identity,
+        size: identity.size,
+      });
+      if (identity.directory) visit(child, childRelative);
     }
-    if (!stats.isFile()) throw staticFailure('windows.deploy.invalid_release_file');
-    hash.update(childRelative.replaceAll('\\', '/'), 'utf8');
-    hash.update('\0');
-    hash.update(readFileSync(nativeChild));
-    hash.update('\0');
-  }
+  };
+  visit(root, '');
+  return result;
+}
+
+function updateLength(hash: ReturnType<typeof createHash>, length: bigint): void {
+  const encoded = Buffer.allocUnsafe(8);
+  encoded.writeBigUInt64BE(length);
+  hash.update(encoded);
 }
 
 export function computeReleaseBuildDigest(
   appRoot: string,
   pathAccess: WindowsDeploymentPathAccess = NATIVE_WINDOWS_DEPLOYMENT_PATH_ACCESS,
 ): string {
+  let rootBefore: ReturnType<typeof releaseIdentity>;
+  try {
+    rootBefore = releaseIdentity(pathAccess.toNativePath(appRoot));
+    if (!rootBefore.directory || !sameWindowsPath(pathAccess.canonicalize(appRoot), appRoot)) {
+      throw new Error('invalid root');
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('windows.deploy.')) throw error;
+    throw staticFailure('windows.deploy.invalid_release_tree');
+  }
+  const manifest = packageManifest(appRoot, pathAccess);
+  verifyDeployedDependencies(appRoot, manifest, pathAccess);
+  const before = collectReleaseEntries(appRoot, pathAccess);
   const hash = createHash('sha256');
-  hash.update('orca-slack-bridge-release-v1\0', 'utf8');
-  const manifest = readFileSync(pathAccess.toNativePath(win32.join(appRoot, 'package.json')));
-  hash.update('package.json\0', 'utf8');
-  hash.update(manifest);
-  hash.update('\0');
-  hashReleaseDirectory(hash, appRoot, 'dist', pathAccess);
+  hash.update('orca-slack-bridge-release-v2\0', 'utf8');
+  for (const entry of before) {
+    hash.update(entry.kind === 'directory' ? 'D' : 'F', 'ascii');
+    const name = Buffer.from(entry.relative, 'utf8');
+    updateLength(hash, BigInt(name.length));
+    hash.update(name);
+    if (entry.kind === 'file') {
+      let descriptor: number | null = null;
+      let bytes: Buffer;
+      try {
+        descriptor = openSync(entry.nativePath, 'r');
+        const immediatelyBefore = releaseDescriptorIdentity(descriptor);
+        if (!immediatelyBefore.file || immediatelyBefore.identity !== entry.identity) {
+          throw staticFailure('windows.deploy.release_changed');
+        }
+        bytes = readFileSync(descriptor);
+        const afterRead = releaseDescriptorIdentity(descriptor);
+        if (!afterRead.file || afterRead.identity !== entry.identity ||
+            BigInt(bytes.length) !== entry.size) throw staticFailure('windows.deploy.release_changed');
+      } finally {
+        if (descriptor !== null) closeSync(descriptor);
+      }
+      const afterPathRead = releaseIdentity(entry.nativePath);
+      if (!afterPathRead.file || afterPathRead.identity !== entry.identity) {
+        throw staticFailure('windows.deploy.release_changed');
+      }
+      updateLength(hash, BigInt(bytes.length));
+      hash.update(bytes);
+    }
+  }
+  const after = collectReleaseEntries(appRoot, pathAccess);
+  if (JSON.stringify(after.map(({ kind, relative, identity }) => ({ kind, relative, identity }))) !==
+      JSON.stringify(before.map(({ kind, relative, identity }) => ({ kind, relative, identity })))) {
+    throw staticFailure('windows.deploy.release_changed');
+  }
+  const rootAfter = releaseIdentity(pathAccess.toNativePath(appRoot));
+  if (!rootAfter.directory || rootAfter.identity !== rootBefore.identity ||
+      !sameWindowsPath(pathAccess.canonicalize(appRoot), appRoot)) {
+    throw staticFailure('windows.deploy.release_changed');
+  }
   return hash.digest('hex');
 }
 
@@ -311,24 +640,59 @@ export async function validateWindowsDeployment(
   }
   const pathAccess = options.pathAccess ?? NATIVE_WINDOWS_DEPLOYMENT_PATH_ACCESS;
   const appRoot = canonicalExisting(input.appRoot, 'app_root', 'directory', pathAccess);
+  let localAppData: string;
+  try {
+    localAppData = canonicalExisting(
+      (options.knownLocalAppData ?? operationalStatusWindowsKnownLocalAppData)(),
+      'local_app_data',
+      'directory',
+      pathAccess,
+    );
+  } catch {
+    throw staticFailure('windows.deploy.local_app_data_unavailable');
+  }
+  const buildDigest = computeReleaseBuildDigest(appRoot, pathAccess);
+  const expectedReleaseRoot = win32.join(
+    localAppData,
+    'OrcaSlackBridge',
+    'releases',
+    buildDigest,
+  );
+  if (!sameWindowsPath(appRoot, expectedReleaseRoot) || win32.basename(appRoot) !== buildDigest) {
+    throw staticFailure('windows.deploy.noncanonical_release_root');
+  }
   const nodePath = canonicalExisting(input.nodePath, 'node', 'file', pathAccess);
   const orcaPath = canonicalExisting(input.orcaPath, 'orca', 'file', pathAccess);
   const configPath = canonicalExisting(input.configPath, 'config', 'file', pathAccess);
-  const statePath = canonicalStatePath(input.statePath, pathAccess);
-  const logDir = canonicalCreatableDirectory(input.logDir, 'log_dir', pathAccess);
+  const statePath = canonicalFuturePath(input.statePath, 'state', 'file', pathAccess);
+  const logDir = canonicalFuturePath(input.logDir, 'log_dir', 'directory', pathAccess);
   if (isWithin(appRoot, statePath) || isWithin(appRoot, logDir)) {
     throw staticFailure('windows.deploy.mutable_path_inside_release');
   }
-  verifyWritableDirectory(win32.dirname(statePath), 'state_directory', pathAccess);
-  verifyWritableDirectory(logDir, 'log_directory', pathAccess);
   const cliPath = canonicalExisting(
     win32.join(appRoot, 'dist', 'cli.js'),
     'cli',
     'file',
     pathAccess,
   );
-  const manifest = packageManifest(appRoot, pathAccess);
-  verifyDeployedDependencies(appRoot, manifest, pathAccess);
+  const launcherPath = canonicalExisting(
+    windowsReleaseLauncherPath(appRoot),
+    'launcher',
+    'file',
+    pathAccess,
+  );
+  let powerShellPath: string;
+  try {
+    powerShellPath = canonicalExisting(
+      (options.trustedPowerShell ?? operationalStatusWindowsTrustedPowerShell)().executable,
+      'powershell',
+      'file',
+      pathAccess,
+    );
+  } catch {
+    throw staticFailure('windows.deploy.powershell_unavailable');
+  }
+  const runtimeManifestPath = windowsRuntimeManifestPath(() => localAppData);
   const version = await (options.versionProbe ?? new SpawnExecutableVersionProbe()).readVersion(nodePath);
   const match = /^v([0-9]+)(?:\.|$)/u.exec(version);
   if (match === null || Number(match[1]) < REQUIRED_NODE_MAJOR) {
@@ -342,12 +706,16 @@ export async function validateWindowsDeployment(
     throw staticFailure('windows.deploy.invalid_config');
   }
   if (config.slack === null) throw staticFailure('windows.deploy.slack_config_required');
-  if (!environmentHasRequiredNames(options.env ?? process.env)) {
+  if (!await (options.environmentPresenceProbe ??
+      new WindowsUserEnvironmentPresenceProbe()).requiredBridgeEnvironmentPresent()) {
     throw staticFailure('windows.deploy.required_environment_absent');
   }
   return {
-    paths: { appRoot, nodePath, orcaPath, configPath, statePath, logDir, cliPath },
-    buildDigest: computeReleaseBuildDigest(appRoot, pathAccess),
+    paths: {
+      appRoot, nodePath, orcaPath, configPath, statePath, logDir, cliPath,
+      launcherPath, powerShellPath, runtimeManifestPath,
+    },
+    buildDigest,
     config,
   };
 }
@@ -475,6 +843,7 @@ export async function prepareDeploymentState(
     throw staticFailure('windows.deploy.unsupported_platform');
   }
   const pathAccess = options.pathAccess ?? NATIVE_WINDOWS_DEPLOYMENT_PATH_ACCESS;
+  prepareMutableDeploymentPaths(deployment, pathAccess);
   const leaseStore = options.leaseStore ??
     new CurrentUserOperationalStatusCapabilityStore(platform, process.env);
   const leaseIdentity = options.resolveSnapshotLeaseIdentity?.(
@@ -537,6 +906,7 @@ export async function prepareDeploymentState(
 /** Uninstall's intentional concurrent writer: exact v13 only, no create and no migration. */
 export function setDeploymentDesiredStopped(
   statePath: string,
+  expectedBuildIdentity?: string,
   clock: () => Date = () => new Date(),
 ): void {
   if (!existsSync(statePath)) throw staticFailure('windows.uninstall.state_absent');
@@ -551,15 +921,30 @@ export function setDeploymentDesiredStopped(
     db.exec('BEGIN IMMEDIATE');
     try {
       const current = db.prepare(
-        'SELECT desired_state, updated_at FROM daemon_health WHERE id = 1',
-      ).get() as { readonly desired_state: unknown; readonly updated_at: unknown } | undefined;
-      if (current === undefined || current.desired_state === 'stopped') {
+        'SELECT revision, build_fingerprint, desired_state, updated_at FROM daemon_health WHERE id = 1',
+      ).get() as {
+        readonly revision: unknown;
+        readonly build_fingerprint: unknown;
+        readonly desired_state: unknown;
+        readonly updated_at: unknown;
+      } | undefined;
+      if (current === undefined) {
         db.exec('COMMIT');
         return;
       }
-      if (current.desired_state !== 'running' || typeof current.updated_at !== 'string' ||
+      if (typeof current.revision !== 'number' || !Number.isSafeInteger(current.revision) ||
+          current.revision < 0 || typeof current.build_fingerprint !== 'string' ||
+          (current.desired_state !== 'running' && current.desired_state !== 'stopped') ||
+          typeof current.updated_at !== 'string' ||
           !Number.isFinite(Date.parse(current.updated_at))) {
         throw staticFailure('windows.uninstall.state_corrupt');
+      }
+      if (expectedBuildIdentity !== undefined && current.build_fingerprint !== expectedBuildIdentity) {
+        throw staticFailure('windows.uninstall.state_identity_mismatch');
+      }
+      if (current.desired_state === 'stopped') {
+        db.exec('COMMIT');
+        return;
       }
       const at = new Date(Math.max(
         requested.getTime(),
@@ -567,8 +952,9 @@ export function setDeploymentDesiredStopped(
       )).toISOString();
       const result = db.prepare(`
         UPDATE daemon_health
-           SET revision = revision + 1, desired_state = 'stopped', updated_at = ?
-         WHERE id = 1 AND desired_state = 'running' AND updated_at <= ?`).run(at, at);
+         SET revision = revision + 1, desired_state = 'stopped', updated_at = ?
+         WHERE id = 1 AND revision = ? AND desired_state = 'running' AND updated_at = ?`)
+        .run(at, current.revision, current.updated_at);
       if (Number(result.changes) !== 1) throw staticFailure('windows.uninstall.desired_state_conflict');
       db.exec('COMMIT');
     } catch (error) {

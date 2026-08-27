@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { win32 } from 'node:path';
 import type { ParsedBridgeConfig } from '../src/project/config.js';
 import {
   classifyTaskLifecycle,
@@ -9,6 +10,13 @@ import { installWindowsTask } from '../src/commands/install.js';
 import { runManagedTaskNow } from '../src/commands/run-now.js';
 import { uninstallWindowsTask } from '../src/commands/uninstall.js';
 import type { ValidatedWindowsDeployment } from '../src/windows/deployment.js';
+import {
+  createWindowsRuntimeManifest,
+  parseWindowsRuntimeManifest,
+  serializeWindowsRuntimeManifest,
+  type WindowsRuntimeManifestStore,
+  type WindowsRuntimeManifestSnapshot,
+} from '../src/windows/runtime-manifest.js';
 import {
   createWindowsTaskDefinition,
   CurrentUserWindowsTaskScheduler,
@@ -22,32 +30,41 @@ import {
 
 const SID = 'S-1-5-21-100-200-300-1001';
 const DIGEST = 'b'.repeat(64);
+const RELEASE_ROOT = win32.join(
+  String.raw`C:\Users\test\AppData\Local\OrcaSlackBridge\releases`,
+  DIGEST,
+);
 const paths = {
-  appRoot: String.raw`C:\releases\bridge-2026.08.27`,
-  nodePath: String.raw`C:\releases\bridge-2026.08.27\node.exe`,
+  appRoot: RELEASE_ROOT,
+  nodePath: String.raw`C:\runtime\node.exe`,
   orcaPath: String.raw`C:\Program Files\Orca\orca.exe`,
   configPath: String.raw`C:\사용자 데이터\bridge config.json`,
   statePath: String.raw`C:\사용자 데이터\state.db`,
   logDir: String.raw`C:\사용자 데이터\logs`,
-  cliPath: String.raw`C:\releases\bridge-2026.08.27\dist\cli.js`,
+  cliPath: win32.join(RELEASE_ROOT, 'dist', 'cli.js'),
+  launcherPath: win32.join(RELEASE_ROOT, 'windows', 'launch-daemon.ps1'),
+  powerShellPath: String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+  runtimeManifestPath: String.raw`C:\Users\test\AppData\Local\OrcaSlackBridge\runtime.json`,
 } as const;
 
 function taskDefinition(): WindowsTaskDefinition {
   return createWindowsTaskDefinition({
     currentSid: SID,
     releaseDigest: DIGEST,
-    ...paths,
+    powerShellPath: paths.powerShellPath,
+    launcherPath: paths.launcherPath,
+    runtimeManifestPath: paths.runtimeManifestPath,
     workingDirectory: paths.appRoot,
   });
 }
 
 function xml(value: WindowsTaskDefinition): string {
   const e = escapeTaskXmlTextForTest;
-  return `<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  return `<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
 <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
 <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger></Triggers>
 <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><Enabled>${String(value.enabled).toLowerCase()}</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>${String(value.enabled).toLowerCase()}</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
 <Actions Context="Author"><Exec><Command>${e(value.action.execute)}</Command><Arguments>${e(value.action.arguments)}</Arguments><WorkingDirectory>${e(value.action.workingDirectory)}</WorkingDirectory></Exec></Actions>
 </Task>`;
 }
@@ -58,6 +75,7 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
   hasRun = false;
   lastTaskResult = 0;
   corruptNextRegister = false;
+  validateFailure = false;
   readonly operations: string[] = [];
 
   async run(operation: TaskSchedulerPowerShellOperation, input: unknown): Promise<unknown> {
@@ -72,9 +90,16 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
         enabled: this.definition.enabled,
         lastTaskResult: this.lastTaskResult,
         lastRunTime: this.hasRun ? '2026-08-27T00:00:00.000Z' : null,
+        nextRunTime: null,
+        missedRuns: 0,
+        observedAt: '2026-08-27T00:00:10.000Z',
       };
     }
     const record = input as Record<string, unknown>;
+    if (operation === 'validate') {
+      if (this.validateFailure) throw new Error('windows.task_scheduler.command_failed');
+      return { ok: true };
+    }
     if (operation === 'register') {
       const desired = (record['definition'] as WindowsTaskDefinition);
       this.definition = this.corruptNextRegister
@@ -99,11 +124,57 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
       this.state = 'Running';
       return { ok: true };
     }
+    if (operation === 'stop') {
+      this.state = 'Ready';
+      return { ok: true };
+    }
     if (operation === 'unregister') {
       this.definition = null;
       return { ok: true };
     }
     throw new Error('unsupported fake operation');
+  }
+}
+
+function runtimeManifestBytes(): Buffer {
+  return serializeWindowsRuntimeManifest(createWindowsRuntimeManifest({
+    releaseRoot: paths.appRoot,
+    releaseDigest: DIGEST,
+    nodeExe: paths.nodePath,
+    distCli: paths.cliPath,
+    config: paths.configPath,
+    state: paths.statePath,
+    orcaExe: paths.orcaPath,
+    logDirectory: paths.logDir,
+  }));
+}
+
+class FakeManifestStore implements WindowsRuntimeManifestStore {
+  bytes: Buffer | null = null;
+  protected = true;
+  readonly operations: string[] = [];
+
+  seed(): this {
+    this.bytes = runtimeManifestBytes();
+    return this;
+  }
+
+  async inspect(_path: string): Promise<WindowsRuntimeManifestSnapshot> {
+    this.operations.push('inspect');
+    if (this.bytes === null) return { kind: 'absent' };
+    return {
+      kind: 'present', bytes: Buffer.from(this.bytes), protected: this.protected,
+      manifest: parseWindowsRuntimeManifest(this.bytes),
+    };
+  }
+
+  async replace(_path: string, expected: Buffer | null, desired: Buffer | null): Promise<void> {
+    this.operations.push('replace');
+    if (expected === null ? this.bytes !== null : this.bytes === null || !this.bytes.equals(expected)) {
+      throw new Error('manifest CAS mismatch');
+    }
+    this.bytes = desired === null ? null : Buffer.from(desired);
+    this.protected = true;
   }
 }
 
@@ -130,11 +201,14 @@ describe('Windows current-user lifecycle', () => {
   it('installs twice as one exact task and never starts without --run-now', async () => {
     const runner = new FakePowerShellRunner();
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const manifestStore = new FakeManifestStore();
     let prepared = 0;
     const dependencies = {
       platform: 'win32' as const,
       scheduler,
+      manifestStore,
       validateDeployment: async () => deployment(),
+      validateExistingState: async () => undefined,
       prepareState: async () => {
         prepared += 1;
         return { backupPath: null, release: async () => undefined };
@@ -147,6 +221,7 @@ describe('Windows current-user lifecycle', () => {
       task: 'unchanged', runNow: 'not-requested',
     });
     expect(runner.operations.filter((operation) => operation === 'register')).toHaveLength(1);
+    expect(runner.operations.filter((operation) => operation === 'validate')).toHaveLength(2);
     expect(runner.operations).not.toContain('start');
     expect(prepared).toBe(1);
   });
@@ -167,6 +242,7 @@ describe('Windows current-user lifecycle', () => {
       let prepared = false;
       await expect(installWindowsTask({ ...paths, runNow: false }, {
         platform: 'win32', scheduler,
+        manifestStore: new FakeManifestStore(),
         validateDeployment: async () => deployment(),
         prepareState: async () => {
           prepared = true;
@@ -187,6 +263,7 @@ describe('Windows current-user lifecycle', () => {
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
     expect(await installWindowsTask({ ...paths, runNow: false }, {
       platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore(),
       validateDeployment: async () => deployment(),
       prepareState: async () => ({ backupPath: null, release: async () => undefined }),
     })).toMatchObject({ task: 'updated' });
@@ -198,10 +275,74 @@ describe('Windows current-user lifecycle', () => {
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
     await expect(installWindowsTask({ ...paths, runNow: false }, {
       platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore(),
       validateDeployment: async () => deployment(),
       prepareState: async () => { throw new Error('windows.deploy.backup_verification_failed'); },
     })).rejects.toThrow('windows.deploy.backup_verification_failed');
     expect(runner.definition).toBeNull();
+    expect(runner.operations).not.toContain('register');
+  });
+
+  it('runs COM validate-only before state or manifest effects and preserves every byte on failure', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.validateFailure = true;
+    const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const manifestStore = new FakeManifestStore().seed();
+    const beforeTask = xml(runner.definition);
+    const beforeManifest = Buffer.from(manifestStore.bytes!);
+    const stateBytes = Buffer.from('immutable-state-before-validation');
+    let prepared = false;
+    await expect(installWindowsTask({ ...paths, runNow: false }, {
+      platform: 'win32', scheduler, manifestStore,
+      validateDeployment: async () => deployment(),
+      prepareState: async () => {
+        prepared = true;
+        stateBytes.fill(0);
+        return { backupPath: null, release: async () => undefined };
+      },
+    })).rejects.toThrow('windows.task_scheduler.command_failed');
+    expect(prepared).toBe(false);
+    expect(xml(runner.definition!)).toBe(beforeTask);
+    expect(manifestStore.bytes).toEqual(beforeManifest);
+    expect(stateBytes.toString()).toBe('immutable-state-before-validation');
+    expect(manifestStore.operations).toEqual([]);
+    expect(runner.operations.at(-1)).toBe('validate');
+  });
+
+  it('fails unchanged reinstalls on missing/corrupt manifest or legacy state without preparing state', async () => {
+    for (const manifestStore of [
+      new FakeManifestStore(),
+      Object.assign(new FakeManifestStore(), { bytes: Buffer.from('{"legacy":true}\n') }),
+    ]) {
+      const runner = new FakePowerShellRunner();
+      runner.definition = taskDefinition();
+      let prepared = false;
+      await expect(installWindowsTask({ ...paths, runNow: false }, {
+        platform: 'win32', scheduler: new CurrentUserWindowsTaskScheduler(runner), manifestStore,
+        validateDeployment: async () => deployment(),
+        prepareState: async () => {
+          prepared = true;
+          return { backupPath: null, release: async () => undefined };
+        },
+      })).rejects.toThrow('windows.install.runtime_manifest_invalid');
+      expect(prepared).toBe(false);
+      expect(runner.operations).not.toContain('register');
+    }
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    let prepared = false;
+    await expect(installWindowsTask({ ...paths, runNow: false }, {
+      platform: 'win32', scheduler: new CurrentUserWindowsTaskScheduler(runner),
+      manifestStore: new FakeManifestStore().seed(),
+      validateDeployment: async () => deployment(),
+      validateExistingState: async () => { throw new Error('windows.install.existing_state_invalid'); },
+      prepareState: async () => {
+        prepared = true;
+        return { backupPath: null, release: async () => undefined };
+      },
+    })).rejects.toThrow('windows.install.existing_state_invalid');
+    expect(prepared).toBe(false);
     expect(runner.operations).not.toContain('register');
   });
 
@@ -215,8 +356,10 @@ describe('Windows current-user lifecycle', () => {
     runner.definition = drifted;
     runner.corruptNextRegister = true;
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const manifestStore = new FakeManifestStore().seed();
     await expect(installWindowsTask({ ...paths, runNow: false }, {
       platform: 'win32', scheduler,
+      manifestStore,
       validateDeployment: async () => deployment(),
       prepareState: async () => ({ backupPath: String.raw`C:\data\backup.db`, release: async () => undefined }),
     })).rejects.toThrow('windows.install.task_update_failed');
@@ -231,6 +374,7 @@ describe('Windows current-user lifecycle', () => {
     const staleScheduler = new CurrentUserWindowsTaskScheduler(staleRunner);
     await expect(runManagedTaskNow(2, {
       platform: 'win32', scheduler: staleScheduler,
+      manifestStore: new FakeManifestStore().seed(),
       verifyRelease: () => true,
       inspectHealth: async () => ({ scheduler: await staleScheduler.inspect(), report: report({ heartbeatAgeSeconds: 91 }) }),
     })).rejects.toThrow('windows.run_now.running_stale');
@@ -243,6 +387,7 @@ describe('Windows current-user lifecycle', () => {
     let observations = 0;
     expect(await runManagedTaskNow(2, {
       platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore().seed(),
       verifyRelease: () => true,
       nowMilliseconds: () => now,
       sleep: async (milliseconds) => { now += milliseconds; },
@@ -266,6 +411,7 @@ describe('Windows current-user lifecycle', () => {
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
     expect(await runManagedTaskNow(2, {
       platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore().seed(),
       verifyRelease: () => true,
       inspectHealth: async () => ({ scheduler: await scheduler.inspect(), report: report() }),
     })).toEqual({ action: 'already-healthy' });
@@ -281,7 +427,9 @@ describe('Windows current-user lifecycle', () => {
     const lifecycle: string[] = [];
     expect(await uninstallWindowsTask(2, {
       platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore().seed(),
       setDesiredStopped: () => { lifecycle.push('desired-stopped'); },
+      verifyRelease: () => true,
       inspectShutdown: async () => {
         runner.state = 'Ready';
         lifecycle.push('waited');
@@ -302,7 +450,9 @@ describe('Windows current-user lifecycle', () => {
     let now = 0;
     await expect(uninstallWindowsTask(1, {
       platform: 'win32', scheduler: timeoutScheduler,
+      manifestStore: new FakeManifestStore().seed(),
       setDesiredStopped: () => undefined,
+      verifyRelease: () => true,
       nowMilliseconds: () => now,
       sleep: async (milliseconds) => { now += milliseconds; },
       inspectShutdown: async () => ({
@@ -314,6 +464,34 @@ describe('Windows current-user lifecycle', () => {
     expect(timeoutRunner.definition).not.toBeNull();
     expect(timeoutRunner.definition?.enabled).toBe(false);
     expect(timeoutRunner.operations).not.toContain('unregister');
+  });
+
+  it('uses --force only after graceful timeout, warns statically, rechecks CAS, and stops the owned task', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.state = 'Running';
+    runner.hasRun = true;
+    const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    let now = 0;
+    const warnings: string[] = [];
+    expect(await uninstallWindowsTask(1, {
+      platform: 'win32', scheduler, force: true,
+      manifestStore: new FakeManifestStore().seed(),
+      setDesiredStopped: () => undefined,
+      verifyRelease: () => true,
+      nowMilliseconds: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+      inspectShutdown: async () => ({
+        scheduler: await scheduler.inspect(),
+        report: report({ heartbeatAgeSeconds: 91 }),
+        pipeReleased: false,
+      }),
+      probePipeReleased: async () => runner.state === 'Ready',
+      onForceWarning: () => { warnings.push('windows.uninstall.force_warning'); },
+    })).toEqual({ task: 'removed' });
+    expect(warnings).toEqual(['windows.uninstall.force_warning']);
+    expect(runner.operations.indexOf('stop')).toBeGreaterThan(runner.operations.indexOf('disable'));
+    expect(runner.operations.indexOf('unregister')).toBeGreaterThan(runner.operations.indexOf('stop'));
   });
 
   it('treats an absent uninstall as success without writing desired state', async () => {
@@ -340,7 +518,9 @@ describe('Windows current-user lifecycle', () => {
 
 const statusTask = (overrides: Partial<TaskStatusObservation> = {}): TaskStatusObservation => ({
   ownership: 'matched', state: 'stopped', schedulerState: 'ready', hasRun: false,
-  lastTaskResult: 0, ...overrides,
+  lastTaskResult: 0, observedAt: '2026-08-27T00:03:00.000Z',
+  lastRunTime: '2026-08-27T00:00:00.000Z', nextRunTime: null, missedRuns: 0,
+  restartCount: 3, restartIntervalSeconds: 60, ...overrides,
 });
 
 describe('O1-6 task facet classifications', () => {
@@ -353,9 +533,41 @@ describe('O1-6 task facet classifications', () => {
     ['stopped-clean', statusTask({ hasRun: true }), report({ state: 'stopped', desiredState: 'stopped' }).daemon, 'matched', 'matched'],
     ['exited-unexpected', statusTask({ hasRun: true }), report({ state: 'stopped', desiredState: 'running' }).daemon, 'matched', 'matched'],
     ['failed-restarting', statusTask({ state: 'running', schedulerState: 'running', hasRun: true, lastTaskResult: 1 }), report({ state: 'absent', desiredState: 'absent' }).daemon, 'unverified', 'readable'],
-    ['failed-exhausted', statusTask({ hasRun: true, lastTaskResult: 1 }), report({ state: 'stopped', desiredState: 'running' }).daemon, 'matched', 'matched'],
+    ['failed-exhausted', statusTask({ hasRun: true, lastTaskResult: 1, observedAt: '2026-08-27T00:03:05.001Z' }), report({ state: 'stopped', desiredState: 'running' }).daemon, 'matched', 'matched'],
     ['drifted', statusTask({ ownership: 'drifted' }), report().daemon, 'matched', 'matched'],
   ] as const)('classifies %s from scheduler plus O1 health', (expected, observation, health, build, config) => {
     expect(classifyTaskLifecycle(observation, health, build, config)).toBe(expected);
+  });
+
+  it('keeps the bounded retry/grace edge and ambiguous evidence restarting, then exhausts one millisecond later', () => {
+    const health = report({ state: 'stopped', desiredState: 'running' }).daemon;
+    expect(classifyTaskLifecycle(statusTask({ hasRun: true, lastTaskResult: 1 }), health, 'matched', 'matched'))
+      .toBe('failed-restarting');
+    expect(classifyTaskLifecycle(statusTask({
+      hasRun: true,
+      lastTaskResult: 1,
+      observedAt: '2026-08-27T00:10:00.000Z',
+      nextRunTime: '2026-08-27T00:10:00.001Z',
+    }), health, 'matched', 'matched')).toBe('failed-restarting');
+    expect(classifyTaskLifecycle(statusTask({
+      hasRun: true,
+      lastTaskResult: 1,
+      observedAt: '2026-08-27T00:03:05.000Z',
+    }), health, 'matched', 'matched')).toBe('failed-restarting');
+    expect(classifyTaskLifecycle(statusTask({
+      hasRun: true,
+      lastTaskResult: 1,
+      observedAt: '2026-08-27T00:03:05.001Z',
+    }), health, 'matched', 'matched')).toBe('failed-exhausted');
+    expect(classifyTaskLifecycle(statusTask({
+      hasRun: true,
+      lastTaskResult: 1,
+      observedAt: '2026-08-27T00:10:00.000Z',
+      missedRuns: 1,
+    }), health, 'matched', 'matched')).toBe('failed-restarting');
+    expect(classifyTaskLifecycle({
+      ownership: 'matched', state: 'stopped', schedulerState: 'ready', hasRun: true,
+      lastTaskResult: 1,
+    }, health, 'matched', 'matched')).toBe('failed-restarting');
   });
 });

@@ -5,4 +5,7 @@ import { defineConfig } from 'vitest/config';
 // 러너가 빠뜨린 사실을 그대로 채워준다: test가 로드하는 모듈은 진입점이 아니다.
 export default defineConfig({
   define: { 'import.meta.main': 'false' },
+  // Several acceptance files exercise the same production singleton pipe and OS capability names.
+  // Run files serially so the full suite validates lifecycle handoff instead of racing global resources.
+  test: { fileParallelism: false },
 });

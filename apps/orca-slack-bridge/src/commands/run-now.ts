@@ -1,5 +1,5 @@
 import { win32 } from 'node:path';
-import { computeReleaseBuildDigest } from '../windows/deployment.js';
+import { verifyCanonicalWindowsRelease } from '../windows/deployment.js';
 import {
   inspectOperationalStatus,
   type OperationalStatusReport,
@@ -12,14 +12,23 @@ import {
   type ManagedWindowsTaskSnapshot,
   type WindowsTaskDefinition,
 } from '../windows/task-scheduler.js';
+import {
+  CurrentUserWindowsRuntimeManifestStore,
+  readValidatedWindowsRuntimeManifest,
+  windowsReleaseLauncherPath,
+  type WindowsRuntimeManifestStore,
+} from '../windows/runtime-manifest.js';
 
 export const DEFAULT_WINDOWS_WAIT_SECONDS = 90;
 export const MIN_WINDOWS_WAIT_SECONDS = 1;
 export const MAX_WINDOWS_WAIT_SECONDS = 300;
 
 export type ManagedTaskLaunch = {
+  readonly nodePath: string;
   readonly cliPath: string;
   readonly appRoot: string;
+  readonly launcherPath: string;
+  readonly runtimeManifestPath: string;
   readonly configPath: string;
   readonly statePath: string;
   readonly orcaPath: string;
@@ -40,6 +49,7 @@ export type RunNowDependencies = {
   readonly nowMilliseconds?: () => number;
   readonly pollMilliseconds?: number;
   readonly verifyRelease?: (launch: ManagedTaskLaunch) => boolean | Promise<boolean>;
+  readonly manifestStore?: WindowsRuntimeManifestStore;
 };
 
 export type RunNowResult = { readonly action: 'already-healthy' | 'started' };
@@ -64,35 +74,69 @@ export function managedTaskStatusObservation(snapshot: ManagedWindowsTaskSnapsho
     schedulerState: snapshot.runtime.state,
     hasRun: snapshot.runtime.hasRun,
     lastTaskResult: snapshot.runtime.lastTaskResult,
+    observedAt: snapshot.runtime.observedAt,
+    lastRunTime: snapshot.runtime.lastRunTime,
+    nextRunTime: snapshot.runtime.nextRunTime,
+    missedRuns: snapshot.runtime.missedRuns,
+    restartCount: snapshot.runtime.restartCount,
+    restartIntervalSeconds: snapshot.runtime.restartIntervalSeconds,
   };
 }
 
-export function extractManagedTaskLaunch(
+function managedTaskReference(
   snapshot: ManagedWindowsTaskSnapshot,
-): ManagedTaskLaunch {
+): {
+  readonly appRoot: string;
+  readonly launcherPath: string;
+  readonly runtimeManifestPath: string;
+  readonly releaseDigest: string;
+} {
   if (snapshot.kind !== 'present' || snapshot.ownership !== 'owned' ||
       snapshot.integrity !== 'matched' || snapshot.definition === null || snapshot.marker === null) {
     throw new Error('windows.run_now.task_not_owned');
   }
   const values = parseWindowsArguments(snapshot.definition.action.arguments);
-  if (values === null || values.length !== 10 || values[1] !== 'daemon' ||
-      values[2] !== '--config' || values[4] !== '--state' || values[6] !== '--orca' ||
-      values[8] !== '--log-dir') {
+  if (values === null || values.length !== 9 || values[0] !== '-NoLogo' ||
+      values[1] !== '-NoProfile' || values[2] !== '-NonInteractive' ||
+      values[3] !== '-ExecutionPolicy' || values[4] !== 'Bypass' ||
+      values[5] !== '-File' || values[7] !== '-SettingsPath') {
     throw new Error('windows.run_now.action_drift');
   }
-  const cliPath = values[0]!;
-  const configPath = values[3]!;
-  const statePath = values[5]!;
-  const orcaPath = values[7]!;
-  const logDir = values[9]!;
-  if (![snapshot.definition.action.execute, snapshot.definition.action.workingDirectory, cliPath,
-    configPath, statePath, orcaPath, logDir].every((value) => win32.isAbsolute(value))) {
+  const launcherPath = values[6]!;
+  const runtimeManifestPath = values[8]!;
+  const appRoot = snapshot.definition.action.workingDirectory;
+  if (![snapshot.definition.action.execute, appRoot, launcherPath, runtimeManifestPath]
+    .every((value) => win32.isAbsolute(value)) ||
+      launcherPath.toLowerCase() !== windowsReleaseLauncherPath(appRoot).toLowerCase()) {
     throw new Error('windows.run_now.action_drift');
   }
   return {
-    cliPath, appRoot: snapshot.definition.action.workingDirectory,
-    configPath, statePath, orcaPath, logDir,
+    appRoot, launcherPath, runtimeManifestPath,
     releaseDigest: snapshot.marker.releaseDigest,
+  };
+}
+
+export async function extractManagedTaskLaunch(
+  snapshot: ManagedWindowsTaskSnapshot,
+  store: WindowsRuntimeManifestStore = new CurrentUserWindowsRuntimeManifestStore(),
+): Promise<ManagedTaskLaunch> {
+  const reference = managedTaskReference(snapshot);
+  const { manifest } = await readValidatedWindowsRuntimeManifest(store, reference.runtimeManifestPath);
+  if (manifest.releaseDigest !== reference.releaseDigest ||
+      manifest.releaseRoot.toLowerCase() !== reference.appRoot.toLowerCase()) {
+    throw new Error('windows.run_now.runtime_manifest_drift');
+  }
+  return {
+    nodePath: manifest.nodeExe,
+    cliPath: manifest.distCli,
+    appRoot: manifest.releaseRoot,
+    launcherPath: reference.launcherPath,
+    runtimeManifestPath: reference.runtimeManifestPath,
+    configPath: manifest.config,
+    statePath: manifest.state,
+    orcaPath: manifest.orcaExe,
+    logDir: manifest.logDirectory,
+    releaseDigest: manifest.releaseDigest,
   };
 }
 
@@ -141,11 +185,14 @@ export async function runManagedTaskNow(
     new CurrentUserTaskSchedulerPowerShellRunner(),
   );
   const initial = await scheduler.inspect();
-  const launch = extractManagedTaskLaunch(initial);
+  const launch = await extractManagedTaskLaunch(
+    initial,
+    dependencies.manifestStore ?? new CurrentUserWindowsRuntimeManifestStore(),
+  );
   let releaseMatches = false;
   try {
     releaseMatches = await (dependencies.verifyRelease ?? ((value) =>
-      computeReleaseBuildDigest(value.appRoot) === value.releaseDigest))(launch);
+      verifyCanonicalWindowsRelease(value.appRoot, value.releaseDigest)))(launch);
   } catch { /* static release drift below */ }
   if (!releaseMatches) throw new Error('windows.run_now.release_drift');
   if (initial.kind !== 'present') throw new Error('windows.run_now.task_absent');

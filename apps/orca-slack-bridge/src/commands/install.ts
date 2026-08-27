@@ -6,6 +6,7 @@ import {
   type ValidatedWindowsDeployment,
   type WindowsDeploymentPaths,
 } from '../windows/deployment.js';
+import { inspectOperationalStatus } from '../operational/status.js';
 import {
   createWindowsTaskDefinition,
   CurrentUserTaskSchedulerPowerShellRunner,
@@ -13,6 +14,13 @@ import {
   type ManagedWindowsTaskSnapshot,
   type WindowsTaskDefinition,
 } from '../windows/task-scheduler.js';
+import {
+  createWindowsRuntimeManifest,
+  CurrentUserWindowsRuntimeManifestStore,
+  serializeWindowsRuntimeManifest,
+  type WindowsRuntimeManifestStore,
+  type WindowsRuntimeManifestSnapshot,
+} from '../windows/runtime-manifest.js';
 import {
   DEFAULT_WINDOWS_WAIT_SECONDS,
   runManagedTaskNow,
@@ -34,8 +42,8 @@ export type InstallCommandResult = {
 
 export type InstallCommandDependencies = {
   readonly platform?: NodeJS.Platform;
-  readonly env?: NodeJS.ProcessEnv;
   readonly scheduler?: CurrentUserWindowsTaskScheduler;
+  readonly manifestStore?: WindowsRuntimeManifestStore;
   readonly validateDeployment?: (
     paths: WindowsDeploymentPaths,
     options: ValidateWindowsDeploymentOptions,
@@ -43,6 +51,7 @@ export type InstallCommandDependencies = {
   readonly prepareState?: (
     deployment: ValidatedWindowsDeployment,
   ) => Promise<PreparedDeploymentState>;
+  readonly validateExistingState?: (deployment: ValidatedWindowsDeployment) => Promise<void>;
   readonly runNow?: RunNowDependencies;
 };
 
@@ -65,9 +74,13 @@ async function verifyDesiredTask(
 async function rollbackUpdatedTask(
   scheduler: CurrentUserWindowsTaskScheduler,
   before: Extract<ManagedWindowsTaskSnapshot, { readonly kind: 'present' }>,
+  expected: WindowsTaskDefinition,
 ): Promise<void> {
   const current = await scheduler.inspect();
-  if (current.kind !== 'present' || current.ownership !== 'owned') {
+  if (current.kind === 'present' && current.xml === before.xml) return;
+  if (current.kind !== 'present' || current.ownership !== 'owned' ||
+      current.marker?.releaseDigest !== parseExpectedRelease(expected) ||
+      current.marker.semanticFingerprint !== parseExpectedSemantic(expected)) {
     throw new Error('windows.install.rollback_collision');
   }
   if (current.xml !== before.xml) await scheduler.restore(before.xml, current.xml);
@@ -80,35 +93,99 @@ async function rollbackUpdatedTask(
   }
 }
 
-async function rollbackCreatedTask(scheduler: CurrentUserWindowsTaskScheduler): Promise<void> {
+function parseExpectedRelease(definition: WindowsTaskDefinition): string | null {
+  const match = /;release=([a-f0-9]{64});semantic=/u.exec(definition.description);
+  return match?.[1] ?? null;
+}
+
+function parseExpectedSemantic(definition: WindowsTaskDefinition): string | null {
+  const match = /;semantic=([a-f0-9]{64})$/u.exec(definition.description);
+  return match?.[1] ?? null;
+}
+
+async function rollbackCreatedTask(
+  scheduler: CurrentUserWindowsTaskScheduler,
+  expected: WindowsTaskDefinition,
+): Promise<void> {
   const current = await scheduler.inspect();
   if (current.kind === 'absent') return;
-  if (current.ownership !== 'owned') throw new Error('windows.install.rollback_collision');
+  if (current.ownership !== 'owned' ||
+      current.marker?.releaseDigest !== parseExpectedRelease(expected) ||
+      current.marker.semanticFingerprint !== parseExpectedSemantic(expected)) {
+    throw new Error('windows.install.rollback_collision');
+  }
   await scheduler.unregister(current.xml);
   if ((await scheduler.inspect()).kind !== 'absent') {
     throw new Error('windows.install.rollback_verification_failed');
   }
 }
 
-async function mutateTaskWithRollback(
+function manifestBeforeBytes(snapshot: WindowsRuntimeManifestSnapshot): Buffer | null {
+  return snapshot.kind === 'present' ? snapshot.bytes : null;
+}
+
+function exactManifest(
+  snapshot: WindowsRuntimeManifestSnapshot,
+  desired: Buffer,
+): boolean {
+  return snapshot.kind === 'present' && snapshot.protected && snapshot.manifest !== null &&
+    snapshot.bytes.equals(desired);
+}
+
+async function mutateDeploymentWithRollback(
   scheduler: CurrentUserWindowsTaskScheduler,
+  manifestStore: WindowsRuntimeManifestStore,
+  manifestPath: string,
+  manifestBefore: WindowsRuntimeManifestSnapshot,
+  manifestDesired: Buffer,
   before: ManagedWindowsTaskSnapshot,
   expected: WindowsTaskDefinition,
 ): Promise<'created' | 'updated'> {
+  let manifestWritten = false;
   try {
+    await manifestStore.replace(manifestPath, manifestBeforeBytes(manifestBefore), manifestDesired);
+    manifestWritten = true;
     await scheduler.register(expected, before.kind === 'present', before.kind === 'present' ? before.xml : undefined);
-    if (!await verifyDesiredTask(scheduler, expected)) {
+    if (!await verifyDesiredTask(scheduler, expected) ||
+        !exactManifest(await manifestStore.inspect(manifestPath), manifestDesired)) {
       throw new Error('windows.install.post_verification_failed');
     }
     return before.kind === 'absent' ? 'created' : 'updated';
   } catch {
+    let rollbackFailed = false;
     try {
-      if (before.kind === 'absent') await rollbackCreatedTask(scheduler);
-      else await rollbackUpdatedTask(scheduler, before);
-    } catch {
-      throw new Error('windows.install.rollback_failed');
+      if (before.kind === 'absent') await rollbackCreatedTask(scheduler, expected);
+      else await rollbackUpdatedTask(scheduler, before, expected);
+    } catch { rollbackFailed = true; }
+    if (manifestWritten) {
+      try {
+        await manifestStore.replace(
+          manifestPath,
+          manifestDesired,
+          manifestBeforeBytes(manifestBefore),
+        );
+        const restored = await manifestStore.inspect(manifestPath);
+        const original = manifestBeforeBytes(manifestBefore);
+        if (original === null ? restored.kind !== 'absent' :
+          restored.kind !== 'present' || !restored.bytes.equals(original)) rollbackFailed = true;
+      } catch { rollbackFailed = true; }
     }
+    if (rollbackFailed) throw new Error('windows.install.rollback_failed');
     throw new Error('windows.install.task_update_failed');
+  }
+}
+
+async function validateExistingDeploymentState(deployment: ValidatedWindowsDeployment): Promise<void> {
+  const report = await inspectOperationalStatus({
+    configPath: deployment.paths.configPath,
+    statePath: deployment.paths.statePath,
+    logDir: deployment.paths.logDir,
+    expectedBuildIdentity: deployment.buildDigest,
+  });
+  if (report.schema.state !== 'matched' ||
+      (report.config.state !== 'matched' && report.config.state !== 'readable') ||
+      (report.build.state !== 'matched' && report.build.state !== 'unverified')) {
+    throw new Error('windows.install.existing_state_invalid');
   }
 }
 
@@ -123,36 +200,59 @@ export async function installWindowsTask(
   const scheduler = dependencies.scheduler ?? new CurrentUserWindowsTaskScheduler(
     new CurrentUserTaskSchedulerPowerShellRunner(),
   );
+  const manifestStore = dependencies.manifestStore ?? new CurrentUserWindowsRuntimeManifestStore();
   const deployment = await (dependencies.validateDeployment ?? validateWindowsDeployment)(input, {
     platform,
-    env: dependencies.env ?? process.env,
   });
   const before = await scheduler.inspect();
   const expected = createWindowsTaskDefinition({
     currentSid: before.currentSid,
     releaseDigest: deployment.buildDigest,
-    nodePath: deployment.paths.nodePath,
-    cliPath: deployment.paths.cliPath,
-    configPath: deployment.paths.configPath,
-    statePath: deployment.paths.statePath,
-    orcaPath: deployment.paths.orcaPath,
-    logDir: deployment.paths.logDir,
+    powerShellPath: deployment.paths.powerShellPath,
+    launcherPath: deployment.paths.launcherPath,
+    runtimeManifestPath: deployment.paths.runtimeManifestPath,
     workingDirectory: deployment.paths.appRoot,
   });
+  // COM TASK_VALIDATE_ONLY is deliberately the first state/task/manifest effect boundary.
+  await scheduler.validate(expected);
   if (before.kind === 'present' && before.ownership !== 'owned') {
     throw new Error('windows.install.foreign_task_collision');
   }
+  const desiredManifest = serializeWindowsRuntimeManifest(createWindowsRuntimeManifest({
+    releaseRoot: deployment.paths.appRoot,
+    releaseDigest: deployment.buildDigest,
+    nodeExe: deployment.paths.nodePath,
+    distCli: deployment.paths.cliPath,
+    config: deployment.paths.configPath,
+    state: deployment.paths.statePath,
+    orcaExe: deployment.paths.orcaPath,
+    logDirectory: deployment.paths.logDir,
+  }));
+  const beforeManifest = await manifestStore.inspect(deployment.paths.runtimeManifestPath);
 
   let task: InstallCommandResult['task'] = 'unchanged';
   let backupCreated = false;
-  if (!exactOwnedTask(before, expected, scheduler)) {
+  if (exactOwnedTask(before, expected, scheduler)) {
+    if (!exactManifest(beforeManifest, desiredManifest)) {
+      throw new Error('windows.install.runtime_manifest_invalid');
+    }
+    await (dependencies.validateExistingState ?? validateExistingDeploymentState)(deployment);
+  } else {
     let prepared: PreparedDeploymentState | null = null;
     try {
       prepared = await (dependencies.prepareState ?? ((value) => prepareDeploymentState(value, {
         platform,
       })))(deployment);
       backupCreated = prepared.backupPath !== null;
-      task = await mutateTaskWithRollback(scheduler, before, expected);
+      task = await mutateDeploymentWithRollback(
+        scheduler,
+        manifestStore,
+        deployment.paths.runtimeManifestPath,
+        beforeManifest,
+        desiredManifest,
+        before,
+        expected,
+      );
     } finally {
       await prepared?.release();
     }
@@ -164,6 +264,7 @@ export async function installWindowsTask(
       ...dependencies.runNow,
       platform,
       scheduler,
+      manifestStore,
     });
     runNow = outcome.action;
   }

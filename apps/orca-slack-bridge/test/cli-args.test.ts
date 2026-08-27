@@ -149,15 +149,19 @@ describe('명령 분기', () => {
     expect(parseArgs([...argv.slice(0, -2), '--wait-seconds', '301']).kind).toBe('error');
   });
 
-  it('uninstall and explicit run-now accept only one bounded wait and no force/path mutation flags', () => {
+  it('uninstall accepts one explicit force flag while run-now remains mutation-minimal', () => {
     for (const command of ['uninstall', 'run-now'] as const) {
       const parsed = parseArgs([command, '--wait-seconds', '45']);
       expect(parsed.kind).toBe('run');
       if (parsed.kind === 'run') expect(parsed).toMatchObject({ command, waitSeconds: 45 });
       expect(parseArgs([command, '--wait-seconds', '0']).kind).toBe('error');
-      expect(parseArgs([command, '--force']).kind).toBe('error');
+      expect(parseArgs([command, '--force']).kind).toBe(command === 'uninstall' ? 'run' : 'error');
       expect(parseArgs([command, '--state', 'C:\\data\\state.db']).kind).toBe('error');
     }
+    const forced = parseArgs(['uninstall', '--force', '--wait-seconds', '45']);
+    expect(forced.kind).toBe('run');
+    if (forced.kind === 'run') expect(forced).toMatchObject({ command: 'uninstall', force: true });
+    expect(parseArgs(['uninstall', '--force', '--force']).kind).toBe('error');
     expect(CLI_USAGE).toContain('install');
     expect(CLI_USAGE).toContain('uninstall');
     expect(CLI_USAGE).toContain('run-now');

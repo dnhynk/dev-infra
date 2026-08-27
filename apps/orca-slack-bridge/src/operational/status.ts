@@ -98,6 +98,12 @@ export type TaskStatusObservation = {
   readonly schedulerState?: 'unavailable' | 'absent' | 'running' | 'ready' | 'queued' | 'disabled' | 'unknown';
   readonly hasRun?: boolean;
   readonly lastTaskResult?: number | null;
+  readonly observedAt?: string;
+  readonly lastRunTime?: string | null;
+  readonly nextRunTime?: string | null;
+  readonly missedRuns?: number;
+  readonly restartCount?: number;
+  readonly restartIntervalSeconds?: number;
 };
 
 export type TaskStatusFacet = {
@@ -1648,7 +1654,42 @@ function validTaskObservation(value: TaskStatusObservation): boolean {
     (value.schedulerState === undefined || schedulerStates.includes(value.schedulerState)) &&
     (value.hasRun === undefined || typeof value.hasRun === 'boolean') &&
     (value.lastTaskResult === undefined || value.lastTaskResult === null ||
-      (Number.isSafeInteger(value.lastTaskResult) && typeof value.lastTaskResult === 'number'));
+      (Number.isSafeInteger(value.lastTaskResult) && typeof value.lastTaskResult === 'number')) &&
+    (value.observedAt === undefined || validTaskTimestamp(value.observedAt, false)) &&
+    (value.lastRunTime === undefined || validTaskTimestamp(value.lastRunTime, true)) &&
+    (value.nextRunTime === undefined || validTaskTimestamp(value.nextRunTime, true)) &&
+    (value.missedRuns === undefined ||
+      (Number.isSafeInteger(value.missedRuns) && value.missedRuns >= 0)) &&
+    (value.restartCount === undefined ||
+      (Number.isSafeInteger(value.restartCount) && value.restartCount > 0)) &&
+    (value.restartIntervalSeconds === undefined ||
+      (Number.isSafeInteger(value.restartIntervalSeconds) && value.restartIntervalSeconds > 0));
+}
+
+function validTaskTimestamp(value: string | null, nullable: boolean): boolean {
+  if (value === null) return nullable;
+  return typeof value === 'string' &&
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3,7}Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value));
+}
+
+/** Allows Task Scheduler query/clock skew without ever declaring an active retry exhausted. */
+const TASK_RETRY_OBSERVATION_GRACE_MILLISECONDS = 5_000;
+
+function retryWindowOpen(task: TaskStatusObservation): boolean {
+  if (!validTaskTimestamp(task.observedAt ?? null, false)) return true;
+  const observed = Date.parse(task.observedAt!);
+  if (task.nextRunTime !== undefined && task.nextRunTime !== null &&
+      validTaskTimestamp(task.nextRunTime, false) && Date.parse(task.nextRunTime) > observed) return true;
+  if (task.lastRunTime === undefined || task.lastRunTime === null ||
+      !validTaskTimestamp(task.lastRunTime, false) ||
+      task.missedRuns === undefined || task.missedRuns !== 0 ||
+      task.restartCount === undefined || !Number.isSafeInteger(task.restartCount) ||
+      task.restartIntervalSeconds === undefined || !Number.isSafeInteger(task.restartIntervalSeconds)) return true;
+  const retryDeadline = Date.parse(task.lastRunTime) +
+    task.restartCount * task.restartIntervalSeconds * 1_000 +
+    TASK_RETRY_OBSERVATION_GRACE_MILLISECONDS;
+  return observed <= retryDeadline;
 }
 
 export function classifyTaskLifecycle(
@@ -1677,7 +1718,7 @@ export function classifyTaskLifecycle(
   if (schedulerState === 'running' || schedulerState === 'queued') {
     return failed ? 'failed-restarting' : 'degraded-hung';
   }
-  if (failed) return 'failed-exhausted';
+  if (failed) return retryWindowOpen(task) ? 'failed-restarting' : 'failed-exhausted';
   if (daemon.desiredState === 'stopped' && daemon.state === 'stopped') return 'stopped-clean';
   if (task.hasRun !== true && daemon.state === 'absent') return 'installed-not-started';
   if (daemon.desiredState === 'running' || daemon.state === 'running' || task.hasRun === true) {
