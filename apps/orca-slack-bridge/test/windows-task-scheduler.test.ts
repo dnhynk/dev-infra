@@ -19,6 +19,8 @@ import {
 } from '../src/windows/task-scheduler.js';
 
 const SID = 'S-1-5-21-100-200-300-1001';
+const OTHER_SID = 'S-1-5-21-100-200-300-1002';
+const ACCOUNT = String.raw`WORKSTATION\operator`;
 const DIGEST = 'a'.repeat(64);
 const windowsIt = process.platform === 'win32' ? it : it.skip;
 
@@ -57,6 +59,19 @@ function xml(value: WindowsTaskDefinition, schemaVersion = '1.2'): string {
     <Priority>7</Priority>
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
   </Settings>
+  <Actions Context="Author"><Exec><Command>${e(value.action.execute)}</Command><Arguments>${e(value.action.arguments)}</Arguments><WorkingDirectory>${e(value.action.workingDirectory)}</WorkingDirectory></Exec></Actions>
+</Task>`;
+}
+
+/** Sanitized exact node shape observed from the disposable registered COM definition. */
+function canonicalRegisteredXml(value: WindowsTaskDefinition): string {
+  const e = escapeTaskXmlTextForTest;
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval></Repetition><UserId>${e(ACCOUNT)}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
   <Actions Context="Author"><Exec><Command>${e(value.action.execute)}</Command><Arguments>${e(value.action.arguments)}</Arguments><WorkingDirectory>${e(value.action.workingDirectory)}</WorkingDirectory></Exec></Actions>
 </Task>`;
 }
@@ -140,6 +155,91 @@ describe('Windows Scheduled Task semantic contract', () => {
       '<StopAtDurationEnd>false</StopAtDurationEnd>',
       '',
     ))).toEqual(expected);
+  });
+
+  it('accepts the sanitized registered export only with its trusted resolved trigger SID', () => {
+    const expected = definition();
+    const registered = canonicalRegisteredXml(expected);
+
+    expect(parseWindowsTaskXml(registered, '1.6')).toBeNull();
+    expect(parseWindowsTaskXml(registered, '1.6', null)).toBeNull();
+    expect(parseWindowsTaskXml(registered, '1.6', OTHER_SID)).toBeNull();
+    expect(parseWindowsTaskXml(
+      registered.replace(ACCOUNT, OTHER_SID),
+      '1.6',
+      SID,
+    )).toBeNull();
+    expect(parseWindowsTaskXml(registered, '1.6', SID)).toEqual(expected);
+    expect(parseWindowsTaskXml(registered, '1.6', SID)?.trigger.userId).toBe(SID);
+  });
+
+  it('accepts only omitted documented defaults and rejects present nondefault drift', () => {
+    const expected = definition();
+    const registered = canonicalRegisteredXml(expected);
+    const explicitDefaults = registered
+      .replace('</Interval></Repetition>',
+        '</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>')
+      .replace('</Repetition><UserId>', '</Repetition><Enabled>true</Enabled><UserId>')
+      .replace('</LogonType></Principal>',
+        '</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>')
+      .replace('<ExecutionTimeLimit>',
+        '<AllowHardTerminate>true</AllowHardTerminate>' +
+        '<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>' +
+        '<AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled>' +
+        '<Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle>' +
+        '<WakeToRun>false</WakeToRun><Priority>7</Priority><ExecutionTimeLimit>');
+    expect(parseWindowsTaskXml(explicitDefaults, '1.6', SID)).toEqual(expected);
+
+    for (const drifted of [
+      explicitDefaults.replace('LeastPrivilege', 'HighestAvailable'),
+      explicitDefaults.replace('<Enabled>true</Enabled><UserId>',
+        '<Enabled>false</Enabled><UserId>'),
+      explicitDefaults.replace('<StopAtDurationEnd>false</StopAtDurationEnd>',
+        '<StopAtDurationEnd>true</StopAtDurationEnd>'),
+      explicitDefaults.replace('<AllowHardTerminate>true</AllowHardTerminate>',
+        '<AllowHardTerminate>false</AllowHardTerminate>'),
+      explicitDefaults.replace('<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+        '<RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>'),
+      explicitDefaults.replace('<AllowStartOnDemand>true</AllowStartOnDemand>',
+        '<AllowStartOnDemand>false</AllowStartOnDemand>'),
+      explicitDefaults.replace('<Hidden>false</Hidden>', '<Hidden>true</Hidden>'),
+      explicitDefaults.replace('<RunOnlyIfIdle>false</RunOnlyIfIdle>',
+        '<RunOnlyIfIdle>true</RunOnlyIfIdle>'),
+      explicitDefaults.replace('<WakeToRun>false</WakeToRun>', '<WakeToRun>true</WakeToRun>'),
+      explicitDefaults.replace('<Priority>7</Priority>', '<Priority>8</Priority>'),
+      registered.replace('<StartWhenAvailable>true</StartWhenAvailable>', ''),
+      registered.replace('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>', ''),
+    ]) expect(parseWindowsTaskXml(drifted, '1.6', SID)).toBeNull();
+  });
+
+  it('strictly validates the inspect triggerUserSid record field', async () => {
+    const expected = definition();
+    const inspectRecord = {
+      exists: true,
+      xml: canonicalRegisteredXml(expected),
+      triggerUserSid: SID as string | null,
+      state: 'Ready',
+      enabled: true,
+      lastTaskResult: 267011,
+      lastRunTime: null,
+      nextRunTime: null,
+      missedRuns: 0,
+      observedAt: '2026-08-27T00:00:00.000Z',
+    };
+    const scheduler = (record: Record<string, unknown>) => new CurrentUserWindowsTaskScheduler({
+      run: async (operation) => operation === 'currentSid' ? SID
+        : operation === 'taskSchemaVersion' ? '1.6'
+          : record,
+    });
+    const matched = await scheduler(inspectRecord).inspect();
+    expect(matched).toMatchObject({
+      kind: 'present', ownership: 'owned', integrity: 'matched', definition: expected,
+    });
+    await expect(scheduler({ ...inspectRecord, triggerUserSid: 'not-a-sid' }).inspect())
+      .rejects.toThrow('windows.task_scheduler.invalid_response');
+    const { triggerUserSid: _omitted, ...missingTriggerSid } = inspectRecord;
+    await expect(scheduler(missingTriggerSid).inspect())
+      .rejects.toThrow('windows.task_scheduler.invalid_response');
   });
 
   it('accepts supported exports only through the host-reported highest Task schema version', () => {
