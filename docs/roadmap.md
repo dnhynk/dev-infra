@@ -254,8 +254,9 @@ content-witness truncate detection을 보장한다.
 
 O1-5는 O1-2 store, O1-3 effective routing, O1-4 health/logger를 production daemon에 연결했다. discovery,
 Run observer, facts-only PR digest는 coalescing/fairness가 있는 단일 execution lane과 completion-based
-jitter/backoff를 공유한다. recurring timer는 positive fractional remainder를 올림해 durable `nextRunAt`보다
-claim이 먼저 시작되지 않게 하고, Gate/Channel reconcile과 heartbeat는 독립적으로 유지된다. GitHub daemon work는
+jitter/backoff를 공유한다. recurring schedule은 monotonic deadline과 durable wall `nextRunAt`을 함께 보존하고
+callback에서 두 fence를 모두 재검사해 이른 claim을 막으며, Gate/Channel reconcile과 heartbeat는 독립적으로
+유지된다. GitHub daemon work는
 hourly command bucket, cached REST+GraphQL floor, repository/global PR budget, timeout/response/page/concurrency
 bound를 적용하며 repository-local 실패는 부분 게시 없이 다음 repository와 후속 cycle로 격리된다. 모든 PR,
 Run, Run-collection root create는 durable prepare/claim과 atomic mapping+posted commit을 거치고 possible-effect
@@ -332,6 +333,16 @@ jitter/backoff는 유지한다. Node-truncating clock regression을 포함한 fo
 typecheck는 통과했지만 local merge qualification일 뿐이다. final O1 production acceptance는 이 repair의
 merged fixed release에서 observer job과 반복 status 및 Task/PID/heartbeat liveness를 함께 확인할 때까지
 pending이다.
+
+그 rounding repair가 포함된 exact merged `main` `7744e3b915b0fe5fba3a29afa2185ea2a28d2d45`의
+production release는 status rotation과 두 번의 `run-observer` durable claim에는 성공했지만, 5분
+`repository-discovery`의 persisted wall deadline에서 다시 missing-start exit `1`을 냈다. 따라서 integer
+monotonic timer 도달만으로 별도 wall fence 도달을 가정하지 않는다. 후속 최소 수리는 completion의 두
+deadline을 schedule에 보존하고 callback마다 더 큰 remaining duration을 올림해 재설치하며, 둘 다 due일
+때만 scheduled due를 enqueue한다. `onStarted` 직전 exact wall sample도 다시 검증한다. 지속적인 1ms
+wall-clock 후퇴와 callback guard 직후의 1ms 후퇴를 store/CLI fence 완화 없이 각각 흡수하는 결정적
+regressions를 포함한 focused 2 files 38 tests와 workspace typecheck는 통과했다. exact
+merged-release production 재검증이 final O1 acceptance의 남은 조건이다.
 
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 

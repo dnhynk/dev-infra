@@ -631,3 +631,24 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   시작하지 않고 durable wall time에만 시작한다. focused observer-supervisor/cli-daemon 2 files 36 tests와
   workspace typecheck는 통과했지만 merge qualification일 뿐이며, final O1 production acceptance는 merged
   fixed release의 반복 observer/Task/PID/heartbeat/status 관측까지 pending이다.
+
+### DL-062 · recurring observer는 monotonic deadline과 durable wall fence를 callback에서 함께 재검사한다
+
+- DL-061은 exact merged `main` `7744e3b915b0fe5fba3a29afa2185ea2a28d2d45`와 immutable release
+  `c0b8673f0cb8e19c89e4ac418f7a3c21fcc59a3245c9f77a7cd0d07b79c13970`에 포함됐다. 이 release는
+  17초 동안 status 8/8, snapshot unavailable 0, stable Task/PID/heartbeat를 보였고 `run-observer`를 두 번
+  durable deadline보다 4ms 뒤에 claim해 성공했다. 그러나 `repository-discovery`의 persisted
+  `2026-08-27T19:50:54.936Z` 경계에서는 다시 `job.started` 없이 Task result `1`로 끝났다. 따라서 positive
+  fractional remainder 올림만으로 production durable claim을 보장한다는 결론은 기각한다.
+- timer가 monotonic deadline에 도달했다는 사실은 별도 wall clock의 persisted `nextRunAt` 도달을 증명하지
+  않으며, platform timer callback 자체도 durable store fence가 아니다. supervisor는 completion에서 두
+  deadline을 하나의 schedule로 보존하고, callback마다 둘의 남은 시간 중 큰 값을 올림해 재설치한다. 두
+  clock이 모두 due인 경우에만 scheduled due bit를 enqueue하고, `onStarted`에 넘길 exact wall sample도 두
+  fence와 다시 비교한다. wall clock의 후퇴는 SQLite fence까지 기다리고, wall clock의 전진은 monotonic
+  interval을 생략하지 않는다.
+- regressions는 production과 같은 not-before claim rejection을 두고 (1) monotonic deadline에서 wall
+  clock이 지속적으로 1ms 뒤인 parent 구현의 early claim과 (2) callback guard 직후 exact claim sample만
+  1ms 뒤로 이동하는 callback-only 수리의 race를 각각 재현한다. 두 이전 구현은 fatal rejection으로
+  끝나지만 dual-clock exact-sample recheck는 wall fence까지 재설치한 뒤 한 번만 claim한다. SQLite/CLI의
+  fail-closed contract는 완화하지 않는다. focused observer-supervisor/cli-daemon 2 files 38 tests와 workspace
+  typecheck는 통과했으며, 이는 merge qualification이고 production acceptance는 아니다.

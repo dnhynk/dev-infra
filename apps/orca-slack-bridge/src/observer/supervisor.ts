@@ -8,6 +8,11 @@ export type ObserverJobName = Extract<
 
 export type ObserverTimer = ReturnType<typeof setTimeout>;
 
+type ObserverSchedule = {
+  readonly monotonicDeadlineMs: number;
+  readonly wallDeadlineMs: number;
+};
+
 export type ObserverClock = {
   readonly monotonicMs: () => number;
   readonly wallNow: () => Date;
@@ -114,9 +119,10 @@ export class ObserverSupervisor {
   private readonly definitions = new Map<ObserverJobName, ObserverJobDefinition>();
   private readonly timers = new Map<ObserverJobName, ObserverTimer>();
   private readonly due = new Set<ObserverJobName>();
+  private readonly dueSchedules = new Map<ObserverJobName, ObserverSchedule>();
   private readonly failures = new Map<ObserverJobName, number>();
   private readonly buckets = new Map<ObserverJobName, number>();
-  private readonly deferredSchedules = new Map<ObserverJobName, number>();
+  private readonly deferredSchedules = new Map<ObserverJobName, ObserverSchedule>();
   private readonly backoffBaseMs: number;
   private accepting = false;
   private stopped = false;
@@ -171,17 +177,28 @@ export class ObserverSupervisor {
   startAfterSocket(digestDelayMs = 60_000): void {
     if (this.stopped || this.accepting) throw new Error('observer supervisor already started');
     this.accepting = true;
-    for (const [name, deadlineMono] of this.deferredSchedules) {
-      this.installTimer(name, deadlineMono);
+    for (const [name, schedule] of this.deferredSchedules) {
+      this.installTimer(name, schedule);
     }
     this.deferredSchedules.clear();
     this.markDue('run-observer');
     const digestDelay = finiteMilliseconds('digestDelayMs', digestDelayMs);
-    this.installTimer('pr-digest', this.clock.monotonicMs() + digestDelay);
+    this.installTimer('pr-digest', {
+      wallDeadlineMs: this.clock.wallNow().getTime() + digestDelay,
+      monotonicDeadlineMs: this.clock.monotonicMs() + digestDelay,
+    });
   }
 
   markDue(name: ObserverJobName): void {
     if (!this.accepting || this.stopped || !this.definitions.has(name)) return;
+    this.dueSchedules.delete(name);
+    this.due.add(name);
+    this.ensurePump();
+  }
+
+  private markScheduledDue(name: ObserverJobName, schedule: ObserverSchedule): void {
+    if (!this.accepting || this.stopped || !this.definitions.has(name)) return;
+    if (!this.due.has(name)) this.dueSchedules.set(name, schedule);
     this.due.add(name);
     this.ensurePump();
   }
@@ -229,11 +246,21 @@ export class ObserverSupervisor {
   }
 
   private async execute(name: ObserverJobName): Promise<void> {
+    const dueSchedule = this.dueSchedules.get(name);
+    this.dueSchedules.delete(name);
+    const startedMono = this.clock.monotonicMs();
+    const startedWall = this.clock.wallNow();
+    if (dueSchedule !== undefined &&
+        (startedMono < dueSchedule.monotonicDeadlineMs ||
+         startedWall.getTime() < dueSchedule.wallDeadlineMs)) {
+      if (this.accepting && !this.stopped) this.installTimer(name, dueSchedule);
+      else if (!this.stopped) this.deferredSchedules.set(name, dueSchedule);
+      return;
+    }
     const definition = this.definitions.get(name)!;
     const abort = new AbortController();
     this.active = { name, abort };
-    const startedMono = this.clock.monotonicMs();
-    const startedAt = this.clock.wallNow().toISOString();
+    const startedAt = startedWall.toISOString();
     let timeout: ObserverTimer | null = this.clock.setTimer(() => abort.abort(), definition.timeoutMs);
     let status: ObserverCompletion['status'] = 'succeeded';
     let result: ObserverJobResult = {};
@@ -294,7 +321,10 @@ export class ObserverSupervisor {
     );
     const completedWall = this.clock.wallNow();
     const completedMono = this.clock.monotonicMs();
-    const deadlineMono = completedMono + nextDelayMs;
+    const schedule: ObserverSchedule = {
+      monotonicDeadlineMs: completedMono + nextDelayMs,
+      wallDeadlineMs: completedWall.getTime() + nextDelayMs,
+    };
     const completion: ObserverCompletion = {
       name,
       status,
@@ -302,7 +332,7 @@ export class ObserverSupervisor {
       durationMs: Math.max(0, Math.round(this.clock.monotonicMs() - startedMono)),
       consecutiveFailures,
       nextDelayMs,
-      nextRunAt: new Date(completedWall.getTime() + nextDelayMs).toISOString(),
+      nextRunAt: new Date(schedule.wallDeadlineMs).toISOString(),
       retryable: !fatal,
       ...result,
     };
@@ -319,24 +349,28 @@ export class ObserverSupervisor {
       return;
     }
     if (this.stopped) return;
-    if (this.accepting) this.installTimer(name, deadlineMono);
-    else this.deferredSchedules.set(name, deadlineMono);
+    if (this.accepting) this.installTimer(name, schedule);
+    else this.deferredSchedules.set(name, schedule);
   }
 
-  private installTimer(name: ObserverJobName, deadlineMono: number): void {
+  private installTimer(name: ObserverJobName, schedule: ObserverSchedule): void {
     const existing = this.timers.get(name);
     if (existing !== undefined) {
       this.clock.clearTimer(existing);
       this.timers.delete(name);
     }
-    const delayMs = Math.ceil(Math.max(0, deadlineMono - this.clock.monotonicMs()));
+    const delayMs = Math.ceil(Math.max(
+      0,
+      schedule.monotonicDeadlineMs - this.clock.monotonicMs(),
+      schedule.wallDeadlineMs - this.clock.wallNow().getTime(),
+    ));
     if (delayMs === 0) {
-      this.markDue(name);
+      this.markScheduledDue(name, schedule);
       return;
     }
     const timer = this.clock.setTimer(() => {
       this.timers.delete(name);
-      this.markDue(name);
+      if (!this.stopped) this.installTimer(name, schedule);
     }, delayMs);
     this.timers.set(name, timer);
   }
@@ -348,6 +382,7 @@ export class ObserverSupervisor {
     this.stopped = true;
     this.accepting = false;
     this.due.clear();
+    this.dueSchedules.clear();
     for (const timer of this.timers.values()) this.clock.clearTimer(timer);
     this.timers.clear();
     this.deferredSchedules.clear();

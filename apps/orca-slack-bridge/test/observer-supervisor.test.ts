@@ -11,10 +11,15 @@ import {
 
 class FakeClock implements ObserverClock {
   now = 0;
+  wallOffsetMs = 0;
+  wallOffsetForRead: ((now: number) => number) | undefined;
   private sequence = 0;
   private readonly timers = new Map<number, { readonly at: number; readonly callback: () => void }>();
   readonly monotonicMs = (): number => this.now;
-  readonly wallNow = (): Date => new Date(Date.UTC(2026, 7, 27) + this.now);
+  readonly wallNow = (): Date => new Date(
+    Date.UTC(2026, 7, 27) + this.now +
+      (this.wallOffsetForRead?.(this.now) ?? this.wallOffsetMs),
+  );
   readonly setTimer = (callback: () => void, milliseconds: number): ReturnType<typeof setTimeout> => {
     const id = ++this.sequence;
     this.timers.set(id, { at: this.now + Math.trunc(milliseconds), callback });
@@ -291,6 +296,88 @@ describe('ObserverSupervisor', () => {
       new Date(Date.UTC(2026, 7, 27)).toISOString(),
       durableNextRunAt,
     ]);
+    await supervisor.stop(100);
+  });
+
+  it('waits for the durable wall fence when wall time remains one millisecond behind', async () => {
+    const clock = new FakeClock();
+    const discoveryStarts: string[] = [];
+    const fatals: unknown[] = [];
+    let durableNextRunAt: string | undefined;
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-a', jitterRatio: 0, clock,
+      jobs: definitions(),
+      onStarted: (name, at) => {
+        if (name !== 'repository-discovery') return;
+        if (durableNextRunAt !== undefined && at < durableNextRunAt) {
+          throw new Error('daemon_job_claim_rejected');
+        }
+        discoveryStarts.push(at);
+      },
+      onCompleted: (completion) => {
+        if (completion.name === 'repository-discovery' && durableNextRunAt === undefined) {
+          durableNextRunAt = completion.nextRunAt;
+        }
+      },
+      onFatal: (error) => { fatals.push(error); },
+    });
+
+    await supervisor.runStartupDiscovery();
+    supervisor.startAfterSocket(60_000);
+    clock.wallOffsetMs = -1;
+
+    await clock.advance(300_000);
+    expect(discoveryStarts).toEqual([new Date(Date.UTC(2026, 7, 27)).toISOString()]);
+    expect(fatals).toEqual([]);
+    await clock.advance(1);
+    expect(discoveryStarts).toEqual([
+      new Date(Date.UTC(2026, 7, 27)).toISOString(),
+      durableNextRunAt,
+    ]);
+    expect(fatals).toEqual([]);
+    await supervisor.stop(100);
+  });
+
+  it('rechecks the exact claim timestamp when wall time falls behind after a timer wake', async () => {
+    const clock = new FakeClock();
+    const discoveryStarts: string[] = [];
+    const fatals: unknown[] = [];
+    let durableNextRunAt: string | undefined;
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-a', jitterRatio: 0, clock,
+      jobs: definitions(),
+      onStarted: (name, at) => {
+        if (name !== 'repository-discovery') return;
+        if (durableNextRunAt !== undefined && at < durableNextRunAt) {
+          throw new Error('daemon_job_claim_rejected');
+        }
+        discoveryStarts.push(at);
+      },
+      onCompleted: (completion) => {
+        if (completion.name === 'repository-discovery' && durableNextRunAt === undefined) {
+          durableNextRunAt = completion.nextRunAt;
+        }
+      },
+      onFatal: (error) => { fatals.push(error); },
+    });
+
+    await supervisor.runStartupDiscovery();
+    supervisor.startAfterSocket(60_000);
+    let boundaryReads = 0;
+    clock.wallOffsetForRead = (now) => {
+      if (now !== 300_000) return 0;
+      boundaryReads += 1;
+      return boundaryReads === 1 ? 0 : -1;
+    };
+
+    await clock.advance(300_000);
+    expect(discoveryStarts).toEqual([new Date(Date.UTC(2026, 7, 27)).toISOString()]);
+    await clock.advance(1);
+    expect(discoveryStarts).toEqual([
+      new Date(Date.UTC(2026, 7, 27)).toISOString(),
+      new Date(Date.parse(durableNextRunAt!) + 1).toISOString(),
+    ]);
+    expect(fatals).toEqual([]);
     await supervisor.stop(100);
   });
 
