@@ -284,8 +284,9 @@ metadata를 Orca/Git branch/dispatch 관계와 어느 수준까지 대조할지�
 - 마지막 오류와 재시도 여부
 - 현재 관리 중인 repository/Run/PR 수
 
-O1-1은 아래 config/default/bound만 확정한다. health/log 구현과 자동 재시작 수단은 후속 O1 PR에서 이
-계약을 소비하며 이 문서의 현재 상태만으로 구현 완료나 운영 설치를 주장하지 않는다.
+O1-1은 아래 config/default/bound를 확정했다. O1-4는 그중 health projection과 bounded log/조회 CLI를
+구현하지만 daemon scheduler 연결은 O1-5, Windows Task ownership은 O1-6/7이 소유한다. 따라서 O1-4만으로
+daemon 자동 시작이나 운영 설치 완료를 주장하지 않는다.
 
 ### O1 automation config contract (O1-1)
 
@@ -320,3 +321,98 @@ repository uniqueness와 exact Orca ID uniqueness를 preflight에서 검증한�
 fallback은 그대로 유효하며 같은 Project 안의 duplicate도 deterministic error로 거부한다. configured
 repository는 lowercase canonical `owner/name`으로 저장하고 `.git` suffix는 config에서 거부한다. 이 config contract는
 scheduler, logger, schema v13, Slack write를 이 PR에서 활성화하지 않는다.
+
+### O1-4 operational telemetry/status/log boundary
+
+latest operational state의 권위는 v13 SQLite이고, 시간순 history는
+`operational.ndjson` current + numbered backups다. writer는 한 줄에 JSON object 하나만 쓰며 LF 포함
+16 KiB를 넘기지 않는다. top-level field는 다음 allowlist뿐이다.
+
+`ts`, `level`, `service`, `schemaVersion`, `build`, `event`, `job`, `outcome`, `attempt`,
+`durationMs`, `nextRunAt`, `errorCode`, `retryable`, bounded numeric `counts`, `entityRef`
+
+event/outcome/job/error/count key는 finite catalog이고 build identity는 logger construction에서, entity identity는
+concrete runtime sink 안에서 SHA-256으로 바뀐다. caller는 opaque raw-identity token이나 raw string만 넘길 수 있고
+이미 redacted됐다고 주장하는 `entityRef` input은 거부한다. persisted `entityRef`는 항상 digest 앞 12 lowercase
+hex다. Error, free-form detail, token/authorization/cookie/secret/password,
+Slack/Gate/GitHub/Orca payload·body·options, raw ID, remote URL, full path를 받을 field는 없다. runtime에서
+unknown key/value나 getter/Proxy 실패를 만나면 입력을 문자열화하지 않고 static `telemetry.rejected`로 바꾼다.
+
+rotation 기본은 5 MiB current + 5 backups이고 config bound는 1..100 MiB, 1..20 backups다. Windows rename
+전에 writer handle을 닫고, sharing violation rename만 bounded retry한 다음 exclusive new current를 연다.
+logger failure는 `logger.write_failed` 한 줄만 stderr와 daemon-facing failure callback으로 보낸다. 원 payload를
+fallback print하지 않는다.
+
+`status [--json] [--config ...] [--state ...] [--log-dir ...]`는 per-state exclusive closed-snapshot
+lease를 WAL 판정 전에 획득한 뒤 WAL이 없는 closed DB만 immutable read-only connection과
+`sqlite3_backup_*` scratch image로 읽는다. production daemon은 같은 lease를 writable store open 전부터
+store close와 owner publication/lifecycle 종료까지 유지한다. lease contention은 source DB/WAL/SHM을 열거나
+판정하지 않고 authenticated owner로만 route하며, owner가 없거나 검증되지 않으면 static unavailable이다.
+live WAL은 새 SQLite reader를 열지 않는다.
+mutable WAL의 logical read-only connection도 `-shm` read mark를 바꿀 수 있기 때문이다. 대신 daemon/store
+owner가 같은 event-loop ownership turn에서 O1-2 strict read API를 직렬로 읽어 versioned, aggregate-only
+snapshot cache를 갱신한다. daemon은 listener를 먼저 소유한 뒤 current-user-only capability를 publish하고
+15초마다 secret/capability ID를 교체한다. capability는 state identity와 typed transport endpoint를 포함하며 30초가
+지나면 무효다. Windows는 `127.0.0.1`에 OS-assigned ephemeral port 하나만 bind하고 DACL이 상속되지 않는
+current-user-only directory/file에 endpoint를 둔다. parent와 file owner/DACL은 매 read/publish/remove에서 실제
+security descriptor로 다시 읽고, protected DACL의 current-user FullControl ACE 하나와 정확한 inheritance/
+propagation만 허용한다. capability root는 `LOCALAPPDATA`/`APPDATA`가 아니라 trusted `GLOBALROOT` system-directory
+경로로 실행한 OS known-folder API에서 얻는다. helper에는 token-bearing daemon env 대신 그 trusted SystemRoot와
+bounded artifact path/kind 또는 machine-wide `Global\\` state digest mutex name만 전달한다. daemon은 capability
+lifecycle 전체에서 per-state exclusive owner claim을 잡고, publish/remove는 held claim과 expected document에
+조건부다. capability는 protected bootstrap hard link와 동일한 고정 inode의 두 bounded checksum slot을 번갈아
+fsync한 뒤 두 slot을 같은 최신 generation으로 덮는다. 따라서 crash 중 한 slot이 손상돼도 마지막 complete
+sequence만 선택하고, 정상 rotation/restart/remove는 pathname quarantine을 만들거나 unknown path를 unlink하지
+않으며 이전 secret도 고정 container에서 지운다. raced replacement는 pinned descriptor/path identity 불일치로
+보존한 채 실패한다. 비-Windows는 exact-UID 0700 runtime directory 안의 active 0600 pathname UDS를 쓰고
+capability에 exact device/inode를 넣어 accept/connect/refresh 때마다 재검증한다. claim은 하나의 deterministic
+protected bootstrap inode를 자체 descriptor/`flock`으로 guard하고 fixed claim name에 no-replace hard-link한다.
+create/write/fsync/link crash와 absent-claim contender 뒤에도 bootstrap+claim 두 directory entry만 남으며,
+stable inode의 kernel `flock`과 descriptor bytes, pre/post pathname identity를 lifecycle 전체에서 유지한다.
+clean restart는 inode/entry를 재사용한다. active transport admission은 계속 exact 0600+UID+device/inode만
+허용하지만, held claim과 verified 0700 parent 아래에서 bind 직후 activation 전 crash가 남긴
+exact-current-UID 0755 socket만 같은 bounded quarantine으로 복구한다. crash socket residue는 삭제하지 않고
+최대 8개까지만 격리한다.
+
+각 연결은 4-byte big-endian length prefix가 붙은 request 정확히 하나를 EOF까지 받은 다음 response 정확히 하나를
+EOF까지 보낸다. 두 방향 모두 partial/oversize/두 번째 frame/trailing bytes/timeout을 거부한다. raw UDS path는
+wire에 싣지 않고 domain-separated SHA-256 transport binding이 exact path/device/inode를 묶는다. HMAC transcript는
+request nonce·freshness·state/capability/transport binding·expected config/build를, response protocol/schema/version·
+capture freshness·complete aggregate snapshot을 함께 묶는다. 따라서 listener나 port만 먼저 차지하고 nonce를
+echo하는 process는 operational data를 만들 수 없다. server는 1초 idle timeout과 별도로 accept부터 2초의
+non-refreshing monotonic absolute deadline, 최대 8 connection을 적용한다. Windows ACL helper는 비동기·취소
+가능하며 request 구조/HMAC 검증 뒤 실행되어 listener event loop와 deadline을 막지 않는다. 인증된 request nonce는
+capability generation당 최대 2,048개를 원자적으로 reserve하고 signed `sentAt + 5초`에 expire하며
+rotation/shutdown에서 비워 cross-connection replay도
+거부한다. response는 match state, finite job/error, timestamp와 bounded
+count만 포함한다. closed snapshot은 immutable source close 전까지 lease를 유지하고 negative WAL 판정 뒤와
+source close 뒤 main-file identity/size/time 및 parent-directory witness와 WAL/SHM/journal absence를 다시 확인한다.
+lease를 따르지 않는 writer가 전이 중 나타나면 scratch를 해석하지 않고 authenticated owner 또는 static
+unavailable로만 수렴한다. immutable open/backup 자체가 실패하면 source를 먼저 닫고 held lease와 admitted
+pre-open witness를 다시 확인해, witness drift는 같은 owner/unavailable 경로로 보내고 stable source corruption은
+기존 `schema.corrupt`로 보존한다. live status process는 source DB/WAL/SHM handle을 전혀 열지 않아 세 파일 bytes와
+source directory entry가 그대로다. owner cache/capability가 absent/stale/malformed/permission-drift/raced이면 static
+`state.snapshot_unavailable` exit 2로 fail closed한다.
+closed DB scratch는 모든 판정 뒤 제거하며 v13일 때만 O1-2 strict store API로 읽는다.
+`automation.enabled=false`이면 repository discovery, Run observer,
+PR digest row는 intentionally disabled라 absent/old failure가 health를 낮추지 않지만 Gate reconcile과 Channel
+delivery는 계속 required다. task ownership은 O1-6이 주입할 facet이며 현재 기본
+`unavailable`은 중립이다. exit은 healthy 0, degraded/stale 1, absent/stopped/schema/config mismatch 2다.
+output에는 fingerprint 값, instance/repository/Slack/Orca ID, source path가 없고 match state, static code,
+timestamp와 aggregate count만 있다. O1-2가 diagnostic으로 보존하는 legacy `notification_state` count는
+표시하되 actionable pending total에서 제외한다.
+
+`logs --tail N [--follow] [--job NAME] [--log-dir ...]`는 current와 최대 configured bound의 numbered chain을
+read-only로 역순 scan해 마지막 1..5,000 safe record만 고른 뒤 시간순으로 출력한다. 모든 generation identity는
+bigint stat의 exact device/file ID를 lossless decimal로 직렬화한다. capture 뒤 path label과 pinned identity를
+재검증하고 rotation이 bounded retry 동안 계속되면 unverified generation order를 내보내지 않고 static failure로
+끝난다. job filter는 JSON을
+strict parse한 뒤 allowlisted `job` field에만 적용한다. corrupt/invalid UTF-8/oversize/unknown-field line은
+blank physical record까지 각각 원문 대신 static diagnostic record가 된다. follow initial tail은 pinned size와
+cursor를 같은 epoch에서 잡아 그 사이 append를 다음 drain으로 정확히 한 번 넘긴다. initial current의 LF 없는
+suffix는 tail에서 빼고 forward decoder로 넘겨 LF가 도착할 때 정확히 한 번 emit한다. poll 사이 여러 rotation은
+old identity를 numbered chain에서 찾아 모든 intermediate generation을 시간순으로 drain한다. 같은 inode의
+truncate-and-rewrite는 consumed prefix의 SHA-256 witness로 smaller/equal/larger replacement를 구별한다. identity,
+size, ctime, mtime가 모두 같아도 no-growth fast path가 SHA-256 검증을 생략하지 않는다. 각 bounded
+scan 뒤 yield 전에 모든 handle을 닫으므로 Windows rotation을 막지 않으며 partial line과 SIGINT/SIGTERM 종료도
+처리한다.

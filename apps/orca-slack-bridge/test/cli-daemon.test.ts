@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { parseArgs, runDaemonCommand } from '../src/cli.js';
+import { parseArgs, runDaemonCommand as runDaemonCommandWithNativeStatus } from '../src/cli.js';
 import type {
   ChannelPipeErrorCode,
   ChannelProductionDeliveryHandlers,
@@ -27,6 +27,10 @@ import type { SocketConnectionFactory, SocketConnectionHooks } from '../src/slac
 import type { OpenSlackViewInput, OpenedSlackView, SlackViewOpener } from '../src/slack/views.js';
 import { APP_TOKEN_VAR } from '../src/slack/verify.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
+import type {
+  OperationalStatusSnapshotLease,
+  OperationalStatusSnapshotLeaseStore,
+} from '../src/operational/status-capability.js';
 
 const GATE_ID = 'gate_daemon';
 const RUN_ID = 'run_daemon';
@@ -44,6 +48,44 @@ const CONFIG: BridgeConfig = {
   projects: [],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
+
+const TEST_STATUS_OWNER_SERVER = {
+  start: () => Promise.resolve(),
+  refresh: () => undefined,
+  stop: () => Promise.resolve(),
+};
+
+class MemorySnapshotLeaseStore implements OperationalStatusSnapshotLeaseStore {
+  held = false;
+
+  async tryAcquireSnapshotLease(): Promise<OperationalStatusSnapshotLease | null> {
+    if (this.held) return null;
+    this.held = true;
+    let released = false;
+    return {
+      assertHeld: () => {
+        if (released || !this.held) throw new Error('status.snapshot_lease_lost');
+      },
+      release: async () => {
+        if (released) return;
+        released = true;
+        this.held = false;
+      },
+    };
+  }
+}
+
+async function runDaemonCommand(
+  ...args: Parameters<typeof runDaemonCommandWithNativeStatus>
+): Promise<number> {
+  const [parsed, config, dependencies] = args;
+  return await runDaemonCommandWithNativeStatus(parsed, config, {
+    ...(dependencies ?? {}),
+    statusOwnerServer: dependencies?.statusOwnerServer ?? TEST_STATUS_OWNER_SERVER,
+    statusSnapshotLeaseStore: dependencies?.statusSnapshotLeaseStore ??
+      new MemorySnapshotLeaseStore(),
+  });
+}
 
 let dir: string;
 let statePath: string;
@@ -330,6 +372,179 @@ class FakeChannelServer {
 }
 
 describe('daemon production wiring', () => {
+  it('holds the snapshot lease from before writable store open through owner shutdown', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    let held = false;
+    const snapshotLeaseStore: OperationalStatusSnapshotLeaseStore = {
+      tryAcquireSnapshotLease: async () => {
+        events.push('lease:acquire');
+        held = true;
+        return {
+          assertHeld: () => {
+            if (!held) throw new Error('status.snapshot_lease_lost');
+          },
+          release: async () => {
+            events.push('lease:release');
+            held = false;
+          },
+        };
+      },
+    };
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      statusSnapshotLeaseStore: snapshotLeaseStore,
+      openStore: (path) => {
+        expect(held).toBe(true);
+        events.push('store:open');
+        const store = new SqliteDigestStore(path);
+        const close = store.close.bind(store);
+        store.close = () => {
+          expect(held).toBe(true);
+          events.push('store:close');
+          close();
+        };
+        return store;
+      },
+      statusOwnerServer: {
+        start: () => {
+          expect(held).toBe(true);
+          events.push('owner:start');
+          return Promise.resolve();
+        },
+        refresh: () => undefined,
+        stop: () => {
+          expect(held).toBe(true);
+          events.push('owner:stop');
+          return Promise.resolve();
+        },
+      },
+      channelServer: new FakeChannelServer(),
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+    });
+    expect(code).toBe(0);
+    expect(events).toEqual([
+      'lease:acquire', 'store:open', 'owner:start', 'owner:stop', 'store:close',
+      'lease:release',
+    ]);
+    expect(held).toBe(false);
+  });
+
+  it('retains the snapshot lease and fails boundedly when writable store closure is uncertain', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const privateDetail = 'SENTINEL_PRIVATE_STORE_CLOSE_DETAIL';
+    const events: string[] = [];
+    const diagnostics: string[] = [];
+    let held = false;
+    let releaseCalls = 0;
+    const physicalClose: { current: (() => void) | null } = { current: null };
+    const snapshotLeaseStore: OperationalStatusSnapshotLeaseStore = {
+      tryAcquireSnapshotLease: async () => {
+        if (held) return null;
+        events.push('lease:acquire');
+        held = true;
+        return {
+          assertHeld: () => {
+            if (!held) throw new Error('status.snapshot_lease_lost');
+          },
+          release: async () => {
+            releaseCalls += 1;
+            events.push('lease:release');
+            held = false;
+          },
+        };
+      },
+    };
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((
+      (value: string | Uint8Array) => {
+        diagnostics.push(String(value));
+        return true;
+      }
+    ) as typeof process.stderr.write);
+
+    try {
+      const code = await runDaemonCommand(parsed, CONFIG, {
+        statusSnapshotLeaseStore: snapshotLeaseStore,
+        openStore: (path) => {
+          expect(held).toBe(true);
+          events.push('store:open');
+          const store = new SqliteDigestStore(path);
+          physicalClose.current = store.close.bind(store);
+          store.close = () => {
+            expect(held).toBe(true);
+            events.push('store:close');
+            throw new Error(privateDetail);
+          };
+          return store;
+        },
+        statusOwnerServer: {
+          start: () => {
+            expect(held).toBe(true);
+            events.push('owner:start');
+            return Promise.resolve();
+          },
+          refresh: () => undefined,
+          stop: () => {
+            expect(held).toBe(true);
+            events.push('owner:stop');
+            return Promise.resolve();
+          },
+        },
+        channelServer: new FakeChannelServer(),
+        orca: new FakeOrca(),
+        slack: new FakeSlack(),
+        connectionFactory: () => ({
+          start: () => Promise.resolve({ appId: 'A0APP' }),
+          close: () => Promise.resolve(),
+        }),
+        waitForStop: () => Promise.resolve(),
+      });
+
+      expect(code).toBe(1);
+      expect(events).toEqual([
+        'lease:acquire', 'store:open', 'owner:start', 'owner:stop', 'store:close',
+      ]);
+      expect(releaseCalls).toBe(0);
+      expect(held).toBe(true);
+      expect(await snapshotLeaseStore.tryAcquireSnapshotLease(
+        statePath,
+        'a'.repeat(64),
+      )).toBeNull();
+      expect(diagnostics).toEqual([
+        'daemon이 strict startup 또는 Gate reconciliation에 실패했다\n',
+      ]);
+      expect(diagnostics.join('')).not.toContain(privateDetail);
+      expect(diagnostics.join('')).not.toContain(statePath);
+    } finally {
+      stderr.mockRestore();
+      physicalClose.current?.();
+    }
+  });
+
+  it('fails bounded lease contention before opening a writable store', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    let opened = false;
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      statusSnapshotLeaseStore: { tryAcquireSnapshotLease: async () => null },
+      openStore: (path) => {
+        opened = true;
+        return new SqliteDigestStore(path);
+      },
+      statusOwnerServer: TEST_STATUS_OWNER_SERVER,
+      waitForStop: () => Promise.resolve(),
+    });
+    expect(code).toBe(1);
+    expect(opened).toBe(false);
+  });
+
   it('owns the Channel server before Socket ingress and retains it through Socket shutdown', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');

@@ -136,7 +136,7 @@ describe('명령 분기', () => {
   });
 
   it('모든 문서화된 명령이 인식된다', () => {
-    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon', 'channel-adapter']) {
+    for (const c of ['snapshot', 'verify-slack', 'digest', 'runs', 'daemon', 'channel-adapter', 'status', 'logs']) {
       expect(parseArgs([c]).kind).toBe('run');
     }
     expect(parseArgs(['gate-register', '--input', 'gate.json']).kind).toBe('run');
@@ -150,12 +150,13 @@ describe('명령 분기', () => {
     expect(parseArgs(['snapshot', '--help']).kind).toBe('help');
   });
 
-  it('daemon 도움말은 live v12 delivery/resume 경계를 정확히 설명한다', () => {
-    expect(CLI_USAGE).toContain('v12 durable store');
+  it('daemon 도움말은 live v13 store와 v12 delivery/resume 경계를 정확히 설명한다', () => {
+    expect(CLI_USAGE).toContain('v13 durable store');
     expect(CLI_USAGE).toContain('production Gate ID를 전달·receipt·consume');
     expect(CLI_USAGE).toContain('실제 후속 Task resume evidence를 관찰한 경우에만 기존 Slack Gate 카드를 갱신');
     expect(CLI_USAGE).not.toContain('v10 durable store');
     expect(CLI_USAGE).not.toContain('v11 durable store');
+    expect(CLI_USAGE).not.toContain('v12 durable store');
     expect(CLI_USAGE).not.toContain('D3-1 receipt probe');
     expect(CLI_USAGE).not.toContain('production Gate를\nChannel에 보내지 않으며');
     expect(CLI_USAGE).not.toContain('Task를\nresume하지 않는다');
@@ -192,6 +193,72 @@ describe('명령 분기', () => {
     expect(parseArgs(['snapshot', '--pr-limit', '0']).kind).toBe('error');
     expect(parseArgs(['snapshot', '--pr-limit', 'x']).kind).toBe('error');
     expect(parseArgs(['snapshot', '--pr-limit', '-3']).kind).toBe('error');
+  });
+});
+
+describe('status와 logs 옵션', () => {
+  it('status는 read-only identity 옵션과 json만 exact하게 받는다', () => {
+    const parsed = parseArgs([
+      'status', '--config', 'config.json', '--state', 'state.db', '--log-dir', 'logs', '--json',
+    ]);
+    expect(parsed.kind).toBe('run');
+    if (parsed.kind === 'run') {
+      expect(parsed).toMatchObject({
+        command: 'status', configPath: 'config.json', statePath: 'state.db',
+        logDir: 'logs', json: true,
+      });
+    }
+    for (const extra of [
+      ['--follow'], ['--tail', '1'], ['--job', 'pr-digest'], ['--dry-run'], ['--orca', 'orca'],
+      ['--pr-limit', '1'], ['stray'], ['--json', '--json'],
+    ]) {
+      const result = parseArgs(['status', ...extra]);
+      expect(result.kind).toBe('error');
+      if (result.kind === 'error') expect(result.message).toContain('status');
+    }
+  });
+
+  it('logs defaults to tail 200 and parses follow plus an exact allowlisted job', () => {
+    const defaults = parseArgs(['logs']);
+    expect(defaults.kind).toBe('run');
+    if (defaults.kind === 'run') expect(defaults).toMatchObject({
+      command: 'logs', tail: 200, follow: false, job: null, logDir: null,
+    });
+    const parsed = parseArgs([
+      'logs', '--tail', '5000', '--follow', '--job', 'channel-delivery', '--log-dir', 'logs',
+    ]);
+    expect(parsed.kind).toBe('run');
+    if (parsed.kind === 'run') expect(parsed).toMatchObject({
+      tail: 5000, follow: true, job: 'channel-delivery', logDir: 'logs',
+    });
+  });
+
+  it('logs rejects tail coercion/out-of-range, unknown jobs, duplicates, and every unknown argument', () => {
+    for (const value of ['0', '-1', '1x', '1.5', '5001', '9007199254740992']) {
+      const parsed = parseArgs(['logs', '--tail', value]);
+      expect(parsed.kind).toBe('error');
+      if (parsed.kind === 'error') expect(parsed.message).toContain('--tail');
+    }
+    for (const argv of [
+      ['logs', '--job', 'private-job'],
+      ['logs', '--config', 'config.json'],
+      ['logs', '--state', 'state.db'],
+      ['logs', '--json'],
+      ['logs', '--dry-run'],
+      ['logs', 'stray'],
+      ['logs', '--tail', '1', '--tail', '2'],
+      ['logs', '--follow', '--follow'],
+    ]) {
+      expect(parseArgs(argv).kind).toBe('error');
+    }
+  });
+
+  it('new read-only flags cannot become silently accepted write-command flags', () => {
+    for (const command of ['digest', 'runs', 'gate-register', 'daemon'] as const) {
+      for (const extra of [['--log-dir', 'logs'], ['--tail', '1'], ['--job', 'pr-digest'], ['--follow']]) {
+        expect(parseArgs([command, ...extra]).kind).toBe('error');
+      }
+    }
   });
 });
 

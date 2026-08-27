@@ -224,6 +224,11 @@ describe('channel-adapter production CLI wiring', () => {
       ], {
         daemon: {
           orca: EMPTY_ORCA,
+          statusOwnerServer: {
+            start: () => Promise.resolve(),
+            refresh: () => undefined,
+            stop: () => Promise.resolve(),
+          },
           slack: {
             post: () => Promise.reject(new Error('unused fake Slack post')),
             update: () => Promise.reject(new Error('unused fake Slack update')),
