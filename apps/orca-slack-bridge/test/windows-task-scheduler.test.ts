@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import {
   createWindowsTaskDefinition,
   CurrentUserTaskSchedulerPowerShellRunner,
+  CurrentUserWindowsTaskScheduler,
   escapeTaskXmlTextForTest,
   fingerprintWindowsTask,
   joinWindowsArguments,
@@ -11,6 +12,7 @@ import {
   parseWindowsTaskMarker,
   parseWindowsTaskXml,
   quoteWindowsArgument,
+  windowsTaskXmlMatchesLaunchBinding,
   WINDOWS_TASK_DESCRIPTION_PREFIX,
   WINDOWS_TASK_NAME,
   type WindowsTaskDefinition,
@@ -31,10 +33,10 @@ function definition(): WindowsTaskDefinition {
   });
 }
 
-function xml(value: WindowsTaskDefinition): string {
+function xml(value: WindowsTaskDefinition, schemaVersion = '1.2'): string {
   const e = escapeTaskXmlTextForTest;
   return `<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<Task version="${schemaVersion}" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
@@ -64,6 +66,8 @@ describe('Windows Scheduled Task semantic contract', () => {
     const runner = new CurrentUserTaskSchedulerPowerShellRunner();
     const currentSid = await runner.run('currentSid', {});
     expect(currentSid).toMatch(/^S-[0-9]+(?:-[0-9]+)+$/u);
+    const schemaVersion = await runner.run('taskSchemaVersion', {});
+    expect(schemaVersion).toBe('1.6');
     const taskName = `Orca Slack Bridge Validate Fixture ${randomUUID()}`;
     expect(await runner.run('inspect', { taskName })).toEqual({ exists: false });
     const systemRoot = process.env['SystemRoot']!;
@@ -129,6 +133,57 @@ describe('Windows Scheduled Task semantic contract', () => {
       '    <AllowStartOnDemand>true</AllowStartOnDemand>\n',
       '',
     ))).toEqual(expected);
+  });
+
+  it('accepts supported exports only through the host-reported highest Task schema version', () => {
+    const expected = definition();
+    expect(parseWindowsTaskXml(xml(expected, '1.3'), '1.3')).toEqual(expected);
+    expect(parseWindowsTaskXml(xml(expected, '1.3'), '1.2')).toBeNull();
+    expect(parseWindowsTaskXml(xml(expected, '1.2'), '1.3')).toEqual(expected);
+    expect(parseWindowsTaskXml(xml(expected, '1.6'), '1.6')).toEqual(expected);
+    expect(parseWindowsTaskXml(xml(expected, '1.0'))).toBeNull();
+    expect(parseWindowsTaskXml(xml(expected, '1.1'))).toBeNull();
+    expect(parseWindowsTaskXml(xml(expected, '1.99'))).toBeNull();
+    expect(parseWindowsTaskXml(xml(expected, '2.0'))).toBeNull();
+    expect(parseWindowsTaskXml(xml(expected, 'not-a-version'))).toBeNull();
+  });
+
+  it('rejects a plausible unsupported COM HighestVersion before task ownership parsing', async () => {
+    const scheduler = new CurrentUserWindowsTaskScheduler({
+      run: async (operation) => {
+        if (operation === 'currentSid') return SID;
+        if (operation === 'taskSchemaVersion') return '1.99';
+        throw new Error('inspect must not run');
+      },
+    });
+    await expect(scheduler.inspect()).rejects.toThrow(
+      'windows.task_scheduler.invalid_schema_version',
+    );
+  });
+
+  it('binds the actual full Task export and marker to the protected launch manifest', () => {
+    const expected = definition();
+    const binding = {
+      currentSid: SID,
+      releaseRoot: expected.action.workingDirectory,
+      releaseDigest: DIGEST,
+      powerShellPath: expected.action.execute,
+      launcherPath: String.raw`C:\릴리스 공간\bridge 1\windows\launch-daemon.ps1`,
+      runtimeManifestPath: String.raw`C:\사용자 데이터\runtime.json`,
+      taskSemanticFingerprint: fingerprintWindowsTask(expected),
+    };
+    const exported = xml(expected, '1.6');
+    expect(windowsTaskXmlMatchesLaunchBinding(exported, binding, '1.6')).toBe(true);
+    expect(windowsTaskXmlMatchesLaunchBinding(exported, {
+      ...binding, taskSemanticFingerprint: '0'.repeat(64),
+    }, '1.6')).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      exported.replace('-SettingsPath', '-DifferentSettingsPath'), binding, '1.6',
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      exported.replace(`release=${DIGEST}`, `release=${'b'.repeat(64)}`), binding, '1.6',
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(exported, binding, '1.4')).toBe(false);
   });
 
   it('fails semantic verification for extra actions, wrong principal/settings, or shell wrappers', () => {

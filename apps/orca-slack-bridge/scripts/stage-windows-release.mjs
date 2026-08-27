@@ -82,9 +82,12 @@ async function main() {
   if (process.argv.length !== 2) throw new Error('windows.stage.invalid_arguments');
   const pnpmCli = process.env.npm_execpath;
   if (pnpmCli === undefined || !existsSync(pnpmCli)) throw new Error('windows.stage.pnpm_unavailable');
-  const [{ computeReleaseBuildDigest }, { operationalStatusWindowsKnownLocalAppData }] = await Promise.all([
+  const [{ computeReleaseBuildDigest, normalizeWindowsReleaseTextFiles },
+    { operationalStatusWindowsKnownLocalAppData },
+    { acquireWindowsReleasePublicationMutex, assertWindowsReleaseFilesystemSemantics }] = await Promise.all([
     import('../dist/windows/deployment.js'),
     import('../dist/operational/status-capability.js'),
+    import('../dist/windows/release-publication.js'),
   ]);
   const localAppData = operationalStatusWindowsKnownLocalAppData();
   const releasesRoot = join(localAppData, 'OrcaSlackBridge', 'releases');
@@ -97,6 +100,7 @@ async function main() {
   if (realpathSync.native(stagingRoot).toLowerCase() !== stagingRoot.toLowerCase()) {
     throw new Error('windows.stage.staging_root_reparse_point');
   }
+  const releasePublicationMutex = await acquireWindowsReleasePublicationMutex();
   // Keep the supported workflow honest about the Windows paths operators actually use.
   const temporary = join(stagingRoot, `검증 staging ${process.pid}-${randomUUID()}`);
   const childEnvironment = { ...process.env };
@@ -131,13 +135,18 @@ async function main() {
       throw new Error('windows.stage.unexpected_output');
     }
     assertRegularTree(temporary);
+    assertWindowsReleaseFilesystemSemantics(temporary);
+    normalizeWindowsReleaseTextFiles(temporary);
+    assertWindowsReleaseFilesystemSemantics(temporary);
     const digest = computeReleaseBuildDigest(temporary);
     const destination = join(releasesRoot, digest);
     if (existsSync(destination)) {
+      assertWindowsReleaseFilesystemSemantics(destination);
       if (computeReleaseBuildDigest(destination) !== digest) {
         throw new Error('windows.stage.existing_release_drift');
       }
       makeFilesReadOnly(destination);
+      assertWindowsReleaseFilesystemSemantics(destination);
       if (computeReleaseBuildDigest(destination) !== digest) {
         throw new Error('windows.stage.existing_release_drift');
       }
@@ -146,7 +155,9 @@ async function main() {
       return;
     }
     renameSync(temporary, destination);
+    assertWindowsReleaseFilesystemSemantics(destination);
     makeFilesReadOnly(destination);
+    assertWindowsReleaseFilesystemSemantics(destination);
     if (computeReleaseBuildDigest(destination) !== digest) {
       throw new Error('windows.stage.post_verification_failed');
     }
@@ -154,6 +165,8 @@ async function main() {
   } catch (error) {
     if (existsSync(temporary)) removeInside(releasesRoot, temporary);
     throw error;
+  } finally {
+    await releasePublicationMutex.release();
   }
 }
 

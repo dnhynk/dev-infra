@@ -90,6 +90,7 @@ function managedTaskReference(
   readonly launcherPath: string;
   readonly runtimeManifestPath: string;
   readonly releaseDigest: string;
+  readonly semanticFingerprint: string;
 } {
   if (snapshot.kind !== 'present' || snapshot.ownership !== 'owned' ||
       snapshot.integrity !== 'matched' || snapshot.definition === null || snapshot.marker === null) {
@@ -113,6 +114,7 @@ function managedTaskReference(
   return {
     appRoot, launcherPath, runtimeManifestPath,
     releaseDigest: snapshot.marker.releaseDigest,
+    semanticFingerprint: snapshot.marker.semanticFingerprint,
   };
 }
 
@@ -123,7 +125,9 @@ export async function extractManagedTaskLaunch(
   const reference = managedTaskReference(snapshot);
   const { manifest } = await readValidatedWindowsRuntimeManifest(store, reference.runtimeManifestPath);
   if (manifest.releaseDigest !== reference.releaseDigest ||
-      manifest.releaseRoot.toLowerCase() !== reference.appRoot.toLowerCase()) {
+      manifest.releaseRoot.toLowerCase() !== reference.appRoot.toLowerCase() ||
+      manifest.launcherPath.toLowerCase() !== reference.launcherPath.toLowerCase() ||
+      manifest.taskSemanticFingerprint !== reference.semanticFingerprint) {
     throw new Error('windows.run_now.runtime_manifest_drift');
   }
   return {

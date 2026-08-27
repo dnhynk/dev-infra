@@ -11,6 +11,7 @@ import {
   createWindowsTaskDefinition,
   CurrentUserTaskSchedulerPowerShellRunner,
   CurrentUserWindowsTaskScheduler,
+  fingerprintWindowsTask,
   type ManagedWindowsTaskSnapshot,
   type WindowsTaskDefinition,
 } from '../windows/task-scheduler.js';
@@ -223,12 +224,19 @@ export async function installWindowsTask(
     releaseDigest: deployment.buildDigest,
     nodeExe: deployment.paths.nodePath,
     distCli: deployment.paths.cliPath,
+    launcherPath: deployment.paths.launcherPath,
+    launcherSha256: deployment.launcherSha256,
+    taskSemanticFingerprint: fingerprintWindowsTask(expected),
     config: deployment.paths.configPath,
     state: deployment.paths.statePath,
     orcaExe: deployment.paths.orcaPath,
     logDirectory: deployment.paths.logDir,
   }));
   const beforeManifest = await manifestStore.inspect(deployment.paths.runtimeManifestPath);
+  if (beforeManifest.kind === 'present' &&
+      (!beforeManifest.protected || beforeManifest.manifest === null)) {
+    throw new Error('windows.install.runtime_manifest_invalid');
+  }
 
   let task: InstallCommandResult['task'] = 'unchanged';
   let backupCreated = false;

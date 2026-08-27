@@ -12,9 +12,10 @@ import {
   readdirSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { backup, DatabaseSync } from 'node:sqlite';
-import { win32 } from 'node:path';
+import { join as nativeJoin, win32 } from 'node:path';
 import { loadConfig, type ParsedBridgeConfig } from '../project/config.js';
 import { APP_TOKEN_VAR, BOT_TOKEN_VAR } from '../slack/verify.js';
 import { SCHEMA_VERSION } from '../store/schema.js';
@@ -23,15 +24,18 @@ import {
   CurrentUserOperationalStatusCapabilityStore,
   operationalStatusCapabilityPath,
   operationalStatusStateIdentity,
+  operationalStatusWindowsKnownAppData,
   operationalStatusWindowsKnownLocalAppData,
   operationalStatusWindowsTrustedPowerShell,
   type OperationalStatusSnapshotLease,
   type OperationalStatusSnapshotLeaseStore,
 } from '../operational/status-capability.js';
+import { fingerprintOperationalBuild } from '../operational/status.js';
 import {
   windowsReleaseLauncherPath,
   windowsRuntimeManifestPath,
 } from './runtime-manifest.js';
+import { assertWindowsReleaseFilesystemSemantics } from './release-publication.js';
 
 export const REQUIRED_BRIDGE_ENVIRONMENT_VARIABLES = [BOT_TOKEN_VAR, APP_TOKEN_VAR] as const;
 export const REQUIRED_NODE_MAJOR = 26;
@@ -53,6 +57,7 @@ export type ValidatedWindowsDeployment = {
     readonly runtimeManifestPath: string;
   };
   readonly buildDigest: string;
+  readonly launcherSha256: string;
   readonly config: ParsedBridgeConfig;
 };
 
@@ -62,6 +67,13 @@ export interface ExecutableVersionProbe {
 
 export interface CurrentUserEnvironmentPresenceProbe {
   requiredBridgeEnvironmentPresent(): Promise<boolean>;
+}
+
+export interface OrcaReadinessProbe {
+  ready(
+    executable: string,
+    knownFolders: { readonly appData: string; readonly localAppData: string },
+  ): Promise<boolean>;
 }
 
 /**
@@ -111,6 +123,109 @@ export class SpawnExecutableVersionProbe implements ExecutableVersionProbe {
         clearTimeout(timer);
         if (code !== 0 || size > 1024) reject(new Error('windows.deploy.node_probe_failed'));
         else resolve(Buffer.concat(chunks).toString('utf8').trim());
+      });
+    });
+  }
+}
+
+function exactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return JSON.stringify(actual) === JSON.stringify([...expected].sort());
+}
+
+/** Closed parser for the supported `orca status --json` readiness document. */
+export function parseOrcaReadinessOutput(raw: string): boolean {
+  let value: unknown;
+  try { value = JSON.parse(raw) as unknown; } catch { return false; }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const top = value as Record<string, unknown>;
+  if (!exactObjectKeys(top, ['id', 'ok', 'result', '_meta']) ||
+      typeof top['id'] !== 'string' || top['id'].length === 0 || top['ok'] !== true ||
+      top['result'] === null || typeof top['result'] !== 'object' || Array.isArray(top['result']) ||
+      top['_meta'] === null || typeof top['_meta'] !== 'object' || Array.isArray(top['_meta'])) return false;
+  const result = top['result'] as Record<string, unknown>;
+  const meta = top['_meta'] as Record<string, unknown>;
+  if (!exactObjectKeys(result, ['target', 'app', 'runtime', 'graph']) ||
+      !exactObjectKeys(meta, ['runtimeId'])) return false;
+  const target = result['target'];
+  const app = result['app'];
+  const runtime = result['runtime'];
+  const graph = result['graph'];
+  if (target === null || typeof target !== 'object' || Array.isArray(target) ||
+      app === null || typeof app !== 'object' || Array.isArray(app) ||
+      runtime === null || typeof runtime !== 'object' || Array.isArray(runtime) ||
+      graph === null || typeof graph !== 'object' || Array.isArray(graph)) return false;
+  const targetRecord = target as Record<string, unknown>;
+  const appRecord = app as Record<string, unknown>;
+  const runtimeRecord = runtime as Record<string, unknown>;
+  const graphRecord = graph as Record<string, unknown>;
+  if (!exactObjectKeys(targetRecord, ['kind']) || targetRecord['kind'] !== 'local' ||
+      !exactObjectKeys(appRecord, ['running', 'pid', 'desktopWindowStatus']) ||
+      appRecord['running'] !== true || appRecord['desktopWindowStatus'] !== 'available' ||
+      typeof appRecord['pid'] !== 'number' || !Number.isSafeInteger(appRecord['pid']) ||
+      appRecord['pid'] <= 0 ||
+      !exactObjectKeys(runtimeRecord, [
+        'state', 'reachable', 'runtimeId', 'appVersion', 'remoteUpdateSupport', 'capabilities',
+      ]) || runtimeRecord['state'] !== 'ready' || runtimeRecord['reachable'] !== true ||
+      typeof runtimeRecord['runtimeId'] !== 'string' || runtimeRecord['runtimeId'].length === 0 ||
+      typeof runtimeRecord['appVersion'] !== 'string' || runtimeRecord['appVersion'].length === 0 ||
+      !Array.isArray(runtimeRecord['capabilities']) ||
+      !exactObjectKeys(graphRecord, ['state']) || graphRecord['state'] !== 'ready' ||
+      meta['runtimeId'] !== runtimeRecord['runtimeId']) return false;
+  const update = runtimeRecord['remoteUpdateSupport'];
+  return update !== null && typeof update === 'object' && !Array.isArray(update) &&
+    exactObjectKeys(update as Record<string, unknown>, ['installMode', 'automatic', 'reason']) &&
+    typeof (update as Record<string, unknown>)['installMode'] === 'string' &&
+    typeof (update as Record<string, unknown>)['automatic'] === 'boolean' &&
+    typeof (update as Record<string, unknown>)['reason'] === 'string';
+}
+
+export class SpawnOrcaReadinessProbe implements OrcaReadinessProbe {
+  constructor(private readonly timeoutMilliseconds = 10_000) {}
+
+  async ready(
+    executable: string,
+    knownFolders: { readonly appData: string; readonly localAppData: string },
+  ): Promise<boolean> {
+    const env: NodeJS.ProcessEnv = {
+      APPDATA: knownFolders.appData,
+      LOCALAPPDATA: knownFolders.localAppData,
+    };
+    for (const name of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP'] as const) {
+      const value = process.env[name];
+      if (value !== undefined) env[name] = value;
+    }
+    return await new Promise<boolean>((resolve, reject) => {
+      const child = spawn(executable, ['status', '--json'], {
+        stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env,
+      });
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error !== undefined) reject(error);
+        else resolve(parseOrcaReadinessOutput(Buffer.concat(chunks).toString('utf8')));
+      };
+      const timer = setTimeout(() => {
+        child.kill();
+        finish(staticFailure('windows.deploy.orca_probe_failed'));
+      }, this.timeoutMilliseconds);
+      timer.unref?.();
+      child.stdout.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > 64 * 1024) {
+          child.kill();
+          finish(staticFailure('windows.deploy.orca_probe_failed'));
+        } else chunks.push(chunk);
+      });
+      child.stderr.resume();
+      child.once('error', () => finish(staticFailure('windows.deploy.orca_probe_failed')));
+      child.once('exit', (code) => {
+        if (code === 0) finish();
+        else finish(staticFailure('windows.deploy.orca_probe_failed'));
       });
     });
   }
@@ -183,7 +298,9 @@ export type ValidateWindowsDeploymentOptions = {
   readonly platform?: NodeJS.Platform;
   readonly versionProbe?: ExecutableVersionProbe;
   readonly environmentPresenceProbe?: CurrentUserEnvironmentPresenceProbe;
+  readonly orcaReadinessProbe?: OrcaReadinessProbe;
   readonly pathAccess?: WindowsDeploymentPathAccess;
+  readonly knownAppData?: () => string;
   readonly knownLocalAppData?: () => string;
   readonly trustedPowerShell?: () => { readonly executable: string };
 };
@@ -570,10 +687,53 @@ function updateLength(hash: ReturnType<typeof createHash>, length: bigint): void
   hash.update(encoded);
 }
 
+function normalizeReleaseTextFile(path: string): void {
+  try {
+    const stats = lstatSync(path, { bigint: true });
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n) throw new Error('invalid file');
+    const bytes = readFileSync(path);
+    if (bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))) throw new Error('bom');
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const normalized = Buffer.from(text.replace(/\r\n?/gu, '\n'), 'utf8');
+    if (!bytes.equals(normalized)) writeFileSync(path, normalized);
+  } catch {
+    throw staticFailure('windows.stage.invalid_app_owned_text');
+  }
+}
+
+/** Canonicalizes only app-owned text; production dependency bytes remain byte-for-byte intact. */
+export function normalizeWindowsReleaseTextFiles(nativeReleaseRoot: string): void {
+  const dist = nativeJoin(nativeReleaseRoot, 'dist');
+  const visit = (directory: string): void => {
+    let entries: string[];
+    try {
+      const stats = lstatSync(directory);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error('invalid directory');
+      entries = readdirSync(directory, { encoding: 'utf8' }).sort();
+    } catch {
+      throw staticFailure('windows.stage.invalid_app_owned_text');
+    }
+    for (const entry of entries) {
+      const path = nativeJoin(directory, entry);
+      let stats: ReturnType<typeof lstatSync>;
+      try { stats = lstatSync(path); } catch {
+        throw staticFailure('windows.stage.invalid_app_owned_text');
+      }
+      if (stats.isDirectory() && !stats.isSymbolicLink()) visit(path);
+      else normalizeReleaseTextFile(path);
+    }
+  };
+  visit(dist);
+  normalizeReleaseTextFile(nativeJoin(nativeReleaseRoot, 'windows', 'launch-daemon.ps1'));
+}
+
 export function computeReleaseBuildDigest(
   appRoot: string,
   pathAccess: WindowsDeploymentPathAccess = NATIVE_WINDOWS_DEPLOYMENT_PATH_ACCESS,
 ): string {
+  const requiresNativeWindowsSemantics = process.platform === 'win32' &&
+    pathAccess === NATIVE_WINDOWS_DEPLOYMENT_PATH_ACCESS;
+  if (requiresNativeWindowsSemantics) assertWindowsReleaseFilesystemSemantics(appRoot);
   let rootBefore: ReturnType<typeof releaseIdentity>;
   try {
     rootBefore = releaseIdentity(pathAccess.toNativePath(appRoot));
@@ -628,6 +788,7 @@ export function computeReleaseBuildDigest(
       !sameWindowsPath(pathAccess.canonicalize(appRoot), appRoot)) {
     throw staticFailure('windows.deploy.release_changed');
   }
+  if (requiresNativeWindowsSemantics) assertWindowsReleaseFilesystemSemantics(appRoot);
   return hash.digest('hex');
 }
 
@@ -641,6 +802,7 @@ export async function validateWindowsDeployment(
   const pathAccess = options.pathAccess ?? NATIVE_WINDOWS_DEPLOYMENT_PATH_ACCESS;
   const appRoot = canonicalExisting(input.appRoot, 'app_root', 'directory', pathAccess);
   let localAppData: string;
+  let appData: string;
   try {
     localAppData = canonicalExisting(
       (options.knownLocalAppData ?? operationalStatusWindowsKnownLocalAppData)(),
@@ -650,6 +812,16 @@ export async function validateWindowsDeployment(
     );
   } catch {
     throw staticFailure('windows.deploy.local_app_data_unavailable');
+  }
+  try {
+    appData = canonicalExisting(
+      (options.knownAppData ?? operationalStatusWindowsKnownAppData)(),
+      'app_data',
+      'directory',
+      pathAccess,
+    );
+  } catch {
+    throw staticFailure('windows.deploy.app_data_unavailable');
   }
   const buildDigest = computeReleaseBuildDigest(appRoot, pathAccess);
   const expectedReleaseRoot = win32.join(
@@ -681,6 +853,9 @@ export async function validateWindowsDeployment(
     'file',
     pathAccess,
   );
+  const launcherSha256 = createHash('sha256')
+    .update(readFileSync(pathAccess.toNativePath(launcherPath)))
+    .digest('hex');
   let powerShellPath: string;
   try {
     powerShellPath = canonicalExisting(
@@ -697,6 +872,16 @@ export async function validateWindowsDeployment(
   const match = /^v([0-9]+)(?:\.|$)/u.exec(version);
   if (match === null || Number(match[1]) < REQUIRED_NODE_MAJOR) {
     throw staticFailure('windows.deploy.unsupported_node');
+  }
+  try {
+    if (!await (options.orcaReadinessProbe ?? new SpawnOrcaReadinessProbe()).ready(
+      orcaPath,
+      { appData, localAppData },
+    )) {
+      throw new Error('not ready');
+    }
+  } catch {
+    throw staticFailure('windows.deploy.orca_not_ready');
   }
   configHasNoCredentialFields(configPath, pathAccess);
   let config: ParsedBridgeConfig;
@@ -716,6 +901,7 @@ export async function validateWindowsDeployment(
       launcherPath, powerShellPath, runtimeManifestPath,
     },
     buildDigest,
+    launcherSha256,
     config,
   };
 }
@@ -765,12 +951,24 @@ async function checkpointAndBackup(
   clock: () => Date,
   pathAccess: WindowsDeploymentPathAccess,
 ): Promise<{ readonly version: number | null; readonly backupPath: string | null }> {
-  if (!existsSync(pathAccess.toNativePath(statePath))) return { version: null, backupPath: null };
-  let db: DatabaseSync | null = new DatabaseSync(pathAccess.toNativePath(statePath));
+  const nativeStatePath = pathAccess.toNativePath(statePath);
+  if (!existsSync(nativeStatePath)) return { version: null, backupPath: null };
+  let version: number | null;
   try {
-    const version = readVersion(db);
-    if (version === null || version === SCHEMA_VERSION) return { version, backupPath: null };
-    if (version < 1 || version > SCHEMA_VERSION) throw staticFailure('windows.deploy.state_version_unsupported');
+    const inspection = new DatabaseSync(nativeStatePath, { readOnly: true });
+    try { version = readVersion(inspection); } finally { inspection.close(); }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('windows.deploy.')) throw error;
+    throw staticFailure('windows.deploy.state_version_invalid');
+  }
+  if (version === null) throw staticFailure('windows.deploy.state_unversioned');
+  if (version === SCHEMA_VERSION) return { version, backupPath: null };
+  if (version < 1 || version > SCHEMA_VERSION) {
+    throw staticFailure('windows.deploy.state_version_unsupported');
+  }
+  const db = new DatabaseSync(nativeStatePath);
+  try {
+    if (readVersion(db) !== version) throw staticFailure('windows.deploy.state_version_changed');
     const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
       | { readonly busy?: unknown }
       | undefined;
@@ -817,7 +1015,6 @@ async function checkpointAndBackup(
     return { version, backupPath };
   } finally {
     db.close();
-    db = null;
   }
 }
 
@@ -903,44 +1100,128 @@ export async function prepareDeploymentState(
   }
 }
 
+type UninstallDaemonHealthRow = {
+  readonly revision: number;
+  readonly instance_id: string;
+  readonly build_fingerprint: string;
+  readonly config_fingerprint: string;
+  readonly desired_state: 'running' | 'stopped';
+  readonly state: 'running' | 'stopped';
+  readonly started_at: string;
+  readonly updated_at: string;
+};
+
+export type DeploymentDaemonHealthLease =
+  | { readonly kind: 'absent' }
+  | {
+      readonly kind: 'present';
+      readonly revision: number;
+      readonly instanceId: string;
+      readonly buildFingerprint: string;
+      readonly configFingerprint: string;
+      readonly desiredState: 'running' | 'stopped';
+      readonly state: 'running' | 'stopped';
+      readonly startedAt: string;
+      readonly updatedAt: string;
+    };
+
+function validatedUninstallDaemonHealth(
+  db: DatabaseSync,
+  expectedBuildIdentity?: string,
+): UninstallDaemonHealthRow | undefined {
+  if (readVersion(db) !== SCHEMA_VERSION) {
+    throw staticFailure('windows.uninstall.state_version_mismatch');
+  }
+  const current = db.prepare(
+    `SELECT revision, instance_id, build_fingerprint, config_fingerprint,
+            desired_state, state, started_at, updated_at
+       FROM daemon_health WHERE id = 1`,
+  ).get() as Record<string, unknown> | undefined;
+  if (current === undefined) return undefined;
+  if (typeof current['revision'] !== 'number' || !Number.isSafeInteger(current['revision']) ||
+      current['revision'] < 0 || typeof current['instance_id'] !== 'string' ||
+      current['instance_id'].length < 1 || typeof current['build_fingerprint'] !== 'string' ||
+      typeof current['config_fingerprint'] !== 'string' ||
+      (current['desired_state'] !== 'running' && current['desired_state'] !== 'stopped') ||
+      (current['state'] !== 'running' && current['state'] !== 'stopped') ||
+      typeof current['started_at'] !== 'string' || !Number.isFinite(Date.parse(current['started_at'])) ||
+      typeof current['updated_at'] !== 'string' ||
+      !Number.isFinite(Date.parse(current['updated_at']))) {
+    throw staticFailure('windows.uninstall.state_corrupt');
+  }
+  if (expectedBuildIdentity !== undefined &&
+      current['build_fingerprint'] !== fingerprintOperationalBuild(expectedBuildIdentity)) {
+    throw staticFailure('windows.uninstall.state_identity_mismatch');
+  }
+  return current as UninstallDaemonHealthRow;
+}
+
+function uninstallDaemonHealthLease(
+  row: UninstallDaemonHealthRow | undefined,
+): DeploymentDaemonHealthLease {
+  return row === undefined ? { kind: 'absent' } : {
+    kind: 'present',
+    revision: row.revision,
+    instanceId: row.instance_id,
+    buildFingerprint: row.build_fingerprint,
+    configFingerprint: row.config_fingerprint,
+    desiredState: row.desired_state,
+    state: row.state,
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function sameDaemonHealthLease(
+  current: UninstallDaemonHealthRow | undefined,
+  expected: DeploymentDaemonHealthLease,
+): boolean {
+  if (current === undefined || expected.kind === 'absent') {
+    return current === undefined && expected.kind === 'absent';
+  }
+  return current.revision === expected.revision && current.instance_id === expected.instanceId &&
+    current.build_fingerprint === expected.buildFingerprint &&
+    current.config_fingerprint === expected.configFingerprint &&
+    current.desired_state === expected.desiredState && current.state === expected.state &&
+    current.started_at === expected.startedAt && current.updated_at === expected.updatedAt;
+}
+
+/** Read-only ownership precondition used before the task is disabled. */
+export function verifyDeploymentDaemonBuildIdentity(
+  statePath: string,
+  expectedBuildIdentity: string,
+): DeploymentDaemonHealthLease {
+  if (!existsSync(statePath)) throw staticFailure('windows.uninstall.state_absent');
+  const db = new DatabaseSync(statePath, { readOnly: true });
+  try {
+    return uninstallDaemonHealthLease(
+      validatedUninstallDaemonHealth(db, expectedBuildIdentity),
+    );
+  } finally { db.close(); }
+}
+
 /** Uninstall's intentional concurrent writer: exact v13 only, no create and no migration. */
 export function setDeploymentDesiredStopped(
   statePath: string,
-  expectedBuildIdentity?: string,
+  expectedBuildIdentity: string,
+  expectedHealth: DeploymentDaemonHealthLease,
   clock: () => Date = () => new Date(),
 ): void {
   if (!existsSync(statePath)) throw staticFailure('windows.uninstall.state_absent');
   const db = new DatabaseSync(statePath);
   try {
-    if (readVersion(db) !== SCHEMA_VERSION) {
-      throw staticFailure('windows.uninstall.state_version_mismatch');
-    }
     db.exec('PRAGMA busy_timeout = 5000');
     const requested = clock();
     if (!Number.isFinite(requested.getTime())) throw staticFailure('windows.uninstall.clock_invalid');
     db.exec('BEGIN IMMEDIATE');
     try {
-      const current = db.prepare(
-        'SELECT revision, build_fingerprint, desired_state, updated_at FROM daemon_health WHERE id = 1',
-      ).get() as {
-        readonly revision: unknown;
-        readonly build_fingerprint: unknown;
-        readonly desired_state: unknown;
-        readonly updated_at: unknown;
-      } | undefined;
+      const current = validatedUninstallDaemonHealth(db, expectedBuildIdentity);
+      if (!sameDaemonHealthLease(current, expectedHealth)) {
+        throw staticFailure('windows.uninstall.desired_state_conflict');
+      }
       if (current === undefined) {
         db.exec('COMMIT');
         return;
-      }
-      if (typeof current.revision !== 'number' || !Number.isSafeInteger(current.revision) ||
-          current.revision < 0 || typeof current.build_fingerprint !== 'string' ||
-          (current.desired_state !== 'running' && current.desired_state !== 'stopped') ||
-          typeof current.updated_at !== 'string' ||
-          !Number.isFinite(Date.parse(current.updated_at))) {
-        throw staticFailure('windows.uninstall.state_corrupt');
-      }
-      if (expectedBuildIdentity !== undefined && current.build_fingerprint !== expectedBuildIdentity) {
-        throw staticFailure('windows.uninstall.state_identity_mismatch');
       }
       if (current.desired_state === 'stopped') {
         db.exec('COMMIT');
@@ -953,8 +1234,13 @@ export function setDeploymentDesiredStopped(
       const result = db.prepare(`
         UPDATE daemon_health
          SET revision = revision + 1, desired_state = 'stopped', updated_at = ?
-         WHERE id = 1 AND revision = ? AND desired_state = 'running' AND updated_at = ?`)
-        .run(at, current.revision, current.updated_at);
+         WHERE id = 1 AND revision = ? AND instance_id = ? AND build_fingerprint = ?
+           AND config_fingerprint = ? AND desired_state = 'running' AND state = ?
+           AND started_at = ? AND updated_at = ?`)
+        .run(
+          at, current.revision, current.instance_id, current.build_fingerprint,
+          current.config_fingerprint, current.state, current.started_at, current.updated_at,
+        );
       if (Number(result.changes) !== 1) throw staticFailure('windows.uninstall.desired_state_conflict');
       db.exec('COMMIT');
     } catch (error) {

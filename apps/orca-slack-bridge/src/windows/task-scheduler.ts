@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { win32 } from 'node:path';
 import { DOMParser, type Element, type Node } from '@xmldom/xmldom';
 import {
   operationalStatusWindowsTrustedPowerShell,
@@ -108,6 +109,7 @@ export type PowerShellTaskRecord = {
 
 export type TaskSchedulerPowerShellOperation =
   | 'currentSid'
+  | 'taskSchemaVersion'
   | 'inspect'
   | 'validate'
   | 'register'
@@ -183,6 +185,14 @@ function New-DesiredTaskDefinition([object]$d) {
 switch ($operation) {
   'currentSid' {
     Write-Result ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+  }
+  'taskSchemaVersion' {
+    $service = New-Object -ComObject 'Schedule.Service'
+    $service.Connect()
+    [uint32]$highest = $service.HighestVersion
+    $major = [uint32]($highest -shr 16)
+    $minor = [uint32]($highest -band 0xffff)
+    Write-Result ([string]$major + '.' + [string]$minor)
   }
   'inspect' {
     $task = Get-ScheduledTask -TaskPath $taskPath -TaskName $inputObject.taskName -ErrorAction SilentlyContinue
@@ -415,6 +425,30 @@ function exactAttributes(
   return Object.keys(expected).every((name) => seen.has(name));
 }
 
+const MINIMUM_TASK_SCHEMA_MINOR = 2;
+const MAXIMUM_TASK_SCHEMA_MINOR = 6;
+
+function supportedTaskSchemaMinor(value: string): number | null {
+  const match = /^1\.([0-9]+)$/u.exec(value);
+  if (match === null || match[1] === undefined || !/^(?:0|[1-9][0-9]*)$/u.test(match[1])) {
+    return null;
+  }
+  const minor = Number(match[1]);
+  return Number.isSafeInteger(minor) && minor >= MINIMUM_TASK_SCHEMA_MINOR &&
+    minor <= MAXIMUM_TASK_SCHEMA_MINOR ? minor : null;
+}
+
+function taskSchemaVersion(root: Element, hostHighestVersion?: string): string | null {
+  const version = root.getAttribute('version');
+  if (version === null || !exactAttributes(root, { version })) return null;
+  const minor = supportedTaskSchemaMinor(version);
+  const hostHighestMinor = hostHighestVersion === undefined
+    ? MAXIMUM_TASK_SCHEMA_MINOR
+    : supportedTaskSchemaMinor(hostHighestVersion);
+  if (minor === null || hostHighestMinor === null || minor > hostHighestMinor) return null;
+  return version;
+}
+
 function elementText(element: Element): string | null {
   if (!exactAttributes(element)) return null;
   let value = '';
@@ -445,9 +479,9 @@ function childInteger(children: ReadonlyMap<string, Element>, name: string): num
 
 type TaskXmlIdentity = { readonly description: string; readonly principalUser: string };
 
-function parseTaskXmlIdentity(xml: string): TaskXmlIdentity | null {
+function parseTaskXmlIdentity(xml: string, hostHighestSchemaVersion?: string): TaskXmlIdentity | null {
   const root = taskDocumentElement(xml);
-  if (root === null || !exactAttributes(root, { version: '1.2' })) return null;
+  if (root === null || taskSchemaVersion(root, hostHighestSchemaVersion) === null) return null;
   const rootChildren = exactChildren(
     root,
     ['RegistrationInfo', 'Triggers', 'Principals', 'Settings', 'Actions'],
@@ -639,9 +673,12 @@ export function createWindowsTaskDefinition(input: {
 }
 
 /** Namespace-aware semantic normalizer for the one allowed Task Scheduler definition. */
-export function parseWindowsTaskXml(xml: string): WindowsTaskDefinition | null {
+export function parseWindowsTaskXml(
+  xml: string,
+  hostHighestSchemaVersion?: string,
+): WindowsTaskDefinition | null {
   const root = taskDocumentElement(xml);
-  if (root === null || !exactAttributes(root, { version: '1.2' })) return null;
+  if (root === null || taskSchemaVersion(root, hostHighestSchemaVersion) === null) return null;
   const rootChildren = exactChildren(
     root,
     ['RegistrationInfo', 'Triggers', 'Principals', 'Settings', 'Actions'],
@@ -775,6 +812,48 @@ function parseRuntime(record: PowerShellTaskRecord, definition: WindowsTaskDefin
   };
 }
 
+export type WindowsTaskLaunchBinding = {
+  readonly currentSid: string;
+  readonly releaseRoot: string;
+  readonly releaseDigest: string;
+  readonly powerShellPath: string;
+  readonly launcherPath: string;
+  readonly runtimeManifestPath: string;
+  readonly taskSemanticFingerprint: string;
+};
+
+function sameWindowsBindingPath(left: string, right: string): boolean {
+  return win32.isAbsolute(left) && win32.isAbsolute(right) &&
+    win32.normalize(left).toLowerCase() === win32.normalize(right).toLowerCase();
+}
+
+/** Closed pre-token binding between a protected manifest and the actual fixed Task export. */
+export function windowsTaskXmlMatchesLaunchBinding(
+  xml: string,
+  input: WindowsTaskLaunchBinding,
+  hostHighestSchemaVersion?: string,
+): boolean {
+  if (!/^S-[0-9]+(?:-[0-9]+)+$/u.test(input.currentSid) ||
+      !/^[a-f0-9]{64}$/u.test(input.releaseDigest) ||
+      !/^[a-f0-9]{64}$/u.test(input.taskSemanticFingerprint)) return false;
+  const definition = parseWindowsTaskXml(xml, hostHighestSchemaVersion);
+  if (definition === null || definition.taskName !== WINDOWS_TASK_NAME ||
+      !definition.enabled || definition.principal.userId !== input.currentSid ||
+      definition.trigger.userId !== input.currentSid ||
+      !sameWindowsBindingPath(definition.action.execute, input.powerShellPath) ||
+      !sameWindowsBindingPath(definition.action.workingDirectory, input.releaseRoot)) return false;
+  const argumentsList = parseWindowsArguments(definition.action.arguments);
+  if (JSON.stringify(argumentsList) !== JSON.stringify([
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', input.launcherPath, '-SettingsPath', input.runtimeManifestPath,
+  ])) return false;
+  const fingerprint = fingerprintWindowsTask(definition);
+  const marker = parseWindowsTaskMarker(definition.description);
+  return fingerprint === input.taskSemanticFingerprint && marker !== null &&
+    marker.releaseDigest === input.releaseDigest &&
+    marker.semanticFingerprint === input.taskSemanticFingerprint;
+}
+
 function canonicalSchedulerTimestamp(value: unknown, nullable: boolean): value is string | null {
   if (value === null) return nullable;
   return typeof value === 'string' &&
@@ -818,6 +897,13 @@ function sidResult(value: unknown): string {
   return value;
 }
 
+function taskSchemaVersionResult(value: unknown): string {
+  if (typeof value !== 'string' || supportedTaskSchemaMinor(value) === null) {
+    throw new Error('windows.task_scheduler.invalid_schema_version');
+  }
+  return value;
+}
+
 function assertOkResult(value: unknown): void {
   if (value === null || typeof value !== 'object' ||
       JSON.stringify(Object.keys(value)) !== JSON.stringify(['ok']) ||
@@ -835,11 +921,12 @@ export class CurrentUserWindowsTaskScheduler {
 
   async inspect(): Promise<ManagedWindowsTaskSnapshot> {
     const currentSid = await this.currentSid();
+    const schemaVersion = taskSchemaVersionResult(await this.runner.run('taskSchemaVersion', {}));
     const record = taskRecord(await this.runner.run('inspect', { taskName: WINDOWS_TASK_NAME }));
     if (!record.exists) return { kind: 'absent', currentSid };
     if (typeof record.xml !== 'string') throw new Error('windows.task_scheduler.invalid_response');
-    const definition = parseWindowsTaskXml(record.xml);
-    const identity = definition === null ? parseTaskXmlIdentity(record.xml) : null;
+    const definition = parseWindowsTaskXml(record.xml, schemaVersion);
+    const identity = definition === null ? parseTaskXmlIdentity(record.xml, schemaVersion) : null;
     const description = definition?.description ?? identity?.description ?? null;
     const marker = description === null ? null : parseWindowsTaskMarker(description);
     const managedDescription = description === WINDOWS_TASK_DESCRIPTION_PREFIX ||

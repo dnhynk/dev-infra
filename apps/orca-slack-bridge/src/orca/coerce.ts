@@ -73,11 +73,10 @@ export function parseOrcaTimestamp(value: string): Date {
 /**
  * `<repositoryId>::<로컬 경로>` 형태에서 앞부분을 꺼낸다. 형식이 다르면 null.
  *
- * 실측(2026-08-24, `orca worktree list --json`): 이 앞부분은 worktree가 아니라 **repository**의
- * id다. `ccb3c8ee-6d9e-42af-af36-9fdac6566fcc` 하나가 `D:/dev-infra`와
- * `C:/Users/dongh/orca/workspaces/dev-infra/*` 를 함께 덮었고, 같은 응답의 `repoId` 필드와 값이
- * 같았다. Task의 `created_by_process_incarnation`(`<id>::<path>@@<hash>:<uuid>`)도 같은 앞부분을
- * 가지므로 두 표면에 같은 함수를 쓴다.
+ * 일반화한 `<repository-id>::<absolute-worktree-path>` 형식에서 앞부분은 worktree가 아닌
+ * repository id다. 여러 worktree id가 동일한 접두사를 공유하고 응답의 repository id
+ * 필드와도 일치했으며, Task의 worktree id도 같은 앞부분을 사용하므로 두 표면에 같은
+ * 함수를 쓴다.
  *
  * **이 형식의 안정성은 계약이 아니다.** `docs/platform-capabilities.md` §7.1이 `<uuid>::<path>`
  * 파싱 안정성을 미검증으로 기록했고, 이 id가 Orca 재설치나 DB 재생성 뒤에도 유지되는지는

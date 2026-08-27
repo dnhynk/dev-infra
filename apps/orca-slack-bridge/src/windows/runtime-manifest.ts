@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { win32 } from 'node:path';
 import {
@@ -5,26 +6,36 @@ import {
   operationalStatusWindowsTrustedPowerShell,
 } from '../operational/status-capability.js';
 
-export const WINDOWS_RUNTIME_MANIFEST_SCHEMA_VERSION = 1;
+export const WINDOWS_RUNTIME_MANIFEST_SCHEMA_VERSION = 2;
+export const WINDOWS_RUNTIME_MANIFEST_REVISION = 1;
 export const WINDOWS_RUNTIME_MANIFEST_FILE = 'runtime.json';
 export const WINDOWS_RELEASE_LAUNCHER_RELATIVE_PATH = win32.join('windows', 'launch-daemon.ps1');
 const HEX_64 = /^[a-f0-9]{64}$/u;
 const MANIFEST_KEYS = [
-  'schemaVersion', 'releaseRoot', 'releaseDigest', 'nodeExe', 'distCli',
-  'config', 'state', 'orcaExe', 'logDirectory',
+  'schemaVersion', 'manifestRevision', 'releaseRoot', 'releaseDigest', 'nodeExe', 'distCli',
+  'launcherPath', 'launcherSha256', 'taskSemanticFingerprint',
+  'config', 'state', 'orcaExe', 'logDirectory', 'manifestDigest',
 ] as const;
+const MANIFEST_IDENTITY_HEADER = 'orca-slack-bridge-runtime-manifest-v2\0';
 
 export type WindowsRuntimeManifest = {
   readonly schemaVersion: typeof WINDOWS_RUNTIME_MANIFEST_SCHEMA_VERSION;
+  readonly manifestRevision: typeof WINDOWS_RUNTIME_MANIFEST_REVISION;
   readonly releaseRoot: string;
   readonly releaseDigest: string;
   readonly nodeExe: string;
   readonly distCli: string;
+  readonly launcherPath: string;
+  readonly launcherSha256: string;
+  readonly taskSemanticFingerprint: string;
   readonly config: string;
   readonly state: string;
   readonly orcaExe: string;
   readonly logDirectory: string;
+  readonly manifestDigest: string;
 };
+
+type WindowsRuntimeManifestIdentity = Omit<WindowsRuntimeManifest, 'manifestDigest'>;
 
 export type WindowsRuntimeManifestSnapshot =
   | { readonly kind: 'absent' }
@@ -218,19 +229,38 @@ export function windowsReleaseLauncherPath(releaseRoot: string): string {
   return win32.join(releaseRoot, WINDOWS_RELEASE_LAUNCHER_RELATIVE_PATH);
 }
 
+export function fingerprintWindowsRuntimeManifest(
+  manifest: WindowsRuntimeManifestIdentity,
+): string {
+  const hash = createHash('sha256').update(MANIFEST_IDENTITY_HEADER, 'utf8');
+  for (const key of MANIFEST_KEYS) {
+    if (key === 'manifestDigest') continue;
+    hash.update(String(manifest[key]), 'utf8').update('\0', 'utf8');
+  }
+  return hash.digest('hex');
+}
+
 export function createWindowsRuntimeManifest(input: {
   readonly releaseRoot: string;
   readonly releaseDigest: string;
   readonly nodeExe: string;
   readonly distCli: string;
+  readonly launcherPath: string;
+  readonly launcherSha256: string;
+  readonly taskSemanticFingerprint: string;
   readonly config: string;
   readonly state: string;
   readonly orcaExe: string;
   readonly logDirectory: string;
 }): WindowsRuntimeManifest {
-  const manifest: WindowsRuntimeManifest = {
+  const identity: WindowsRuntimeManifestIdentity = {
     schemaVersion: WINDOWS_RUNTIME_MANIFEST_SCHEMA_VERSION,
+    manifestRevision: WINDOWS_RUNTIME_MANIFEST_REVISION,
     ...input,
+  };
+  const manifest: WindowsRuntimeManifest = {
+    ...identity,
+    manifestDigest: fingerprintWindowsRuntimeManifest(identity),
   };
   if (parseWindowsRuntimeManifest(serializeWindowsRuntimeManifest(manifest)) === null) {
     throw new Error('windows.runtime_manifest.invalid');
@@ -254,13 +284,22 @@ export function parseWindowsRuntimeManifest(bytes: Buffer): WindowsRuntimeManife
   const record = value as Record<string, unknown>;
   if (JSON.stringify(Object.keys(record)) !== JSON.stringify(MANIFEST_KEYS) ||
       record['schemaVersion'] !== WINDOWS_RUNTIME_MANIFEST_SCHEMA_VERSION ||
-      typeof record['releaseDigest'] !== 'string' || !HEX_64.test(record['releaseDigest'])) return null;
-  for (const key of ['releaseRoot', 'nodeExe', 'distCli', 'config', 'state', 'orcaExe', 'logDirectory'] as const) {
+      record['manifestRevision'] !== WINDOWS_RUNTIME_MANIFEST_REVISION ||
+      typeof record['releaseDigest'] !== 'string' || !HEX_64.test(record['releaseDigest']) ||
+      typeof record['launcherSha256'] !== 'string' || !HEX_64.test(record['launcherSha256']) ||
+      typeof record['taskSemanticFingerprint'] !== 'string' ||
+      !HEX_64.test(record['taskSemanticFingerprint']) ||
+      typeof record['manifestDigest'] !== 'string' || !HEX_64.test(record['manifestDigest'])) return null;
+  for (const key of [
+    'releaseRoot', 'nodeExe', 'distCli', 'launcherPath', 'config', 'state', 'orcaExe', 'logDirectory',
+  ] as const) {
     if (typeof record[key] !== 'string' || !canonicalWindowsPath(record[key])) return null;
   }
   const manifest = record as WindowsRuntimeManifest;
   if (!sameWindowsPath(win32.basename(manifest.releaseRoot), manifest.releaseDigest) ||
       !sameWindowsPath(manifest.distCli, win32.join(manifest.releaseRoot, 'dist', 'cli.js')) ||
+      !sameWindowsPath(manifest.launcherPath, windowsReleaseLauncherPath(manifest.releaseRoot)) ||
+      manifest.manifestDigest !== fingerprintWindowsRuntimeManifest(manifest) ||
       raw !== serializeWindowsRuntimeManifest(manifest).toString('utf8')) return null;
   return manifest;
 }

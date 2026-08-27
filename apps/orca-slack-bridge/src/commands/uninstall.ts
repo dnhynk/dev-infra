@@ -4,7 +4,12 @@ import {
   inspectOperationalStatus,
   type OperationalStatusReport,
 } from '../operational/status.js';
-import { setDeploymentDesiredStopped, verifyCanonicalWindowsRelease } from '../windows/deployment.js';
+import {
+  setDeploymentDesiredStopped,
+  verifyCanonicalWindowsRelease,
+  verifyDeploymentDaemonBuildIdentity,
+  type DeploymentDaemonHealthLease,
+} from '../windows/deployment.js';
 import {
   CurrentUserTaskSchedulerPowerShellRunner,
   CurrentUserWindowsTaskScheduler,
@@ -34,7 +39,12 @@ export type UninstallCommandDependencies = {
   readonly setDesiredStopped?: (
     statePath: string,
     expectedBuildIdentity: string,
+    expectedHealth: DeploymentDaemonHealthLease,
   ) => void | Promise<void>;
+  readonly verifyStateIdentity?: (
+    statePath: string,
+    expectedBuildIdentity: string,
+  ) => DeploymentDaemonHealthLease | Promise<DeploymentDaemonHealthLease>;
   readonly inspectShutdown?: (launch: ManagedTaskLaunch) => Promise<UninstallShutdownObservation>;
   readonly probePipeReleased?: () => Promise<boolean>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
@@ -139,15 +149,38 @@ export async function uninstallWindowsTask(
   }
   const releaseDigest = initial.marker.releaseDigest;
   const semanticFingerprint = initial.marker.semanticFingerprint;
+  const healthLease = await (dependencies.verifyStateIdentity ?? verifyDeploymentDaemonBuildIdentity)(
+    launch.statePath,
+    launch.releaseDigest,
+  );
   await scheduler.disable(initial.xml);
   const disabled = await scheduler.inspect();
   if (!exactSameOwnedTask(disabled, releaseDigest, semanticFingerprint) || disabled.runtime.enabled) {
     throw new Error('windows.uninstall.disable_verification_failed');
   }
-  await (dependencies.setDesiredStopped ?? setDeploymentDesiredStopped)(
-    launch.statePath,
-    launch.releaseDigest,
-  );
+  try {
+    await (dependencies.setDesiredStopped ?? setDeploymentDesiredStopped)(
+      launch.statePath,
+      launch.releaseDigest,
+      healthLease,
+    );
+  } catch (error) {
+    // A daemon lifetime/revision race after disable must not strand a healthy owned service.
+    try {
+      const recoveryTarget = await scheduler.inspect();
+      if (!exactSameOwnedTask(recoveryTarget, releaseDigest, semanticFingerprint) ||
+          recoveryTarget.runtime.enabled) throw new Error('recovery target drift');
+      if (initial.runtime.enabled) await scheduler.restore(initial.xml, recoveryTarget.xml);
+      const recovered = initial.runtime.enabled ? await scheduler.inspect() : recoveryTarget;
+      if (!exactSameOwnedTask(recovered, releaseDigest, semanticFingerprint) ||
+          recovered.runtime.enabled !== initial.runtime.enabled) {
+        throw new Error('recovery verification failed');
+      }
+    } catch {
+      throw new Error('windows.uninstall.disable_recovery_failed');
+    }
+    throw error;
+  }
 
   const pipeProbe = dependencies.probePipeReleased ?? channelPipeIsReleased;
   const inspectShutdown = dependencies.inspectShutdown ?? defaultShutdownInspector(scheduler, pipeProbe);

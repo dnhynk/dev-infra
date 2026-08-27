@@ -1,15 +1,24 @@
-import { describe, expect, it } from 'vitest';
-import { win32 } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, win32 } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { ParsedBridgeConfig } from '../src/project/config.js';
 import {
   classifyTaskLifecycle,
+  fingerprintOperationalBuild,
   type OperationalStatusReport,
   type TaskStatusObservation,
 } from '../src/operational/status.js';
 import { installWindowsTask } from '../src/commands/install.js';
 import { runManagedTaskNow } from '../src/commands/run-now.js';
 import { uninstallWindowsTask } from '../src/commands/uninstall.js';
-import type { ValidatedWindowsDeployment } from '../src/windows/deployment.js';
+import {
+  setDeploymentDesiredStopped,
+  verifyDeploymentDaemonBuildIdentity,
+  type DeploymentDaemonHealthLease,
+  type ValidatedWindowsDeployment,
+} from '../src/windows/deployment.js';
+import { SqliteDigestStore } from '../src/store/sqlite.js';
 import {
   createWindowsRuntimeManifest,
   parseWindowsRuntimeManifest,
@@ -21,6 +30,7 @@ import {
   createWindowsTaskDefinition,
   CurrentUserWindowsTaskScheduler,
   escapeTaskXmlTextForTest,
+  fingerprintWindowsTask,
   parseWindowsTaskXml,
   WINDOWS_TASK_DESCRIPTION_PREFIX,
   type TaskSchedulerPowerShellOperation,
@@ -30,6 +40,7 @@ import {
 
 const SID = 'S-1-5-21-100-200-300-1001';
 const DIGEST = 'b'.repeat(64);
+const lifecycleTemporaryRoots: string[] = [];
 const RELEASE_ROOT = win32.join(
   String.raw`C:\Users\test\AppData\Local\OrcaSlackBridge\releases`,
   DIGEST,
@@ -46,6 +57,53 @@ const paths = {
   powerShellPath: String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
   runtimeManifestPath: String.raw`C:\Users\test\AppData\Local\OrcaSlackBridge\runtime.json`,
 } as const;
+
+afterEach(() => {
+  for (const root of lifecycleTemporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function realDaemonState(buildIdentity = DIGEST) {
+  const root = mkdtempSync(join(tmpdir(), 'orca-windows-lifecycle-state-'));
+  lifecycleTemporaryRoots.push(root);
+  const statePath = join(root, 'state.db');
+  const store = new SqliteDigestStore(statePath);
+  store.recordDaemonStart({
+    instanceId: 'daemon-real-store',
+    buildFingerprint: fingerprintOperationalBuild(buildIdentity),
+    configFingerprint: 'c'.repeat(64),
+    at: '2026-08-27T00:00:00.000Z',
+  });
+  store.close();
+  return {
+    setDesiredStopped: (
+      _ignoredPath: string,
+      expectedBuildIdentity: string,
+      expectedHealth: DeploymentDaemonHealthLease,
+    ): void => {
+      setDeploymentDesiredStopped(
+        statePath,
+        expectedBuildIdentity,
+        expectedHealth,
+        () => new Date('2026-08-27T00:00:01.000Z'),
+      );
+    },
+    verifyStateIdentity: (_ignoredPath: string, expectedBuildIdentity: string) =>
+      verifyDeploymentDaemonBuildIdentity(statePath, expectedBuildIdentity),
+    advanceHealthRevision: (): void => {
+      const reopened = new SqliteDigestStore(statePath);
+      try {
+        if (reopened.recordDaemonHeartbeat(
+          'daemon-real-store',
+          '2026-08-27T00:00:00.500Z',
+        ) === null) throw new Error('fixture heartbeat failed');
+      } finally { reopened.close(); }
+    },
+    desiredState: (): string | null => {
+      const reopened = new SqliteDigestStore(statePath);
+      try { return reopened.readDaemonHealth()?.desiredState ?? null; } finally { reopened.close(); }
+    },
+  };
+}
 
 function taskDefinition(): WindowsTaskDefinition {
   return createWindowsTaskDefinition({
@@ -81,6 +139,7 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
   async run(operation: TaskSchedulerPowerShellOperation, input: unknown): Promise<unknown> {
     this.operations.push(operation);
     if (operation === 'currentSid') return SID;
+    if (operation === 'taskSchemaVersion') return '1.2';
     if (operation === 'inspect') {
       if (this.definition === null) return { exists: false };
       return {
@@ -136,12 +195,17 @@ class FakePowerShellRunner implements TaskSchedulerPowerShellRunner {
   }
 }
 
-function runtimeManifestBytes(): Buffer {
+function runtimeManifestBytes(
+  taskSemanticFingerprint = fingerprintWindowsTask(taskDefinition()),
+): Buffer {
   return serializeWindowsRuntimeManifest(createWindowsRuntimeManifest({
     releaseRoot: paths.appRoot,
     releaseDigest: DIGEST,
     nodeExe: paths.nodePath,
     distCli: paths.cliPath,
+    launcherPath: paths.launcherPath,
+    launcherSha256: 'e'.repeat(64),
+    taskSemanticFingerprint,
     config: paths.configPath,
     state: paths.statePath,
     orcaExe: paths.orcaPath,
@@ -182,6 +246,7 @@ function deployment(): ValidatedWindowsDeployment {
   return {
     paths,
     buildDigest: DIGEST,
+    launcherSha256: 'e'.repeat(64),
     config: {} as ParsedBridgeConfig,
   };
 }
@@ -281,6 +346,29 @@ describe('Windows current-user lifecycle', () => {
     })).rejects.toThrow('windows.deploy.backup_verification_failed');
     expect(runner.definition).toBeNull();
     expect(runner.operations).not.toContain('register');
+  });
+
+  it('never replaces a present invalid or unprotected manifest during a new install', async () => {
+    for (const manifestStore of [
+      Object.assign(new FakeManifestStore(), { bytes: Buffer.from('{"foreign":true}\n') }),
+      Object.assign(new FakeManifestStore().seed(), { protected: false }),
+    ]) {
+      const runner = new FakePowerShellRunner();
+      let prepared = false;
+      await expect(installWindowsTask({ ...paths, runNow: false }, {
+        platform: 'win32',
+        scheduler: new CurrentUserWindowsTaskScheduler(runner),
+        manifestStore,
+        validateDeployment: async () => deployment(),
+        prepareState: async () => {
+          prepared = true;
+          return { backupPath: null, release: async () => undefined };
+        },
+      })).rejects.toThrow('windows.install.runtime_manifest_invalid');
+      expect(prepared).toBe(false);
+      expect(runner.operations).not.toContain('register');
+      expect(manifestStore.operations).toEqual(['inspect']);
+    }
   });
 
   it('runs COM validate-only before state or manifest effects and preserves every byte on failure', async () => {
@@ -418,6 +506,20 @@ describe('Windows current-user lifecycle', () => {
     expect(runner.operations).not.toContain('start');
   });
 
+  it('rejects a protected self-consistent manifest bound to another task fingerprint', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    const manifestStore = new FakeManifestStore();
+    manifestStore.bytes = runtimeManifestBytes('0'.repeat(64));
+    await expect(runManagedTaskNow(2, {
+      platform: 'win32',
+      scheduler: new CurrentUserWindowsTaskScheduler(runner),
+      manifestStore,
+      verifyRelease: () => true,
+    })).rejects.toThrow('windows.run_now.runtime_manifest_drift');
+    expect(runner.operations).not.toContain('start');
+  });
+
   it('uninstalls in disable/desired-stop/wait/unregister order and preserves a timed-out task', async () => {
     const runner = new FakePowerShellRunner();
     runner.definition = taskDefinition();
@@ -425,10 +527,15 @@ describe('Windows current-user lifecycle', () => {
     runner.hasRun = true;
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
     const lifecycle: string[] = [];
+    const daemonState = realDaemonState();
     expect(await uninstallWindowsTask(2, {
       platform: 'win32', scheduler,
       manifestStore: new FakeManifestStore().seed(),
-      setDesiredStopped: () => { lifecycle.push('desired-stopped'); },
+      verifyStateIdentity: daemonState.verifyStateIdentity,
+      setDesiredStopped: (statePath, expectedBuildIdentity, expectedHealth) => {
+        daemonState.setDesiredStopped(statePath, expectedBuildIdentity, expectedHealth);
+        lifecycle.push('desired-stopped');
+      },
       verifyRelease: () => true,
       inspectShutdown: async () => {
         runner.state = 'Ready';
@@ -442,6 +549,7 @@ describe('Windows current-user lifecycle', () => {
     })).toEqual({ task: 'removed' });
     expect(runner.operations.indexOf('disable')).toBeLessThan(runner.operations.indexOf('unregister'));
     expect(lifecycle).toEqual(['desired-stopped', 'waited']);
+    expect(daemonState.desiredState()).toBe('stopped');
 
     const timeoutRunner = new FakePowerShellRunner();
     timeoutRunner.definition = taskDefinition();
@@ -451,6 +559,7 @@ describe('Windows current-user lifecycle', () => {
     await expect(uninstallWindowsTask(1, {
       platform: 'win32', scheduler: timeoutScheduler,
       manifestStore: new FakeManifestStore().seed(),
+      verifyStateIdentity: () => ({ kind: 'absent' }),
       setDesiredStopped: () => undefined,
       verifyRelease: () => true,
       nowMilliseconds: () => now,
@@ -466,18 +575,67 @@ describe('Windows current-user lifecycle', () => {
     expect(timeoutRunner.operations).not.toContain('unregister');
   });
 
+  it('fails a release identity mismatch closed before disable, stop, or unregister', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.state = 'Running';
+    const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const daemonState = realDaemonState('d'.repeat(64));
+    await expect(uninstallWindowsTask(1, {
+      platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore().seed(),
+      verifyStateIdentity: daemonState.verifyStateIdentity,
+      setDesiredStopped: daemonState.setDesiredStopped,
+      verifyRelease: () => true,
+    })).rejects.toThrow('windows.uninstall.state_identity_mismatch');
+    expect(daemonState.desiredState()).toBe('running');
+    expect(runner.definition).not.toBeNull();
+    expect(runner.definition?.enabled).toBe(true);
+    expect(runner.operations).not.toContain('disable');
+    expect(runner.operations).not.toContain('stop');
+    expect(runner.operations).not.toContain('unregister');
+  });
+
+  it('fences a post-precheck daemon revision race and CAS-restores the enabled owned task', async () => {
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.state = 'Running';
+    const daemonState = realDaemonState();
+    await expect(uninstallWindowsTask(1, {
+      platform: 'win32',
+      scheduler: new CurrentUserWindowsTaskScheduler(runner),
+      manifestStore: new FakeManifestStore().seed(),
+      verifyRelease: () => true,
+      verifyStateIdentity: (statePath, expectedBuildIdentity) => {
+        const lease = daemonState.verifyStateIdentity(statePath, expectedBuildIdentity);
+        daemonState.advanceHealthRevision();
+        return lease;
+      },
+      setDesiredStopped: daemonState.setDesiredStopped,
+    })).rejects.toThrow('windows.uninstall.desired_state_conflict');
+    expect(daemonState.desiredState()).toBe('running');
+    expect(runner.definition).not.toBeNull();
+    expect(runner.definition?.enabled).toBe(true);
+    expect(runner.operations).toContain('disable');
+    expect(runner.operations).toContain('restoreXml');
+    expect(runner.operations).not.toContain('stop');
+    expect(runner.operations).not.toContain('unregister');
+  });
+
   it('uses --force only after graceful timeout, warns statically, rechecks CAS, and stops the owned task', async () => {
     const runner = new FakePowerShellRunner();
     runner.definition = taskDefinition();
     runner.state = 'Running';
     runner.hasRun = true;
     const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    const daemonState = realDaemonState();
     let now = 0;
     const warnings: string[] = [];
     expect(await uninstallWindowsTask(1, {
       platform: 'win32', scheduler, force: true,
       manifestStore: new FakeManifestStore().seed(),
-      setDesiredStopped: () => undefined,
+      verifyStateIdentity: daemonState.verifyStateIdentity,
+      setDesiredStopped: daemonState.setDesiredStopped,
       verifyRelease: () => true,
       nowMilliseconds: () => now,
       sleep: async (milliseconds) => { now += milliseconds; },
@@ -490,6 +648,7 @@ describe('Windows current-user lifecycle', () => {
       onForceWarning: () => { warnings.push('windows.uninstall.force_warning'); },
     })).toEqual({ task: 'removed' });
     expect(warnings).toEqual(['windows.uninstall.force_warning']);
+    expect(daemonState.desiredState()).toBe('stopped');
     expect(runner.operations.indexOf('stop')).toBeGreaterThan(runner.operations.indexOf('disable'));
     expect(runner.operations.indexOf('unregister')).toBeGreaterThan(runner.operations.indexOf('stop'));
   });

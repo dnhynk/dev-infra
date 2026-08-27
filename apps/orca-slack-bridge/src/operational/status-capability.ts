@@ -675,7 +675,15 @@ if ([String]::IsNullOrWhiteSpace($path)) { exit 11 }
 [Console]::Out.Write($path)
 `;
 
+const WINDOWS_READ_APP_DATA = String.raw`
+$ErrorActionPreference = 'Stop'
+$path = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+if ([String]::IsNullOrWhiteSpace($path)) { exit 11 }
+[Console]::Out.Write($path)
+`;
+
 let windowsKnownLocalAppDataCache: string | null = null;
+let windowsKnownAppDataCache: string | null = null;
 
 function sameFileIdentity(
   left: BigIntStats,
@@ -735,6 +743,29 @@ export function operationalStatusWindowsKnownLocalAppData(): string {
     throw new Error('status.capability_path_unavailable');
   }
   windowsKnownLocalAppDataCache = base;
+  return base;
+}
+
+/** Resolves the current user's roaming AppData through the trusted Windows known-folder API. */
+export function operationalStatusWindowsKnownAppData(): string {
+  if (windowsKnownAppDataCache !== null) return windowsKnownAppDataCache;
+  const { root, executable } = operationalStatusWindowsTrustedPowerShell();
+  const output = execFileSync(executable, encodedPowerShellArguments(WINDOWS_READ_APP_DATA), {
+    encoding: 'utf8',
+    env: operationalStatusWindowsKnownFolderEnvironment(root),
+    windowsHide: true,
+    timeout: 1_500,
+    maxBuffer: 512,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (output !== output.trim() || output.length === 0) {
+    throw new Error('status.capability_path_unavailable');
+  }
+  const base = realpathSync.native(output);
+  if (!operationalStatusWindowsLocalPathIsCanonical(base)) {
+    throw new Error('status.capability_path_unavailable');
+  }
+  windowsKnownAppDataCache = base;
   return base;
 }
 
