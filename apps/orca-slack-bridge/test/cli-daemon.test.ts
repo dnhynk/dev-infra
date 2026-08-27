@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -434,6 +434,98 @@ describe('daemon production wiring', () => {
       'lease:release',
     ]);
     expect(held).toBe(false);
+  });
+
+  it('retains the snapshot lease and fails boundedly when writable store closure is uncertain', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const privateDetail = 'SENTINEL_PRIVATE_STORE_CLOSE_DETAIL';
+    const events: string[] = [];
+    const diagnostics: string[] = [];
+    let held = false;
+    let releaseCalls = 0;
+    const physicalClose: { current: (() => void) | null } = { current: null };
+    const snapshotLeaseStore: OperationalStatusSnapshotLeaseStore = {
+      tryAcquireSnapshotLease: async () => {
+        if (held) return null;
+        events.push('lease:acquire');
+        held = true;
+        return {
+          assertHeld: () => {
+            if (!held) throw new Error('status.snapshot_lease_lost');
+          },
+          release: async () => {
+            releaseCalls += 1;
+            events.push('lease:release');
+            held = false;
+          },
+        };
+      },
+    };
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((
+      (value: string | Uint8Array) => {
+        diagnostics.push(String(value));
+        return true;
+      }
+    ) as typeof process.stderr.write);
+
+    try {
+      const code = await runDaemonCommand(parsed, CONFIG, {
+        statusSnapshotLeaseStore: snapshotLeaseStore,
+        openStore: (path) => {
+          expect(held).toBe(true);
+          events.push('store:open');
+          const store = new SqliteDigestStore(path);
+          physicalClose.current = store.close.bind(store);
+          store.close = () => {
+            expect(held).toBe(true);
+            events.push('store:close');
+            throw new Error(privateDetail);
+          };
+          return store;
+        },
+        statusOwnerServer: {
+          start: () => {
+            expect(held).toBe(true);
+            events.push('owner:start');
+            return Promise.resolve();
+          },
+          refresh: () => undefined,
+          stop: () => {
+            expect(held).toBe(true);
+            events.push('owner:stop');
+            return Promise.resolve();
+          },
+        },
+        channelServer: new FakeChannelServer(),
+        orca: new FakeOrca(),
+        slack: new FakeSlack(),
+        connectionFactory: () => ({
+          start: () => Promise.resolve({ appId: 'A0APP' }),
+          close: () => Promise.resolve(),
+        }),
+        waitForStop: () => Promise.resolve(),
+      });
+
+      expect(code).toBe(1);
+      expect(events).toEqual([
+        'lease:acquire', 'store:open', 'owner:start', 'owner:stop', 'store:close',
+      ]);
+      expect(releaseCalls).toBe(0);
+      expect(held).toBe(true);
+      expect(await snapshotLeaseStore.tryAcquireSnapshotLease(
+        statePath,
+        'a'.repeat(64),
+      )).toBeNull();
+      expect(diagnostics).toEqual([
+        'daemon이 strict startup 또는 Gate reconciliation에 실패했다\n',
+      ]);
+      expect(diagnostics.join('')).not.toContain(privateDetail);
+      expect(diagnostics.join('')).not.toContain(statePath);
+    } finally {
+      stderr.mockRestore();
+      physicalClose.current?.();
+    }
   });
 
   it('fails bounded lease contention before opening a writable store', async () => {

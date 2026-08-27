@@ -967,6 +967,8 @@ export async function runDaemonCommand(
   let channelServer: ChannelDaemonServer | null = null;
   let statusOwnerServer: OperationalStatusOwnerServerLike | null = null;
   let statusSnapshotLease: OperationalStatusSnapshotLease | null = null;
+  let writableStoreOpenAttempted = false;
+  let failureReported = false;
   let channelDelivery: ChannelDeliveryRuntime | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
@@ -984,6 +986,11 @@ export async function runDaemonCommand(
     stopReason = reason;
     reconciliationAbort.abort();
     resolveStop();
+  };
+  const reportFailure = (): void => {
+    if (failureReported) return;
+    failureReported = true;
+    process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
   };
   if (processStopLatch !== null) {
     void processStopLatch.promise.then(() => requestStop('requested'));
@@ -1014,6 +1021,7 @@ export async function runDaemonCommand(
     );
     if (statusSnapshotLease === null) throw new Error('status.snapshot_lease_failed');
     statusSnapshotLease.assertHeld();
+    writableStoreOpenAttempted = true;
     store = (dependencies.openStore ?? ((path) => new SqliteDigestStore(path)))(resolvedStatePath);
     statusOwnerServer = dependencies.statusOwnerServer ?? new OperationalStatusOwnerServer({
       statePath: resolvedStatePath,
@@ -1218,7 +1226,7 @@ export async function runDaemonCommand(
     channelServer = null;
     return stopReason === 'pipe_failure' ? 1 : 0;
   } catch {
-    process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
+    reportFailure();
     return 1;
   } finally {
     acceptingInbound = false;
@@ -1249,10 +1257,15 @@ export async function runDaemonCommand(
         // The store remains the owner until the bounded local status listener has been retired.
       }
     }
-    try { store?.close(); } catch {
-      // The lease remains held until the writable handle has attempted its bounded close.
+    let writableStoreClosureUncertain = writableStoreOpenAttempted && store === null;
+    if (store !== null) {
+      try {
+        store.close();
+      } catch {
+        writableStoreClosureUncertain = true;
+      }
     }
-    if (statusSnapshotLease !== null) {
+    if (!writableStoreClosureUncertain && statusSnapshotLease !== null) {
       try {
         statusSnapshotLease.assertHeld();
         await statusSnapshotLease.release();
@@ -1262,6 +1275,12 @@ export async function runDaemonCommand(
       statusSnapshotLease = null;
     }
     processStopLatch?.dispose();
+    if (writableStoreClosureUncertain) {
+      // Do not release or discard the descriptor/mutex when the writable handle may still be live.
+      // The CLI entrypoint exits nonzero immediately after this bounded static diagnostic.
+      reportFailure();
+      return 1;
+    }
   }
 }
 
