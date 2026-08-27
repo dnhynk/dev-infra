@@ -548,5 +548,10 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - broader console control handler나 별도 native process wrapper는 이 관측된 differentiator를 닫는 데
   필요하지 않아 도입하지 않는다. disposable registered Task가 `Running`인 채 direct PowerShell→Node
   pair 하나를 245초 유지하고 clean exit 뒤 task/process/file residual `0/0/0`을 보여야 한다.
-- production O1 완료는 hotfix merge 뒤 exact release에서 같은 beyond-boundary ownership을 다시 관측할
-  때까지 보류한다. Task가 끝난 뒤 건강한 daemon만 남은 상태는 acceptance가 아니다.
+- fixed merged-main release `1eb41697c6c22f51893adbf4e89fdd864bb399d4a6e0fdba8ed4a978cd93fd38`는
+  production Task에서 같은 direct pair와 fresh heartbeat를 332초 유지했고 O1 background job 세 개를
+  모두 성공시켰다. 이 control로 repair는 accepted하지만, 과거 `0xC000013A`의 특정 console-close
+  인과는 직접 관측된 사실이 아니라 근거가 있는 추론으로 남긴다.
+- production O1 완료 조건은 hotfix merge 뒤 exact release에서 같은 beyond-boundary ownership을 다시
+  관측하는 것이었고, 위 control로 충족됐다. Task가 끝난 뒤 건강한 daemon만 남은 상태는 여전히
+  acceptance가 아니다.

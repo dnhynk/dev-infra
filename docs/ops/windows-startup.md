@@ -1,6 +1,6 @@
 # Windows current-user 자동 시작 운영
 
-상태: **O1 canonical operator workflow**
+상태: **O1 canonical operator workflow · production accepted**
 
 Managed Task의 AtLogOn trigger는 duration 없는 PT1M repetition을 가진다. daemon process가 종료되면
 다음 repetition이 다시 실행하고, 이미 실행 중이면 `IgnoreNew`가 겹침을 막는다. 별도의
@@ -11,10 +11,10 @@ boundary를 노출하지 않도록 `-WindowStyle Hidden`을 사용하며, 이 �
 launcher/`run-now` binding 검증에 포함된다.
 
 O1-7 상태와 redacted disposable-task cleanup 증거는
-[O1 operational acceptance evidence](../evidence/o1-operational-acceptance.md)를 따른다. 이 문서의
-production install은 hotfix merge 뒤 exact merged-main release를 stage하고 Task `Running`과 하나의 direct
-daemon child가 관측된 2~4분 경계를 넘어 유지되는 local startup/status smoke를 통과할 때까지 pending이다.
-D3 `LIVE_CHANNEL_UNVERIFIED`와는 별도 조건이다.
+[O1 operational acceptance evidence](../evidence/o1-operational-acceptance.md)를 따른다. exact merged-main
+release `1eb41697c6c22f51893adbf4e89fdd864bb399d4a6e0fdba8ed4a978cd93fd38`는 Task `Running`과 하나의
+direct daemon child, fresh heartbeat, matched build/config/schema를 332초 동안 유지해 관측된 2~4분
+경계를 넘겼고 production install은 accepted다. D3 `LIVE_CHANNEL_UNVERIFIED`와는 별도 조건이다.
 대상: Windows PowerShell 5.1, Node.js 26.x, pnpm 11.22.0
 
 ## 불변 release 만들기

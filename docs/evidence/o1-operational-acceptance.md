@@ -1,6 +1,6 @@
 # O1 operational acceptance evidence
 
-Status: **disposable Windows supervisor repair and local hermetic aggregate PASS; production Task supervisor not yet accepted; hotfix CI, merge, and redeployment pending**
+Status: **O1-7 PASS — exact-head CI and independent audit passed; merged-main immutable release installed; production Task supervisor remained healthy beyond the prior failure boundary**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
@@ -12,7 +12,7 @@ The first production install from exact merged `main` at
 `8d857f94c0ad44617071aaa97a4756cd9e114b42` exposed a Windows registered-export
 canonicalization and absent-create rollback gap and ended with
 `windows.install.rollback_failed`. The exact owned residual task was safely removed and no manifest
-or daemon process remained; production installation is pending the fixed merge.
+or daemon process remained; production installation was then left pending the fixed merge.
 
 The second production install from exact merged `main` at
 `a3e018bffef633e8d55d3e2dc2dc1c50f8a846b2` left the owned Task and protected manifest
@@ -38,8 +38,9 @@ Node, but no source of such an event was directly observed. The repair therefore
 `-WindowStyle Hidden` into task creation, the semantic fingerprint, the launcher binding verifier,
 and the dynamic `run-now` caller. It intentionally does not introduce a broader control handler or
 process wrapper; the acceptance criterion is that the Task remains `Running` with one direct daemon
-child past the observed boundary, then both exit without an orphan. Causality remains inferred
-until that fixed release passes the production control.
+child past the observed boundary, then both exit without an orphan. The fixed release passed the
+production control recorded below, which accepts the repair but does not retroactively prove that a
+specific console-close source caused the historical failure.
 
 ## Operational failure matrix
 
@@ -115,9 +116,9 @@ Rollback means selecting the prior immutable staged release and running that rel
 command with the same six absolute operator inputs; task XML and protected manifest replacement are
 CAS checked and rolled back on post-registration mismatch. Do not delete state, config, logs, or
 release roots as part of rollback. The pre-hotfix production Task is not accepted merely because its
-orphaned daemon is healthy. Production installation remains pending until this repair is merged, a
-new exact merged-main release is deployed, and Task state plus direct parent/child ownership remain
-healthy past the observed boundary.
+orphaned daemon was healthy. The repaired exact merged-main release satisfied the production
+installation condition: Task state and direct parent/child ownership remained healthy past the
+observed boundary.
 
 ## Privacy boundary
 
@@ -132,8 +133,10 @@ retains its generated task name, paths, XML, process command line, or mock state
 - Node 26.8.1 focused hard-crash acceptance: 1 file, 2/2 tests passed; bridge typecheck PASS.
 - Supervisor hotfix focused Windows suite: 4 files, 60/60 tests passed. Full O1-7 hermetic gate:
   75 files passed, 1,666 tests passed, 9 platform-skipped; workspace typecheck and bridge build PASS.
-- Exact-head CI: pending PR validation. The named O1-7 step runs the complete bridge Vitest suite once;
-  the separate typecheck job is the only other code-validation invocation.
+- Exact hotfix head `73ebddcca7c6584e9b197caef2103ab43821181f`: GitHub Actions run
+  `33092888227` passed `test` and `typecheck`; the final documentation-only inference correction then
+  passed a scoped independent read-only re-audit. PR #48 squash-merged as exact `main`
+  `da76bf3cd76b4979154ee8dcd6706ce3627f2a5e`.
 - The pre-repair disposable sample proved that an already-started Exec exiting 23 does not activate
   `RestartOnFailure`; every run still ended with residual task/process/file `0/0/0` and external
   writes `0`. This is the audited O1-6 crash-recovery gap that introduced the PT1M trigger repetition.
@@ -145,10 +148,24 @@ retains its generated task name, paths, XML, process command line, or mock state
   for 247 seconds against the 245-second minimum, clean child/parent exit, and residual
   task/process/file `0/0/0`; external writes `0`; failure code `null`.
 - The first exact merged-main stage/install exposed the canonical registered-export/rollback gap
-  above. The fixed-merge production stage/install and local startup/status smoke remain pending.
+  above.
 - The second exact merged-main install retained a matched Task/manifest but ended with Task result
   `2` and no new daemon log/heartbeat; the following merged-main SID repair reached daemon startup.
 - The release from exact `533a4a9530fdd6f6ddc20ba6a265ded3e7a0d3e6` then exposed the
-  `0xC000013A` Task-console boundary and orphaned one healthy daemon. No production acceptance is
-  claimed until the hidden-action hotfix is merged and the fixed release passes the same
-  beyond-boundary ownership observation.
+  `0xC000013A` Task-console boundary and orphaned one healthy daemon.
+- Production control PASS: exact merged `main` `da76bf3cd76b4979154ee8dcd6706ce3627f2a5e`
+  staged immutable release
+  `1eb41697c6c22f51893adbf4e89fdd864bb399d4a6e0fdba8ed4a978cd93fd38`; plain install created the
+  exact current-user Task and its exported argv contained `"-WindowStyle" "Hidden"`. From the
+  2026-08-28 01:28:19 +09:00 demand start through the 332-second beyond-boundary observation, the
+  Task remained `Running` with result `267009`, exactly one Windows PowerShell launcher and one
+  direct Node daemon child retained the same identities, heartbeat remained fresh, and
+  schema/config/build/task ownership all remained matched/healthy. Repository discovery, Run
+  observer, and facts-only PR digest each recorded a new successful production attempt after that
+  start with zero consecutive failures. The installed CLI then returned
+  `run-now action=already-healthy` without starting a second instance.
+- The read-only aggregate remains `degraded` with `job.absent`, `registry.rejected`, and
+  `work.pending`. The absent Gate/Channel jobs correspond to the separately preserved D3
+  `LIVE_CHANNEL_UNVERIFIED` state; the registry/work backlog is reported as existing state rather
+  than hidden. None indicates a failed O1 supervisor, stale heartbeat, failed O1 background job, or
+  build/config/schema/task mismatch, so these separate conditions do not revoke this acceptance.
