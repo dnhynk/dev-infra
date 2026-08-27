@@ -1,7 +1,14 @@
 {
   "name": "@dev-infra/orca-slack-bridge",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",

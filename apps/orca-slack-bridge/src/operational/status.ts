@@ -78,9 +78,32 @@ export const STATUS_CODES = [
 
 export type StatusCode = typeof STATUS_CODES[number];
 export type StatusExitCode = 0 | 1 | 2;
-export type TaskStatusFacet = {
+export type TaskLifecycleState =
+  | 'unavailable'
+  | 'uninstalled'
+  | 'disabled'
+  | 'installed-not-started'
+  | 'healthy'
+  | 'degraded-hung'
+  | 'stopped-clean'
+  | 'exited-unexpected'
+  | 'failed-restarting'
+  | 'failed-exhausted'
+  | 'drifted';
+
+/** Injected scheduler-only evidence. Health is joined inside this module, never by the adapter. */
+export type TaskStatusObservation = {
   readonly ownership: 'unavailable' | 'absent' | 'matched' | 'drifted';
   readonly state: 'unavailable' | 'running' | 'stopped';
+  readonly schedulerState?: 'unavailable' | 'absent' | 'running' | 'ready' | 'queued' | 'disabled' | 'unknown';
+  readonly hasRun?: boolean;
+  readonly lastTaskResult?: number | null;
+};
+
+export type TaskStatusFacet = {
+  readonly ownership: TaskStatusObservation['ownership'];
+  readonly state: TaskStatusObservation['state'];
+  readonly lifecycle: TaskLifecycleState;
 };
 
 export type OperationalStatusReport = {
@@ -149,7 +172,7 @@ export type InspectOperationalStatusOptions = {
   readonly env?: NodeJS.ProcessEnv;
   readonly platform?: NodeJS.Platform;
   readonly clock?: () => Date;
-  readonly taskFacet?: () => TaskStatusFacet | Promise<TaskStatusFacet>;
+  readonly taskFacet?: () => TaskStatusObservation | Promise<TaskStatusObservation>;
   /** Safe projected test/adapter seam; production validates the same aggregate-only shape. */
   readonly snapshot?: OperationalStatusSnapshot;
   /** Deterministic test seam; production never exposes the read-only source connection. */
@@ -205,7 +228,12 @@ type SnapshotResult =
   | { readonly kind: 'owner_unavailable' }
   | { readonly kind: 'ready'; readonly value: OperationalStatusSnapshot };
 
-const EMPTY_TASK: TaskStatusFacet = { ownership: 'unavailable', state: 'unavailable' };
+const EMPTY_TASK_OBSERVATION: TaskStatusObservation = {
+  ownership: 'unavailable', state: 'unavailable', schedulerState: 'unavailable',
+};
+const EMPTY_TASK: TaskStatusFacet = {
+  ownership: 'unavailable', state: 'unavailable', lifecycle: 'unavailable',
+};
 const EMPTY_WORK: OperationalStatusReport['work'] = {
   pending: {
     gateCards: 0, channelDeliveries: 0, resumeBaselines: 0, slackRootIntents: 0,
@@ -1607,9 +1635,65 @@ function readLogState(logDir: string): OperationalStatusReport['logs']['state'] 
   }
 }
 
-function validTaskFacet(value: TaskStatusFacet): boolean {
-  return ['unavailable', 'absent', 'matched', 'drifted'].includes(value.ownership) &&
-    ['unavailable', 'running', 'stopped'].includes(value.state);
+function validTaskObservation(value: TaskStatusObservation): boolean {
+  const schedulerStates = [
+    'unavailable', 'absent', 'running', 'ready', 'queued', 'disabled', 'unknown',
+  ];
+  return value !== null && typeof value === 'object' &&
+    ['unavailable', 'absent', 'matched', 'drifted'].includes(value.ownership) &&
+    ['unavailable', 'running', 'stopped'].includes(value.state) &&
+    (value.schedulerState === undefined || schedulerStates.includes(value.schedulerState)) &&
+    (value.hasRun === undefined || typeof value.hasRun === 'boolean') &&
+    (value.lastTaskResult === undefined || value.lastTaskResult === null ||
+      (Number.isSafeInteger(value.lastTaskResult) && typeof value.lastTaskResult === 'number'));
+}
+
+export function classifyTaskLifecycle(
+  task: TaskStatusObservation,
+  daemon: OperationalStatusReport['daemon'],
+  build: OperationalStatusReport['build']['state'],
+  config: OperationalStatusReport['config']['state'],
+): TaskLifecycleState {
+  if (task.ownership === 'unavailable') return 'unavailable';
+  if (task.ownership === 'absent') return 'uninstalled';
+  if (task.ownership === 'drifted') return 'drifted';
+  const schedulerState = task.schedulerState ??
+    (task.state === 'running' ? 'running' : task.state === 'stopped' ? 'ready' : 'unknown');
+  if (schedulerState === 'disabled') return 'disabled';
+  if (schedulerState === 'unknown' || schedulerState === 'unavailable' || schedulerState === 'absent') {
+    return 'drifted';
+  }
+  const freshHeartbeat = daemon.heartbeatAgeSeconds !== null &&
+    daemon.heartbeatAgeSeconds <= daemon.staleAfterSeconds;
+  const exactHealthy = schedulerState === 'running' && daemon.state === 'running' &&
+    daemon.desiredState === 'running' && freshHeartbeat && daemon.lastErrorCode === null &&
+    build === 'matched' && config === 'matched';
+  if (exactHealthy) return 'healthy';
+  const failed = task.hasRun !== false && task.lastTaskResult !== undefined && task.lastTaskResult !== null &&
+    task.lastTaskResult !== 0;
+  if (schedulerState === 'running' || schedulerState === 'queued') {
+    return failed ? 'failed-restarting' : 'degraded-hung';
+  }
+  if (failed) return 'failed-exhausted';
+  if (daemon.desiredState === 'stopped' && daemon.state === 'stopped') return 'stopped-clean';
+  if (task.hasRun !== true && daemon.state === 'absent') return 'installed-not-started';
+  if (daemon.desiredState === 'running' || daemon.state === 'running' || task.hasRun === true) {
+    return 'exited-unexpected';
+  }
+  return 'installed-not-started';
+}
+
+function projectTaskFacet(
+  task: TaskStatusObservation,
+  daemon: OperationalStatusReport['daemon'],
+  build: OperationalStatusReport['build']['state'],
+  config: OperationalStatusReport['config']['state'],
+): TaskStatusFacet {
+  return {
+    ownership: task.ownership,
+    state: task.state,
+    lifecycle: classifyTaskLifecycle(task, daemon, build, config),
+  };
 }
 
 export async function inspectOperationalStatus(
@@ -1626,13 +1710,15 @@ export async function inspectOperationalStatus(
   }
 
   const staleAfterSeconds = config.automation.health.staleAfterSeconds;
-  let task = EMPTY_TASK;
+  let taskObservation = EMPTY_TASK_OBSERVATION;
   if (options.taskFacet !== undefined) {
     try {
       const observed = await options.taskFacet();
-      task = validTaskFacet(observed) ? observed : { ownership: 'drifted', state: 'stopped' };
+      taskObservation = validTaskObservation(observed)
+        ? observed
+        : { ownership: 'drifted', state: 'stopped', schedulerState: 'unknown' };
     } catch {
-      task = { ownership: 'drifted', state: 'stopped' };
+      taskObservation = { ownership: 'drifted', state: 'stopped', schedulerState: 'unknown' };
     }
   }
 
@@ -1644,7 +1730,16 @@ export async function inspectOperationalStatus(
   } catch {
     const base = baseReport(staleAfterSeconds);
     return withOutcome(
-      { ...base, config: { state: 'readable' }, task },
+      {
+        ...base,
+        config: { state: 'readable' },
+        task: projectTaskFacet(
+          taskObservation,
+          base.daemon,
+          base.build.state,
+          'readable',
+        ),
+      },
       new Set(['state.path_unavailable']),
       2,
     );
@@ -1698,7 +1793,18 @@ export async function inspectOperationalStatus(
           ? 'state.snapshot_unavailable'
         : 'schema.absent';
     return withOutcome(
-      { ...base, schema, config: { state: 'readable' }, task, logs: { state: logState } },
+      {
+        ...base,
+        schema,
+        config: { state: 'readable' },
+        task: projectTaskFacet(
+          taskObservation,
+          base.daemon,
+          base.build.state,
+          'readable',
+        ),
+        logs: { state: logState },
+      },
       new Set([code]),
       2,
     );
@@ -1767,6 +1873,7 @@ export async function inspectOperationalStatus(
   if (snapshot.value.work.pending.actionableTotal > 0) add('work.pending', 1);
   if (snapshot.value.work.uncertain.total > 0) add('work.uncertain', 1);
   if (snapshot.value.work.dead.total > 0) add('work.dead', 1);
+  const task = projectTaskFacet(taskObservation, daemonProjection, buildState, configState);
   if (task.ownership === 'absent') add('task.absent', 2);
   else if (task.ownership === 'drifted') add('task.drift', 2);
   if (task.state === 'stopped') add('task.stopped', 2);
@@ -1791,7 +1898,7 @@ export function formatOperationalStatus(report: OperationalStatusReport): string
     `schema=${report.schema.state} expected=${report.schema.expectedVersion} found=${report.schema.foundVersion ?? 'none'}`,
     `config=${report.config.state} build=${report.build.state}`,
     `daemon=${report.daemon.state} desired=${report.daemon.desiredState} heartbeatAgeSeconds=${report.daemon.heartbeatAgeSeconds ?? 'none'}`,
-    `task=${report.task.ownership}/${report.task.state} logs=${report.logs.state}`,
+    `task=${report.task.ownership}/${report.task.state} lifecycle=${report.task.lifecycle} logs=${report.logs.state}`,
     `registry active=${report.registry.active} pending=${report.registry.pending} rejected=${report.registry.rejected} deferred=${report.registry.deferred}`,
     `work pending=${report.work.pending.actionableTotal} legacy=${report.work.pending.legacyNotifications} uncertain=${report.work.uncertain.total} dead=${report.work.dead.total}`,
   ];

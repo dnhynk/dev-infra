@@ -99,8 +99,8 @@ describe('명령 분기', () => {
     }
   });
 
-  it('daemon은 config/state/orca만 받고 dry-run·json·PR 범위를 거부한다', () => {
-    const parsed = parseArgs(['daemon', '--config', 'bridge.json', '--state', 'state.db', '--orca', 'orca-test']);
+  it('daemon은 config/state/orca/log-dir만 받고 dry-run·json·PR 범위를 거부한다', () => {
+    const parsed = parseArgs(['daemon', '--config', 'bridge.json', '--state', 'state.db', '--orca', 'orca-test', '--log-dir', 'logs']);
     expect(parsed.kind).toBe('run');
     if (parsed.kind === 'run') expect(parsed).toMatchObject({ command: 'daemon', statePath: 'state.db' });
     for (const extra of [['--dry-run'], ['--json'], ['--pr', '1'], ['--pr-limit', '1'], ['stray']]) {
@@ -109,7 +109,7 @@ describe('명령 분기', () => {
   });
 
   it('daemon value flags never fall back when their value is missing or another flag', () => {
-    for (const flag of ['--config', '--state', '--orca']) {
+    for (const flag of ['--config', '--state', '--orca', '--log-dir']) {
       const missing = parseArgs(['daemon', flag]);
       expect(missing.kind).toBe('error');
       if (missing.kind === 'error') expect(missing.message).toContain(flag);
@@ -117,6 +117,50 @@ describe('명령 분기', () => {
       expect(displaced.kind).toBe('error');
       if (displaced.kind === 'error') expect(displaced.message).toContain(flag);
     }
+  });
+
+  it('install은 여섯 exact path와 bounded wait를 요구하고 --run-now를 install에만 둔다', () => {
+    const argv = [
+      'install',
+      '--app-root', String.raw`C:\release with space\v1`,
+      '--node', String.raw`C:\runtime\node.exe`,
+      '--orca', String.raw`C:\tools\orca.exe`,
+      '--config', String.raw`C:\data\config.json`,
+      '--state', String.raw`C:\data\state.db`,
+      '--log-dir', String.raw`C:\data\logs`,
+      '--run-now', '--wait-seconds', '120',
+    ];
+    const parsed = parseArgs(argv);
+    expect(parsed.kind).toBe('run');
+    if (parsed.kind === 'run') expect(parsed).toMatchObject({
+      command: 'install',
+      appRoot: String.raw`C:\release with space\v1`,
+      nodePath: String.raw`C:\runtime\node.exe`,
+      orcaBin: String.raw`C:\tools\orca.exe`,
+      runNow: true,
+      waitSeconds: 120,
+    });
+    for (const flag of ['--app-root', '--node', '--orca', '--config', '--state', '--log-dir']) {
+      const missing = argv.filter((token, index) => token !== flag && argv[index - 1] !== flag);
+      expect(parseArgs(missing).kind).toBe('error');
+    }
+    expect(parseArgs([...argv, '--force']).kind).toBe('error');
+    expect(parseArgs([...argv, '--run-now']).kind).toBe('error');
+    expect(parseArgs([...argv.slice(0, -2), '--wait-seconds', '301']).kind).toBe('error');
+  });
+
+  it('uninstall and explicit run-now accept only one bounded wait and no force/path mutation flags', () => {
+    for (const command of ['uninstall', 'run-now'] as const) {
+      const parsed = parseArgs([command, '--wait-seconds', '45']);
+      expect(parsed.kind).toBe('run');
+      if (parsed.kind === 'run') expect(parsed).toMatchObject({ command, waitSeconds: 45 });
+      expect(parseArgs([command, '--wait-seconds', '0']).kind).toBe('error');
+      expect(parseArgs([command, '--force']).kind).toBe('error');
+      expect(parseArgs([command, '--state', 'C:\\data\\state.db']).kind).toBe('error');
+    }
+    expect(CLI_USAGE).toContain('install');
+    expect(CLI_USAGE).toContain('uninstall');
+    expect(CLI_USAGE).toContain('run-now');
   });
 
   it('channel-adapter는 옵션이나 위치 인자 없이만 실행된다', () => {
@@ -253,12 +297,16 @@ describe('status와 logs 옵션', () => {
     }
   });
 
-  it('new read-only flags cannot become silently accepted write-command flags', () => {
-    for (const command of ['digest', 'runs', 'gate-register', 'daemon'] as const) {
+  it('read-only flags cannot leak into write commands; daemon accepts only its lifecycle log-dir', () => {
+    for (const command of ['digest', 'runs', 'gate-register'] as const) {
       for (const extra of [['--log-dir', 'logs'], ['--tail', '1'], ['--job', 'pr-digest'], ['--follow']]) {
         expect(parseArgs([command, ...extra]).kind).toBe('error');
       }
     }
+    for (const extra of [['--tail', '1'], ['--job', 'pr-digest'], ['--follow']]) {
+      expect(parseArgs(['daemon', ...extra]).kind).toBe('error');
+    }
+    expect(parseArgs(['daemon', '--log-dir', 'logs']).kind).toBe('run');
   });
 });
 
