@@ -2726,6 +2726,31 @@ describe('read-only operational status classification', () => {
     expect(readdirSync(dir).sort()).toEqual(beforeFiles);
   }, 15_000);
 
+  it('reads a multi-page closed snapshot with the positive backup batch bound', async () => {
+    const store = healthyStore();
+    store.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded',
+      repositories: [],
+      bindings: [],
+      issues: Array.from({ length: 512 }, (_, index) => ({
+        issueHash: index.toString(16).padStart(64, '0'),
+        category: 'capacity_deferred' as const,
+      })),
+      at: AT0,
+    });
+    store.close();
+
+    // The default SQLite page size is 4096; the populated fixture must cross one page without
+    // opening another source connection between the closed-WAL witness and the status read.
+    expect(statSync(statePath).size).toBeGreaterThan(4096);
+
+    await expect(inspect()).resolves.toMatchObject({
+      exitCode: 1,
+      schema: { state: 'matched', foundVersion: 13 },
+      registry: { active: 0, pending: 0, rejected: 0, deferred: 512 },
+    });
+  }, 15_000);
+
   it('does not alter or echo a corrupt source database', async () => {
     writeFileSync(statePath, 'SENTINEL_CORRUPT_DATABASE');
     const beforeHash = sha256(statePath);

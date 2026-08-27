@@ -407,8 +407,9 @@ const STATUS_OWNER_MESSAGE_MAX_AGE_MS = 5_000;
 const STATUS_OWNER_MAX_ACCEPTED_NONCES = 2_048;
 // Node's backup() schedules one libuv work item per page batch. A closed status read needs the
 // complete consistent image, so splitting the default 100-page batch only exposes it to unrelated
-// thread-pool contention between steps. sqlite3_backup_step() defines a negative rate as all pages.
-const STATUS_CLOSED_BACKUP_ALL_PAGES = -1;
+// thread-pool contention between steps. Node 26.8 validates rate as a positive int32; this is the
+// largest accepted batch and is effectively one step for the bounded state database.
+const STATUS_CLOSED_BACKUP_MAX_PAGES = 2_147_483_647;
 const FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
 const NONCE_PATTERN = /^[0-9a-f]{32}$/;
 const FAILURE_CODE_SET = new Set<string>(OPERATIONAL_FAILURE_CODES);
@@ -1519,7 +1520,7 @@ async function readStoredStatus(
     // sqlite3_backup_* takes one transactionally consistent image. If a writer commits or
     // checkpoints concurrently, SQLite restarts the backup rather than combining file epochs.
     if (afterSqliteBackupStep === undefined) {
-      await backup(source, copy, { rate: STATUS_CLOSED_BACKUP_ALL_PAGES });
+      await backup(source, copy, { rate: STATUS_CLOSED_BACKUP_MAX_PAGES });
     }
     else await backup(source, copy, { rate: 1, progress: afterSqliteBackupStep });
     source.close();
