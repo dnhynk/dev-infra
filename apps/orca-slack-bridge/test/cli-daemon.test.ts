@@ -868,6 +868,75 @@ describe('daemon production wiring', () => {
     expect(held).toBe(false);
   });
 
+  it('keeps the daemon alive when the production post-mutation status refresh fails', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    let refreshCalls = 0;
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      statusOwnerServer: {
+        start: () => Promise.resolve(),
+        refresh: () => {
+          refreshCalls += 1;
+          if (refreshCalls === 1) throw new Error('status.snapshot_unavailable');
+        },
+        stop: () => Promise.resolve(),
+      },
+      channelServer: new FakeChannelServer(),
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+    });
+
+    expect(code).toBe(0);
+    expect(refreshCalls).toBe(3);
+    const reopened = new SqliteDigestStore(statePath);
+    try {
+      expect(reopened.readDaemonHealth()).toMatchObject({ revision: 1, state: 'stopped' });
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('keeps an explicit startup status refresh failure fatal', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    let refreshCalls = 0;
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as
+      typeof process.stderr.write);
+    try {
+      const code = await runDaemonCommand(parsed, CONFIG, {
+        statusOwnerServer: {
+          start: () => Promise.resolve(),
+          refresh: () => {
+            refreshCalls += 1;
+            if (refreshCalls === 2) throw new Error('status.snapshot_unavailable');
+          },
+          stop: () => Promise.resolve(),
+        },
+        channelServer: new FakeChannelServer(),
+        orca: new FakeOrca(),
+        slack: new FakeSlack(),
+        connectionFactory: () => ({
+          start: () => Promise.resolve({ appId: 'A0APP' }),
+          close: () => Promise.resolve(),
+        }),
+        waitForStop: () => Promise.resolve(),
+      });
+
+      expect(code).toBe(1);
+      expect(refreshCalls).toBe(2);
+      expect(stderr).toHaveBeenCalledWith(
+        'daemon이 strict startup 또는 Gate reconciliation에 실패했다\n',
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it('retains the snapshot lease and fails boundedly when writable store closure is uncertain', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
