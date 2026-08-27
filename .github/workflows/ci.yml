@@ -39,6 +39,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm -r test
+      - name: O1-7 hermetic operational acceptance
+        run: pnpm acceptance:o1-7
 
   typecheck:
     name: typecheck

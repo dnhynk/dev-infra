@@ -38,7 +38,7 @@ function xml(value: WindowsTaskDefinition, schemaVersion = '1.2'): string {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="${schemaVersion}" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger></Triggers>
+  <Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -112,6 +112,9 @@ describe('Windows Scheduled Task semantic contract', () => {
       logonType: 'InteractiveToken',
       runLevel: 'Limited',
     });
+    expect(parsed?.trigger.repetition).toEqual({
+      interval: 'PT1M', duration: null, stopAtDurationEnd: false,
+    });
     expect(parsed?.settings).toMatchObject({
       startWhenAvailable: true,
       multipleInstances: 'IgnoreNew',
@@ -131,6 +134,10 @@ describe('Windows Scheduled Task semantic contract', () => {
     ]);
     expect(parseWindowsTaskXml(xml(expected).replace(
       '    <AllowStartOnDemand>true</AllowStartOnDemand>\n',
+      '',
+    ))).toEqual(expected);
+    expect(parseWindowsTaskXml(xml(expected).replace(
+      '<StopAtDurationEnd>false</StopAtDurationEnd>',
       '',
     ))).toEqual(expected);
   });
@@ -195,6 +202,18 @@ describe('Windows Scheduled Task semantic contract', () => {
     ))).toBeNull();
     expect(parseWindowsTaskXml(valid.replace('InteractiveToken', 'Password'))).toBeNull();
     expect(parseWindowsTaskXml(valid.replace('<Count>3</Count>', '<Count>10</Count>'))).toBeNull();
+    expect(parseWindowsTaskXml(valid.replace(
+      '<Repetition><Interval>PT1M</Interval>',
+      '<Repetition><Interval>PT2M</Interval>',
+    ))).toBeNull();
+    expect(parseWindowsTaskXml(valid.replace(
+      '<StopAtDurationEnd>false</StopAtDurationEnd>',
+      '<StopAtDurationEnd>true</StopAtDurationEnd>',
+    ))).toBeNull();
+    expect(parseWindowsTaskXml(valid.replace(
+      '<Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd>',
+      '<Interval>PT1M</Interval><Duration>PT2M</Duration><StopAtDurationEnd>false</StopAtDurationEnd>',
+    ))).toBeNull();
     expect(parseWindowsTaskXml(valid.replace('Context="Author"', 'Context="Other"'))).toBeNull();
     expect(parseWindowsTaskXml(valid.replace('</Actions>', '<ComHandler><ClassId>x</ClassId></ComHandler></Actions>'))).toBeNull();
     expect(parseWindowsTaskXml(valid.replace(
@@ -225,7 +244,7 @@ describe('Windows Scheduled Task semantic contract', () => {
       .replace('<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
         '<t:Task version="1.2" xmlns:t="http://schemas.microsoft.com/windows/2004/02/mit/task">')
       .replace('</Task>', '</t:Task>')
-      .replace(/<(\/)?(RegistrationInfo|Description|Triggers|LogonTrigger|Enabled|UserId|Principals|Principal|LogonType|RunLevel|Settings|MultipleInstancesPolicy|DisallowStartIfOnBatteries|StopIfGoingOnBatteries|AllowHardTerminate|StartWhenAvailable|RunOnlyIfNetworkAvailable|IdleSettings|Duration|WaitTimeout|StopOnIdleEnd|RestartOnIdle|AllowStartOnDemand|Hidden|RunOnlyIfIdle|WakeToRun|ExecutionTimeLimit|Priority|RestartOnFailure|Interval|Count|Actions|Exec|Command|Arguments|WorkingDirectory)(?=[ >])/gu,
+      .replace(/<(\/)?(RegistrationInfo|Description|Triggers|LogonTrigger|Repetition|Enabled|UserId|Principals|Principal|LogonType|RunLevel|Settings|MultipleInstancesPolicy|DisallowStartIfOnBatteries|StopIfGoingOnBatteries|AllowHardTerminate|StartWhenAvailable|RunOnlyIfNetworkAvailable|IdleSettings|Duration|WaitTimeout|StopOnIdleEnd|RestartOnIdle|StopAtDurationEnd|AllowStartOnDemand|Hidden|RunOnlyIfIdle|WakeToRun|ExecutionTimeLimit|Priority|RestartOnFailure|Interval|Count|Actions|Exec|Command|Arguments|WorkingDirectory)(?=[ >])/gu,
         '<$1t:$2');
     expect(parseWindowsTaskXml(prefixed)).toEqual(expected);
     expect(parseWindowsTaskXml(xml(expected).replace(

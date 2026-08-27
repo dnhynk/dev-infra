@@ -7,6 +7,7 @@
   },
   "scripts": {
     "acceptance:d3-4": "node tools/d3-4-lifecycle-acceptance.mjs",
+    "acceptance:o1-7": "node tools/o1-7-operational-acceptance.mjs",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
   },

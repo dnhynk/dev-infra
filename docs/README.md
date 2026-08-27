@@ -1,6 +1,6 @@
 # dev-infra 문서 인덱스
 
-상태: **C1~D3 구현·offline 검증 완료, D3 live 경로 관찰·exact-build 재수용 대기, O1 진행 예정**
+상태: **C1~D3 구현·offline 검증 완료, D3 `LIVE_CHANNEL_UNVERIFIED` 유지, O1-1~6 merged · O1-7 Windows disposable PASS/production 배포 대기**
 기준일: **2026-08-26**
 
 이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
@@ -79,4 +79,5 @@ durable delivery, Task-resume evidence, existing-card projection은 hermetic fai
 사람이 승인한 Claude Code 2.1.243 session에서 live 경로도 관찰됐다. 다만 그 session의 Adapter는
 authority repair 전 build에서 시작됐고 daemon만 repair 후 build로 바뀌어 exact-build 조건을 충족하지
 못했다. 따라서 상태는 `LIVE_CHANNEL_UNVERIFIED`이며 redacted 관찰과 잔여 조건은
-[D3 live acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다. 다음 구현 slice는 O1이다.
+[D3 live acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다. O1의 hermetic/Windows
+검증과 merged-main 배포 잔여 조건은 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 있다.

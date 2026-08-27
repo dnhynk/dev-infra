@@ -1,6 +1,17 @@
 # Windows current-user 자동 시작 운영
 
 상태: **O1 canonical operator workflow**
+
+Managed Task의 AtLogOn trigger는 duration 없는 PT1M repetition을 가진다. daemon process가 종료되면
+다음 repetition이 다시 실행하고, 이미 실행 중이면 `IgnoreNew`가 겹침을 막는다. 별도의
+`RestartOnFailure` 3회/PT1M은 unmet start condition 또는 action-start failure용이며, 이미 시작된
+Exec의 exit code를 process crash recovery로 해석하지 않는다. uninstall은 repetition보다 먼저 exact
+owned task를 disable한 뒤 shutdown fence를 진행한다.
+
+O1-7 상태와 redacted disposable-task cleanup 증거는
+[O1 operational acceptance evidence](../evidence/o1-operational-acceptance.md)를 따른다. 이 문서의
+production install은 PR merge 뒤 exact merged-main release를 stage하고 local startup/status smoke가
+통과할 때까지 pending이다. D3 `LIVE_CHANNEL_UNVERIFIED`와는 별도 조건이다.
 대상: Windows PowerShell 5.1, Node.js 26.x, pnpm 11.22.0
 
 ## 불변 release 만들기

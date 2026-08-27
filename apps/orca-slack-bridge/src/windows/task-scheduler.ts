@@ -10,6 +10,7 @@ export const WINDOWS_TASK_NAME = 'Orca Slack Bridge Daemon';
 export const WINDOWS_TASK_DESCRIPTION_PREFIX = 'ORCA_SLACK_BRIDGE_MANAGED_V1';
 export const WINDOWS_TASK_RESTART_COUNT = 3;
 export const WINDOWS_TASK_RESTART_INTERVAL = 'PT1M';
+export const WINDOWS_TASK_REPETITION_INTERVAL = 'PT1M';
 export const WINDOWS_TASK_EXECUTION_TIME_LIMIT = 'PT0S';
 export const WINDOWS_TASK_IDLE_DURATION = 'PT10M';
 export const WINDOWS_TASK_IDLE_WAIT_TIMEOUT = 'PT1H';
@@ -32,6 +33,11 @@ export type WindowsTaskDefinition = {
     readonly kind: 'AtLogOn';
     readonly userId: string;
     readonly enabled: true;
+    readonly repetition: {
+      readonly interval: typeof WINDOWS_TASK_REPETITION_INTERVAL;
+      readonly duration: null;
+      readonly stopAtDurationEnd: false;
+    };
   };
   readonly settings: {
     readonly startWhenAvailable: true;
@@ -155,6 +161,8 @@ function New-DesiredTaskDefinition([object]$d) {
   $trigger = $definition.Triggers.Create(9)
   $trigger.UserId = [string]$d.trigger.userId
   $trigger.Enabled = $true
+  $trigger.Repetition.Interval = 'PT1M'
+  $trigger.Repetition.StopAtDurationEnd = $false
   $definition.Settings.Enabled = [bool]$d.enabled
   $definition.Settings.StartWhenAvailable = $true
   $definition.Settings.MultipleInstances = 2
@@ -627,7 +635,16 @@ export function createWindowsTaskDefinition(input: {
       logonType: 'InteractiveToken',
       runLevel: 'Limited',
     },
-    trigger: { kind: 'AtLogOn', userId: input.currentSid, enabled: true },
+    trigger: {
+      kind: 'AtLogOn',
+      userId: input.currentSid,
+      enabled: true,
+      repetition: {
+        interval: WINDOWS_TASK_REPETITION_INTERVAL,
+        duration: null,
+        stopAtDurationEnd: false,
+      },
+    },
     settings: {
       startWhenAvailable: true,
       multipleInstances: 'IgnoreNew',
@@ -703,7 +720,7 @@ export function parseWindowsTaskXml(
       actions === null || actions.length !== 1 || actions[0]?.localName !== 'Exec' ||
       !exactAttributes(actionsElement, { Context: 'Author' }) || !exactAttributes(actions[0])) return null;
   const principal = exactChildren(principals[0], ['UserId', 'LogonType', 'RunLevel']);
-  const logonTrigger = exactChildren(triggers[0], ['Enabled', 'UserId']);
+  const logonTrigger = exactChildren(triggers[0], ['Enabled', 'UserId', 'Repetition']);
   const settings = exactChildren(rootChildren.get('Settings')!, [
     'MultipleInstancesPolicy', 'DisallowStartIfOnBatteries', 'StopIfGoingOnBatteries',
     'AllowHardTerminate', 'StartWhenAvailable', 'RunOnlyIfNetworkAvailable', 'IdleSettings',
@@ -712,11 +729,18 @@ export function parseWindowsTaskXml(
   ], ['AllowStartOnDemand']);
   const exec = exactChildren(actions[0], ['Command', 'Arguments', 'WorkingDirectory']);
   if (principal === null || logonTrigger === null || settings === null || exec === null) return null;
+  const repetition = exactChildren(
+    logonTrigger.get('Repetition')!,
+    ['Interval'],
+    ['StopAtDurationEnd'],
+  );
   const idle = exactChildren(settings.get('IdleSettings')!, [
     'Duration', 'WaitTimeout', 'StopOnIdleEnd', 'RestartOnIdle',
   ]);
   const restart = exactChildren(settings.get('RestartOnFailure')!, ['Interval', 'Count']);
-  if (idle === null || restart === null || !exactAttributes(settings.get('IdleSettings')!) ||
+  if (repetition === null || idle === null || restart === null ||
+      !exactAttributes(logonTrigger.get('Repetition')!) ||
+      !exactAttributes(settings.get('IdleSettings')!) ||
       !exactAttributes(settings.get('RestartOnFailure')!)) return null;
   const description = childText(registration, 'Description');
   const principalUser = childText(principal, 'UserId');
@@ -730,6 +754,9 @@ export function parseWindowsTaskXml(
       childText(principal, 'LogonType') !== 'InteractiveToken' ||
       childText(principal, 'RunLevel') !== 'LeastPrivilege' ||
       childBoolean(logonTrigger, 'Enabled') !== true ||
+      childText(repetition, 'Interval') !== WINDOWS_TASK_REPETITION_INTERVAL ||
+      (repetition.has('StopAtDurationEnd') &&
+       childBoolean(repetition, 'StopAtDurationEnd') !== false) ||
       childText(settings, 'MultipleInstancesPolicy') !== 'IgnoreNew' ||
       childBoolean(settings, 'DisallowStartIfOnBatteries') !== false ||
       childBoolean(settings, 'StopIfGoingOnBatteries') !== false ||
@@ -753,7 +780,16 @@ export function parseWindowsTaskXml(
     description,
     enabled,
     principal: { userId: principalUser, logonType: 'InteractiveToken', runLevel: 'Limited' },
-    trigger: { kind: 'AtLogOn', userId: triggerUser, enabled: true },
+    trigger: {
+      kind: 'AtLogOn',
+      userId: triggerUser,
+      enabled: true,
+      repetition: {
+        interval: WINDOWS_TASK_REPETITION_INTERVAL,
+        duration: null,
+        stopAtDurationEnd: false,
+      },
+    },
     settings: {
       startWhenAvailable: true,
       multipleInstances: 'IgnoreNew',
