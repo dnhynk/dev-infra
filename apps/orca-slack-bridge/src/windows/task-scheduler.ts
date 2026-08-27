@@ -711,6 +711,7 @@ export function createWindowsTaskDefinition(input: {
         '-NoLogo',
         '-NoProfile',
         '-NonInteractive',
+        '-WindowStyle', 'Hidden',
         '-ExecutionPolicy', 'Bypass',
         '-File', input.launcherPath,
         '-SettingsPath', input.runtimeManifestPath,
@@ -945,7 +946,8 @@ export function windowsTaskXmlMatchesLaunchBinding(
       !sameWindowsBindingPath(definition.action.workingDirectory, input.releaseRoot)) return false;
   const argumentsList = parseWindowsArguments(definition.action.arguments);
   if (JSON.stringify(argumentsList) !== JSON.stringify([
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+    '-ExecutionPolicy', 'Bypass',
     '-File', input.launcherPath, '-SettingsPath', input.runtimeManifestPath,
   ])) return false;
   const fingerprint = fingerprintWindowsTask(definition);

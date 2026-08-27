@@ -560,6 +560,31 @@ describe('Windows current-user lifecycle', () => {
     expect(runner.operations).not.toContain('start');
   });
 
+  it('fails the dynamic run-now caller closed when the registered action is not hidden', async () => {
+    const expected = taskDefinition();
+    for (const argumentsValue of [
+      expected.action.arguments.replace('"Hidden"', '"Normal"'),
+      expected.action.arguments.replace('"-WindowStyle" "Hidden" ', ''),
+    ]) {
+      const runner = new FakePowerShellRunner();
+      const actionDrift = {
+        ...expected,
+        action: { ...expected.action, arguments: argumentsValue },
+      };
+      runner.definition = {
+        ...actionDrift,
+        description: `${WINDOWS_TASK_DESCRIPTION_PREFIX};release=${DIGEST};semantic=${fingerprintWindowsTask(actionDrift)}`,
+      };
+      const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+      await expect(runManagedTaskNow(2, {
+        platform: 'win32', scheduler,
+        manifestStore: new FakeManifestStore().seed(),
+        verifyRelease: () => true,
+      })).rejects.toThrow('windows.run_now.action_drift');
+      expect(runner.operations).not.toContain('start');
+    }
+  });
+
   it('rejects a protected self-consistent manifest bound to another task fingerprint', async () => {
     const runner = new FakePowerShellRunner();
     runner.definition = taskDefinition();

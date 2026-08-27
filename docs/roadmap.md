@@ -272,6 +272,16 @@ O1-7 실측에서 `RestartOnFailure`가 이미 시작된 Exec의 exit 23을 재�
 드러났다. 최소 수리는 managed AtLogOn trigger의 duration 없는 PT1M repetition이며, 기존
 `RestartOnFailure` 3회/PT1M과 `IgnoreNew`는 각각 action-start failure와 overlap 경계로 유지한다.
 
+후속 exact merged-main production 표본 `533a4a9530fdd6f6ddc20ba6a265ded3e7a0d3e6`에서는
+SID binding을 통과해 daemon이 시작됐지만, interactive Task action의 Windows PowerShell이 약 2~4분 뒤
+`0xC000013A`로 끝나고 `CreateNoWindow` Node만 orphan으로 남았다. Task 밖에서 hidden window로 시작한
+동일 release/workload는 240초 동안 parent-owned였으므로, 최소 hotfix는 task action의
+`-WindowStyle Hidden`을 생성·semantic fingerprint·launcher binding·dynamic `run-now` parsing에 고정한다.
+disposable registered-task 표본은 하나의 PowerShell parent와 direct Node child 및 Task `Running` 상태를
+245초 동안 유지하고 clean exit 뒤 residual `0/0/0`을 확인했다. 이 repair가 merge된 exact release로 같은
+beyond-boundary production 관측을 통과하기 전까지 O1 production 설치 완료 상태는 열어 두며, 건강한 orphan
+daemon만으로 완료를 주장하지 않는다.
+
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
 ## 11. 별도 후속 workstream

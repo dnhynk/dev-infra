@@ -533,3 +533,20 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   exact owned task를 먼저 disable하므로 shutdown fence 뒤 새 외부 work를 시작하지 않는다.
 - disposable acceptance는 별도 bounded PT1M TimeTrigger로 exit 23 뒤 두 번째 OS launch와 clean exit
   0을 증명하고, production trigger의 indefinite 의미는 strict pure XML/fingerprint test로 검증한다.
+
+## 2026-08-28 · O1 Task supervisor hotfix
+
+### DL-058 · interactive Task의 PowerShell supervisor window를 hidden으로 고정한다
+
+- exact merged-main production release에서 Task action PowerShell과 `CreateNoWindow` Node daemon 하나가
+  시작된 뒤 약 2~4분에 PowerShell만 `0xC000013A`로 끝나 Node가 orphan으로 남았다. 같은 immutable
+  inputs와 workload를 Task 밖에서 hidden window로 시작한 control은 240초 동안 parent-owned였고,
+  exact-setting 및 단순 parent/child control은 130초를 넘겨 유지됐다.
+- managed action에 Windows PowerShell `-WindowStyle Hidden`을 고정하고, action argument를 포함하는
+  semantic fingerprint, launcher의 registered Task binding, dynamic `run-now` parser가 omission이나
+  non-hidden drift를 모두 거절하게 한다.
+- broader console control handler나 별도 native process wrapper는 이 관측된 differentiator를 닫는 데
+  필요하지 않아 도입하지 않는다. disposable registered Task가 `Running`인 채 direct PowerShell→Node
+  pair 하나를 245초 유지하고 clean exit 뒤 task/process/file residual `0/0/0`을 보여야 한다.
+- production O1 완료는 hotfix merge 뒤 exact release에서 같은 beyond-boundary ownership을 다시 관측할
+  때까지 보류한다. Task가 끝난 뒤 건강한 daemon만 남은 상태는 acceptance가 아니다.

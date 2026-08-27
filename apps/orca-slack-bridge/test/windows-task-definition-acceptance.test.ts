@@ -75,7 +75,8 @@ describe('O1-7 CI-safe Windows Task definition acceptance', () => {
       },
     });
     expect(parseWindowsArguments(definition.action.arguments)).toEqual([
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+      '-ExecutionPolicy', 'Bypass',
       '-File', LAUNCHER, '-SettingsPath', MANIFEST,
     ]);
     expect(parseWindowsTaskMarker(definition.description)).toEqual({
@@ -89,7 +90,7 @@ describe('O1-7 CI-safe Windows Task definition acceptance', () => {
     const parsed = parseWindowsTaskXml(xml, '1.6');
     expect(parsed).not.toBeNull();
     const fingerprint = fingerprintWindowsTask(parsed!);
-    expect(windowsTaskXmlMatchesLaunchBinding(xml, {
+    const binding = {
       currentSid: SID,
       releaseRoot: ROOT,
       releaseDigest: DIGEST,
@@ -97,7 +98,14 @@ describe('O1-7 CI-safe Windows Task definition acceptance', () => {
       launcherPath: LAUNCHER,
       runtimeManifestPath: MANIFEST,
       taskSemanticFingerprint: fingerprint,
-    }, '1.6')).toBe(true);
+    };
+    expect(windowsTaskXmlMatchesLaunchBinding(xml, binding, '1.6')).toBe(true);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      xml.replace('&quot;Hidden&quot;', '&quot;Normal&quot;'), binding, '1.6',
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      xml.replace('&quot;-WindowStyle&quot; &quot;Hidden&quot; ', ''), binding, '1.6',
+    )).toBe(false);
 
     for (const drifted of [
       xml.replace('<Count>3</Count>', '<Count>4</Count>'),

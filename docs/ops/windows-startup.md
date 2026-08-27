@@ -6,12 +6,15 @@ Managed Task의 AtLogOn trigger는 duration 없는 PT1M repetition을 가진다.
 다음 repetition이 다시 실행하고, 이미 실행 중이면 `IgnoreNew`가 겹침을 막는다. 별도의
 `RestartOnFailure` 3회/PT1M은 unmet start condition 또는 action-start failure용이며, 이미 시작된
 Exec의 exit code를 process crash recovery로 해석하지 않는다. uninstall은 repetition보다 먼저 exact
-owned task를 disable한 뒤 shutdown fence를 진행한다.
+owned task를 disable한 뒤 shutdown fence를 진행한다. interactive PowerShell action은 console-close
+boundary를 노출하지 않도록 `-WindowStyle Hidden`을 사용하며, 이 값은 Task semantic fingerprint와
+launcher/`run-now` binding 검증에 포함된다.
 
 O1-7 상태와 redacted disposable-task cleanup 증거는
 [O1 operational acceptance evidence](../evidence/o1-operational-acceptance.md)를 따른다. 이 문서의
-production install은 PR merge 뒤 exact merged-main release를 stage하고 local startup/status smoke가
-통과할 때까지 pending이다. D3 `LIVE_CHANNEL_UNVERIFIED`와는 별도 조건이다.
+production install은 hotfix merge 뒤 exact merged-main release를 stage하고 Task `Running`과 하나의 direct
+daemon child가 관측된 2~4분 경계를 넘어 유지되는 local startup/status smoke를 통과할 때까지 pending이다.
+D3 `LIVE_CHANNEL_UNVERIFIED`와는 별도 조건이다.
 대상: Windows PowerShell 5.1, Node.js 26.x, pnpm 11.22.0
 
 ## 불변 release 만들기
@@ -60,8 +63,9 @@ $node = '<versioned Node 26 node.exe 절대경로>'
 plain install은 task를 시작하지 않는다. 즉시 확인하려면 같은 install에 `--run-now`를 추가하거나
 나중에 staged CLI의 `run-now --wait-seconds 90`을 사용한다. install은 현재 SID의 root Scheduled
 Task를 COM validate-only로 먼저 검증하고, protected runtime manifest와 task를 CAS/rollback으로
-갱신한다. task action에는 절대 System32 Windows PowerShell, versioned launcher, protected manifest
-경로만 들어간다. Task XML은 schema `1.2`부터 host COM `HighestVersion`까지의 export만 허용하며,
+갱신한다. task action에는 절대 System32 Windows PowerShell, 고정된 hidden/noninteractive flags,
+versioned launcher, protected manifest 경로만 들어간다. Task XML은 schema `1.2`부터 host COM
+`HighestVersion`까지의 export만 허용하며,
 현재 host 범위를 벗어난 `1.99` 같은 plausible future 값도 fail closed한다.
 
 launcher는 매 시작마다 상속된 두 canonical token과 build identity를 먼저 버린다. 현재 User의
