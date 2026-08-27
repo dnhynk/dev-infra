@@ -171,10 +171,13 @@ export class ObserverSupervisor {
   startAfterSocket(digestDelayMs = 60_000): void {
     if (this.stopped || this.accepting) throw new Error('observer supervisor already started');
     this.accepting = true;
-    for (const [name, delay] of this.deferredSchedules) this.installTimer(name, delay);
+    for (const [name, deadlineMono] of this.deferredSchedules) {
+      this.installTimer(name, deadlineMono);
+    }
     this.deferredSchedules.clear();
     this.markDue('run-observer');
-    this.installTimer('pr-digest', finiteMilliseconds('digestDelayMs', digestDelayMs));
+    const digestDelay = finiteMilliseconds('digestDelayMs', digestDelayMs);
+    this.installTimer('pr-digest', this.clock.monotonicMs() + digestDelay);
   }
 
   markDue(name: ObserverJobName): void {
@@ -290,6 +293,8 @@ export class ObserverSupervisor {
       bucket,
     );
     const completedWall = this.clock.wallNow();
+    const completedMono = this.clock.monotonicMs();
+    const deadlineMono = completedMono + nextDelayMs;
     const completion: ObserverCompletion = {
       name,
       status,
@@ -314,13 +319,21 @@ export class ObserverSupervisor {
       return;
     }
     if (this.stopped) return;
-    if (this.accepting) this.installTimer(name, nextDelayMs);
-    else this.deferredSchedules.set(name, nextDelayMs);
+    if (this.accepting) this.installTimer(name, deadlineMono);
+    else this.deferredSchedules.set(name, deadlineMono);
   }
 
-  private installTimer(name: ObserverJobName, delayMs: number): void {
+  private installTimer(name: ObserverJobName, deadlineMono: number): void {
     const existing = this.timers.get(name);
-    if (existing !== undefined) this.clock.clearTimer(existing);
+    if (existing !== undefined) {
+      this.clock.clearTimer(existing);
+      this.timers.delete(name);
+    }
+    const delayMs = Math.max(0, deadlineMono - this.clock.monotonicMs());
+    if (delayMs === 0) {
+      this.markDue(name);
+      return;
+    }
     const timer = this.clock.setTimer(() => {
       this.timers.delete(name);
       this.markDue(name);

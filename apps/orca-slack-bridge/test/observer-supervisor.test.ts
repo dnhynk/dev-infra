@@ -151,6 +151,112 @@ describe('ObserverSupervisor', () => {
     expect(await supervisor.stop(100)).toBe(true);
   });
 
+  it('anchors deferred startup scheduling to completion, including overdue deadlines', async () => {
+    const clock = new FakeClock();
+    const completions: ObserverCompletion[] = [];
+    let discoveryCalls = 0;
+    const discoveryStarts: number[] = [];
+    const digestStarts: number[] = [];
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-a', jitterRatio: 0, clock,
+      jobs: definitions({
+        'repository-discovery': async () => {
+          discoveryCalls += 1;
+          discoveryStarts.push(clock.now);
+          return {};
+        },
+        'pr-digest': async () => {
+          digestStarts.push(clock.now);
+          return {};
+        },
+      }),
+      onCompleted: (completion) => { completions.push(completion); },
+    });
+
+    await supervisor.runStartupDiscovery();
+    const firstCompletion = completions[0]!;
+    expect(firstCompletion.nextRunAt).toBe(new Date(Date.UTC(2026, 7, 27, 0, 0, 0) + 300_000)
+      .toISOString());
+
+    await clock.advance(60_000);
+    supervisor.startAfterSocket(60_000);
+    await clock.advance(59_999);
+    expect(discoveryCalls).toBe(1);
+    expect(digestStarts).toEqual([]);
+    await clock.advance(1);
+    expect(digestStarts).toEqual([120_000]);
+    await clock.advance(179_999);
+    expect(discoveryCalls).toBe(1);
+    await clock.advance(1);
+    expect(discoveryCalls).toBe(2);
+    expect(discoveryStarts[1]).toBe(300_000);
+
+    await supervisor.stop(100);
+
+    const overdueClock = new FakeClock();
+    const overdueStarts: number[] = [];
+    const overdueSupervisor = new ObserverSupervisor({
+      installationSeed: 'installation-a', jitterRatio: 0, clock: overdueClock,
+      jobs: definitions({
+        'repository-discovery': async () => {
+          overdueStarts.push(overdueClock.now);
+          return {};
+        },
+      }),
+    });
+
+    await overdueSupervisor.runStartupDiscovery();
+    await overdueClock.advance(300_001);
+    overdueSupervisor.startAfterSocket(60_000);
+    await flush();
+    expect(overdueStarts).toEqual([0, 300_001]);
+    await overdueSupervisor.stop(100);
+  });
+
+  it('anchors recurring scheduling to completion while onCompleted is slow', async () => {
+    const clock = new FakeClock();
+    const completions: ObserverCompletion[] = [];
+    const runObserverStarts: number[] = [];
+    let releaseCompletion!: () => void;
+    const completionGate = new Promise<void>((resolve) => { releaseCompletion = resolve; });
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-a', jitterRatio: 0, clock,
+      jobs: definitions({
+        'run-observer': async () => {
+          runObserverStarts.push(clock.now);
+          return {};
+        },
+      }),
+      onCompleted: (completion) => {
+        completions.push(completion);
+        if (completion.name === 'run-observer' &&
+            completions.filter((row) => row.name === 'run-observer').length === 1) {
+          return completionGate;
+        }
+      },
+    });
+
+    await supervisor.runStartupDiscovery();
+    supervisor.startAfterSocket(60_000);
+    await flush();
+    expect(runObserverStarts).toEqual([0]);
+    const firstCompletion = completions.find((row) => row.name === 'run-observer')!;
+
+    await clock.advance(60_000);
+    releaseCompletion();
+    await flush();
+    await clock.advance(59_999);
+    expect(runObserverStarts).toEqual([0]);
+    await clock.advance(1);
+    expect(runObserverStarts).toEqual([0, 120_000]);
+    expect(firstCompletion.nextRunAt).toBe(new Date(Date.UTC(2026, 7, 27, 0, 0, 0) + 120_000)
+      .toISOString());
+    expect(runObserverStarts[1]).toBe(Date.parse(firstCompletion.nextRunAt) -
+      Date.UTC(2026, 7, 27, 0, 0, 0));
+
+    await supervisor.stop(100);
+  });
+
   it('continues durable failure and jitter buckets after a daemon restart', async () => {
     const clock = new FakeClock();
     const completions: ObserverCompletion[] = [];
