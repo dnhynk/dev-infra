@@ -222,6 +222,13 @@ function expectStaticRejection(fixture: ReturnType<typeof createLauncherFixture>
 }
 
 describe('versioned Windows launcher', () => {
+  it('strictly resolves and forwards the one exported LogonTrigger SID', () => {
+    const source = launcherSource();
+    expect(source).toContain("'xml', 'currentSid', 'resolvedTriggerUserSid'");
+    expect(source).toContain('$triggerUsers.Count -ne 1');
+    expect(source).toContain('}, undefined, input.resolvedTriggerUserSid)');
+  });
+
   const driftCases = [
     ['transitive byte', (fixture: ReturnType<typeof createLauncherFixture>) => {
       writeFileSync(fixture.nestedPayload, 'drifted bytes\n');
@@ -272,7 +279,7 @@ describe('versioned Windows launcher', () => {
     const fixture = createLauncherFixture();
     const result = fixture.run();
     expect(result.error).toBeUndefined();
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr).toBe('');
     expect(readFileSync(fixture.tokenReadMarker, 'utf8')).toBe('botapp');

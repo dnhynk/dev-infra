@@ -925,11 +925,19 @@ export function windowsTaskXmlMatchesLaunchBinding(
   xml: string,
   input: WindowsTaskLaunchBinding,
   hostHighestSchemaVersion?: string,
+  trustedResolvedTriggerUserSid?: string | null,
 ): boolean {
   if (!/^S-[0-9]+(?:-[0-9]+)+$/u.test(input.currentSid) ||
       !/^[a-f0-9]{64}$/u.test(input.releaseDigest) ||
-      !/^[a-f0-9]{64}$/u.test(input.taskSemanticFingerprint)) return false;
-  const definition = parseWindowsTaskXml(xml, hostHighestSchemaVersion);
+      !/^[a-f0-9]{64}$/u.test(input.taskSemanticFingerprint) ||
+      (trustedResolvedTriggerUserSid !== undefined &&
+       trustedResolvedTriggerUserSid !== null &&
+       !WINDOWS_SID_PATTERN.test(trustedResolvedTriggerUserSid))) return false;
+  const definition = parseWindowsTaskXml(
+    xml,
+    hostHighestSchemaVersion,
+    trustedResolvedTriggerUserSid,
+  );
   if (definition === null || definition.taskName !== WINDOWS_TASK_NAME ||
       !definition.enabled || definition.principal.userId !== input.currentSid ||
       definition.trigger.userId !== input.currentSid ||
