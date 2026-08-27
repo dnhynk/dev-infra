@@ -1,6 +1,6 @@
 # O1 operational acceptance evidence
 
-Status: **disposable Windows and local hermetic aggregate PASS; canonical-export hotfix CI and fixed-merge production deployment pending**
+Status: **disposable Windows and local hermetic aggregate PASS; launcher SID hotfix CI and fixed-merge production deployment pending**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
@@ -13,6 +13,13 @@ The first production install from exact merged `main` at
 canonicalization and absent-create rollback gap and ended with
 `windows.install.rollback_failed`. The exact owned residual task was safely removed and no manifest
 or daemon process remained; production installation is pending the fixed merge.
+
+The second production install from exact merged `main` at
+`a3e018bffef633e8d55d3e2dc2dc1c50f8a846b2` left the owned Task and protected manifest
+semantically matched, but the Task ended with last result `2` and produced no new daemon log or
+heartbeat. The launcher rejected the canonical exported account name before daemon start because
+its dynamic binding verifier did not receive the trusted resolved LogonTrigger SID; deployment of
+this second hotfix remains pending its fixed merge.
 
 ## Operational failure matrix
 
@@ -106,3 +113,6 @@ retains its generated task name, paths, XML, process command line, or mock state
   task/process/file `0/0/0`; external writes `0`; failure code `null`.
 - The first exact merged-main stage/install exposed the canonical registered-export/rollback gap
   above. The fixed-merge production stage/install and local startup/status smoke remain pending.
+- The second exact merged-main install retained a matched Task/manifest but ended with Task result
+  `2` and no new daemon log/heartbeat; the launcher SID-forwarding repair is pending fixed-merge
+  deployment.

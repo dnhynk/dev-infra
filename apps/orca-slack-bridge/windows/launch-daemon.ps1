@@ -384,11 +384,13 @@ async function main() {
   const input = JSON.parse(raw);
   if (input === null || typeof input !== 'object' || Array.isArray(input) ||
       JSON.stringify(Object.keys(input)) !== JSON.stringify([
-        'xml', 'currentSid', 'powerShellPath', 'settingsPath', 'releaseRoot',
+        'xml', 'currentSid', 'resolvedTriggerUserSid', 'powerShellPath', 'settingsPath', 'releaseRoot',
         'releaseDigest', 'launcherPath', 'taskSemanticFingerprint',
       ]) || typeof input.xml !== 'string' || input.xml.length === 0 ||
       input.xml.length > 1024 * 1024 || typeof input.currentSid !== 'string' ||
-      !/^S-[0-9]+(?:-[0-9]+)+$/u.test(input.currentSid)) throw new Error('input');
+      !/^S-[0-9]+(?:-[0-9]+)+$/u.test(input.currentSid) ||
+      typeof input.resolvedTriggerUserSid !== 'string' ||
+      !/^S-[0-9]+(?:-[0-9]+)+$/u.test(input.resolvedTriggerUserSid)) throw new Error('input');
   const modulePath = win32.join(input.releaseRoot, 'dist', 'windows', 'task-scheduler.js');
   const api = await import(pathToFileURL(modulePath).href);
   if (!api.windowsTaskXmlMatchesLaunchBinding(input.xml, {
@@ -399,7 +401,7 @@ async function main() {
     launcherPath: input.launcherPath,
     runtimeManifestPath: input.settingsPath,
     taskSemanticFingerprint: input.taskSemanticFingerprint,
-  })) throw new Error('identity');
+  }, undefined, input.resolvedTriggerUserSid)) throw new Error('identity');
 }
 
 main().catch(() => { process.exitCode = 1; });
@@ -418,6 +420,50 @@ function Assert-TaskBinding($Runtime, [string]$RuntimeSettingsPath) {
   if ([String]::IsNullOrWhiteSpace($xmlBefore) -or $xmlBefore.Length -gt 1048576) {
     throw 'task export'
   }
+  $xmlSettings = [Xml.XmlReaderSettings]::new()
+  $xmlSettings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+  $xmlSettings.XmlResolver = $null
+  $stringReader = [IO.StringReader]::new($xmlBefore)
+  $xmlReader = [Xml.XmlReader]::Create($stringReader, $xmlSettings)
+  try {
+    $taskDocument = [Xml.XmlDocument]::new()
+    $taskDocument.XmlResolver = $null
+    $taskDocument.Load($xmlReader)
+  } finally {
+    $xmlReader.Dispose()
+    $stringReader.Dispose()
+  }
+  $namespace = [Xml.XmlNamespaceManager]::new($taskDocument.NameTable)
+  $namespace.AddNamespace('task', $taskDocument.DocumentElement.NamespaceURI)
+  $triggerUsers = @($taskDocument.SelectNodes(
+    '/task:Task/task:Triggers/task:LogonTrigger/task:UserId',
+    $namespace
+  ))
+  if ($triggerUsers.Count -ne 1) { throw 'task trigger identity' }
+  $rawTriggerUser = [string]$triggerUsers[0].InnerText
+  if ([String]::IsNullOrWhiteSpace($rawTriggerUser) -or
+      -not [String]::Equals($rawTriggerUser, $rawTriggerUser.Trim(), [StringComparison]::Ordinal)) {
+    throw 'task trigger identity'
+  }
+  [object[]]$resolvedTriggerUsers = @()
+  try {
+    $resolvedTriggerUsers = @([Security.Principal.SecurityIdentifier]::new($rawTriggerUser))
+  } catch [ArgumentException] {
+    try {
+      $resolvedTriggerUsers = @(
+        [Security.Principal.NTAccount]::new($rawTriggerUser).Translate(
+          [Security.Principal.SecurityIdentifier]
+        )
+      )
+    } catch [Security.Principal.IdentityNotMappedException] {
+      throw 'task trigger identity'
+    }
+  }
+  if ($resolvedTriggerUsers.Count -ne 1 -or
+      $resolvedTriggerUsers[0] -isnot [Security.Principal.SecurityIdentifier]) {
+    throw 'task trigger identity'
+  }
+  $resolvedTriggerUserSid = [string]$resolvedTriggerUsers[0].Value
   $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   $systemDirectory = [Environment]::SystemDirectory
   Assert-AbsoluteCanonicalPath $systemDirectory
@@ -432,6 +478,7 @@ function Assert-TaskBinding($Runtime, [string]$RuntimeSettingsPath) {
   $inputObject = [ordered]@{
     xml = $xmlBefore
     currentSid = $sid
+    resolvedTriggerUserSid = $resolvedTriggerUserSid
     powerShellPath = $currentPowerShell
     settingsPath = $RuntimeSettingsPath
     releaseRoot = [string]$Runtime.releaseRoot

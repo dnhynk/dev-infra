@@ -281,6 +281,20 @@ describe('Windows Scheduled Task semantic contract', () => {
     };
     const exported = xml(expected, '1.6');
     expect(windowsTaskXmlMatchesLaunchBinding(exported, binding, '1.6')).toBe(true);
+    const canonicalExport = canonicalRegisteredXml(expected);
+    expect(windowsTaskXmlMatchesLaunchBinding(canonicalExport, binding, '1.6')).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      canonicalExport, binding, '1.6', SID,
+    )).toBe(true);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      canonicalExport, binding, '1.6', OTHER_SID,
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      canonicalExport, binding, '1.6', 'not-a-sid',
+    )).toBe(false);
+    expect(windowsTaskXmlMatchesLaunchBinding(
+      canonicalExport.replace(ACCOUNT, OTHER_SID), binding, '1.6', SID,
+    )).toBe(false);
     expect(windowsTaskXmlMatchesLaunchBinding(exported, {
       ...binding, taskSemanticFingerprint: '0'.repeat(64),
     }, '1.6')).toBe(false);
