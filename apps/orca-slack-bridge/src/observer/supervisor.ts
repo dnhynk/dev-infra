@@ -329,7 +329,7 @@ export class ObserverSupervisor {
       this.clock.clearTimer(existing);
       this.timers.delete(name);
     }
-    const delayMs = Math.max(0, deadlineMono - this.clock.monotonicMs());
+    const delayMs = Math.ceil(Math.max(0, deadlineMono - this.clock.monotonicMs()));
     if (delayMs === 0) {
       this.markDue(name);
       return;

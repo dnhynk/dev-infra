@@ -609,3 +609,25 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   2 files 82 pass/9 platform-skip와 workspace typecheck는 merge 자격만 증명하며, final O1
   production acceptance는 merged fixed release에서 반복 status와 heartbeat/Task liveness를 다시 관측할
   때까지 pending이다.
+
+## 2026-08-28 · O1 observer durable-claim timer hotfix
+
+### DL-061 · positive observer timer remainder는 durable wall schedule을 넘도록 올림한다
+
+- exact merged `main` `0865beffd7f1556599210c4c3581c6e95332c1d0` 이후의 최근 unclean production
+  log epoch들은 persisted observer `nextRunAt` 직전에 끝났고, 그 epoch에는 `job.started`,
+  `daemon.failed`, `daemon.stopped`가 없었다. 이 signature만으로 timer 인과를 직접 계측한 것은 아니지만,
+  아래 source boundary와 결정적 regression이 같은 failure path를 재현한다.
+- supervisor는 completion 때 wall-clock `nextRunAt`과 monotonic deadline을 함께 만들고, durable completion
+  callback 뒤 남은 monotonic 시간을 timer에 넘긴다. 그 값이 양의 fractional millisecond이면 Node timer가
+  정수로 내림해 wall `nextRunAt`보다 한 millisecond 이른 callback을 만들 수 있다. SQLite는 아직 미래인
+  `nextRunAt` claim을 `null`로 거절하고 `job.started`를 기록하지 않으며, CLI는 그 거절을 fatal로 처리해
+  exit `1`로 끝난다. 이는 관측된 missing-event epoch와 일치하는 source-supported diagnosis다.
+- 최소 수리는 timer 설치 경계에서만 `Math.ceil(Math.max(0, deadline - now))`를 적용한다. overdue work의
+  즉시 enqueue, completion-based monotonic deadline, durable wall schedule, jitter/backoff, SQLite claim fence와
+  CLI의 fail-closed null-claim 처리는 바꾸지 않는다.
+- regression clock은 Node처럼 fractional timer delay를 truncate하고 completion callback에 0.5ms를 소비시켜,
+  수리 전 persisted wall time보다 1ms 이른 start를 결정적으로 재현한다. 수리 뒤 그 early boundary에서는
+  시작하지 않고 durable wall time에만 시작한다. focused observer-supervisor/cli-daemon 2 files 36 tests와
+  workspace typecheck는 통과했지만 merge qualification일 뿐이며, final O1 production acceptance는 merged
+  fixed release의 반복 observer/Task/PID/heartbeat/status 관측까지 pending이다.

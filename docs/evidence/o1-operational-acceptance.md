@@ -1,6 +1,6 @@
 # O1 operational acceptance evidence
 
-Status: **O1-7 production acceptance reopened — Task supervisor evidence remains valid; Windows status-liveness repair awaits merge and fixed-release production verification**
+Status: **O1-7 production acceptance reopened — status-liveness repair merged; observer durable-claim timer repair awaits merge and fixed-release production verification**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
@@ -53,6 +53,26 @@ closed. The response is still built and authenticated from the captured immutabl
 O1 production acceptance remains pending until an exact merged fixed release passes repeated status
 sampling together with Task/PID/heartbeat liveness.
 
+That status-liveness repair merged as exact `main`
+`0865beffd7f1556599210c4c3581c6e95332c1d0`. Recent unclean production log epochs after that
+merge ended shortly before a persisted observer `nextRunAt` and contained no `job.started`,
+`daemon.failed`, or `daemon.stopped` event. This event absence alone does not directly instrument the
+cause, but it matches a narrower source-supported failure path: the supervisor derives both the
+durable wall `nextRunAt` and a monotonic deadline, then passes the positive fractional remainder
+after its durable completion callback to Node's integer timer boundary. Truncation can fire less
+than one millisecond before the monotonic deadline, which becomes the prior wall millisecond;
+SQLite then rejects the not-yet-due claim, emits no `job.started`, and the CLI treats the null claim
+as fatal exit `1`.
+
+The minimum repair rounds only that nonnegative remaining timer delay up. It preserves overdue
+immediate enqueue, completion-based scheduling, jitter/backoff, the durable wall timestamp, the
+SQLite due fence, and the CLI's fail-closed claim handling. A deterministic fake clock that
+truncates timers like Node spends 0.5ms in the completion callback: before the repair it starts at
+the wall millisecond immediately before `nextRunAt`; after the repair it remains idle there and
+starts only at the durable wall time. Focused observer-supervisor/cli-daemon tests and workspace
+typecheck qualify the change for merge; final O1 production acceptance remains pending on a merged
+fixed release and repeated observer/Task/PID/heartbeat/status observation.
+
 The first production install from exact merged `main` at
 `8d857f94c0ad44617071aaa97a4756cd9e114b42` exposed a Windows registered-export
 canonicalization and absent-create rollback gap and ended with
@@ -92,7 +112,7 @@ specific console-close source caused the historical failure.
 | Production risk | Acceptance seam | Expected invariant |
 |---|---|---|
 | two daemon processes | `o1-operational-acceptance.test.ts` binds the exact fixed Channel pipe from a child process, rejects the production server, transfers ownership, rejects a second production contender, then rebinds after stop | exactly one pipe owner; a loser performs no ingress or external work |
-| startup order, overlap, outage/backoff | `cli-daemon`, `observer-supervisor`, and `github-background` focused files | discovery precedes Socket ingress; Run starts immediately; digest starts at +60s; one serial lane; due work coalesces; Orca/GitHub/Slack failures remain bounded and recover with completion-based backoff |
+| startup order, overlap, outage/backoff | `cli-daemon`, `observer-supervisor`, and `github-background` focused files | discovery precedes Socket ingress; Run starts immediately; digest starts at +60s; one serial lane; due work coalesces; positive fractional timer remainders round up so no recurring claim precedes its durable `nextRunAt`; Orca/GitHub/Slack failures remain bounded and recover with completion-based backoff |
 | hard crash and stale restart | `o1-operational-acceptance.test.ts` launches the installed `vite-node` fixture, which writes through `SqliteDigestStore` and exits 23 without `store.close`, then the parent reopens the database | daemon desired state, job checkpoint/failure bucket, and root intent survive process death; orphan work is fenced before restart and the possible Slack effect has no repost authority |
 | possible Slack effect | `root-intent-publish` and durable reopen acceptance | `sending` from an old instance becomes `uncertain`; uncertain intent is never claimable or reposted; only proven pre-send no-effect may retry |
 | normal mapped update | `run-publish` focused file | a changed observation updates the one stored root timestamp and never creates a second root |
@@ -113,7 +133,7 @@ call Task Scheduler.
 | Concern | Default | Hard/semantic boundary |
 |---|---:|---|
 | repository discovery | every 300s; 30s timeout | startup pass before Socket; deterministic ±10% installation jitter |
-| Run observer | every 120s; 90s timeout | immediate startup enqueue; completion-based schedule |
+| Run observer | every 120s; 90s timeout | immediate startup enqueue; completion-based schedule; positive fractional remaining delay rounds up before the durable claim |
 | PR digest | every 900s; 300s timeout | first pass 60s after Socket; 10 PR/repository; 100 PR global pass budget |
 | GitHub budget | 2,000 commands/hour | defer before work below REST or GraphQL floor 1,000; at most two commands concurrently |
 | daemon health | heartbeat 15s; stale after 90s | exact instance/revision ownership |
@@ -165,8 +185,8 @@ CAS checked and rolled back on post-registration mismatch. Do not delete state, 
 release roots as part of rollback. The pre-supervisor-hotfix production Task is not accepted merely
 because its orphaned daemon was healthy. The repaired exact merged-main release satisfied the Task
 supervisor condition: Task state and direct parent/child ownership remained healthy past the
-observed boundary. Final O1 acceptance is nevertheless reopened for the later status-rotation race
-and requires a merged fixed release production check.
+observed boundary. The status-liveness repair subsequently merged, but the observer timer boundary
+keeps final O1 acceptance open until its own merged fixed-release production check.
 
 ## Privacy boundary
 
@@ -178,6 +198,13 @@ retains its generated task name, paths, XML, process command line, or mock state
 
 ## Recorded results
 
+- Observer durable-claim timer local qualification from exact base
+  `0865beffd7f1556599210c4c3581c6e95332c1d0`: focused
+  `test/observer-supervisor.test.ts` plus `test/cli-daemon.test.ts` passed 2 files, 36/36 tests;
+  workspace typecheck PASS. The regression uses a Node-truncating fake timer and a 0.5ms completion
+  boundary to reject a start in the wall millisecond before persisted `nextRunAt`, then permits it
+  at that durable wall time. This is merge qualification only; fixed-release production acceptance
+  remains pending.
 - Post-audit Windows status-liveness local qualification from exact base
   `4fe4d8f005440f61affb0dd0e814b06ce4519499`: focused production-cadence
   `test/operational-status.test.ts` plus `test/cli-daemon.test.ts` passed 2 files, 82 tests passed and
@@ -241,4 +268,8 @@ retains its generated task name, paths, XML, process command line, or mock state
   7 unavailable results in 18 status calls over 50.2 seconds while Task/PIDs/heartbeat remained
   stable, followed by Task result `1` after the last healthy heartbeat. The deadline-starvation and
   post-mutation refresh-propagation explanations above remain qualified source-supported diagnoses;
-  final acceptance awaits the exact merged repair in production.
+  that repair merged as exact `main` `0865beffd7f1556599210c4c3581c6e95332c1d0`.
+- Recent unclean production epochs after that merge ended shortly before persisted observer
+  `nextRunAt` without `job.started`, `daemon.failed`, or `daemon.stopped`. The truncating-timer
+  regression and source path above qualify the narrow observer repair for merge; final acceptance
+  awaits its exact merged release in production.
