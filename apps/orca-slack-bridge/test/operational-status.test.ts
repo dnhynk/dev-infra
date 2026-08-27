@@ -259,6 +259,8 @@ class MemoryCapabilityStore implements
   invalid = false;
   raceAfterPublish: OperationalStatusCapabilityDocument | null = null;
   requestVerification: ((signal: AbortSignal) => Promise<void>) | null = null;
+  afterRequestRead: ((observed: OperationalStatusCapabilityRead) => void) | null = null;
+  requestReads = 0;
   private claimToken: symbol | null = null;
   private snapshotLeaseToken: symbol | null = null;
 
@@ -314,8 +316,13 @@ class MemoryCapabilityStore implements
   }
 
   async readForRequest(path: string, signal: AbortSignal): Promise<OperationalStatusCapabilityRead> {
+    this.requestReads += 1;
     if (this.requestVerification !== null) await this.requestVerification(signal);
-    return signal.aborted ? { kind: 'invalid' } : this.read(path);
+    const observed: OperationalStatusCapabilityRead = signal.aborted
+      ? { kind: 'invalid' }
+      : this.read(path);
+    this.afterRequestRead?.(observed);
+    return observed;
   }
 
   publish(
@@ -967,6 +974,7 @@ describe('read-only operational status classification', () => {
     const report = await inspectThroughFakeOwner('malformed-snapshot');
     expect(report).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
     expect(JSON.stringify(report)).not.toContain('SENTINEL');
+    expect(capabilities.requestReads).toBe(1);
   });
 
   it('rejects a stale owner cache and removes the endpoint on bounded shutdown', async () => {
@@ -1175,6 +1183,190 @@ describe('read-only operational status classification', () => {
       exitCode: 2,
       codes: ['state.snapshot_unavailable'],
     });
+    expect(capabilities.requestReads).toBe(1);
+  });
+
+  it('re-reads the protected capability once when the owner rotates before authentication', async () => {
+    const store = healthyStore();
+    let transportTime = Date.parse(TRANSPORT_AT);
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      clock: () => new Date(transportTime),
+    });
+    try {
+      await owner.start();
+      const first = capabilities.active();
+      let rotated = false;
+      capabilities.afterRequestRead = (observed) => {
+        if (rotated || observed.kind !== 'ready' ||
+            observed.value.status !== 'active' ||
+            observed.value.capabilityId !== first.capabilityId) return;
+        rotated = true;
+        capabilities.afterRequestRead = null;
+        transportTime += STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS;
+        owner.refresh();
+      };
+
+      expect(await inspect({
+        ownerTransportClock: () => new Date(transportTime),
+      })).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
+      const replacement = capabilities.active();
+      expect(rotated).toBe(true);
+      expect(replacement.transport).toEqual(first.transport);
+      expect(replacement.capabilityId).not.toBe(first.capabilityId);
+      expect(replacement.secret).not.toBe(first.secret);
+      // Initial read, protected re-read, then the owner's request-time verification.
+      expect(capabilities.requestReads).toBe(3);
+    } finally {
+      capabilities.afterRequestRead = null;
+      await owner.stop();
+      store.close();
+    }
+  });
+
+  it('does not retry an empty stable-capability failure', async () => {
+    const store = healthyStore();
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      connections += 1;
+      sockets.add(socket);
+      socket.on('error', () => undefined);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('data', () => undefined);
+      socket.on('end', () => socket.destroy());
+    });
+    try {
+      await new Promise<void>((resolveListen, reject) => {
+        server.once('error', reject);
+        server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, resolveListen);
+      });
+      const address = server.address();
+      if (address === null || typeof address === 'string') throw new Error('expected TCP listener');
+      capabilities.document = activeOperationalStatusCapability(
+        operationalStatusStateIdentity(statePath, 'win32'),
+        { kind: 'tcp', host: '127.0.0.1', port: address.port },
+        TRANSPORT_AT,
+      );
+
+      expect(await inspect({
+        platform: 'win32',
+        ownerTimeoutMilliseconds: 200,
+      })).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
+      expect(connections).toBe(1);
+      expect(capabilities.requestReads).toBe(2);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      store.close();
+    }
+  });
+
+  it.each([
+    ['capability ID', 'capabilityId'],
+    ['capability secret', 'secret'],
+  ] as const)('does not retry when only the %s changes', async (_label, changedField) => {
+    const store = healthyStore();
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      connections += 1;
+      sockets.add(socket);
+      socket.on('error', () => undefined);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('data', () => undefined);
+      socket.on('end', () => socket.destroy());
+    });
+    try {
+      await new Promise<void>((resolveListen, reject) => {
+        server.once('error', reject);
+        server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, resolveListen);
+      });
+      const address = server.address();
+      if (address === null || typeof address === 'string') throw new Error('expected TCP listener');
+      const transport = { kind: 'tcp', host: '127.0.0.1', port: address.port } as const;
+      capabilities.document = activeOperationalStatusCapability(
+        operationalStatusStateIdentity(statePath, 'win32'),
+        transport,
+        TRANSPORT_AT,
+      );
+      const first = capabilities.active();
+      const generated = activeOperationalStatusCapability(
+        first.stateIdentity,
+        transport,
+        TRANSPORT_AT,
+      );
+      const halfRotated: ActiveOperationalStatusCapability = changedField === 'capabilityId'
+        ? { ...generated, secret: first.secret }
+        : { ...generated, capabilityId: first.capabilityId };
+      capabilities.afterRequestRead = (observed) => {
+        if (capabilities.requestReads !== 1 || observed.kind !== 'ready') return;
+        capabilities.afterRequestRead = null;
+        capabilities.document = structuredClone(halfRotated);
+      };
+
+      expect(await inspect({
+        platform: 'win32',
+        ownerTimeoutMilliseconds: 200,
+      })).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
+      const replacement = capabilities.active();
+      expect(replacement.capabilityId === first.capabilityId)
+        .toBe(changedField !== 'capabilityId');
+      expect(replacement.secret === first.secret).toBe(changedField !== 'secret');
+      expect(connections).toBe(1);
+      expect(capabilities.requestReads).toBe(2);
+    } finally {
+      capabilities.afterRequestRead = null;
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      store.close();
+    }
+  });
+
+  it('does not re-read or retry after the original owner-request deadline expires', async () => {
+    const store = healthyStore();
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      connections += 1;
+      sockets.add(socket);
+      socket.on('error', () => undefined);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('data', () => undefined);
+      // Hold the readable half open until the client's one overall deadline closes it.
+      socket.on('end', () => undefined);
+    });
+    try {
+      await new Promise<void>((resolveListen, reject) => {
+        server.once('error', reject);
+        server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, resolveListen);
+      });
+      const address = server.address();
+      if (address === null || typeof address === 'string') throw new Error('expected TCP listener');
+      capabilities.document = activeOperationalStatusCapability(
+        operationalStatusStateIdentity(statePath, 'win32'),
+        { kind: 'tcp', host: '127.0.0.1', port: address.port },
+        TRANSPORT_AT,
+      );
+      const startedAt = process.hrtime.bigint();
+
+      expect(await inspect({
+        platform: 'win32',
+        ownerTimeoutMilliseconds: 50,
+      })).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
+      const elapsedMilliseconds = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      expect(elapsedMilliseconds).toBeLessThan(200);
+      expect(connections).toBe(1);
+      expect(capabilities.requestReads).toBe(1);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      store.close();
+    }
   });
 
   it('rotates a stolen capability and rejects the old authenticator while serving the new one', async () => {
