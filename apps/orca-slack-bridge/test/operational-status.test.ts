@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { backup, DatabaseSync } from 'node:sqlite';
 import {
   chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
   readdirSync, renameSync, rmSync, statSync, writeFileSync,
@@ -764,14 +764,17 @@ function projectedSnapshot(
 
 describe('read-only operational status classification', () => {
   // This one integration owns schema creation, WAL checkpoint, online backup, and strict reopen.
-  // Only fixture preparation gets the wider CI contention budget; the product read stays strict.
+  // Assert the production all-pages operation directly; wall time includes unrelated CI scheduling.
   it('reports a fully matched daemon as healthy with static aggregate-only output', async () => {
     healthyStore().close();
-    const inspectStartedAt = process.hrtime.bigint();
-    const report = await inspect();
-    const inspectElapsedMilliseconds =
-      Number(process.hrtime.bigint() - inspectStartedAt) / 1_000_000;
-    expect(inspectElapsedMilliseconds).toBeLessThan(4_000);
+    let backupRate: number | null = null;
+    const report = await inspect({
+      sqliteBackup: async (source, destination, options) => {
+        backupRate = options?.rate ?? null;
+        return await backup(source, destination, options);
+      },
+    });
+    expect(backupRate).toBe(2_147_483_647);
     expect(report).toMatchObject({
       overall: 'healthy', exitCode: 0, codes: ['status.healthy'],
       schema: { state: 'matched', expectedVersion: 13, foundVersion: 13 },

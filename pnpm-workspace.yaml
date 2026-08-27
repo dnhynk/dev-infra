@@ -1,6 +1,8 @@
 packages:
   - apps/*
 
+injectWorkspacePackages: true
+
 allowBuilds:
   esbuild: true
 

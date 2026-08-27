@@ -1,11 +1,20 @@
 {
   "name": "@dev-infra/orca-slack-bridge",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "files": [
+    "dist",
+    "windows/launch-daemon.ps1"
+  ],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "stage:windows": "node scripts/stage-windows-release.mjs"
   },
   "bin": {
     "orca-slack-bridge": "./dist/cli.js"
@@ -14,6 +23,7 @@
     "@modelcontextprotocol/sdk": "1.30.0",
     "@slack/socket-mode": "3.0.0",
     "@slack/web-api": "8.0.0",
+    "@xmldom/xmldom": "0.9.12",
     "undici": "^7.29.0"
   }
 }

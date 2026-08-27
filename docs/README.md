@@ -20,8 +20,9 @@
 11. [검증된 플랫폼 역량과 제약](platform-capabilities.md)
 12. [Slack App 준비 절차](ops/slack-app-setup.md)
 13. [Channel Adapter 운영·live acceptance](ops/channel-adapter-acceptance.md)
-14. [요구사항 추적표](traceability.md)
-15. [Phase 0/D3 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
+14. [Windows current-user 자동 시작 운영](ops/windows-startup.md)
+15. [요구사항 추적표](traceability.md)
+16. [Phase 0/D3 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
 
 ## 문서 권위와 표기
 

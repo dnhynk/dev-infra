@@ -124,6 +124,18 @@ import {
 } from './observer/supervisor.js';
 import type { SlackRootIntentRuntime } from './slack/root-intent.js';
 import { randomUUID } from 'node:crypto';
+import { installWindowsTask, type InstallCommandDependencies } from './commands/install.js';
+import {
+  DEFAULT_WINDOWS_WAIT_SECONDS,
+  managedTaskStatusObservation,
+  runManagedTaskNow,
+  type RunNowDependencies,
+} from './commands/run-now.js';
+import { uninstallWindowsTask, type UninstallCommandDependencies } from './commands/uninstall.js';
+import {
+  CurrentUserTaskSchedulerPowerShellRunner,
+  CurrentUserWindowsTaskScheduler,
+} from './windows/task-scheduler.js';
 
 export type Command =
   | 'snapshot'
@@ -134,7 +146,10 @@ export type Command =
   | 'daemon'
   | 'channel-adapter'
   | 'status'
-  | 'logs';
+  | 'logs'
+  | 'install'
+  | 'uninstall'
+  | 'run-now';
 
 export type ParsedArgs =
   | { readonly kind: 'help' }
@@ -164,6 +179,16 @@ export type ParsedArgs =
       readonly follow: boolean;
       /** logs가 parsed allowlisted job field로 거를 이름. */
       readonly job: DaemonJobName | null;
+      /** Windows current-user deployment release root. */
+      readonly appRoot: string | null;
+      /** Exact versioned node.exe used by the Scheduled Task action. */
+      readonly nodePath: string | null;
+      /** Install is the only lifecycle command allowed to request an immediate start. */
+      readonly runNow: boolean;
+      /** Bounded health/clean-stop wait for Windows lifecycle commands. */
+      readonly waitSeconds: number;
+      /** Explicit post-timeout owned-task force recovery; uninstall only. */
+      readonly force: boolean;
     };
 
 type RunArgs = Extract<ParsedArgs, { readonly kind: 'run' }>;
@@ -182,7 +207,7 @@ function arg(argv: readonly string[], name: string): string | undefined {
 
 const COMMANDS: readonly Command[] = [
   'snapshot', 'verify-slack', 'digest', 'runs', 'gate-register', 'daemon', 'channel-adapter',
-  'status', 'logs',
+  'status', 'logs', 'install', 'uninstall', 'run-now',
 ];
 
 function isCommand(v: string | undefined): v is Command {
@@ -199,7 +224,9 @@ const VALUE_FLAGS: readonly string[] = [
   '--input',
 ];
 const BOOL_FLAGS: readonly string[] = ['--json', '--dry-run', '--socket'];
-const ALL_VALUE_FLAGS: readonly string[] = [...VALUE_FLAGS, '--log-dir', '--tail', '--job'];
+const ALL_VALUE_FLAGS: readonly string[] = [
+  ...VALUE_FLAGS, '--log-dir', '--tail', '--job', '--app-root', '--node', '--wait-seconds',
+];
 
 /**
  * 되돌릴 수 없는 외부 write를 하는 명령.
@@ -207,7 +234,9 @@ const ALL_VALUE_FLAGS: readonly string[] = [...VALUE_FLAGS, '--log-dir', '--tail
  * 이 목록의 명령은 write 안전 때문에 모르는 인자를 거부한다. `verify-slack`은 별도로
  * Socket preflight 선택 오타를 막기 위해 exact allowlist를 쓴다.
  */
-const WRITE_COMMANDS: readonly Command[] = ['digest', 'runs', 'gate-register', 'daemon'];
+const WRITE_COMMANDS: readonly Command[] = [
+  'digest', 'runs', 'gate-register', 'daemon', 'install', 'uninstall', 'run-now',
+];
 
 /** `gate-register` has a deliberately narrow production transport; other known flags are still invalid. */
 function unknownGateRegisterArg(argv: readonly string[]): string | null {
@@ -229,7 +258,7 @@ function unknownGateRegisterArg(argv: readonly string[]): string | null {
 
 /** Long-running consumer accepts only the identities needed to open its exact local/remote paths. */
 function unknownDaemonArg(argv: readonly string[]): string | null {
-  const valueFlags = new Set(['--config', '--state', '--orca']);
+  const valueFlags = new Set(['--config', '--state', '--orca', '--log-dir']);
   for (let i = 1; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === undefined) continue;
@@ -381,6 +410,41 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   }
   const missing = missingFlagValue(argv);
   if (missing !== null) return { kind: 'error', message: missing };
+  if (command === 'install') {
+    const required = ['--app-root', '--node', '--orca', '--config', '--state', '--log-dir'];
+    const flags = [...required, '--wait-seconds', '--run-now'];
+    const unknown = unknownExactArg(
+      argv,
+      ['--app-root', '--node', '--orca', '--config', '--state', '--log-dir', '--wait-seconds'],
+      ['--run-now'],
+    );
+    if (unknown !== null) return { kind: 'error', message: 'install이 모르는 인자다' };
+    const repeated = repeatedExactArg(argv, flags);
+    if (repeated !== null) return { kind: 'error', message: `install은 ${repeated}을 한 번만 받는다` };
+    const absent = required.find((flag) => arg(argv, flag) === undefined || arg(argv, flag) === '');
+    if (absent !== undefined) return { kind: 'error', message: `install은 ${absent}이 필수다` };
+  }
+  if (command !== 'install' && argv.includes('--run-now')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --run-now` };
+  }
+  for (const installOnly of ['--app-root', '--node']) {
+    if (command !== 'install' && argv.includes(installOnly)) {
+      return { kind: 'error', message: `${command}가 모르는 인자다: ${installOnly}` };
+    }
+  }
+  if (command !== 'install' && command !== 'uninstall' && command !== 'run-now' &&
+      argv.includes('--wait-seconds')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --wait-seconds` };
+  }
+  if (command === 'uninstall' || command === 'run-now') {
+    const unknown = unknownExactArg(argv, ['--wait-seconds'], command === 'uninstall' ? ['--force'] : []);
+    if (unknown !== null) return { kind: 'error', message: `${command}이 모르는 인자다` };
+    const repeated = repeatedExactArg(argv, command === 'uninstall' ? ['--wait-seconds', '--force'] : ['--wait-seconds']);
+    if (repeated !== null) return { kind: 'error', message: `${command}은 ${repeated}을 한 번만 받는다` };
+  }
+  if (command !== 'uninstall' && argv.includes('--force')) {
+    return { kind: 'error', message: `${command}가 모르는 인자다: --force` };
+  }
   if (command === 'status') {
     const flags = ['--config', '--state', '--log-dir', '--json'];
     const unknown = unknownExactArg(argv, ['--config', '--state', '--log-dir'], ['--json']);
@@ -395,7 +459,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     const repeated = repeatedExactArg(argv, flags);
     if (repeated !== null) return { kind: 'error', message: `logs는 ${repeated}을 한 번만 받는다` };
   }
-  if ((WRITE_COMMANDS as readonly string[]).includes(command)) {
+  if ((WRITE_COMMANDS as readonly string[]).includes(command) &&
+      command !== 'daemon' && command !== 'install' && command !== 'uninstall' &&
+      command !== 'run-now') {
     const unknown = unknownWriteFlag(argv);
     if (unknown !== null) {
       return { kind: 'error', message: `${command}가 모르는 인자다: ${unknown}` };
@@ -454,6 +520,13 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       !(OPERATIONAL_JOB_NAMES as readonly string[]).includes(jobRaw)) {
     return { kind: 'error', message: '--job이 알려진 daemon job 이름이 아니다' };
   }
+  const waitRaw = arg(argv, '--wait-seconds');
+  const waitSeconds = waitRaw === undefined ? DEFAULT_WINDOWS_WAIT_SECONDS : Number(waitRaw);
+  if ((command === 'install' || command === 'uninstall' || command === 'run-now') &&
+      (!/^[1-9][0-9]*$/u.test(waitRaw ?? String(DEFAULT_WINDOWS_WAIT_SECONDS)) ||
+       !Number.isSafeInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > 300)) {
+    return { kind: 'error', message: '--wait-seconds는 1..300 정수여야 한다' };
+  }
   return {
     kind: 'run',
     command,
@@ -470,10 +543,15 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     tail,
     follow: command === 'logs' && argv.includes('--follow'),
     job: command === 'logs' && jobRaw !== undefined ? jobRaw as DaemonJobName : null,
+    appRoot: arg(argv, '--app-root') ?? null,
+    nodePath: arg(argv, '--node') ?? null,
+    runNow: command === 'install' && argv.includes('--run-now'),
+    waitSeconds,
+    force: command === 'uninstall' && argv.includes('--force'),
   };
 }
 
-export const CLI_USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter|status|logs>
+export const CLI_USAGE = `orca-slack-bridge <snapshot|verify-slack|digest|runs|gate-register|daemon|channel-adapter|status|logs|install|uninstall|run-now>
 
 snapshot      Orca와 GitHub을 read-only로 1회 관찰한다
 verify-slack  Slack 토큰과 설정을 확인한다 (기본은 연결하지 않는다)
@@ -484,6 +562,9 @@ daemon        Gate action과 verified Channel delivery/resume를 durable하게 �
 channel-adapter session별 stdio MCP Channel Adapter를 실행하고 daemon pipe에 재연결한다
 status        local operational state를 read-only로 진단한다
 logs          redacted rotating NDJSON history를 read-only로 읽는다
+install       prebuilt release를 current-user Windows Scheduled Task로 설치한다
+uninstall     managed task를 clean stop 뒤 등록 해제한다 (data/release는 보존)
+run-now       exact-owned installed task를 시작하고 fresh heartbeat를 기다린다
 
   --config <path>   설정 파일 (기본: ORCA_SLACK_BRIDGE_CONFIG 또는 OS 설정 경로)
   --orca <path>     orca 실행 파일 (기본: ORCA_BIN 또는 'orca')
@@ -511,6 +592,7 @@ gate-register 전용:
 daemon 전용:
 
   --state <path>    v13 durable store 경로 (additive migration, dry-run 없음)
+  --log-dir <path>  operational log directory
 
 status 전용:
 
@@ -518,6 +600,25 @@ status 전용:
   --state <path>    읽을 durable store (source migration/create 없음)
   --log-dir <path>  operational log directory
   --json            aggregate/static-code report를 JSON으로 출력
+
+install 전용:
+
+  --app-root <path> stage:windows가 만든 LocalAppData digest release root (절대경로, 필수)
+  --node <path>     Node 26+ node.exe (절대경로, 필수)
+  --orca <path>     orca 실행 파일 (절대경로, 필수)
+  --config <path>   strict credential-free config (절대경로, 필수)
+  --state <path>    durable store (절대경로, 필수)
+  --log-dir <path>  operational log directory (절대경로, 필수)
+  --run-now         설치 후 exact release heartbeat까지 기다린다
+  --wait-seconds N  heartbeat 제한시간 (1..300, 기본 90)
+
+uninstall·run-now 전용:
+
+  --wait-seconds N  clean stop 또는 heartbeat 제한시간 (1..300, 기본 90)
+
+uninstall 전용:
+
+  --force           clean-stop timeout 뒤 exact-owned task만 강제 중지하고 bounded release를 기다린다
 
 logs 전용:
 
@@ -1848,6 +1949,9 @@ export type CliMainDependencies = {
     readonly pollMilliseconds?: number;
     readonly clock?: () => Date;
   };
+  readonly install?: InstallCommandDependencies;
+  readonly uninstall?: UninstallCommandDependencies;
+  readonly runNow?: RunNowDependencies;
 };
 
 type ProcessAbortLatch = { readonly signal: AbortSignal; readonly dispose: () => void };
@@ -1870,8 +1974,27 @@ async function runStatusCli(
   parsed: RunArgs,
   dependencies: InspectOperationalStatusOptions | undefined,
 ): Promise<number> {
+  let productionTask: Awaited<ReturnType<CurrentUserWindowsTaskScheduler['inspect']>> | null = null;
+  if (dependencies === undefined && process.platform === 'win32') {
+    try {
+      const scheduler = new CurrentUserWindowsTaskScheduler(
+        new CurrentUserTaskSchedulerPowerShellRunner(),
+      );
+      productionTask = await scheduler.inspect();
+    } catch {
+      productionTask = null;
+    }
+  }
   const report = await inspectOperationalStatus({
     ...dependencies,
+    ...(productionTask === null
+      ? {}
+      : {
+          taskFacet: () => managedTaskStatusObservation(productionTask),
+          ...(productionTask.kind === 'present' && productionTask.marker !== null
+            ? { expectedBuildIdentity: productionTask.marker.releaseDigest }
+            : {}),
+        }),
     ...(parsed.configPath === null ? {} : { configPath: parsed.configPath }),
     ...(parsed.statePath === null ? {} : { statePath: parsed.statePath }),
     ...(parsed.logDir === null ? {} : { logDir: parsed.logDir }),
@@ -1929,6 +2052,13 @@ async function runLogsCli(
   }
 }
 
+function writeWindowsLifecycleFailure(command: 'install' | 'uninstall' | 'run-now', error: unknown): void {
+  const code = error instanceof Error && /^windows\.[a-z0-9_.]+$/u.test(error.message)
+    ? error.message
+    : `windows.${command.replace('-', '_')}.failed`;
+  process.stderr.write(code + '\n');
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   dependencies: CliMainDependencies = {},
@@ -1949,6 +2079,57 @@ export async function main(
 
   if (parsed.command === 'logs') {
     return await runLogsCli(parsed, dependencies.logs);
+  }
+
+  if (parsed.command === 'install') {
+    try {
+      if (parsed.appRoot === null || parsed.nodePath === null || parsed.orcaBin === null ||
+          parsed.configPath === null || parsed.statePath === null || parsed.logDir === null) {
+        throw new Error('windows.install.invalid_arguments');
+      }
+      const result = await installWindowsTask({
+        appRoot: parsed.appRoot,
+        nodePath: parsed.nodePath,
+        orcaPath: parsed.orcaBin,
+        configPath: parsed.configPath,
+        statePath: parsed.statePath,
+        logDir: parsed.logDir,
+        runNow: parsed.runNow,
+        waitSeconds: parsed.waitSeconds,
+      }, dependencies.install);
+      process.stdout.write(
+        `install task=${result.task} backup=${result.backupCreated ? 'created' : 'not-needed'} runNow=${result.runNow}\n`,
+      );
+      return 0;
+    } catch (error) {
+      writeWindowsLifecycleFailure('install', error);
+      return 1;
+    }
+  }
+
+  if (parsed.command === 'uninstall') {
+    try {
+      const result = await uninstallWindowsTask(parsed.waitSeconds, {
+        ...dependencies.uninstall,
+        force: parsed.force,
+      });
+      process.stdout.write(`uninstall task=${result.task}\n`);
+      return 0;
+    } catch (error) {
+      writeWindowsLifecycleFailure('uninstall', error);
+      return 1;
+    }
+  }
+
+  if (parsed.command === 'run-now') {
+    try {
+      const result = await runManagedTaskNow(parsed.waitSeconds, dependencies.runNow);
+      process.stdout.write(`run-now action=${result.action}\n`);
+      return 0;
+    } catch (error) {
+      writeWindowsLifecycleFailure('run-now', error);
+      return 1;
+    }
   }
 
   if (parsed.command === 'gate-register') {

@@ -5960,7 +5960,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     return this.transitionDaemonHealth(() => Number(this.db.prepare(`
       UPDATE daemon_health
          SET revision = revision + 1, desired_state = ?, updated_at = ?
-       WHERE id = 1 AND updated_at <= ?`).run(state, safeAt, safeAt).changes));
+      WHERE id = 1 AND updated_at <= ?`).run(state, safeAt, safeAt).changes));
   }
 
   readDaemonHealth(): DaemonHealthRecord | null {
