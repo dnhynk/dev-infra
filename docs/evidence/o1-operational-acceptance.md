@@ -13,7 +13,7 @@ credential was used. D3 remains `LIVE_CHANNEL_UNVERIFIED` and is not changed by 
 |---|---|---|
 | two daemon processes | `o1-operational-acceptance.test.ts` binds the exact fixed Channel pipe from a child process, rejects the production server, transfers ownership, rejects a second production contender, then rebinds after stop | exactly one pipe owner; a loser performs no ingress or external work |
 | startup order, overlap, outage/backoff | `cli-daemon`, `observer-supervisor`, and `github-background` focused files | discovery precedes Socket ingress; Run starts immediately; digest starts at +60s; one serial lane; due work coalesces; Orca/GitHub/Slack failures remain bounded and recover with completion-based backoff |
-| hard crash and stale restart | O1 durable reopen acceptance plus daemon/store regressions | daemon desired state, registry generation, job checkpoint/failure bucket, and root intent survive reopen; orphan work is fenced before restart |
+| hard crash and stale restart | `o1-operational-acceptance.test.ts` launches the installed `vite-node` fixture, which writes through `SqliteDigestStore` and exits 23 without `store.close`, then the parent reopens the database | daemon desired state, job checkpoint/failure bucket, and root intent survive process death; orphan work is fenced before restart and the possible Slack effect has no repost authority |
 | possible Slack effect | `root-intent-publish` and durable reopen acceptance | `sending` from an old instance becomes `uncertain`; uncertain intent is never claimable or reposted; only proven pre-send no-effect may retry |
 | normal mapped update | `run-publish` focused file | a changed observation updates the one stored root timestamp and never creates a second root |
 | auto discovery and routing | `discovery-reconcile` and `run-effective-routing` focused files | aliases and exact Orca IDs coalesce by canonical repository; multi-repository consensus routes once; cross-Project, contradictory, unreadable, or over-capacity facts route zero |
@@ -22,9 +22,11 @@ credential was used. D3 remains `LIVE_CHANNEL_UNVERIFIED` and is not changed by 
 | privacy and operability | `operational-logger` and `operational-status` focused files | allowlisted NDJSON only, hashed refs, bounded rotation, read-only status, and exact pending/uncertain/dead aggregates without identities |
 | current-user Scheduled Task | `o1-7-windows-scheduled-task-acceptance.ps1` under a process-wide mutex | unique exact target, non-admin create, semantic export, demand start, IgnoreNew, bounded PT1M TimeTrigger relaunch after exit 23, clean exit 0, exact unregister, and residual task/process/file counts all zero |
 
-The hermetic entry point is `pnpm acceptance:o1-7`. It invokes one serialized Vitest process and
-does not contact an LLM or a live external service. CI runs the same entry point on the checked-out
-commit; Windows Task-definition tests are pure XML/semantic tests and do not call Task Scheduler.
+The hermetic entry point is `pnpm acceptance:o1-7`. Because the repository has one workspace package,
+it invokes that bridge package's complete Vitest suite once and does not contact an LLM or a
+live external service. CI runs only that named acceptance step for tests on the checked-out commit;
+typecheck remains a separate job. Windows Task-definition tests are pure XML/semantic tests and do not
+call Task Scheduler.
 
 ## Fixed defaults and bounds
 
@@ -86,12 +88,9 @@ retains its generated task name, paths, XML, process command line, or mock state
 
 ## Recorded results
 
-- New process/durable acceptance: 2/2 passed during implementation.
-- Node 26.8.1 focused Windows repair gate: 4 files, 53/53 tests passed.
-- Node 26.8.1 local O1-7 aggregate: 15 files, 323 passed, 9 skipped; root typecheck PASS;
-  bridge build PASS. The committed runner intentionally retains only the focused matrix because CI
-  owns typecheck separately and merged-main staging owns the final build/deploy smoke.
-- Exact-head CI: pending PR validation; the local aggregate is not rerun after runner cost cleanup.
+- Node 26.8.1 focused hard-crash acceptance: 1 file, 2/2 tests passed; bridge typecheck PASS.
+- Exact-head CI: pending PR validation. The named O1-7 step runs the complete bridge Vitest suite once;
+  the separate typecheck job is the only other code-validation invocation.
 - The pre-repair disposable sample proved that an already-started Exec exiting 23 does not activate
   `RestartOnFailure`; every run still ended with residual task/process/file `0/0/0` and external
   writes `0`. This is the audited O1-6 crash-recovery gap that introduced the PT1M trigger repetition.

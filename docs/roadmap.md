@@ -262,7 +262,8 @@ Run, Run-collection root create는 durable prepare/claim과 atomic mapping+poste
 bounded accepted-work drain 뒤 clean stop 및 owner release를 수행하고 drain timeout은 nonzero다. Windows Task
 O1-6의 current-user 설치·제거 lifecycle은 merged됐다. O1-7은 exact fixed-pipe, durable restart,
 outage/backoff, no-repost, multi-repository fail-closed, shutdown, privacy/status를 하나의 hermetic CI
-gate로 묶었다. 실제 Windows restart 표본 결과와 production 설치 성공 판정은
+gate로 묶었다. 단일 workspace package의 complete bridge Vitest suite는 `acceptance:o1-7`에서 CI당
+한 번만 실행하고 typecheck는 별도 job으로 유지한다. 실제 Windows restart 표본 결과와 production 설치 성공 판정은
 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 따르며, merged-main
 배포·startup smoke 전에는 production 설치 완료를 주장하지 않는다. D3의
 `LIVE_CHANNEL_UNVERIFIED`는 이 O1 상태와 독립적으로 그대로 유지한다.

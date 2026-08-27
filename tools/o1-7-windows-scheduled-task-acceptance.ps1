@@ -10,6 +10,7 @@ $mutex = [Threading.Mutex]::new($false, 'Local\OrcaSlackBridgeO17ScheduledTaskAc
 $mutexHeld = $false
 $taskName = $null
 $taskCreated = $false
+$registrationAttempted = $false
 $tempRoot = $null
 $payloadPath = $null
 $semanticExportMatched = $false
@@ -145,6 +146,7 @@ try {
   $definition = New-ScheduledTask -Action $action -Trigger @($logonTrigger, $restartTrigger) -Principal $principal `
     -Settings $settings -Description $marker
   $stage = 'register'
+  $registrationAttempted = $true
   Register-ScheduledTask -TaskPath '\' -TaskName $taskName -InputObject $definition | Out-Null
   $taskCreated = $true
 
@@ -229,15 +231,15 @@ try {
     "stage_$stage"
   }
 } finally {
-  if ($taskCreated) {
+  if ($registrationAttempted) {
     try {
       $owned = Get-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction SilentlyContinue
       if ($null -ne $owned) {
         [xml]$ownedExport = Export-ScheduledTask -TaskPath '\' -TaskName $taskName
         $ownedNs = [Xml.XmlNamespaceManager]::new($ownedExport.NameTable)
         $ownedNs.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
-        $ownedMarker = $ownedExport.SelectSingleNode('/t:Task/t:RegistrationInfo/t:Description', $ownedNs).InnerText
-        if ($ownedMarker -ceq $marker) {
+        $ownedMarkerNode = $ownedExport.SelectSingleNode('/t:Task/t:RegistrationInfo/t:Description', $ownedNs)
+        if ($null -ne $ownedMarkerNode -and $ownedMarkerNode.InnerText -ceq $marker) {
           Stop-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskPath '\' -TaskName $taskName -Confirm:$false
         } else {
@@ -256,13 +258,33 @@ try {
     }
   }
   if ($tempRoot -and (Test-Path -LiteralPath $tempRoot)) {
-    try { Remove-Item -LiteralPath $tempRoot -Recurse -Force } catch { $failureCode = 'file_cleanup_failed' }
+    try {
+      $resolvedSystemTemp = [IO.Path]::GetFullPath(
+        (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath()) -ErrorAction Stop).Path
+      ).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      $resolvedTempRoot = [IO.Path]::GetFullPath(
+        (Resolve-Path -LiteralPath $tempRoot -ErrorAction Stop).Path
+      )
+      $systemTempPrefix = $resolvedSystemTemp + [IO.Path]::DirectorySeparatorChar
+      if (-not $resolvedTempRoot.StartsWith($systemTempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+          [IO.Path]::GetFileName($resolvedTempRoot) -cne "orca-o1-7-task-$nonce") {
+        throw 'temp_root_cleanup_target_mismatch'
+      }
+      Remove-Item -LiteralPath $resolvedTempRoot -Recurse -Force
+    } catch {
+      $failureCode = if ($_.Exception.Message -eq 'temp_root_cleanup_target_mismatch') {
+        'temp_root_cleanup_target_mismatch'
+      } else {
+        'file_cleanup_failed'
+      }
+    }
   }
   $residualTasks = if ($taskName -and
     $null -ne (Get-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction SilentlyContinue)) { 1 } else { 0 }
   $residualProcesses = if ($payloadPath) { (Get-AcceptanceProcesses $payloadPath).Count } else { 0 }
   $residualFiles = if ($tempRoot -and (Test-Path -LiteralPath $tempRoot)) { 1 } else { 0 }
-  if ($residualTasks -ne 0 -or $residualProcesses -ne 0 -or $residualFiles -ne 0) {
+  if (($residualTasks -ne 0 -or $residualProcesses -ne 0 -or $residualFiles -ne 0) -and
+      $null -eq $failureCode) {
     $failureCode = 'residual_artifact_detected'
   }
   if ($mutexHeld) { $mutex.ReleaseMutex() }

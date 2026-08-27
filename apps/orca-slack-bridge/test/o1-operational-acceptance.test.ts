@@ -1,7 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -17,9 +19,16 @@ const AT0 = '2026-08-27T00:00:00.000Z';
 const AT1 = '2026-08-27T00:00:01.000Z';
 const AT2 = '2026-08-27T00:00:02.000Z';
 const AT3 = '2026-08-27T00:00:03.000Z';
+const VITEST_ENTRY = resolve(dirname(createRequire(import.meta.url).resolve('vitest')), 'dist/index.js');
+const VITE_NODE_ENTRY = resolve(dirname(VITEST_ENTRY), '../../vite-node/vite-node.mjs');
+const HARD_CRASH_FIXTURE = fileURLToPath(new URL('./fixtures/o1-hard-crash.ts', import.meta.url));
 
+let externalCalls = 0;
 const offlineOrca: OrcaRunner = {
-  run: () => Promise.reject(new Error('O1 acceptance forbids external Orca work')),
+  run: () => {
+    externalCalls += 1;
+    return Promise.reject(new Error('O1 acceptance forbids external Orca work'));
+  },
 };
 
 const servers: ChannelPipeServer[] = [];
@@ -30,6 +39,7 @@ afterEach(async () => {
   for (const child of children.splice(0)) {
     if (child.exitCode === null) child.kill();
   }
+  externalCalls = 0;
 });
 
 function productionPipeServer(): ChannelPipeServer {
@@ -116,23 +126,22 @@ describe('O1-7 hermetic operational acceptance', () => {
     await contender.stop();
   }, 15_000);
 
-  it('recovers durable daemon, job, and possible-effect root intent state without repost authority', () => {
+  it('recovers durable daemon, job, and possible-effect root intent state after a hard crash without repost authority', () => {
     const directory = mkdtempSync(join(tmpdir(), 'orca-o1-7-durable-'));
     const databasePath = join(directory, 'state.db');
     const entity = { kind: 'run', key: runKey('o1_acceptance') } as const;
+    let store: SqliteDigestStore | null = null;
     try {
-      let store = new SqliteDigestStore(databasePath);
-      store.recordDaemonStart({
-        instanceId: 'old-instance', buildFingerprint: 'build.1',
-        configFingerprint: 'config.1', at: AT0,
+      const child = spawnSync(process.execPath, [VITE_NODE_ENTRY, HARD_CRASH_FIXTURE, databasePath], {
+        encoding: 'utf8',
+        timeout: 10_000,
+        windowsHide: true,
       });
-      const oldJob = store.startDaemonJob('run-observer', AT0)!;
-      store.advanceDaemonJobCheckpoint(oldJob, 0, 7, AT1);
-      store.prepareSlackRootIntent({
-        ...entity, channelId: 'C1', renderFingerprint: 'render.1', at: AT0,
-      });
-      expect(store.claimSlackRootIntent(entity, 'old-instance', AT1)?.kind).toBe('claimed');
-      store.close();
+      expect(child.error).toBeUndefined();
+      expect(child.stderr).toBe('');
+      expect(child.status).toBe(23);
+      expect(child.signal).toBeNull();
+      expect(JSON.parse(child.stdout)).toEqual({ externalCalls: 0 });
 
       store = new SqliteDigestStore(databasePath);
       expect(store.readDaemonHealth()).toMatchObject({
@@ -161,9 +170,10 @@ describe('O1-7 hermetic operational acceptance', () => {
         instanceId: 'new-instance', buildFingerprint: 'build.1',
         configFingerprint: 'config.1', at: AT3,
       })).toMatchObject({ instanceId: 'new-instance', desiredState: 'running' });
-      store.close();
+      expect(externalCalls).toBe(0);
     } finally {
+      store?.close();
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
