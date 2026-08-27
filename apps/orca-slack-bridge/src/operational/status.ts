@@ -1399,7 +1399,9 @@ async function requestOwnedOperationalStatus(
         socket.destroy();
         resolveRequest(value);
       };
-      const timer = setTimeout(() => finish(failedWithoutResponse()), remainingMilliseconds);
+      // A deadline expiry is not evidence of rotation. Only an early empty close/error may
+      // authorize the one protected re-read; otherwise timer jitter could create a retry oracle.
+      const timer = setTimeout(() => finish({ kind: 'terminal' }), remainingMilliseconds);
       timer.unref?.();
       socket.on('connect', () => socket.end(request));
       socket.on('error', () => finish(failedWithoutResponse()));
