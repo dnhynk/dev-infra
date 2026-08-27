@@ -113,11 +113,19 @@
 |---|---|---|---|
 | OD-060 | 실제 Slack/GitHub/Orca 통합 테스트 범위 | 첫 외부 write 전 | DECIDED |
 | OD-061 | 테스트 workspace/repository/Run과 owner identity | 첫 외부 write 전 | DECIDED |
-| OD-062 | 허용 지연, polling/API/LLM 비용 한도 | 운영 전 | OPEN |
-| OD-063 | daemon 자동 시작 방식 | O1 전 | OPEN |
-| OD-064 | health/log/audit format과 secret 마스킹 | 실제 통합 전 | OPEN |
-| OD-065 | 초기 동시 repository/Run 규모 | S0 전 | OPEN |
+| OD-062 | 허용 지연, polling/API/LLM 비용 한도 | 운영 전 | DECIDED |
+| OD-063 | daemon 자동 시작 방식 | O1 전 | DECIDED |
+| OD-064 | health/log/audit format과 secret 마스킹 | 실제 통합 전 | DECIDED |
+| OD-065 | 초기 동시 repository/Run 규모 | S0 전 | DECIDED |
 | OD-068 | D1의 수동 등록 다중 repo 범위와 O1 자동 발견/routing 경계 | D1/O1 전 | DECIDED |
+
+O1-7 적용 메모: OD-027과 OD-062/063/064/065의 제품 결정은 코드와 hermetic acceptance에
+반영됐다. 남은 것은 결정 재논의가 아니라 disposable Windows restart 표본과 merged-main production
+startup smoke이며, 현재 결과는 [O1 evidence](evidence/o1-operational-acceptance.md)가 권위다.
+
+OD-063 보강: MS-TSCH 2.5.4.2의 `RestartOnFailure`는 이미 시작된 Exec process의 nonzero exit를
+재실행하는 계약이 아니다. 따라서 process-exit recovery는 duration 없는 PT1M AtLogOn repetition이
+소유하고, launch/start failure는 기존 3회/PT1M `RestartOnFailure`, overlap은 `IgnoreNew`가 소유한다.
 | OD-078 | D1이 Orca Run을 등록된 repository에 잇는 열쇠 | D1 전 | DECIDED |
 
 ## 결정 기록 형식

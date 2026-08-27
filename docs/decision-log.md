@@ -504,3 +504,32 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   `LIVE_CHANNEL_UNVERIFIED`를 유지하고 최종 merged build에서 재수용한다.
 - 실제 ID와 payload를 제거한 근거는
   [D3 live Channel acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다.
+
+## 2026-08-27 · O1 operational closure boundary
+
+### DL-056 · O1 acceptance는 hermetic CI와 disposable Windows 표본을 분리한다
+
+- exact fixed-pipe 경합, durable daemon/job/root intent 복구, outage/backoff, no-repost,
+  multi-repository fail-closed, shutdown fence, no-LLM, redaction/status는 하나의 hermetic CI gate로
+  실행한다.
+- Windows Task-definition 의미 검증은 CI-safe pure test로 유지한다. 실제 Task Scheduler 표본은
+  current-user, unique exact target, mock payload, serialized runner만 허용하고 task/process/file 잔존
+  aggregate가 모두 0이어야 한다.
+- OD-027과 OD-062/063/064/065의 결정은 닫혔다. Windows 표본과 merged-main deployment smoke는
+  구현 결정이 아니라 rollout evidence residual로 남긴다.
+- O1은 D3 live authority가 아니다. `LIVE_CHANNEL_UNVERIFIED`는 그대로 유지하며 production 설치도
+  merged-main startup/status smoke 전에는 완료로 표기하지 않는다.
+- redacted 결과와 실행 명령은
+  [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 기록한다.
+
+### DL-057 · Windows process-exit recovery는 trigger repetition이 소유한다
+
+- disposable Task에서 action이 시작된 뒤 exit 23을 반환해도 `RestartOnFailure`가 재실행하지 않는
+  것을 관찰했다. task/process/file cleanup aggregate는 `0/0/0`이었다.
+- MS-TSCH 2.5.4.2에 따라 `RestartOnFailure`는 unmet start condition/action-start failure 경계로
+  유지한다. 이미 시작된 daemon process의 종료 복구는 AtLogOn trigger의 duration 없는 PT1M
+  repetition으로 분리한다.
+- `MultipleInstancesPolicy=IgnoreNew`가 healthy daemon과 repetition의 overlap을 막는다. uninstall은
+  exact owned task를 먼저 disable하므로 shutdown fence 뒤 새 외부 work를 시작하지 않는다.
+- disposable acceptance는 별도 bounded PT1M TimeTrigger로 exit 23 뒤 두 번째 OS launch와 clean exit
+  0을 증명하고, production trigger의 indefinite 의미는 strict pure XML/fingerprint test로 검증한다.

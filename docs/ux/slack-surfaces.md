@@ -1,6 +1,6 @@
 # Slack 메시지 UX 스펙
 
-상태: **Draft · 문구와 Block Kit layout 미확정**
+상태: **Draft · O1 background update/no-repost 계약 구현, 문구와 Block Kit layout 미확정**
 
 이 문서는 사용자가 모바일에서 Agent 개발 전체를 빠르게 파악하도록 메시지의 정보 구조와 상태별 의미를 정의한다. 예시는 고정 문구가 아니라 semantic requirement다.
 

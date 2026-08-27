@@ -1,6 +1,6 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · C1~D3 구현·offline 검증 및 D3 split-build live 관찰 반영 · exact-build 재수용 대기**
+상태: **Draft · C1~D3 및 O1 구현·Windows disposable PASS 반영 · production smoke와 D3 exact-build 재수용 대기**
 
 이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 
@@ -285,8 +285,14 @@ metadata를 Orca/Git branch/dispatch 관계와 어느 수준까지 대조할지�
 - 현재 관리 중인 repository/Run/PR 수
 
 O1-1은 아래 config/default/bound를 확정했다. O1-4는 health projection과 bounded log/조회 CLI를,
-O1-5는 daemon observer scheduler와 Slack root delivery fence를 연결했다. Windows Task ownership과 설치
-성공 판정은 여전히 O1-6/7이 소유하므로 현재 상태만으로 PC 자동 시작이나 운영 설치 완료를 주장하지 않는다.
+O1-5는 daemon observer scheduler와 Slack root delivery fence를 연결했고 O1-6은 Windows Task
+ownership/lifecycle을 merged했다. O1-7 hermetic process gate는 이를 함께 검증하지만, evidence의
+Windows 표본과 merged-main deployment smoke 전에는 PC 자동 시작이나 운영 설치 완료를 주장하지 않는다.
+
+Windows process-exit recovery는 AtLogOn trigger의 duration 없는 PT1M repetition이 소유한다.
+`IgnoreNew`가 이미 실행 중인 daemon과의 overlap을 막고, `RestartOnFailure` 3회/PT1M은 unmet start
+condition/action-start failure에만 남는다. disable이 shutdown보다 먼저이므로 stop fence 뒤 repetition은
+새 daemon work를 만들 수 없다.
 
 ### O1 automation config contract (O1-1)
 
