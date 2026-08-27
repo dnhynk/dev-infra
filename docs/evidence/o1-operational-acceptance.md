@@ -30,14 +30,16 @@ controls also survived beyond 130 seconds, excluding battery, idle, execution-ti
 child-wait limits. Production O1 acceptance therefore remains open even though the orphaned daemon
 itself was healthy.
 
-The narrow differentiator is the Task action's exposed interactive console: the registered action
-omitted Windows PowerShell `-WindowStyle Hidden`, while its Node child uses `CreateNoWindow`. A
-console-close control event can therefore terminate the PowerShell host with
-`STATUS_CONTROL_C_EXIT` without reaching Node. The repair pins `-WindowStyle Hidden` into task
-creation, the semantic fingerprint, the launcher binding verifier, and the dynamic `run-now`
-caller. It intentionally does not introduce a broader control handler or process wrapper; the
-acceptance criterion is that the Task remains `Running` with one direct daemon child past the
-observed boundary, then both exit without an orphan.
+The observations support, but do not prove, a narrow console-boundary hypothesis: the registered
+Task action exposed an interactive Windows PowerShell console and omitted `-WindowStyle Hidden`,
+while its Node child uses `CreateNoWindow`. A console-close control event is consistent with the
+observed `STATUS_CONTROL_C_EXIT` because it can terminate the PowerShell host without reaching
+Node, but no source of such an event was directly observed. The repair therefore pins
+`-WindowStyle Hidden` into task creation, the semantic fingerprint, the launcher binding verifier,
+and the dynamic `run-now` caller. It intentionally does not introduce a broader control handler or
+process wrapper; the acceptance criterion is that the Task remains `Running` with one direct daemon
+child past the observed boundary, then both exit without an orphan. Causality remains inferred
+until that fixed release passes the production control.
 
 ## Operational failure matrix
 
