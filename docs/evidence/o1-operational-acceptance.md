@@ -1,6 +1,6 @@
 # O1 operational acceptance evidence
 
-Status: **O1-7 production acceptance reopened — timer rounding repair merged but insufficient; observer dual-clock durable fence repair awaits merge and fixed-release production verification**
+Status: **O1-7 production acceptance PASS — the exact merged dual-clock release passed capability rotation and recurring durable wall fences**
 
 This evidence is for O1-7 only. The baseline was clean merged `main` at
 `c26a53a7faf1b3c57aa384e88b2874362ecc3d2f`; O1-5 and O1-6 had independent canonical PASS
@@ -91,6 +91,28 @@ between the callback guard and claim sample. This preserves the
 durable SQLite rejection and CLI fatal handling instead of weakening either one. Focused
 observer-supervisor/cli-daemon tests passed 38/38 and workspace typecheck passed; these results
 qualify the change for merge but do not replace the fixed-release production observation.
+
+The repair squash-merged as exact `main`
+`013b958bfa4863715943428e30fbbafd5f1fa3b4` in PR #53 after GitHub Actions run `33112753352`
+passed both `test` and `typecheck`. Its immutable Windows release is
+`eba32cd112c65a78745d348056ef60347740933fa0466436d9cf48400156c450`, with operational build
+fingerprint `ff7928cde96045eec8f8e7d6b24bb0e4d98daae5db13df734fd49a2bf93a02f0`.
+The installed current-user Task started that release at `2026-08-27T20:31:24.569Z`; startup
+repository discovery succeeded and persisted `nextRunAt=2026-08-27T20:36:19.067Z`.
+
+Eight serial status reads from `20:32:11.053Z` through `20:32:39.955Z` crossed a 15-second
+capability rotation with 8/8 parseable reports, zero snapshot failures, matched
+schema/config/build/task ownership, healthy Task/daemon state, heartbeat age 0–12 seconds, and
+stable launcher/daemon PIDs `35440`/`26084`. The recurring `run-observer` claim started at
+`20:33:53.726Z`, 15ms after its persisted `20:33:53.711Z` fence, and succeeded. A following
+`run-observer` attempt also succeeded before repository discovery started at
+`20:36:19.073Z`, 6ms after its persisted wall fence, and succeeded at `20:36:21.787Z`.
+At `20:36:57.988Z`, 5 minutes 33 seconds after daemon start and beyond the previously fatal
+five-minute boundary, the Task remained Running with the same two PIDs and a fresh heartbeat. A
+final read at `20:37:16.695Z` still reported matched schema/config/build, healthy Task/daemon,
+repository attempt 22 succeeded, and run-observer attempt 43 succeeded. This closes O1-7
+production acceptance. The aggregate remains transparently `degraded` only for the separately
+preserved `job.absent`, `registry.rejected`, and `work.pending` conditions described below.
 
 The first production install from exact merged `main` at
 `8d857f94c0ad44617071aaa97a4756cd9e114b42` exposed a Windows registered-export
@@ -205,8 +227,9 @@ release roots as part of rollback. The pre-supervisor-hotfix production Task is 
 because its orphaned daemon was healthy. The repaired exact merged-main release satisfied the Task
 supervisor condition: Task state and direct parent/child ownership remained healthy past the
 observed boundary. The status-liveness and rounding repairs subsequently merged, but production
-rejected the rounding-only release at the repository wall fence. Final O1 acceptance stays open
-until the dual-clock callback repair passes its exact merged-release production check.
+rejected the rounding-only release at the repository wall fence. The exact merged dual-clock
+release then passed both the rotation-boundary status probe and that recurring repository wall
+fence while retaining stable Task/PIDs/heartbeat, so O1 production acceptance is closed as PASS.
 
 ## Privacy boundary
 
@@ -301,3 +324,13 @@ retains its generated task name, paths, XML, process command line, or mock state
   repair reproduced one valid source path but its merged production release repeated the
   repository-boundary exit. Final acceptance therefore awaits the dual-clock callback recheck in an
   exact merged release.
+- Final dual-clock production qualification: PR #53 squash-merged as exact `main`
+  `013b958bfa4863715943428e30fbbafd5f1fa3b4`; GitHub Actions run `33112753352` passed `test` and
+  `typecheck`; immutable release
+  `eba32cd112c65a78745d348056ef60347740933fa0466436d9cf48400156c450` installed and started with
+  build fingerprint `ff7928cde96045eec8f8e7d6b24bb0e4d98daae5db13df734fd49a2bf93a02f0`.
+  Status passed 8/8 over 28.9 seconds across capability rotation with stable PIDs `35440`/`26084`.
+  `run-observer` started 15ms after its persisted deadline and succeeded; `repository-discovery`
+  started 6ms after `2026-08-27T20:36:19.067Z` and succeeded. The same Task/PIDs and a fresh
+  heartbeat remained at the 5-minute-33-second observation, closing O1-7 production acceptance as
+  PASS without changing the separately preserved D3 state or existing backlog diagnostics.

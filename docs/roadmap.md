@@ -341,8 +341,14 @@ monotonic timer 도달만으로 별도 wall fence 도달을 가정하지 않는�
 deadline을 schedule에 보존하고 callback마다 더 큰 remaining duration을 올림해 재설치하며, 둘 다 due일
 때만 scheduled due를 enqueue한다. `onStarted` 직전 exact wall sample도 다시 검증한다. 지속적인 1ms
 wall-clock 후퇴와 callback guard 직후의 1ms 후퇴를 store/CLI fence 완화 없이 각각 흡수하는 결정적
-regressions를 포함한 focused 2 files 38 tests와 workspace typecheck는 통과했다. exact
-merged-release production 재검증이 final O1 acceptance의 남은 조건이다.
+regressions를 포함한 focused 2 files 38 tests와 workspace typecheck는 통과했다. 이 수리는 PR #53으로
+exact `main` `013b958bfa4863715943428e30fbbafd5f1fa3b4`에 merge됐고, immutable release
+`eba32cd112c65a78745d348056ef60347740933fa0466436d9cf48400156c450`로 설치됐다. status는 28.9초 동안
+8/8로 capability rotation을 통과했고 Task/PID/heartbeat가 유지됐다. recurring `run-observer`는 persisted
+deadline보다 15ms 뒤에 시작해 성공했으며, `repository-discovery`는 persisted
+`2026-08-27T20:36:19.067Z`보다 6ms 뒤에 시작해 성공했다. daemon 시작 5분 33초 뒤에도 같은 launcher/daemon
+PID가 유지됐으므로 O1-7 production acceptance는 PASS로 닫는다. 별도 D3와 기존 backlog 때문에 read-only
+aggregate가 `degraded`인 상태는 O1 실패로 재분류하지 않는다.
 
 핵심 C/D 수직 슬라이스 이후 크기를 다시 산정한다.
 
