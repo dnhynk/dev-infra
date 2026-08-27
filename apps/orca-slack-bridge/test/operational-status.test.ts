@@ -1266,6 +1266,67 @@ describe('read-only operational status classification', () => {
     }
   });
 
+  it.each([
+    ['capability ID', 'capabilityId'],
+    ['capability secret', 'secret'],
+  ] as const)('does not retry when only the %s changes', async (_label, changedField) => {
+    const store = healthyStore();
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const server = createServer({ allowHalfOpen: true }, (socket) => {
+      connections += 1;
+      sockets.add(socket);
+      socket.on('error', () => undefined);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('data', () => undefined);
+      socket.on('end', () => socket.destroy());
+    });
+    try {
+      await new Promise<void>((resolveListen, reject) => {
+        server.once('error', reject);
+        server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, resolveListen);
+      });
+      const address = server.address();
+      if (address === null || typeof address === 'string') throw new Error('expected TCP listener');
+      const transport = { kind: 'tcp', host: '127.0.0.1', port: address.port } as const;
+      capabilities.document = activeOperationalStatusCapability(
+        operationalStatusStateIdentity(statePath, 'win32'),
+        transport,
+        TRANSPORT_AT,
+      );
+      const first = capabilities.active();
+      const generated = activeOperationalStatusCapability(
+        first.stateIdentity,
+        transport,
+        TRANSPORT_AT,
+      );
+      const halfRotated: ActiveOperationalStatusCapability = changedField === 'capabilityId'
+        ? { ...generated, secret: first.secret }
+        : { ...generated, capabilityId: first.capabilityId };
+      capabilities.afterRequestRead = (observed) => {
+        if (capabilities.requestReads !== 1 || observed.kind !== 'ready') return;
+        capabilities.afterRequestRead = null;
+        capabilities.document = structuredClone(halfRotated);
+      };
+
+      expect(await inspect({
+        platform: 'win32',
+        ownerTimeoutMilliseconds: 200,
+      })).toMatchObject({ exitCode: 2, codes: ['state.snapshot_unavailable'] });
+      const replacement = capabilities.active();
+      expect(replacement.capabilityId === first.capabilityId)
+        .toBe(changedField !== 'capabilityId');
+      expect(replacement.secret === first.secret).toBe(changedField !== 'secret');
+      expect(connections).toBe(1);
+      expect(capabilities.requestReads).toBe(2);
+    } finally {
+      capabilities.afterRequestRead = null;
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      store.close();
+    }
+  });
+
   it('does not re-read or retry after the original owner-request deadline expires', async () => {
     const store = healthyStore();
     const sockets = new Set<Socket>();

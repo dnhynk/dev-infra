@@ -267,9 +267,11 @@ gate로 묶었다. 단일 workspace package의 complete bridge Vitest suite는 `
 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 따른다. hotfix exact head
 `73ebddcca7c6584e9b197caef2103ab43821181f`가 CI와 독립 감사를 통과해
 `da76bf3cd76b4979154ee8dcd6706ce3627f2a5e`로 merge됐고, 해당 merged-main release가 startup smoke와
-beyond-boundary ownership 관측을 통과해 Task supervisor 조건을 닫았다. 이후 status capability rotation
-race가 관측되어 final O1 production acceptance는 다시 열렸으며, D3의 `LIVE_CHANNEL_UNVERIFIED`는 이 O1
-상태와 독립적으로 그대로 유지한다.
+beyond-boundary ownership 관측을 통과해 Task supervisor 조건을 닫았다. 이후 `status`의
+`state.snapshot_unavailable`이 15초 capability rotation 경계와 맞물려 반복 관측되어 final O1 production
+acceptance는 다시 열렸다. protected capability read와 owner authentication 사이의 generation 전환은 그
+현상을 설명하는 코드상 가능한 interleaving이며, D3의 `LIVE_CHANNEL_UNVERIFIED`는 이 O1 상태와 독립적으로
+그대로 유지한다.
 
 O1-7 실측에서 `RestartOnFailure`가 이미 시작된 Exec의 exit 23을 재실행하지 않는 O1-6 gap이
 드러났다. 최소 수리는 managed AtLogOn trigger의 duration 없는 PT1M repetition이며, 기존

@@ -146,7 +146,7 @@ retains its generated task name, paths, XML, process command line, or mock state
 ## Recorded results
 
 - Status capability-rotation hotfix local qualification: focused
-  `test/operational-status.test.ts` passed 1 file, 49 tests passed and 9 platform-skipped (58 total);
+  `test/operational-status.test.ts` passed 1 file, 51 tests passed and 9 platform-skipped (60 total);
   workspace typecheck PASS. This is merge qualification only; fixed-release production acceptance
   remains pending.
 - Node 26.8.1 focused hard-crash acceptance: 1 file, 2/2 tests passed; bridge typecheck PASS.
