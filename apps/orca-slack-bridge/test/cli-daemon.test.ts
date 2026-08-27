@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { parseArgs, runDaemonCommand as runDaemonCommandWithNativeStatus } from '../src/cli.js';
+import {
+  fairDigestCycle,
+  parseArgs,
+  runDaemonCommand as runDaemonCommandWithNativeStatus,
+} from '../src/cli.js';
+import type { EffectiveBridgeConfig } from '../src/discovery/types.js';
 import type {
   ChannelPipeErrorCode,
   ChannelProductionDeliveryHandlers,
@@ -21,7 +26,11 @@ import { GATE_DIRECT_OPTION_ID } from '../src/gate/direct-input-types.js';
 import type { GateSnapshot } from '../src/gate/resolution-types.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { OrcaRunner } from '../src/orca/client.js';
-import { DEFAULT_CORRELATION_KEYS, type BridgeConfig } from '../src/project/config.js';
+import {
+  DEFAULT_CORRELATION_KEYS,
+  parseConfig,
+  type BridgeConfig,
+} from '../src/project/config.js';
 import type { PostMessageInput, PostedMessage, SlackPoster, UpdateMessageInput } from '../src/slack/post.js';
 import type { SocketConnectionFactory, SocketConnectionHooks } from '../src/slack/socket.js';
 import type { OpenSlackViewInput, OpenedSlackView, SlackViewOpener } from '../src/slack/views.js';
@@ -48,11 +57,16 @@ const CONFIG: BridgeConfig = {
   projects: [],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
 };
+const ENABLED_CONFIG = parseConfig(CONFIG);
 
 const TEST_STATUS_OWNER_SERVER = {
   start: () => Promise.resolve(),
   refresh: () => undefined,
   stop: () => Promise.resolve(),
+};
+const TEST_TELEMETRY = {
+  log: async () => ({ ok: true as const }),
+  close: async () => undefined,
 };
 
 class MemorySnapshotLeaseStore implements OperationalStatusSnapshotLeaseStore {
@@ -84,6 +98,7 @@ async function runDaemonCommand(
     statusOwnerServer: dependencies?.statusOwnerServer ?? TEST_STATUS_OWNER_SERVER,
     statusSnapshotLeaseStore: dependencies?.statusSnapshotLeaseStore ??
       new MemorySnapshotLeaseStore(),
+    telemetry: dependencies?.telemetry ?? TEST_TELEMETRY,
   });
 }
 
@@ -309,6 +324,61 @@ class FakeSlack implements SlackPoster {
   }
 }
 
+class ObserverSlack implements SlackPoster {
+  readonly posts: PostMessageInput[] = [];
+  readonly updates: UpdateMessageInput[] = [];
+  constructor(private readonly events: string[]) {}
+  post(input: PostMessageInput): Promise<PostedMessage> {
+    this.events.push('slack:post');
+    this.posts.push(input);
+    return Promise.resolve({ channel: input.channel, ts: '1787554800.009999' });
+  }
+  update(input: UpdateMessageInput): Promise<PostedMessage> {
+    this.updates.push(input);
+    return Promise.resolve({ channel: input.channel, ts: input.ts });
+  }
+}
+
+class ObserverOrca implements OrcaRunner {
+  readonly calls: string[][] = [];
+  constructor(
+    private readonly events: string[],
+    private readonly failures: {
+      readonly discovery?: boolean;
+      readonly discoverySchema?: boolean;
+      readonly runs?: boolean;
+      readonly runsSchema?: boolean;
+    } = {},
+  ) {}
+  run(args: readonly string[]): Promise<string> {
+    this.calls.push([...args]);
+    if (args[0] === 'repo' && args[1] === 'list') {
+      this.events.push('orca:repo-list');
+      if (this.failures.discovery === true) return Promise.reject(new Error('discovery unavailable'));
+      if (this.failures.discoverySchema === true) return Promise.resolve('{}');
+      return Promise.resolve(JSON.stringify({
+        _meta: { runtimeId: 'runtime-test' }, id: 'repo-list', ok: true,
+        result: { repos: [] },
+      }));
+    }
+    if (args[0] === 'orchestration' && args[1] === 'run-list') {
+      this.events.push('orca:run-list');
+      if (this.failures.runs === true) return Promise.reject(new Error('runs unavailable'));
+      if (this.failures.runsSchema === true) {
+        return Promise.resolve(JSON.stringify({
+          id: 'run-list', ok: true, result: { runs: {} },
+        }));
+      }
+      return Promise.resolve(JSON.stringify({ id: 'run-list', ok: true, result: { runs: [] } }));
+    }
+    if (args[0] === 'orchestration' && args[1] === 'inbox') {
+      this.events.push('orca:inbox');
+      return Promise.resolve(JSON.stringify({ id: 'inbox', ok: true, result: { messages: [] } }));
+    }
+    return Promise.reject(new Error('unexpected observer command'));
+  }
+}
+
 class NeverSettlingOrca implements OrcaRunner {
   readonly calls: string[][] = [];
   run(args: readonly string[]): Promise<string> {
@@ -372,6 +442,368 @@ class FakeChannelServer {
 }
 
 describe('daemon production wiring', () => {
+  it('runs bounded discovery before Socket, then enqueues the Run observer immediately', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const orca = new ObserverOrca(events);
+    const slack = new ObserverSlack(events);
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer(events),
+      orca,
+      slack,
+      connectionFactory: () => ({
+        start: () => {
+          events.push('socket:start');
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => { events.push('socket:close'); return Promise.resolve(); },
+      }),
+      waitForStop: async () => { await waitFor(() => slack.posts.length === 1); },
+      installationSeed: 'daemon-order-test',
+    });
+
+    expect(code).toBe(0);
+    expect(events.indexOf('channel:start')).toBeLessThan(events.indexOf('orca:repo-list'));
+    expect(events.indexOf('orca:repo-list')).toBeLessThan(events.indexOf('socket:start'));
+    expect(events.indexOf('socket:start')).toBeLessThan(events.indexOf('orca:run-list'));
+    expect(events.indexOf('orca:run-list')).toBeLessThan(events.indexOf('slack:post'));
+    expect(events.indexOf('socket:close')).toBeLessThan(events.indexOf('channel:stop'));
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')?.state).toBe('succeeded');
+    expect(reopened.findDaemonJobOutcome('run-observer')?.state).toBe('succeeded');
+    expect(reopened.findRunCollectionMessage()).not.toBeNull();
+    reopened.close();
+  });
+
+  it('keeps the Socket and Gate plane alive while discovery and Run observers back off', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const orca = new ObserverOrca(events, { discovery: true, runs: true });
+    let liveStore: SqliteDigestStore | null = null;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      openStore: (path) => {
+        liveStore = new SqliteDigestStore(path);
+        return liveStore;
+      },
+      channelServer: new FakeChannelServer(events),
+      orca,
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => {
+          events.push('socket:start');
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => { events.push('socket:close'); return Promise.resolve(); },
+      }),
+      waitForStop: async () => {
+        await waitFor(() =>
+          liveStore?.findDaemonJobOutcome('run-observer')?.state === 'backoff');
+      },
+      installationSeed: 'daemon-outage-test',
+    });
+
+    expect(code).toBe(0);
+    expect(events).toContain('socket:start');
+    expect(events.indexOf('orca:repo-list')).toBeLessThan(events.indexOf('socket:start'));
+    expect(events.indexOf('socket:start')).toBeLessThan(events.indexOf('orca:run-list'));
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')).toMatchObject({
+      state: 'backoff', errorCode: 'discovery.query_failed', consecutiveFailures: 1,
+    });
+    expect(reopened.findDaemonJobOutcome('run-observer')).toMatchObject({
+      state: 'backoff', errorCode: 'run.query_failed', consecutiveFailures: 1,
+    });
+    reopened.close();
+  });
+
+  it('fails before Socket ingress on an observer schema invariant', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    let socketStarts = 0;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events, { discoverySchema: true }),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => {
+          socketStarts += 1;
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-schema-test',
+    });
+
+    expect(code).toBe(1);
+    expect(socketStarts).toBe(0);
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')).toMatchObject({
+      state: 'failed', errorCode: 'discovery.schema_drift', consecutiveFailures: 1,
+    });
+    reopened.close();
+  });
+
+  it('treats a discovery store mutation failure as fatal before Socket ingress', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    let socketStarts = 0;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      openStore: (path) => new SqliteDigestStore(path, {
+        operationalFault: (point) => {
+          if (point === 'after_discovery_registry') throw new Error('injected store fault');
+        },
+      }),
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => {
+          socketStarts += 1;
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-store-invariant-test',
+    });
+
+    expect(code).toBe(1);
+    expect(socketStarts).toBe(0);
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')).toMatchObject({
+      state: 'failed', errorCode: 'schema.drift', consecutiveFailures: 1,
+    });
+    expect(reopened.readDaemonHealth()).toMatchObject({
+      state: 'running', cleanStoppedAt: null,
+    });
+    reopened.close();
+  });
+
+  it('treats malformed Run rows as a fatal invariant after draining Socket ingress', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events, { runsSchema: true }),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => {
+          events.push('socket:start');
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => {
+          events.push('socket:close');
+          return Promise.resolve();
+        },
+      }),
+      waitForStop: () => new Promise<void>(() => undefined),
+      installationSeed: 'daemon-run-schema-test',
+    });
+
+    expect(code).toBe(1);
+    expect(events).toContain('socket:start');
+    expect(events).toContain('socket:close');
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('run-observer')).toMatchObject({
+      state: 'failed', errorCode: 'run.schema_drift', consecutiveFailures: 1,
+    });
+    expect(reopened.readDaemonHealth()).toMatchObject({
+      state: 'running', cleanStoppedAt: null,
+    });
+    reopened.close();
+  });
+
+  it('durably claims and executes a mandated startup pass despite a future persisted schedule', async () => {
+    const seeded = new SqliteDigestStore(statePath);
+    const now = Date.now();
+    const first = seeded.startDaemonJob(
+      'pr-digest', new Date(now - 5_000).toISOString(),
+    );
+    if (first === null) throw new Error('initial digest claim failed');
+    seeded.completeDaemonJobSuccess({
+      claim: first,
+      at: new Date(now - 4_000).toISOString(),
+      nextRunAt: new Date(now + 60 * 60_000).toISOString(),
+      durationMs: 1_000,
+      checkpoint: 0,
+    });
+    seeded.close();
+
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    let liveStore: SqliteDigestStore | null = null;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      openStore: (path) => {
+        liveStore = new SqliteDigestStore(path);
+        return liveStore;
+      },
+      channelServer: new FakeChannelServer(events),
+      orca: new ObserverOrca(events),
+      slack: new ObserverSlack(events),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      digestStartupDelayMs: 10,
+      waitForStop: async () => {
+        await waitFor(() => {
+          const outcome = liveStore?.findDaemonJobOutcome('pr-digest');
+          return outcome?.attempt === 2 && outcome.state === 'succeeded';
+        });
+      },
+      installationSeed: 'daemon-startup-takeover-test',
+    });
+
+    const reopened = new SqliteDigestStore(statePath);
+    const digestOutcome = reopened.findDaemonJobOutcome('pr-digest');
+    const diagnostic = JSON.stringify({
+      discovery: reopened.findDaemonJobOutcome('repository-discovery'),
+      runs: reopened.findDaemonJobOutcome('run-observer'),
+      digestOutcome,
+      health: reopened.readDaemonHealth(),
+      events,
+    });
+    reopened.close();
+    expect(code, diagnostic).toBe(0);
+    expect(digestOutcome).toMatchObject({
+      state: 'succeeded', attempt: 2, consecutiveFailures: 0,
+    });
+  });
+
+  it('uses code-point repository order so fair checkpoints ignore the host locale', () => {
+    const effective: EffectiveBridgeConfig = {
+      base: {
+        ...ENABLED_CONFIG,
+        automation: {
+          ...ENABLED_CONFIG.automation,
+          prDigest: {
+            ...ENABLED_CONFIG.automation.prDigest,
+            prLimit: 1,
+            globalPrBudget: 1,
+          },
+        },
+      },
+      configFingerprint: 'f'.repeat(64),
+      revision: 1,
+      projects: [{
+        key: 'project', name: 'project', origin: 'explicit', orcaRepositoryIds: [],
+        repositories: [
+          { canonicalKey: 'github.com/owner/alpha', nameWithOwner: 'owner/alpha' },
+          { canonicalKey: 'github.com/owner/beta', nameWithOwner: 'owner/beta' },
+        ],
+      }],
+      bindings: [],
+      diagnostics: [],
+      routing: { status: 'ready' },
+    };
+    const localeCompare = vi.spyOn(String.prototype, 'localeCompare')
+      .mockImplementation(() => { throw new Error('host locale must not participate'); });
+    try {
+      expect(fairDigestCycle(effective, 0)).toMatchObject({
+        repositories: ['owner/alpha'], checkpoint: 1,
+      });
+      expect(fairDigestCycle(effective, 1)).toMatchObject({
+        repositories: ['owner/beta'], checkpoint: 0,
+      });
+    } finally {
+      localeCompare.mockRestore();
+    }
+  });
+
+  it('keeps the legacy reconciliation cadence independent while startup discovery is pending', async () => {
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const events: string[] = [];
+    const delegated = new ObserverOrca(events);
+    let releaseDiscovery!: () => void;
+    const discovery = new Promise<void>((resolve) => { releaseDiscovery = resolve; });
+    const orca: OrcaRunner = {
+      run: async (args) => {
+        if (args[0] === 'repo' && args[1] === 'list') {
+          events.push('orca:repo-list');
+          await discovery;
+          return JSON.stringify({
+            _meta: { runtimeId: 'runtime-test' }, id: 'repo-list', ok: true,
+            result: { repos: [] },
+          });
+        }
+        return await delegated.run(args);
+      },
+    };
+    const slack = new ObserverSlack(events);
+    let deliveryReconciles = 0;
+    const running = runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer(events),
+      createChannelDelivery: () => ({
+        reconcile: async () => { deliveryReconciles += 1; },
+        recordAttempted: () => undefined,
+        recordReceipted: () => undefined,
+      }),
+      orca,
+      slack,
+      reconcileIntervalMs: 10,
+      connectionFactory: () => ({
+        start: () => {
+          events.push('socket:start');
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: async () => { await waitFor(() => slack.posts.length === 1); },
+      installationSeed: 'daemon-independent-gate-test',
+    });
+
+    await waitFor(() => events.includes('orca:repo-list'));
+    await waitFor(() => deliveryReconciles >= 2);
+    expect(events).not.toContain('socket:start');
+    releaseDiscovery();
+    expect(await running).toBe(0);
+    expect(events).toContain('socket:start');
+  });
+
+  it('honors a durable desired_state stop without opening Socket ingress', async () => {
+    const seeded = new SqliteDigestStore(statePath);
+    const started = new Date(Date.now() - 2_000).toISOString();
+    const stopped = new Date(Date.now() - 1_000).toISOString();
+    seeded.recordDaemonStart({
+      instanceId: 'prior-daemon', buildFingerprint: 'a'.repeat(64),
+      configFingerprint: 'b'.repeat(64), at: started,
+    });
+    seeded.setDaemonDesiredState('stopped', stopped);
+    seeded.close();
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    let socketStarts = 0;
+    const code = await runDaemonCommand(parsed, CONFIG, {
+      channelServer: new FakeChannelServer(),
+      orca: new FakeOrca(),
+      slack: new FakeSlack(),
+      connectionFactory: () => ({
+        start: () => {
+          socketStarts += 1;
+          return Promise.resolve({ appId: 'A0APP' });
+        },
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+    });
+
+    expect(code).toBe(0);
+    expect(socketStarts).toBe(0);
+    const reopened = new SqliteDigestStore(statePath);
+    expect(reopened.readDaemonHealth()).toMatchObject({
+      desiredState: 'stopped', state: 'stopped',
+    });
+    reopened.close();
+  });
+
   it('holds the snapshot lease from before writable store open through owner shutdown', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');

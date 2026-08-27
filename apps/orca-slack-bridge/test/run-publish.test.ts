@@ -259,7 +259,7 @@ describe('Run 루트 재사용', () => {
     expect(slack.updates).toHaveLength(0);
   });
 
-  it('게시가 실패하면 매핑 행을 남기지 않는다', async () => {
+  it('게시 여부를 모르는 실패는 uncertain으로 봉쇄하고 매핑을 만들지 않는다', async () => {
     const store = new SqliteDigestStore(dbPath);
     const failing: SlackPoster = {
       async post(): Promise<PostedMessage> {
@@ -270,14 +270,13 @@ describe('Run 루트 재사용', () => {
       },
     };
 
-    await expect(publishRunCard(options(store, failing), input())).rejects.toThrow(
-      /chat.postMessage가 실패했다/,
-    );
+    const result = await publishRunCard(options(store, failing), input());
     const mapped = store.findRunMessage(runKey(RUN_ID));
+    const intent = store.findSlackRootIntent({ kind: 'run', key: runKey(RUN_ID) });
     store.close();
-    // 실패를 기록으로 바꾸지 않는다. 다만 이 행이 없다는 것이 "게시되지 않았다"를 뜻하지는
-    // 않는다 — 그것이 `run/publish.ts`가 적어 둔 창 2다.
+    expect(result.action).toBe('uncertain');
     expect(mapped).toBeNull();
+    expect(intent?.state).toBe('uncertain');
   });
 });
 
@@ -670,20 +669,21 @@ describe('컬렉션 카드 (OD-080)', () => {
       },
     };
 
-    await expect(
-      publishRunCollection(options(store, failing), {
+    const report = await publishRunCollection(options(store, failing), {
         observedAt: AT,
         runs: [facts()],
         unregistered: { count: 4, runs: [] },
         degraded: [],
-      }),
-    ).rejects.toThrow(/chat.postMessage가 실패했다/);
+      });
     const mapped = store.findRunCollectionMessage();
+    const runIntent = store.findSlackRootIntent({ kind: 'run', key: runKey(RUN_ID) });
     store.close();
 
     expect(posts).toHaveLength(2);
     expect(posts[0]?.text).toContain('등록되지 않은 Run 4건');
     // 컬렉션 카드의 매핑은 남았다. 다음 관찰이 그것을 재사용한다.
     expect(mapped?.messageTs).toBe('1787403740.000001');
+    expect(report.runs[0]?.action).toBe('uncertain');
+    expect(runIntent?.state).toBe('uncertain');
   });
 });

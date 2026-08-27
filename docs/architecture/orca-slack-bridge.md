@@ -284,9 +284,9 @@ metadata를 Orca/Git branch/dispatch 관계와 어느 수준까지 대조할지�
 - 마지막 오류와 재시도 여부
 - 현재 관리 중인 repository/Run/PR 수
 
-O1-1은 아래 config/default/bound를 확정했다. O1-4는 그중 health projection과 bounded log/조회 CLI를
-구현하지만 daemon scheduler 연결은 O1-5, Windows Task ownership은 O1-6/7이 소유한다. 따라서 O1-4만으로
-daemon 자동 시작이나 운영 설치 완료를 주장하지 않는다.
+O1-1은 아래 config/default/bound를 확정했다. O1-4는 health projection과 bounded log/조회 CLI를,
+O1-5는 daemon observer scheduler와 Slack root delivery fence를 연결했다. Windows Task ownership과 설치
+성공 판정은 여전히 O1-6/7이 소유하므로 현재 상태만으로 PC 자동 시작이나 운영 설치 완료를 주장하지 않는다.
 
 ### O1 automation config contract (O1-1)
 
@@ -416,3 +416,35 @@ truncate-and-rewrite는 consumed prefix의 SHA-256 witness로 smaller/equal/larg
 size, ctime, mtime가 모두 같아도 no-growth fast path가 SHA-256 검증을 생략하지 않는다. 각 bounded
 scan 뒤 yield 전에 모든 handle을 닫으므로 Windows rotation을 막지 않으며 partial line과 SIGINT/SIGTERM 종료도
 처리한다.
+
+### O1-5 daemon observer와 root delivery boundary
+
+daemon startup은 writable v13 store와 fixed Channel pipe를 먼저 소유하고 D2 Gate·D3 Channel recovery를
+끝낸다. 호환되는 config fingerprint의 LKG routing만 읽은 뒤 같은 observer lane에서 bounded repository
+discovery를 즉시 수행하고, 그 pass가 끝난 뒤 Slack Socket을 연다. Socket open 직후 Run observer를 due로
+만들고 PR digest의 첫 due는 60초 뒤다. 이후 discovery/Run/digest는 각각 300/120/900초 completion-based
+schedule, 30/90/300초 deadline, installation-seeded deterministic jitter와 30초 시작 exponential backoff를
+쓴다. 세 job은 due bit만 coalesce하는 round-robin lane 하나를 공유해 backlog나 observer 간 overlap을 만들지
+않는다. 기존 Gate/Channel 5초 reconcile과 15초 health heartbeat는 이 lane 밖에서 독립적으로 계속 돈다.
+
+observer의 GitHub 경계는 daemon 전체 token bucket 2,000 commands/hour, REST와 GraphQL remaining 각각
+1,000의 floor, 5분 quota cache, command당 20초와 8 MiB, 동시 실행 2개를 적용한다. PR은 repository당 최대
+10개, fair cycle 전체 최대 100개이며 repository의 모든 GitHub 사실을 먼저 수집한 뒤에만 그 repository의
+Slack write를 시작한다. quota/budget/deadline 또는 repository-local 실패는 해당 repository를 부분 게시하지
+않고 durable deferred count와 bounded backoff로 남긴다. daemon digest는 deterministic facts-only 결과만
+만들며 model provider module을 runtime import·생성·호출하지 않는다. 기존 one-shot digest의 model summary
+경로는 별도로 유지된다.
+
+PR, Run, Run collection의 새 Slack root는 모두 `slack_root_intent` pending 준비와 sending claim을 durable하게
+commit한 뒤 `chat.postMessage`를 한 번만 시도한다. exact success response의 channel/ts와 기존 mapping, posted
+state는 한 transaction으로 commit한다. transport write, timeout, 5xx, response 뒤 crash, mapping commit
+불확실성은 uncertain으로 고정하고 이후 poll은 post를 0회 수행한다. startup은 orphan sending도 uncertain으로
+바꾼다. 게시되지 않았음이 증명된 rate-limit failure만 pending으로 되돌릴 수 있다. 기존 mapped root의
+fingerprint skip/update와 thread dedupe는 그대로이며 Gate thread reply는 root intent 대상이 아니다.
+
+observer의 GitHub/Orca/discovery outage는 job-local failure/backoff라 Socket과 Gate plane을 죽이지 않는다.
+반대로 store/schema/config invariant, fixed-pipe ownership, operational status mutation, fatal logger failure는
+daemon-fatal이다. shutdown은 새 ingress와 timers를 먼저 막고 observer/child AbortController를 취소한 뒤
+accepted work를 bounded drain하며, timeout이면 nonzero다. clean shutdown만 daemon clean-stop을 기록하고
+Socket, pipe, status owner, log, store, snapshot lease 순으로 소유권을 놓는다. `desired_state=stopped`도 같은
+graceful 경로를 사용한다.

@@ -438,6 +438,15 @@ class FailingThread implements ThreadPoster {
   }
 }
 
+class NeverSettlingThread implements ThreadPoster {
+  readonly replies: ThreadReplyInput[] = [];
+
+  reply(input: ThreadReplyInput): Promise<PostedMessage> {
+    this.replies.push(input);
+    return new Promise(() => undefined);
+  }
+}
+
 /** 결정적 대역. 같은 사실이 같은 카드를 내는지 보려면 모델 출력이 흔들리면 안 된다. */
 class StubProvider implements SummaryProvider {
   readonly calls: SummaryFacts[] = [];
@@ -471,6 +480,7 @@ type Once = {
   readonly buildConclusion?: string;
   readonly slack?: SlackPoster | null;
   readonly provider?: SummaryProvider;
+  readonly summaryMode?: 'model' | 'facts_only';
   readonly onlyPr?: number | null;
   readonly channel?: string;
   /** thread 게시 경계. 넘기지 않으면 null이고 전이는 `unposted`로 남는다. */
@@ -482,6 +492,8 @@ type Once = {
   /** 참이면 `deps`·reviewer_result shape·`options`·`payload`의 깨진 row도 함께 섞인다(OD-079). */
   readonly brokenFields?: boolean;
   readonly gh?: GhOver;
+  readonly slackTimeoutMs?: number;
+  readonly signal?: AbortSignal;
 };
 
 /** 매 실행이 store 파일을 새로 연다. 재시작 뒤에도 매핑을 찾는지 함께 본다. */
@@ -503,9 +515,12 @@ async function digestOnce(opts: Once = {}): Promise<DigestReport> {
         thread: opts.thread ?? null,
         provider: opts.provider ?? new StubProvider(),
         cache: new MemorySummaryCache(),
+        ...(opts.summaryMode === undefined ? {} : { summaryMode: opts.summaryMode }),
         prLimit: 50,
         onlyPr: opts.onlyPr ?? null,
         now: () => new Date('2026-08-22T02:00:00Z'),
+        ...(opts.slackTimeoutMs === undefined ? {} : { slackTimeoutMs: opts.slackTimeoutMs }),
+        ...(opts.signal === undefined ? {} : { signal: opts.signal }),
       },
     );
   } finally {
@@ -576,6 +591,21 @@ describe('runDigest 멱등', () => {
  * action만 보면 이 회귀가 드러나지 않는다.
  */
 describe('runDigest 요약 재사용', () => {
+  it('daemon facts-only mode ignores a present model key and performs zero provider calls', async () => {
+    const previous = process.env['ORCA_SLACK_BRIDGE_OPENAI_KEY'];
+    process.env['ORCA_SLACK_BRIDGE_OPENAI_KEY'] = 'present-but-must-not-be-used';
+    const trap = new StubProvider();
+    try {
+      const report = await digestOnce({ provider: trap, summaryMode: 'facts_only' });
+      expect(trap.calls).toHaveLength(0);
+      expect(card(report).summary).toMatchObject({
+        kind: 'failed', reason: 'daemon facts-only mode',
+      });
+    } finally {
+      if (previous === undefined) delete process.env['ORCA_SLACK_BRIDGE_OPENAI_KEY'];
+      else process.env['ORCA_SLACK_BRIDGE_OPENAI_KEY'] = previous;
+    }
+  });
   it('사실이 그대로면 두 번째 실행은 summarizer를 부르지 않는다', async () => {
     const slack = new FakeSlack();
     const provider = new StubProvider();
@@ -758,6 +788,62 @@ describe('runDigest dry-run', () => {
 });
 
 describe('runDigest 실패와 경계', () => {
+  it('isolates a failed repository without publishing its collected prefix or blocking the next repo', async () => {
+    const repositories = ['good/one', 'bad/two', 'good/three'] as const;
+    const ids = new Map(repositories.map((name, index) => [name, index + 1]));
+    const ghCalls: string[][] = [];
+    const gh: GhRunner = {
+      run: async (args) => {
+        ghCalls.push([...args]);
+        const joined = args.join(' ');
+        if (args[0] === 'api' && args[1]?.startsWith('repos/') &&
+            !joined.includes('/branches/') && !joined.includes('/rules/')) {
+          const name = args[1].slice('repos/'.length) as typeof repositories[number];
+          return JSON.stringify({ id: ids.get(name), full_name: name });
+        }
+        if (args[0] === 'pr' && args[1] === 'list') {
+          const name = args[args.indexOf('--repo') + 1];
+          if (name === 'good/three') return '[]';
+          return JSON.stringify([prRow({ url: `https://github.com/${name}/pull/7` })]);
+        }
+        if (args[0] === 'api' && args[1] === 'graphql') {
+          if (joined.includes('owner=bad') && joined.includes('name=two')) {
+            throw new Error('repository-local GraphQL failure');
+          }
+          return rollupJson('SUCCESS');
+        }
+        if (joined.includes('/protection/required_status_checks')) {
+          throw new GhCommandError(args, 1, 'gh: Branch not protected (HTTP 404)');
+        }
+        if (joined.includes('/rules/branches/')) return '[]';
+        throw new Error(`unexpected isolated gh command: ${joined}`);
+      },
+    };
+    const config: BridgeConfig = {
+      ...CONFIG,
+      projects: [{ name: 'isolation', repositories: [...repositories], orcaRepositoryIds: [] }],
+    };
+    const slack = new FakeSlack();
+    const store = new SqliteDigestStore(dbPath);
+    try {
+      const report = await runDigest(new FakeOrca(), gh, {
+        config, channel: CHANNEL, store, slack, thread: null,
+        summaryMode: 'facts_only', prLimit: 10, onlyPr: null,
+        repositories, isolateRepositoryFailures: true,
+        now: () => new Date('2026-08-22T02:00:00Z'),
+      });
+      expect(report.repositoryFailures).toEqual([
+        { repository: 'bad/two', reason: 'query_failed' },
+      ]);
+      expect(slack.posts).toHaveLength(1);
+      expect(store.findPrMessage(`pr:1#7`)).not.toBeNull();
+      expect(store.findPrMessage(`pr:2#7`)).toBeNull();
+      expect(ghCalls.some((args) => args.includes('good/three'))).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
   it('summarizer가 실패해도 축소 카드를 게시한다', async () => {
     const slack = new FakeSlack();
     const report = await digestOnce({ slack, provider: new FailingProvider() });
@@ -1141,6 +1227,29 @@ describe('runDigest 전이', () => {
     ]);
     expect(thread.replies).toHaveLength(1);
     expect(readThreadEvents(PR_KEY).map((e) => e.messageTs)).toEqual(['1700000001.000001']);
+  });
+
+  it('bounds a cancellation-ignoring transition reply and keeps the event retryable', async () => {
+    await digestOnce({ verdict: null, prs: [prRow(OPEN_ROW)] });
+    const hanging = new NeverSettlingThread();
+    const began = Date.now();
+
+    await expect(digestOnce({
+      thread: hanging,
+      verdict: 'approve',
+      prs: [prRow(OPEN_ROW)],
+      slackTimeoutMs: 10,
+    })).rejects.toThrow(/thread reply deadline/);
+
+    expect(Date.now() - began).toBeLessThan(1_000);
+    expect(hanging.replies).toHaveLength(1);
+    expect(hanging.replies[0]?.signal?.aborted).toBe(true);
+    expect(readThreadEvents(PR_KEY)).toEqual([]);
+
+    const recovered = new FakeThread();
+    await digestOnce({ thread: recovered, verdict: 'approve', prs: [prRow(OPEN_ROW)] });
+    expect(recovered.replies).toHaveLength(1);
+    expect(readThreadEvents(PR_KEY)).toHaveLength(1);
   });
 
   /**

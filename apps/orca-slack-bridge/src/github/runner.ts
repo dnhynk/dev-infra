@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const MAX_GITHUB_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 /**
  * `gh` 호출 경계.
@@ -44,7 +45,7 @@ export class GhCli implements GhRunner {
     try {
       const { stdout } = await execFileAsync(this.bin, [...args], {
         encoding: 'utf8',
-        maxBuffer: 32 * 1024 * 1024,
+        maxBuffer: MAX_GITHUB_COMMAND_OUTPUT_BYTES,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         ...(options.timeoutMs === undefined ? {} : { timeout: Math.trunc(options.timeoutMs) }),
         killSignal: 'SIGTERM',

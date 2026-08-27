@@ -201,6 +201,16 @@ class FailingGateReplySlack extends FakeSlack {
   }
 }
 
+class NeverSettlingGateReplySlack extends FakeSlack {
+  readonly replySignals: (AbortSignal | undefined)[] = [];
+
+  override reply(input: ThreadReplyInput): Promise<PostedMessage> {
+    this.replies.push(input);
+    this.replySignals.push(input.signal);
+    return new Promise(() => undefined);
+  }
+}
+
 class FailOnceGateUpdateSlack extends FakeSlack {
   private failed = false;
 
@@ -442,6 +452,35 @@ describe('collect → project → render → existing Run thread publish', () =>
       expect(reopened.findGateLocalObservation(gateKey(GATE_ID))?.mappingState).toBe('matched');
     } finally {
       reopened.close();
+    }
+  });
+
+  it('bounds a cancellation-ignoring first Gate reply and leaves its mapping retryable', async () => {
+    const orca = new MutableFakeOrca();
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const hanging = new NeverSettlingGateReplySlack();
+    try {
+      const began = Date.now();
+      await expect(runRunObserver(orca, {
+        config: CONFIG,
+        channel: CHANNEL,
+        store,
+        slack: hanging,
+        thread: hanging,
+        now: () => new Date(AT),
+        slackTimeoutMs: 10,
+      })).rejects.toThrow(/thread reply deadline/);
+
+      expect(Date.now() - began).toBeLessThan(1_000);
+      expect(hanging.replies).toHaveLength(1);
+      expect(hanging.replySignals[0]?.aborted).toBe(true);
+      expect(store.findGateMessage(gateKey(GATE_ID))).toBeNull();
+      expect(store.findGateLocalObservation(gateKey(GATE_ID))).toMatchObject({
+        metadataState: 'matched', mappingState: 'missing',
+      });
+    } finally {
+      store.close();
     }
   });
 

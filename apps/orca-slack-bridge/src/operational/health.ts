@@ -23,7 +23,11 @@ export interface DaemonOperationalHealthWriter {
   daemonStarted(input: DaemonStartInput): Promise<DaemonHealthRecord>;
   daemonHeartbeat(instanceId: string, at: string): Promise<DaemonHealthRecord | null>;
   daemonCleanStopped(instanceId: string, at: string): Promise<DaemonHealthRecord | null>;
-  jobStarted(job: DaemonJobName, at: string): Promise<DaemonJobClaim | null>;
+  jobStarted(
+    job: DaemonJobName,
+    at: string,
+    options?: { readonly startupTakeover?: boolean },
+  ): Promise<DaemonJobClaim | null>;
   jobSucceeded(input: DaemonJobSuccessCompletion): Promise<DaemonJobOutcomeRecord | null>;
   jobFailed(
     input: DaemonJobCompletion & { readonly errorCode: OperationalFailureCode },
@@ -45,10 +49,13 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
       'startDaemonJob' | 'completeDaemonJobSuccess' | 'completeDaemonJobFailure' |
       'scheduleDaemonJobBackoff'>,
     private readonly telemetry: OperationalTelemetrySink,
+    /** Synchronous owner refresh; it runs in the same store-ownership turn as every mutation. */
+    private readonly afterMutation: () => void = () => undefined,
   ) {}
 
   async daemonStarted(input: DaemonStartInput): Promise<DaemonHealthRecord> {
     const record = this.store.recordDaemonStart(input);
+    this.afterMutation();
     await this.event({
       level: 'info', event: 'daemon.started', outcome: 'started',
       entityIdentity: entityIdentity(input.instanceId),
@@ -58,6 +65,7 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
 
   async daemonHeartbeat(instanceId: string, at: string): Promise<DaemonHealthRecord | null> {
     const record = this.store.recordDaemonHeartbeat(instanceId, at);
+    this.afterMutation();
     await this.event(record === null
       ? { level: 'warn', event: 'daemon.failed', outcome: 'rejected', errorCode: 'validation.failed' }
       : { level: 'debug', event: 'daemon.heartbeat', outcome: 'healthy' });
@@ -66,14 +74,20 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
 
   async daemonCleanStopped(instanceId: string, at: string): Promise<DaemonHealthRecord | null> {
     const record = this.store.recordDaemonCleanStop(instanceId, at);
+    this.afterMutation();
     await this.event(record === null
       ? { level: 'warn', event: 'daemon.failed', outcome: 'rejected', errorCode: 'validation.failed' }
       : { level: 'info', event: 'daemon.stopped', outcome: 'stopped' });
     return record;
   }
 
-  async jobStarted(job: DaemonJobName, at: string): Promise<DaemonJobClaim | null> {
-    const claim = this.store.startDaemonJob(job, at);
+  async jobStarted(
+    job: DaemonJobName,
+    at: string,
+    options: { readonly startupTakeover?: boolean } = {},
+  ): Promise<DaemonJobClaim | null> {
+    const claim = this.store.startDaemonJob(job, at, options);
+    this.afterMutation();
     if (claim !== null) await this.event({
       level: 'info', event: 'job.started', job, outcome: 'started',
     });
@@ -82,6 +96,7 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
 
   async jobSucceeded(input: DaemonJobSuccessCompletion): Promise<DaemonJobOutcomeRecord | null> {
     const record = this.store.completeDaemonJobSuccess(input);
+    this.afterMutation();
     if (record !== null) await this.event({
       level: 'info', event: 'job.succeeded', job: record.jobName, outcome: 'succeeded',
       attempt: record.attempt,
@@ -97,6 +112,7 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
     retryable: boolean,
   ): Promise<DaemonJobOutcomeRecord | null> {
     const record = this.store.completeDaemonJobFailure(input);
+    this.afterMutation();
     if (record !== null) await this.event({
       level: 'error', event: 'job.failed', job: record.jobName, outcome: 'failed',
       attempt: record.attempt,
@@ -114,6 +130,7 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
     at: string,
   ): Promise<DaemonJobOutcomeRecord | null> {
     const record = this.store.scheduleDaemonJobBackoff(job, expectedRevision, nextRunAt, at);
+    this.afterMutation();
     if (record !== null) await this.event({
       level: 'warn', event: 'job.backoff', job, outcome: 'backoff',
       attempt: record.attempt,

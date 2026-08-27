@@ -29,6 +29,7 @@ import { projectGateDecisions } from '../gate/project.js';
 import type { GateMetadata } from '../gate/types.js';
 import { runKey } from '../identity/keys.js';
 import type { GateStore } from '../store/schema.js';
+import { OperationalStoreError } from '../store/sqlite.js';
 import { aggregateBlockers, aggregateDispatches, aggregateTasks } from './aggregate.js';
 import { runIdentity } from './liveness.js';
 import type {
@@ -200,6 +201,7 @@ async function readRunSources(
     try {
       gateMetadata = gateStore.listGateMetadata(runKey(run.id));
     } catch (e) {
+      if (e instanceof OperationalStoreError) throw e;
       degraded.push({
         kind: 'query_failed',
         detail: `gate_metadata 조회 실패: ${message(e)}`,
@@ -487,7 +489,11 @@ export async function collectRunFacts(
   let listedRuns: readonly OrcaRun[];
   try {
     listedRuns = await listRuns(orca);
-  } catch {
+  } catch (error) {
+    // Transport/process failures remain retryable daemon outages. JSON/envelope/row-shape failures
+    // are contract drift and must retain their typed fatal boundary.
+    if (!(error instanceof TypeError) && !(error instanceof SyntaxError) &&
+        !(error instanceof RangeError)) throw error;
     throw new RunCollectionContractError('RUN_ORDERING_UNRELIABLE');
   }
   validateRunWorkingSet(listedRuns);

@@ -817,6 +817,33 @@ describe('daemon health and monotonic job outcomes', () => {
     store.close();
   });
 
+  it('atomically takes over a future schedule for a mandated startup pass', () => {
+    const store = new SqliteDigestStore(path);
+    const first = store.startDaemonJob('pr-digest', AT0)!;
+    expect(store.completeDaemonJobSuccess({
+      claim: first,
+      at: AT1,
+      nextRunAt: '2026-08-26T00:10:00.000Z',
+      durationMs: 1_000,
+      checkpoint: 7,
+    })).toMatchObject({ state: 'succeeded', attempt: 1, checkpoint: 7 });
+    expect(store.startDaemonJob('pr-digest', AT2)).toBeNull();
+
+    const startup = store.startDaemonJob('pr-digest', AT2, { startupTakeover: true });
+    expect(startup).not.toBeNull();
+    expect(store.findDaemonJobOutcome('pr-digest')).toMatchObject({
+      state: 'running', attempt: 2, checkpoint: 7, nextRunAt: null,
+    });
+    expect(store.completeDaemonJobSuccess({
+      claim: startup!,
+      at: AT3,
+      nextRunAt: '2026-08-26T00:20:00.000Z',
+      durationMs: 1_000,
+      checkpoint: 8,
+    })).toMatchObject({ state: 'succeeded', attempt: 2, checkpoint: 8 });
+    store.close();
+  });
+
   it('accepts only the finite redacted failure-code catalog in every operational writer and row', () => {
     const store = new SqliteDigestStore(path);
     const job = store.startDaemonJob('repository-discovery', AT0)!;

@@ -1,12 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  boundedSlackReply,
   boundedSlackUpdate,
   SlackApiError,
+  SlackThreadReplyTimeoutError,
   SlackUpdateTimeoutError,
   SlackWebApiPoster,
   botToken,
   type SlackBlock,
   type SlackPoster,
+  type ThreadPoster,
 } from '../src/slack/post.js';
 import { BOT_TOKEN_VAR, maskToken } from '../src/slack/verify.js';
 
@@ -408,6 +411,53 @@ describe('SlackWebApiPoster · post와 update의 재시도 비대칭', () => {
  * 남고 되돌릴 수 없다. 아래 단언은 `update`가 아니라 `post`와 대조한다.
  */
 describe('SlackWebApiPoster.reply', () => {
+  it('bounds an injected thread poster that ignores cancellation and never settles', async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const hanging: ThreadPoster = {
+      reply: (input) => {
+        receivedSignal = input.signal;
+        return new Promise(() => undefined);
+      },
+    };
+    const began = Date.now();
+
+    await expect(boundedSlackReply(hanging, replyInput, 10)).rejects.toBeInstanceOf(
+      SlackThreadReplyTimeoutError,
+    );
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(Date.now() - began).toBeLessThan(1_000);
+  });
+
+  it('carries an external observer abort into an injected thread poster', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      let receivedSignal: AbortSignal | undefined;
+      const hanging: ThreadPoster = {
+        reply: (input) => {
+          calls += 1;
+          receivedSignal = input.signal;
+          return new Promise(() => undefined);
+        },
+      };
+      const controller = new AbortController();
+      const replying = boundedSlackReply(hanging, {
+        ...replyInput,
+        signal: controller.signal,
+      });
+      await Promise.resolve();
+      controller.abort();
+
+      await expect(replying).rejects.toThrowError('Slack thread reply aborted');
+      expect(calls).toBe(1);
+      expect(receivedSignal?.aborted).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('chat.postMessage를 호출하고 thread_ts를 함께 보낸다', async () => {
     const fake = new FakeFetch([{ body: { ok: true, channel: 'C9', ts: '1700000009.000009' } }]);
     const result = await poster(fake).reply(replyInput);

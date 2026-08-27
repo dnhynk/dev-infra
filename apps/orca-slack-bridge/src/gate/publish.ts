@@ -1,6 +1,7 @@
 import { renderFingerprint, type RenderedCard } from '../digest/render.js';
 import { taskKey, type RunKey } from '../identity/keys.js';
 import {
+  boundedSlackReply,
   boundedSlackUpdate,
   DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
   type SlackPoster,
@@ -38,6 +39,8 @@ export type GatePublishOptions = {
   readonly channel: string;
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
+  /** Observer deadline/shutdown fence carried through first replies and later updates. */
+  readonly signal?: AbortSignal;
   readonly fault?: (
     point:
       | 'after_gate_observation_reservation_before_confirmation'
@@ -177,6 +180,7 @@ export async function publishGateCard(
       options.now,
       undefined,
       options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+      options.signal,
     );
     return {
       gate,
@@ -209,12 +213,13 @@ export async function publishGateCard(
   if (existing === null) {
     const stagedCard = stagedGateCard(card);
     const stagedFingerprint = renderFingerprint(stagedCard);
-    const posted = await options.thread.reply({
+    const posted = await boundedSlackReply(options.thread, {
       channel: options.channel,
       threadTs: rootMessageTs,
       text: stagedCard.text,
       blocks: stagedCard.blocks,
-    });
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
     await options.fault?.('after_staged_first_reply_before_mapping', gate.key);
     options.store.insertGateMessage({
       gateKey: gate.key,
@@ -269,6 +274,7 @@ export async function publishGateCard(
         options.now,
         undefined,
         options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+        options.signal,
       );
       return {
         gate,
@@ -287,6 +293,7 @@ export async function publishGateCard(
       ts: existing.messageTs,
       text: card.text,
       blocks: card.blocks,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);
@@ -317,6 +324,7 @@ export async function publishGateCard(
       options.now,
       undefined,
       options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+      options.signal,
     );
     if (projection.card !== null && projection.fingerprint !== null) {
       return {

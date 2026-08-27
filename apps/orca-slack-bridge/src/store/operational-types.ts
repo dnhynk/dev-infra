@@ -297,7 +297,11 @@ export interface OperationalStore {
   setDaemonDesiredState(state: DaemonDesiredState, at: string): DaemonHealthRecord | null;
   readDaemonHealth(): DaemonHealthRecord | null;
 
-  startDaemonJob(jobName: DaemonJobName, at: string): DaemonJobClaim | null;
+  startDaemonJob(
+    jobName: DaemonJobName,
+    at: string,
+    options?: { readonly startupTakeover?: boolean },
+  ): DaemonJobClaim | null;
   completeDaemonJobSuccess(input: DaemonJobSuccessCompletion): DaemonJobOutcomeRecord | null;
   completeDaemonJobFailure(input: DaemonJobCompletion & { readonly errorCode: OperationalFailureCode }): DaemonJobOutcomeRecord | null;
   scheduleDaemonJobBackoff(jobName: DaemonJobName, expectedRevision: number, nextRunAt: string, at: string): DaemonJobOutcomeRecord | null;

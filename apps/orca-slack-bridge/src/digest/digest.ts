@@ -13,18 +13,29 @@ import {
   type UnreadableField,
 } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
-import type { SlackPoster, ThreadPoster } from '../slack/post.js';
+import {
+  boundedSlackReply,
+  boundedSlackUpdate,
+  DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  type SlackPoster,
+  type ThreadPoster,
+} from '../slack/post.js';
+import {
+  postSlackRootAtMostOnce,
+  type SlackRootIntentRuntime,
+} from '../slack/root-intent.js';
 import { buildCorrelationView, collectRuns } from '../snapshot/snapshot.js';
 import type { DigestStore } from '../store/schema.js';
+import { OperationalStoreError, SchemaVersionError } from '../store/sqlite.js';
+import { factsFingerprint } from '../summarize/fingerprint.js';
+import type { SummaryProvider } from '../summarize/openai.js';
 import {
-  factsFingerprint,
+  factsOnlySummary,
   parseSummary,
   serializeSummary,
-  summarize,
   type SummaryCache,
-  type SummaryProvider,
   type SummaryResult,
-} from '../summarize/index.js';
+} from '../summarize/result.js';
 import { buildSummaryFacts } from './facts.js';
 import { projectPullRequest } from './project.js';
 import {
@@ -98,6 +109,10 @@ export type DigestAction =
   | 'update'
   /** 매핑 행이 있고 렌더 지문이 같다. Slack을 호출하지 않는다. */
   | 'skip'
+  /** A definitive no-effect create failure remains eligible for a later observation. */
+  | 'deferred'
+  /** A possible-effect create is permanently fenced from another post. */
+  | 'uncertain'
   /**
    * 매핑 행의 채널이 설정의 대상 채널과 다르다. Slack에도 `pr_message` 매핑에도 쓰지 않는다.
    *
@@ -197,6 +212,11 @@ export type DigestReport = {
    */
   readonly degraded: readonly UnreadableField[];
   readonly results: readonly DigestResult[];
+  /** Present only in daemon repository-isolation mode. */
+  readonly repositoryFailures?: readonly {
+    readonly repository: string;
+    readonly reason: 'query_failed' | 'budget_deferred' | 'deadline_deferred';
+  }[];
 };
 
 export type DigestOptions = {
@@ -219,8 +239,10 @@ export type DigestOptions = {
    * 관측에서 다시 후보가 된다(`digest/transition.ts`).
    */
   readonly thread: ThreadPoster | null;
-  readonly provider: SummaryProvider;
-  readonly cache: SummaryCache;
+  readonly provider?: SummaryProvider;
+  readonly cache?: SummaryCache;
+  /** Omitted means the existing one-shot model behavior. */
+  readonly summaryMode?: 'model' | 'facts_only';
   readonly prLimit: number;
   /**
    * 이 번호의 PR만 처리한다. null이면 전부.
@@ -230,7 +252,20 @@ export type DigestOptions = {
    */
   readonly onlyPr: number | null;
   readonly now: () => Date;
+  /** Daemon-selected fair cycle. Omitted means all configured repositories. */
+  readonly repositories?: readonly string[];
+  /** A failed repository is reported and the next repository still runs. */
+  readonly isolateRepositoryFailures?: boolean;
+  readonly rootIntent?: SlackRootIntentRuntime;
+  readonly slackTimeoutMs?: number;
+  /** Observer deadline/shutdown fence carried through every Slack write. */
+  readonly signal?: AbortSignal;
 };
+
+function isDigestInvariantError(error: unknown): boolean {
+  return error instanceof OperationalStoreError || error instanceof SchemaVersionError ||
+    error instanceof TypeError || error instanceof SyntaxError || error instanceof RangeError;
+}
 
 export async function runDigest(
   orca: OrcaRunner,
@@ -245,9 +280,32 @@ export async function runDigest(
   const tasksByRun = new Map(runs.map((r) => [runKey(r.run.id), r.tasks]));
 
   const results: DigestResult[] = [];
-  for (const name of config.projects.flatMap((p) => p.repositories)) {
-    const repository = await fetchRepositoryIdentity(gh, name);
-    for (const source of await listPullRequests(gh, repository, options.prLimit)) {
+  const repositoryFailures: NonNullable<DigestReport['repositoryFailures']>[number][] = [];
+  const configured = options.repositories ?? config.projects.flatMap((p) => p.repositories);
+  const repositories = [...new Map(configured.map((name) => [name.toLowerCase(), name])).values()];
+  for (const name of repositories) {
+    let repository: Awaited<ReturnType<typeof fetchRepositoryIdentity>>;
+    let sources: PullRequestFacts[];
+    try {
+      repository = await fetchRepositoryIdentity(gh, name);
+      // Collection for the entire repository finishes before its first Slack write. A GitHub page,
+      // quota, budget, or deadline failure therefore cannot publish only a prefix of this repo.
+      sources = await listPullRequests(gh, repository, options.prLimit);
+    } catch (error) {
+      if (options.isolateRepositoryFailures !== true) throw error;
+      if (isDigestInvariantError(error)) throw error;
+      const named = error instanceof Error ? error.name : '';
+      repositoryFailures.push({
+        repository: name,
+        reason: named === 'GithubBudgetDeferredError'
+          ? 'budget_deferred'
+          : named === 'GithubDeadlineDeferredError'
+            ? 'deadline_deferred'
+            : 'query_failed',
+      });
+      continue;
+    }
+    for (const source of sources) {
       if (options.onlyPr !== null && source.number !== options.onlyPr) continue;
       const correlation = resolveCorrelation(
         parseCorrelationMetadata(source.body, config.correlationKeys),
@@ -284,6 +342,7 @@ export async function runDigest(
       ...inbox.unreadable,
     ],
     results,
+    ...(options.isolateRepositoryFailures === true ? { repositoryFailures } : {}),
   };
 }
 
@@ -312,6 +371,7 @@ async function digestOne(
   tasks: readonly OrcaTask[],
   options: DigestOptions,
 ): Promise<DigestResult> {
+  const signal = options.signal ?? options.rootIntent?.signal;
   // 직전 관측을 먼저 읽는다. 없으면 null이고 그것은 "이 PR을 처음 본다"는 정상 출력이다.
   // 이 값이 `reconcileTerminal`의 `previous`이며, 그 함수의 프로덕션 호출자는 여기 하나다.
   const previousState = options.store.findPrState(observed.key);
@@ -348,11 +408,27 @@ async function digestOne(
 
   // 게이트 A. 요약 입력이 그대로면 저장된 문구를 되살리고 provider를 부르지 않는다(OD-035).
   const reused =
+    options.summaryMode !== 'facts_only' &&
     existing !== null && existing.factsFingerprint === factsFp
       ? parseSummary(existing.summaryJson, factsFp)
       : null;
-  const summary =
-    reused ?? (await summarize(facts, { provider: options.provider, cache: options.cache }));
+  let summary: SummaryResult;
+  if (options.summaryMode === 'facts_only') {
+    summary = factsOnlySummary(facts);
+  } else if (reused !== null) {
+    summary = reused;
+  } else {
+    if (options.provider === undefined) {
+      throw new TypeError('one-shot digest requires a summary provider');
+    }
+    // The provider module is imported only on the one-shot model path. A daemon facts-only digest
+    // cannot import, construct, or call it even when a model key is present in the environment.
+    const { summarize } = await import('../summarize/index.js');
+    summary = await summarize(facts, {
+      provider: options.provider,
+      ...(options.cache === undefined ? {} : { cache: options.cache }),
+    });
+  }
 
   const card = renderCard({ pr, summary });
   const fingerprint = renderFingerprint(card);
@@ -418,12 +494,13 @@ async function digestOne(
         continue;
       }
       const event = renderThreadEvent({ pr, transition: t, observedAt: at });
-      const posted = await options.thread.reply({
+      const posted = await boundedSlackReply(options.thread, {
         channel: options.channel,
         threadTs,
         text: event.text,
         blocks: event.blocks,
-      });
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
       options.store.recordThreadEvent({
         prKey: pr.key,
         dedupeKey: t.dedupeKey,
@@ -467,29 +544,41 @@ async function digestOne(
 
   const at = options.now().toISOString();
   if (existing === null) {
-    const posted = await options.slack.post({
+    const created = await postSlackRootAtMostOnce({
+      store: options.store,
+      entity: { kind: 'pr', key: pr.key },
       channel: options.channel,
-      text: card.text,
-      blocks: card.blocks,
+      renderFingerprint: fingerprint,
+      message: { text: card.text, blocks: card.blocks },
+      mapping: {
+        kind: 'pr',
+        factsFingerprint: factsFp,
+        summaryJson: serializeSummary(summary),
+      },
+      slack: options.slack,
+      now: options.now,
+      ...(options.rootIntent === undefined ? {} : { runtime: options.rootIntent }),
     });
-    // channel은 Slack이 돌려준 값을 쓴다. 그것이 이후 update가 쓸 canonical ID다.
-    options.store.insertPrMessage({
-      prKey: pr.key,
-      channelId: posted.channel,
-      messageTs: posted.ts,
-      ...record,
-      at,
-    });
-    const transitions = await settle(posted.ts);
-    return { ...base, action: 'create', messageTs: posted.ts, transitions };
+    if (created.kind === 'blocked') {
+      const transitions = await settle(null);
+      return {
+        ...base,
+        action: created.state === 'pending' ? 'deferred' : 'uncertain',
+        messageTs: created.messageTs,
+        transitions,
+      };
+    }
+    const transitions = await settle(created.message.ts);
+    return { ...base, action: 'create', messageTs: created.message.ts, transitions };
   }
 
-  const updated = await options.slack.update({
+  const updated = await boundedSlackUpdate(options.slack, {
     channel: existing.channelId,
     ts: existing.messageTs,
     text: card.text,
     blocks: card.blocks,
-  });
+    ...(signal === undefined ? {} : { signal }),
+  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateObservation(pr.key, record, at);
   return {
     ...base,
