@@ -652,3 +652,20 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   끝나지만 dual-clock exact-sample recheck는 wall fence까지 재설치한 뒤 한 번만 claim한다. SQLite/CLI의
   fail-closed contract는 완화하지 않는다. focused observer-supervisor/cli-daemon 2 files 38 tests와 workspace
   typecheck는 통과했으며, 이는 merge qualification이고 production acceptance는 아니다.
+
+### DL-063 · exact merged dual-clock release의 wall-fence 통과로 O1-7 production acceptance를 닫는다
+
+- PR #53은 GitHub Actions run `33112753352`의 `test`와 `typecheck`, 그리고 parent early-claim regression을
+  직접 확인한 독립 재감사 PASS 뒤 exact `main` `013b958bfa4863715943428e30fbbafd5f1fa3b4`로 merge됐다.
+  immutable release는 `eba32cd112c65a78745d348056ef60347740933fa0466436d9cf48400156c450`, operational build
+  fingerprint는 `ff7928cde96045eec8f8e7d6b24bb0e4d98daae5db13df734fd49a2bf93a02f0`이다.
+- production status는 `2026-08-27T20:32:11.053Z`부터 `20:32:39.955Z`까지 8/8 parseable, snapshot failure
+  0으로 15초 capability rotation을 통과했다. schema/config/build/task는 모두 matched/healthy였고 launcher와
+  daemon PID `35440`/`26084`, heartbeat age 0..12초가 유지됐다.
+- recurring `run-observer`는 persisted `20:33:53.711Z`보다 15ms 뒤에 시작해 성공했다.
+  `repository-discovery`는 persisted `20:36:19.067Z`보다 6ms 뒤에 시작해 `20:36:21.787Z`에 성공했고,
+  daemon 시작 5분 33초 뒤에도 같은 Task/PID와 fresh heartbeat가 유지됐다. 이는 rounding-only release가
+  실패했던 정확한 5분 wall fence를 통과한 production evidence이므로 O1-7을 PASS로 닫는다.
+- read-only aggregate의 `job.absent`, `registry.rejected`, `work.pending`는 별도 D3
+  `LIVE_CHANNEL_UNVERIFIED`와 기존 backlog를 숨기지 않는 진단이다. schema/config/build/task mismatch,
+  stale heartbeat 또는 O1 background job failure가 아니므로 이 별도 상태가 O1 PASS를 취소하지 않는다.
