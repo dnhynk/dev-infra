@@ -31,6 +31,17 @@ export type AutomationConfig = {
     readonly intervalSeconds: number;
     readonly timeoutSeconds: number;
   };
+  /**
+   * Durable Gate outbox sweep.
+   *
+   * The Slack action path resolves in real time, but an action whose Orca mutation was interrupted
+   * (transient Orca failure, daemon death mid-flight) leaves a durable intent that nothing retries
+   * without this pass. The owner sees a pressed button and no resolution.
+   */
+  readonly gateReconcile: {
+    readonly intervalSeconds: number;
+    readonly timeoutSeconds: number;
+  };
   readonly prDigest: {
     readonly intervalSeconds: number;
     readonly timeoutSeconds: number;
@@ -64,6 +75,9 @@ export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = Object.freeze({
   enabled: true,
   repositoryDiscovery: Object.freeze({ intervalSeconds: 300, timeoutSeconds: 30 }),
   runObserver: Object.freeze({ intervalSeconds: 120, timeoutSeconds: 90 }),
+  // 60s so a stuck decision converges well inside the owner's attention span; the engine's own
+  // 20s reconcile deadline bounds one pass.
+  gateReconcile: Object.freeze({ intervalSeconds: 60, timeoutSeconds: 30 }),
   prDigest: Object.freeze({
     intervalSeconds: 900,
     timeoutSeconds: 300,
@@ -219,6 +233,7 @@ function parseAutomation(value: unknown): AutomationConfig {
       'enabled',
       'repositoryDiscovery',
       'runObserver',
+      'gateReconcile',
       'prDigest',
       'github',
       'scheduler',
@@ -237,6 +252,7 @@ function parseAutomation(value: unknown): AutomationConfig {
     'timeoutSeconds',
   ]);
   const runObserver = section(value, 'runObserver', ['intervalSeconds', 'timeoutSeconds']);
+  const gateReconcile = section(value, 'gateReconcile', ['intervalSeconds', 'timeoutSeconds']);
   const prDigest = section(value, 'prDigest', [
     'intervalSeconds',
     'timeoutSeconds',
@@ -302,6 +318,22 @@ function parseAutomation(value: unknown): AutomationConfig {
         DEFAULT_AUTOMATION_CONFIG.runObserver.timeoutSeconds,
         'automation.runObserver.timeoutSeconds',
         15,
+        300,
+      ),
+    },
+    gateReconcile: {
+      intervalSeconds: boundedNumber(
+        gateReconcile['intervalSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.gateReconcile.intervalSeconds,
+        'automation.gateReconcile.intervalSeconds',
+        15,
+        900,
+      ),
+      timeoutSeconds: boundedNumber(
+        gateReconcile['timeoutSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.gateReconcile.timeoutSeconds,
+        'automation.gateReconcile.timeoutSeconds',
+        10,
         300,
       ),
     },

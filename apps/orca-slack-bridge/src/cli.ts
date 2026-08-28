@@ -1665,6 +1665,34 @@ export async function runDaemonCommand(
           },
         },
         {
+          /*
+           * Durable Gate outbox sweep.
+           *
+           * The Slack action path already resolves in real time through `GateActionHandler`. What
+           * had no owner was the interrupted case: an action whose Orca mutation died mid-flight
+           * leaves a durable intent, and without a recurring pass nothing ever retries it. The owner
+           * sees a pressed button and no resolution, with no signal that anything is wrong.
+           *
+           * `reconcile` is already serialized per Gate and carries its own bounded deadline, so this
+           * job only supplies the cadence.
+           */
+          name: 'gate-reconcile' as const,
+          intervalMs: automation.gateReconcile.intervalSeconds * 1_000,
+          timeoutMs: automation.gateReconcile.timeoutSeconds * 1_000,
+          backoffCapMs: 10 * 60_000,
+          run: async (signal: AbortSignal) => {
+            try {
+              await engine.reconcile(signal);
+              return {};
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              throw new ObserverJobFailure(
+                signal.aborted ? 'scheduler.timeout' : 'gate.reconcile_failed',
+              );
+            }
+          },
+        },
+        {
           name: 'pr-digest' as const,
           intervalMs: automation.prDigest.intervalSeconds * 1_000,
           timeoutMs: automation.prDigest.timeoutSeconds * 1_000,
@@ -1744,7 +1772,7 @@ export async function runDaemonCommand(
         jobs: observerJobs,
         clock: observerClock,
         initialState: Object.fromEntries([
-          'repository-discovery', 'run-observer', 'pr-digest',
+          'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest',
         ].map((name) => {
           const prior = daemonStore.findDaemonJobOutcome(name as ObserverJobName);
           return [name, {

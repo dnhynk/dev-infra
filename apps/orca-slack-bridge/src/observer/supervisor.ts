@@ -3,7 +3,7 @@ import type { DaemonJobName, OperationalFailureCode } from '../store/operational
 
 export type ObserverJobName = Extract<
   DaemonJobName,
-  'repository-discovery' | 'run-observer' | 'pr-digest'
+  'repository-discovery' | 'run-observer' | 'gate-reconcile' | 'pr-digest'
 >;
 
 export type ObserverTimer = ReturnType<typeof setTimeout>;
@@ -78,7 +78,25 @@ export type ObserverSupervisorOptions = {
   readonly onFatal?: (error: unknown) => void;
 };
 
+/**
+ * Round-robin selection order.
+ *
+ * A name marked due but absent here can never be selected, while `ensurePump` re-arms for as long
+ * as anything is due — so omitting a schedulable job spins the lane forever rather than delaying it.
+ * Every job this supervisor can schedule must appear.
+ */
 const FAIR_ORDER: readonly ObserverJobName[] = [
+  'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest',
+];
+
+/**
+ * Jobs a supervisor cannot be constructed without.
+ *
+ * Deliberately not `FAIR_ORDER`: selection order and the construction invariant are different
+ * questions. `gate-reconcile` is schedulable but optional, so callers that never wired the Gate
+ * plane still build a valid supervisor.
+ */
+const REQUIRED_JOBS: readonly ObserverJobName[] = [
   'repository-discovery', 'run-observer', 'pr-digest',
 ];
 
@@ -154,7 +172,7 @@ export class ObserverSupervisor {
         `${job.name}.executionBucket`, initial?.executionBucket ?? 0,
       ));
     }
-    for (const name of FAIR_ORDER) {
+    for (const name of REQUIRED_JOBS) {
       if (!this.definitions.has(name)) throw new TypeError(`missing observer job ${name}`);
     }
   }
@@ -182,6 +200,10 @@ export class ObserverSupervisor {
     }
     this.deferredSchedules.clear();
     this.markDue('run-observer');
+    // Sweep the durable Gate outbox immediately. Restart-after-death is exactly the case this job
+    // owns: an action whose Orca mutation died mid-flight left an intent behind, and waiting one
+    // full interval leaves the owner staring at a pressed button for that whole window.
+    this.markDue('gate-reconcile');
     const digestDelay = finiteMilliseconds('digestDelayMs', digestDelayMs);
     this.installTimer('pr-digest', {
       wallDeadlineMs: this.clock.wallNow().getTime() + digestDelay,
