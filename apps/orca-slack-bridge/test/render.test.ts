@@ -79,6 +79,11 @@ function plain(card: RenderedCard): string {
         .map((e) => `[${(e['text'] as Record<string, unknown>)['text']}](${e['url']})`)
         .join(' ');
     }
+    if (o['type'] === 'divider') return '⎯⎯⎯';
+    if (o['type'] === 'context') {
+      const elements = o['elements'] as readonly Record<string, unknown>[];
+      return elements.map((e) => `(context) ${String(e['text'])}`).join('\n');
+    }
     return String((o['text'] as Record<string, unknown>)['text']);
   });
   return [`fallback: ${card.text}`, ...parts].join('\n---\n');

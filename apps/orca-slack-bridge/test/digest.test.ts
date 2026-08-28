@@ -906,8 +906,10 @@ describe('C1 출구 조건', () => {
     const slack = new FakeSlack();
     await digestOnce({ slack });
     const blocks = slack.posts[0]?.blocks ?? [];
-    const first = JSON.stringify(blocks[0]);
-    expect(first).toContain(`${REPO} #7`);
+    // identity는 카드 머리(제목 줄과 그 아래 작은 줄)에 있어야 한다. 어느 쪽 block에 놓을지는
+    // layout 결정이고, 요구는 훑을 때 맨 위에서 보인다는 것이다(OD-047).
+    const header = JSON.stringify(blocks.slice(0, 2));
+    expect(header).toContain(`${REPO} #7`);
     const actions = blocks.find((b) => b['type'] === 'actions') as
       | { elements: { url: string; action_id: string }[] }
       | undefined;

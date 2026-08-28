@@ -216,13 +216,26 @@ function cardText(card: { text: string; blocks: readonly Record<string, unknown>
   return [card.text, ...sections].join('\n');
 }
 
-/** 라벨로 section 하나를 고른다. 절이 서로 다른 block인지 보는 데 쓴다. */
+/**
+ * 라벨로 block 하나를 고른다. 절이 서로 다른 block인지 보는 데 쓴다.
+ *
+ * section과 context를 모두 본다. 두 절이 서로 다른 block이어야 한다는 요구(OD-069)는 block
+ * **종류**가 아니라 block이 나뉘어 있느냐의 요구다.
+ */
 function sectionWith(
   card: { blocks: readonly Record<string, unknown>[] },
   label: string,
 ): string {
   const found = card.blocks
-    .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
+    .map((b) => {
+      const direct = (b['text'] as { text?: string } | undefined)?.text;
+      if (direct !== undefined) return direct;
+      const elements = b['elements'];
+      return Array.isArray(elements)
+        ? (elements as readonly Record<string, unknown>[])
+          .map((e) => String(e['text'] ?? '')).join('\n')
+        : '';
+    })
     .filter((t) => t.startsWith(`*${label}*`));
   expect(found).toHaveLength(1);
   return found[0] as string;

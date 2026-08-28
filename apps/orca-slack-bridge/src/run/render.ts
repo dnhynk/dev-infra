@@ -150,6 +150,19 @@ function labelled(label: string, lines: readonly string[]): SlackBlock {
   return section([`*${label}*`, ...lines].join('\n'));
 }
 
+/**
+ * 작은 글씨 한 줄.
+ *
+ * binding 계보나 attempt 이력처럼 **운영자가 추적할 때 필요하지만 상태를 훑을 때는 앞에 오면
+ * 안 되는** 사실을 담는다. 사실을 지우는 것이 아니라 무게를 낮춘다.
+ */
+function context(lines: readonly string[]): SlackBlock {
+  return {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: capSectionText(lines.join('  ·  ')) }],
+  };
+}
+
 /** Splits logical lines across section blocks without ever slicing a structured ref token. */
 function labelledSections(label: string, lines: readonly string[]): SlackBlock[] {
   const blocks: SlackBlock[] = [];
@@ -516,9 +529,10 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   const escapedObjective = esc(objective === '' ? '(objective 없음)' : objective);
 
   const blocks: SlackBlock[] = [];
-  blocks.push(
-    section(`${live.emoji} *${escapedIdentity}* · ${esc(id.runId)} · ${escapedObjective}`),
-  );
+  // 사람이 `#agent-runs`를 훑을 때 Run을 알아보는 것은 id가 아니라 objective다. objective가
+  // 본문 첫 줄이고 identity·id·liveness 라벨은 바로 아래 작은 줄로 접힌다. 세 사실 모두 남는다.
+  blocks.push(section(`${live.emoji} *${escapedObjective}*`));
+  blocks.push(context([escapedIdentity, esc(id.runId), `${live.emoji} ${live.label}`]));
 
   // Run identity 절. 판정과 그 판정이 선 근거를 같은 자리에 둔다.
   const identityLines = [
@@ -539,7 +553,9 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   } else {
     identityLines.push(...id.observed.map(bindingLine));
   }
-  blocks.push(labelled('Run identity', identityLines));
+  // binding 계보는 소유권을 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다.
+  // liveness 판정 자체는 위 헤더 줄에 이미 라벨로 나와 있고, 여기에는 그 판정의 근거가 남는다.
+  blocks.push(context(['*Run identity*', ...identityLines]));
 
   /*
    * 진행 절(OD-069).
@@ -569,7 +585,8 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   dispatchLines.push(
     'attempt 이력이다. retry는 Task 수를 늘리지 않으므로 진행 절과 더하지 않는다',
   );
-  blocks.push(labelled('Dispatch attempts', dispatchLines));
+  // 작은 글씨로 둔다. 진행 절과 시각적으로도 다른 무게가 되어야 두 수를 더해 읽지 않는다.
+  blocks.push(context(['*Dispatch attempts*', ...dispatchLines]));
 
   // PR 절. 재료는 store에 있는 것뿐이고 그 경계를 같은 자리에서 밝힌다.
   const prLines =

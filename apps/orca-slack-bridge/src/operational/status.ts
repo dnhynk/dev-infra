@@ -125,8 +125,9 @@ export type OperationalStatusReport = {
   readonly config: { readonly state: 'readable' | 'matched' | 'mismatched' | 'invalid' };
   readonly build: { readonly state: 'matched' | 'mismatched' | 'unverified' };
   readonly daemon: {
-    readonly desiredState: 'running' | 'stopped' | 'absent';
-    readonly state: 'running' | 'stopped' | 'absent';
+    /** `unknown` means the owner snapshot was unreadable, not that the daemon is gone. */
+    readonly desiredState: 'running' | 'stopped' | 'absent' | 'unknown';
+    readonly state: 'running' | 'stopped' | 'absent' | 'unknown';
     readonly heartbeatAgeSeconds: number | null;
     readonly staleAfterSeconds: number;
     readonly lastErrorCode: DaemonHealthRecord['lastErrorCode'];
@@ -744,6 +745,11 @@ export type OperationalStatusOwnerServerOptions = {
   readonly acceptedNonceLimit?: number;
   readonly beforeRefresh?: () => void;
   readonly afterDaemonCapture?: () => void;
+  /**
+   * Reports a swallowed periodic refresh failure with its consecutive-failure count. Without this
+   * the owner can stop serving status indefinitely while the daemon looks healthy (DL-031).
+   */
+  readonly onRefreshFailure?: (consecutiveFailures: number) => void;
   /** Test-only crash seam after bind and before Linux chmod/identity publication. */
   readonly afterListen?: () => void | Promise<void>;
 };
@@ -770,6 +776,7 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
   private generation: OwnerGeneration | null = null;
   private readonly sockets = new Set<Socket>();
   private acceptedNonceCapabilityId: string | null = null;
+  private refreshFailures = 0;
   private readonly acceptedNonces = new Map<string, number>();
 
   constructor(private readonly options: OperationalStatusOwnerServerOptions) {
@@ -819,6 +826,34 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     this.acceptedNonceLimit = acceptedNonceLimit;
   }
 
+  /**
+   * `publish` commits to the durable artifact before this class records the new generation. If any
+   * later step of the same refresh throws, the artifact holds a capability the owner never adopted
+   * and every subsequent rotation would CAS against a stale `expected` forever — the owner stops
+   * publishing while the daemon stays healthy, so `status` fails closed permanently.
+   *
+   * Re-adopt the durable document, but only when it is provably this owner's own committed write:
+   * protected read, `active`, exact state identity, exact current transport, and not older than the
+   * generation held in memory. Anything else keeps the in-memory generation and fails closed as before.
+   */
+  private reconcileDurableCapability(generation: OwnerGeneration): OwnerGeneration {
+    const durable = this.capabilityStore.read(this.capabilityPath);
+    if (durable.kind !== 'ready' || durable.value.status !== 'active') return generation;
+    if (sameCanonical(durable.value, generation.capability)) return generation;
+    if (durable.value.stateIdentity !== this.stateIdentity) return generation;
+    if (!sameCanonical(durable.value.transport, generation.capability.transport)) return generation;
+    const durableAt = Date.parse(durable.value.publishedAt);
+    const heldAt = Date.parse(generation.capability.publishedAt);
+    if (!Number.isFinite(durableAt) || !Number.isFinite(heldAt) || durableAt < heldAt) {
+      return generation;
+    }
+    const adopted: OwnerGeneration = { ...generation, capability: durable.value };
+    this.acceptedNonces.clear();
+    this.acceptedNonceCapabilityId = durable.value.capabilityId;
+    this.generation = adopted;
+    return adopted;
+  }
+
   refresh(): void {
     try {
       const previous = this.generation;
@@ -838,25 +873,26 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
       const captured = captureOperationalStore(this.options.store, this.options.afterDaemonCapture);
       const now = transportNow(this.clock);
       if (now === null) throw new Error('status.snapshot_unavailable');
-      const previousAge = now.getTime() - Date.parse(previous.capability.publishedAt);
+      const current = this.reconcileDurableCapability(previous);
+      const previousAge = now.getTime() - Date.parse(current.capability.publishedAt);
       const capability = previousAge < 0 ||
           previousAge >= STATUS_OWNER_CAPABILITY_ROTATE_AFTER_MS
         ? activeOperationalStatusCapability(
           this.stateIdentity,
-          previous.capability.transport,
+          current.capability.transport,
           now.toISOString(),
         )
-        : previous.capability;
+        : current.capability;
       const generation: OwnerGeneration = {
         capturedAt: now.toISOString(),
         captured,
         capability,
       };
-      if (capability !== previous.capability) {
+      if (capability !== current.capability) {
         this.capabilityStore.publish(
           this.capabilityPath,
           generation.capability,
-          previous.capability,
+          current.capability,
           claim,
         );
         const confirmed = this.capabilityStore.read(this.capabilityPath);
@@ -995,7 +1031,15 @@ export class OperationalStatusOwnerServer implements OperationalStatusOwnerServe
     }
     if (this.refreshMilliseconds !== null) {
       this.timer = setInterval(() => {
-        try { this.refresh(); } catch { /* stale cache fails closed at the client */ }
+        try {
+          this.refresh();
+          this.refreshFailures = 0;
+        } catch {
+          // The cache still fails closed at the client, but a silent failure here is
+          // indistinguishable from a healthy owner, so it must be reportable (DL-031).
+          this.refreshFailures += 1;
+          try { this.options.onRefreshFailure?.(this.refreshFailures); } catch { /* never break the owner */ }
+        }
       }, this.refreshMilliseconds);
       this.timer.unref?.();
     }
@@ -1781,6 +1825,9 @@ export function classifyTaskLifecycle(
   if (task.ownership === 'unavailable') return 'unavailable';
   if (task.ownership === 'absent') return 'uninstalled';
   if (task.ownership === 'drifted') return 'drifted';
+  // Every remaining branch joins daemon health. When that facet is unreadable the join has no
+  // input, and claiming `degraded-hung` would report a healthy daemon as stuck (DL-030).
+  if (daemon.state === 'unknown' || daemon.desiredState === 'unknown') return 'unavailable';
   const schedulerState = task.schedulerState ??
     (task.state === 'running' ? 'running' : task.state === 'stopped' ? 'ready' : 'unknown');
   if (schedulerState === 'disabled') return 'disabled';
@@ -1917,14 +1964,20 @@ export async function inspectOperationalStatus(
         : snapshot.kind === 'owner_unavailable'
           ? 'state.snapshot_unavailable'
         : 'schema.absent';
+    // An unreadable owner snapshot says nothing about the daemon. Reporting `absent` here made a
+    // healthy daemon look gone, which `uninstall` reads as clean shutdown and `run-now` as unhealthy.
+    const daemon = snapshot.kind === 'owner_unavailable'
+      ? { ...base.daemon, desiredState: 'unknown' as const, state: 'unknown' as const }
+      : base.daemon;
     return withOutcome(
       {
         ...base,
         schema,
+        daemon,
         config: { state: 'readable' },
         task: projectTaskFacet(
           taskObservation,
-          base.daemon,
+          daemon,
           base.build.state,
           'readable',
         ),

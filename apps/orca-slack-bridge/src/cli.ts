@@ -1308,6 +1308,21 @@ export async function runDaemonCommand(
       store,
       capabilityPath: statusCapabilityPath,
       ...(nativeStatusStore === null ? {} : { capabilityStore: nativeStatusStore }),
+      // A refresh that keeps failing leaves `status` permanently unavailable while every other
+      // subsystem stays healthy. Report it on a bounded cadence so the operator sees it (DL-031).
+      onRefreshFailure: (consecutiveFailures) => {
+        if (telemetry === null) return;
+        if (consecutiveFailures !== 1 && consecutiveFailures !== 10 &&
+            consecutiveFailures !== 60 && consecutiveFailures % 300 !== 0) return;
+        void telemetry.log({
+          level: 'warn',
+          event: 'status.owner_degraded',
+          outcome: 'degraded',
+          errorCode: 'status.owner_refresh_failed',
+          retryable: true,
+          attempt: consecutiveFailures,
+        }).catch(() => { /* reporting never breaks the owner */ });
+      },
     });
     await statusOwnerServer.start();
     statusSnapshotLease.assertHeld();
@@ -1650,6 +1665,34 @@ export async function runDaemonCommand(
           },
         },
         {
+          /*
+           * Durable Gate outbox sweep.
+           *
+           * The Slack action path already resolves in real time through `GateActionHandler`. What
+           * had no owner was the interrupted case: an action whose Orca mutation died mid-flight
+           * leaves a durable intent, and without a recurring pass nothing ever retries it. The owner
+           * sees a pressed button and no resolution, with no signal that anything is wrong.
+           *
+           * `reconcile` is already serialized per Gate and carries its own bounded deadline, so this
+           * job only supplies the cadence.
+           */
+          name: 'gate-reconcile' as const,
+          intervalMs: automation.gateReconcile.intervalSeconds * 1_000,
+          timeoutMs: automation.gateReconcile.timeoutSeconds * 1_000,
+          backoffCapMs: 10 * 60_000,
+          run: async (signal: AbortSignal) => {
+            try {
+              await engine.reconcile(signal);
+              return {};
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              throw new ObserverJobFailure(
+                signal.aborted ? 'scheduler.timeout' : 'gate.reconcile_failed',
+              );
+            }
+          },
+        },
+        {
           name: 'pr-digest' as const,
           intervalMs: automation.prDigest.intervalSeconds * 1_000,
           timeoutMs: automation.prDigest.timeoutSeconds * 1_000,
@@ -1729,7 +1772,7 @@ export async function runDaemonCommand(
         jobs: observerJobs,
         clock: observerClock,
         initialState: Object.fromEntries([
-          'repository-discovery', 'run-observer', 'pr-digest',
+          'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest',
         ].map((name) => {
           const prior = daemonStore.findDaemonJobOutcome(name as ObserverJobName);
           return [name, {

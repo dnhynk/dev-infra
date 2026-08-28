@@ -38,6 +38,7 @@ export const OPERATIONAL_LOG_EVENTS = [
   'discovery.completed',
   'registry.changed',
   'root_intent.changed',
+  'status.owner_degraded',
   'logger.failed',
   'telemetry.rejected',
   'log.corrupt_line',

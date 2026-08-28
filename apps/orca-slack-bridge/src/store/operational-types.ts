@@ -133,6 +133,7 @@ export const OPERATIONAL_FAILURE_CODES = [
   'channel.delivery_failed',
   'scheduler.timeout',
   'scheduler.aborted',
+  'status.owner_refresh_failed',
   'slack.validation_failed',
   'slack.transport_unknown',
   'slack.commit_unknown',

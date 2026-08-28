@@ -472,6 +472,10 @@ describe('daemon production wiring', () => {
     const reopened = new SqliteDigestStore(statePath);
     expect(reopened.findDaemonJobOutcome('repository-discovery')?.state).toBe('succeeded');
     expect(reopened.findDaemonJobOutcome('run-observer')?.state).toBe('succeeded');
+    // The durable Gate outbox sweep must actually be scheduled. It was defined but never
+    // registered, so a Slack action whose Orca mutation died mid-flight had no retry owner and
+    // `status` reported the job as `absent` forever.
+    expect(reopened.findDaemonJobOutcome('gate-reconcile')?.state).toBe('succeeded');
     expect(reopened.findRunCollectionMessage()).not.toBeNull();
     reopened.close();
   });

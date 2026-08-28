@@ -1,6 +1,6 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · C1~D3 및 O1 구현·Windows disposable PASS 반영 · production smoke와 D3 exact-build 재수용 대기**
+상태: **Draft · C1~D3와 O1 구현 완료 · O1-7 production acceptance PASS · D3 exact-build 재수용 대기**
 
 이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 

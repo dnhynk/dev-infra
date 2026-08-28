@@ -183,6 +183,27 @@ function labelled(label: string, lines: readonly string[]): SlackBlock {
   return section([`*${label}*`, ...lines].join('\n'));
 }
 
+const DIVIDER: SlackBlock = { type: 'divider' };
+
+/**
+ * 작은 글씨 한 줄.
+ *
+ * identity, 상태 배지, 관측 한계처럼 **읽는 사람이 먼저 보지 않아도 되는** 사실을 담는다.
+ * section으로 쓰면 본문과 같은 크기라 카드가 전부 같은 무게로 읽히고, 모바일에서 실제로 봐야
+ * 하는 한 줄이 묻힌다. 사실을 지우는 것이 아니라 위계를 준다.
+ */
+function context(lines: readonly string[]): SlackBlock {
+  return {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: capSectionText(lines.join('  ·  ')) }],
+  };
+}
+
+/** 가운뎃점으로 잇는 한 줄. 빈 조각은 버린다. */
+function joinInline(parts: readonly (string | null)[]): string {
+  return parts.filter((p): p is string => p !== null && p !== '').join('  ·  ');
+}
+
 /**
  * 카드 최상단 identity.
  *
@@ -227,12 +248,35 @@ export function renderCard(input: RenderInput): RenderedCard {
   const escapedIdentity = esc(identity);
   const escapedTitle = esc(title);
 
+  // 위계: 제목 → 요약 → 판정 사실 → 관측 한계 → action.
+  //
+  // 이전 layout은 사실마다 `*라벨*` + 본문 section을 하나씩 쌓아 열 블록이 모두 같은 무게로
+  // 읽혔고, 모바일에서 실제로 봐야 하는 한 줄(무엇이 바뀌었나, 지금 막혀 있나)이 그 안에 묻혔다.
+  // 표시하는 사실은 그대로 두고 무게만 다르게 준다: 제목이 가장 크고, identity·상태·위험도는
+  // 한 줄 배지로 접히고, 관측 한계는 작은 글씨로 내려간다.
   const blocks: SlackBlock[] = [];
-  blocks.push(section(`${emoji} *${escapedIdentity}* · ${escapedTitle}`));
+
+  // 사람이 `#pr-digest`를 훑을 때 먼저 찾는 것은 저장소가 아니라 **무엇이 바뀌었는가**다.
+  // 그래서 제목이 본문 크기의 첫 줄이고 identity는 바로 아래 작은 줄로 간다.
+  blocks.push(section(`${emoji} *${escapedTitle}*`));
+  blocks.push(context([
+    joinInline([
+      escapedIdentity,
+      label,
+      pr.isDraft ? '초안(draft) PR이다' : null,
+      summary.risk === null
+        ? null
+        : `위험도 ${RISK_LABEL[summary.risk]} (reviewer findings severity 기준)`,
+    ]),
+  ]));
 
   if (summary.kind === 'ok') {
-    blocks.push(labelled('무엇이 바뀌나', [esc(summary.draft.what)]));
-    blocks.push(labelled('왜 필요한가', [esc(summary.draft.why)]));
+    // what은 본문, why는 그 아래 이탤릭 한 줄. 두 블록으로 나누면 같은 한 문단이 두 번
+    // 끊겨 읽힌다. 라벨을 지운 것이 아니라 문장 자체가 라벨 역할을 하도록 붙여 둔다.
+    blocks.push(section([
+      esc(summary.draft.what),
+      `_왜 필요한가 — ${esc(summary.draft.why)}_`,
+    ].join('\n')));
   } else {
     blocks.push(
       labelled('요약 실패', [
@@ -242,15 +286,18 @@ export function renderCard(input: RenderInput): RenderedCard {
     );
   }
 
-  const now = [label];
-  if (pr.isDraft) now.push('• 초안(draft) PR이다');
-  blocks.push(labelled('현재', now));
+  blocks.push(DIVIDER);
 
   const review: string[] = [];
   if (pr.review === null) {
     review.push('reviewer_result가 관찰되지 않았다');
   } else {
-    review.push(`판정: ${pr.review.verdict}`);
+    // 판정과 finding 건수를 한 줄에 붙인다. 훑는 사람이 리뷰 절에서 찾는 것은 이 둘이다.
+    const total = pr.review.findingsTotal;
+    review.push(joinInline([
+      `판정: ${pr.review.verdict}`,
+      total === 0 ? null : `finding ${total}건`,
+    ]));
     if (pr.review.headMatch === 'different') {
       // 사실 진술이다. 이전 approval이 아직 유효한지 판정하지 않는다(OD-031, C2).
       review.push('reviewer가 본 commit이 현재 head와 다르다');
@@ -267,19 +314,12 @@ export function renderCard(input: RenderInput): RenderedCard {
       }
     }
   }
-  blocks.push(labelled('리뷰', review));
-
   // reviewGist는 review 사실이 있을 때만 존재한다. 검증이 그것을 이미 강제한다(validate.ts).
+  // 리뷰 절 안에 이탤릭으로 붙인다. 따로 블록을 만들면 판정과 그 요약이 갈라져 읽힌다.
   if (summary.kind === 'ok' && summary.draft.reviewGist !== null) {
-    blocks.push(labelled('리뷰 핵심', [esc(summary.draft.reviewGist)]));
+    review.push(`_리뷰 핵심 — ${esc(summary.draft.reviewGist)}_`);
   }
-
-  if (summary.risk !== null) {
-    // risk는 reviewer findings severity에서 파생한다. 모델이 정하지 않는다(OD-037).
-    blocks.push(
-      labelled('위험도', [`${RISK_LABEL[summary.risk]} (reviewer findings severity 기준)`]),
-    );
-  }
+  blocks.push(labelled('리뷰', review));
 
   const ci: string[] = [];
   if (pr.checksHeadSha !== pr.headSha) {
@@ -296,21 +336,26 @@ export function renderCard(input: RenderInput): RenderedCard {
   ci.push(...(pr.checks.length === 0 ? ['관찰된 check 없음'] : pr.checks.map(checkLine)));
   blocks.push(labelled('CI', ci));
 
-  const worker: string[] = [];
-  if (pr.workerReport === null) {
-    // worker-read fallback을 쓰지 않으므로 없음이 곧 최종 관찰이다(OD-025, OD-070).
-    worker.push('worker 보고 없음');
-  } else {
-    worker.push(`결과: ${pr.workerReport.outcome}`);
-    // 요약이 성공했다면 이 본문은 이미 요약 입력이었다. 실패했을 때만 사실 텍스트로 싣는다.
-    if (summary.kind === 'failed') worker.push(esc(pr.workerReport.body));
-  }
-  blocks.push(labelled('worker 보고', worker));
+  // worker 보고 본문은 요약이 실패했을 때만 사실 텍스트로 필요하다. 성공했다면 그 본문은 이미
+  // 위 요약의 입력이었으므로 결과 한 마디만 남기고 작은 글씨로 내린다.
+  const workerBody = pr.workerReport !== null && summary.kind === 'failed'
+    ? esc(pr.workerReport.body)
+    : null;
+  // worker-read fallback을 쓰지 않으므로 없음이 곧 최종 관찰이다(OD-025, OD-070).
+  const workerLine = pr.workerReport === null
+    ? 'worker 보고 없음'
+    : `worker 보고 결과: ${pr.workerReport.outcome}`;
+  if (workerBody !== null) blocks.push(labelled('worker 보고', [workerLine, workerBody]));
 
-  const truncated: string[] = [];
-  if (pr.truncation.prBody) truncated.push('PR 본문이 상한에서 잘려 요약이 전체를 보지 못했다');
-  if (pr.truncation.changedFiles) truncated.push('변경 파일 목록을 일부만 관측했다');
-  if (truncated.length > 0) blocks.push(labelled('관측 범위', truncated));
+  // 관측 한계와 worker 결과는 판정이 아니라 이 카드가 무엇을 보고 무엇을 못 봤는지에 대한
+  // 단서다. 지우지 않되 본문과 같은 무게로 두지 않는다.
+  const footnotes: string[] = [];
+  if (workerBody === null) footnotes.push(workerLine);
+  if (pr.truncation.prBody) {
+    footnotes.push('관측 범위: PR 본문이 상한에서 잘려 요약이 전체를 보지 못했다');
+  }
+  if (pr.truncation.changedFiles) footnotes.push('관측 범위: 변경 파일 목록을 일부만 관측했다');
+  if (footnotes.length > 0) blocks.push(context(footnotes));
 
   // PR 링크는 모든 상태에서 존재한다. C1 카드의 유일한 action이며 URL만 싣는다.
   // C1에는 interaction handler가 없다. 이 버튼은 링크를 여는 것 외에 아무 일도 하지 않는다.

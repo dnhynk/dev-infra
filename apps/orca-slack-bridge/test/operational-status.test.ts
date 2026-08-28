@@ -1681,6 +1681,116 @@ describe('read-only operational status classification', () => {
     }
   });
 
+  it('resynchronizes after a committed publish whose confirming read failed', async () => {
+    // Production signature: the artifact held one fully committed capability (both slots, adjacent
+    // sequences) for ten hours while the daemon stayed healthy and `status` failed closed forever.
+    // `publish` commits before `refresh` records the generation, so a throw in between left the
+    // durable document ahead of memory and every later rotation CAS'd against a stale `expected`.
+    const store = healthyStore();
+    let now = new Date(TRANSPORT_AT);
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      clock: () => now,
+    });
+    try {
+      await owner.start();
+      const started = capabilities.active();
+
+      // Rotate, letting the publish commit but failing the confirming read exactly once.
+      now = new Date(Date.parse(TRANSPORT_AT) + 20_000);
+      capabilities.raceAfterPublish = null;
+      const confirmFailure = { invalid: false };
+      const realRead = capabilities.read.bind(capabilities);
+      capabilities.read = ((path: string, enforceProtection = true) =>
+        confirmFailure.invalid
+          ? { kind: 'invalid' as const }
+          : realRead(path, enforceProtection)) as typeof capabilities.read;
+      const publishedWhileFailing: string[] = [];
+      const realPublish = capabilities.publish.bind(capabilities);
+      capabilities.publish = ((...args: Parameters<typeof capabilities.publish>) => {
+        realPublish(...args);
+        publishedWhileFailing.push(capabilities.active().capabilityId);
+        confirmFailure.invalid = true;
+      }) as typeof capabilities.publish;
+
+      expect(() => owner.refresh()).toThrow('status.snapshot_unavailable');
+      expect(publishedWhileFailing).toHaveLength(1);
+      const committed = capabilities.active();
+      expect(committed.capabilityId).not.toBe(started.capabilityId);
+
+      // The transient is over. Before the fix every later refresh threw forever because the
+      // in-memory generation still held `started` while the artifact held `committed`.
+      capabilities.read = realRead as typeof capabilities.read;
+      capabilities.publish = realPublish as typeof capabilities.publish;
+      confirmFailure.invalid = false;
+      now = new Date(Date.parse(TRANSPORT_AT) + 40_000);
+      expect(() => owner.refresh()).not.toThrow();
+      const recovered = capabilities.active();
+      expect(recovered.capabilityId).not.toBe(committed.capabilityId);
+      expect(recovered.publishedAt).toBe(now.toISOString());
+
+      // A live client reads the recovered capability, so `status` is available again.
+      expect(await inspect({ ownerTransportClock: () => now }))
+        .toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
+    } finally {
+      await owner.stop();
+      store.close();
+    }
+  });
+
+  it('adopts a durable capability only when it is provably this owner and not older', async () => {
+    const store = healthyStore();
+    let now = new Date(TRANSPORT_AT);
+    const owner = new OperationalStatusOwnerServer({
+      statePath,
+      store,
+      capabilityPath,
+      capabilityStore: capabilities,
+      refreshMilliseconds: null,
+      clock: () => now,
+    });
+    try {
+      await owner.start();
+      const held = capabilities.active();
+      now = new Date(Date.parse(TRANSPORT_AT) + 20_000);
+
+      // Foreign transport: a squatter that swapped the endpoint must never be adopted.
+      capabilities.document = activeOperationalStatusCapability(
+        operationalStatusStateIdentity(statePath),
+        { kind: 'tcp', host: '127.0.0.1', port: 1 },
+        now.toISOString(),
+      );
+      expect(() => owner.refresh()).toThrow('status.snapshot_unavailable');
+
+      // Foreign state identity: same shape, different database.
+      capabilities.document = activeOperationalStatusCapability(
+        'f'.repeat(64),
+        held.transport,
+        now.toISOString(),
+      );
+      expect(() => owner.refresh()).toThrow('status.snapshot_unavailable');
+
+      // A rolled-back, older document is not adopted either.
+      capabilities.document = activeOperationalStatusCapability(
+        operationalStatusStateIdentity(statePath),
+        held.transport,
+        new Date(Date.parse(TRANSPORT_AT) - 60_000).toISOString(),
+      );
+      expect(() => owner.refresh()).toThrow('status.snapshot_unavailable');
+
+      // None of the three was adopted, so the owner still holds its own capability and can retire it.
+      capabilities.document = held;
+      expect(() => owner.refresh()).not.toThrow();
+    } finally {
+      await owner.stop();
+      store.close();
+    }
+  });
+
   it('serves eight concurrent clients and deterministically shuts down and rebinds', async () => {
     const store = healthyStore();
     const options = {

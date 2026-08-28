@@ -1,6 +1,6 @@
 # Orchestration Bootstrap & Continuity 스펙
 
-상태: **Draft · 구현 전**  
+상태: **구현 완료 · A와 B를 `skills/init-orchestrate/SKILL.md`와 `tools/rollover-monitor/`로 구현했고 throwaway Run에서 감지→handoff→successor 생성→인수를 완주했다**  
 해결 대상: **A + B**  
 관련 문서: [제품 비전](../product-vision.md), [작업 규약](../process/working-agreement.md), [미결정 사항](../open-decisions.md)
 
@@ -196,7 +196,18 @@ SPEC_READY
 - handoff 도중 실패해도 durable checkpoint와 실제 Orca/Git 상태를 보존한다.
 - 자동 전환을 검증하지 못했으면 “자동 재개됨”이라고 표시하지 않는다.
 
-single-writer를 어떤 기술로 보장할지는 TBD다.
+single-writer는 **시간적 배제**로 보장한다(OD-016). predecessor가 임계값에서 스스로 신규
+dispatch·merge를 멈추고(self-fence) → handoff를 확정한 뒤 → `terminal create`로 successor를 만들고 →
+successor가 그 터미널에서 `run-use --id <run_id>`를 실행한다. self-fence가 successor 생성보다 앞서므로
+두 coordinator의 mutation 구간이 겹치지 않는다. 인수 시 `consumer_generation`이 오르는 것을 관측했으므로
+predecessor가 자신이 밀려났음을 판정할 값도 실재한다.
+
+`--takeover-legacy`는 이 경로가 아니다. 플랫폼이 자동 채택한 legacy Run 전용이며 일반 Run에는
+`invalid_argument`로 거부된다.
+
+남은 실패 구간은 하나다. **predecessor가 successor 생성 직후·인수 확인 전에 죽으면 아무도 되살리지
+않는다.** durable `HANDOFF.md`가 남아 데이터는 잃지 않지만 그 구간에서 무인성이 깨진다. daemon watchdog으로
+덮는 것은 후속 범위다(DL-017).
 
 ## 7. Handoff가 보존해야 하는 의미
 
@@ -233,13 +244,20 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - 중간에 멈출 수 없는 외부 효과가 있다면 완료 여부를 명시한다.
 - rollover 때문에 전체 Run의 독립 작업을 불필요하게 정지하지 않는다.
 
-아직 정하지 않은 것:
+감지 주체와 threshold는 확정됐다(OD-014, DL-017).
 
-- token/context telemetry 사용 가능 여부
-- 정량 threshold
-- 모델 자기 판단과 외부 monitor 중 감지 주체
-- 자동 rollover에 대한 최초 Run 승인 범위
-- successor 세션 생성·초기화·ACK 방법
+- 감지 주체는 모델의 자기 판단이 아니라 **외부 monitor**다. `tools/rollover-monitor/`가 Claude Code
+  Stop hook으로 동작하며, 활성 coordinator Run 마커가 있는 세션에서만 transcript 꼬리의
+  `message.usage`를 읽어 남은 컨텍스트를 판정한다.
+- 임계값 미만이면 `{"decision":"block"}`으로 사전 승인된 롤오버 절차를 지시한다.
+- 자동 rollover 승인은 **Run 시작 시 1회**다. `/init-orchestrate` 시점에 합의하면 이후 열화마다 묻지
+  않는다. 매 rollover 승인은 "작업실에 없어도 계속 돈다"는 B의 목표와 충돌한다.
+- Run 시작 시 1회 승인은 UX 선택이 아니라 기술적 전제조건이다. rollover 지시를 주입하는 hook은 자기
+  권위를 주장할 수 없고, 모델이 이를 prompt injection으로 판단해 거부하는 것을 실측했다
+  ([플랫폼 검증 §3.6](../platform-capabilities.md#36-hook-기반-세션-제어와-컨텍스트-측정)).
+- successor 세션 생성은 `terminal create`, 인수는 `run-use --id <run_id>`, 제출 확인은 `--screen`
+  대조다. `send --text`가 `/`로 시작하면 셸이 경로로 치환할 수 있고 `accepted`/`bytesWritten`은 그
+  손상을 알리지 않으므로 `--screen` 대조가 유일한 탐지 수단이다.
 
 ## 9. Source of truth
 
@@ -288,23 +306,21 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 
 모든 수용 테스트는 실행 명령과 출력을 남긴다. 실행하지 않은 테스트는 미검증으로 기록한다.
 
-## 11. 구현 전에 확정할 사항
+## 11. 아직 열려 있는 사항
 
-- skill의 실제 패키징과 `/orchestration`과의 호출 순서
-- fresh/resume 판별 방식 또는 명시적 옵션
-- authoritative spec 발견 규칙
-- `HANDOFF.md` 위치, schema, archive/overwrite, atomic write
-- context degradation 신호와 threshold
-- successor 세션 생성 및 명령 주입의 공식 수단
-- coordinator single-writer 보장 방식
-- active worker가 있는 동안 권한을 이관하는 절차
-- 여러 Run이 같은 repository에 있을 때 선택 규칙
-- service tier를 supervised worker 경로에서 지정할 수단
-- PR correlation metadata 형식
-- handoff redaction과 transcript 포함 범위
-- 자동 rollover 실패의 알림 경로
+이 workstream이 착수 전 닫아야 했던 항목은 skill 패키징·호출 순서(OD-010), authoritative spec 발견
+규칙(OD-011), fresh/resume 판별(OD-012), `HANDOFF.md` 위치·schema·atomic write(OD-013), 열화
+threshold(OD-014), successor 생성·부팅·ACK(OD-015), single-writer와 권한 이관(OD-016), PR correlation
+metadata 형식(OD-021)까지 모두 확정됐다. Run↔repository↔coordinator session identity는 OD-020이고,
+repository는 수동 등록 설정(OD-068)과 연결하며 live/stale은 Run row의 `consumer_generation`으로
+구분한다. coordinator 환경변수는 보조 단서로만 쓴다.
 
-이 항목은 [미결정 사항](../open-decisions.md)에서 추적한다.
+남은 항목은 둘이다.
+
+- **OD-018** · handoff redaction과 transcript 포함 범위
+- **OD-074** · supervised worker 경로에서 service tier를 지정할 수단. `worker-start`로는 표현할 수 없다
+
+두 항목은 [미결정 사항](../open-decisions.md)에서 추적한다.
 
 Run↔repository↔coordinator session identity는 OD-020으로 확정됐다. repository는 수동 등록 설정(OD-068)과
 연결하고, live/stale은 Run row의 `consumer_generation`으로 구분하며 coordinator 환경변수는 보조 단서로만 쓴다.

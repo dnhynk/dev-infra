@@ -66,6 +66,42 @@ function definitions(
 }
 
 describe('ObserverSupervisor', () => {
+  it('selects every schedulable job it accepts, so a due name can never spin the lane', async () => {
+    // A name marked due but missing from the round-robin order can never be selected, while
+    // `ensurePump` re-arms for as long as anything is due. That is a busy spin, not a delay:
+    // `gate-reconcile` was schedulable and enqueued at startup while absent from the order.
+    const clock = new FakeClock();
+    const ran: ObserverJobName[] = [];
+    const withGate: ObserverJobDefinition[] = [
+      ...definitions(),
+      {
+        name: 'gate-reconcile',
+        intervalMs: 60_000,
+        timeoutMs: 30_000,
+        backoffCapMs: 600_000,
+        run: async () => { ran.push('gate-reconcile'); return {}; },
+      },
+    ];
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-gate', jitterRatio: 0, clock, jobs: withGate,
+    });
+    supervisor.startAfterSocket();
+    await flush();
+    expect(ran).toEqual(['gate-reconcile']);
+    // The lane is idle afterwards rather than spinning on an unselectable due bit.
+    expect(supervisor.snapshot().due).toEqual([]);
+    await supervisor.stop(1_000);
+  });
+
+  it('still constructs without the optional Gate plane wired', () => {
+    // `gate-reconcile` is schedulable but not required; selection order and the construction
+    // invariant are different questions and must not be collapsed into one list.
+    const clock = new FakeClock();
+    expect(() => new ObserverSupervisor({
+      installationSeed: 'installation-nogate', jitterRatio: 0, clock, jobs: definitions(),
+    })).not.toThrow();
+  });
+
   it('uses one lane, coalesces due bits, and round-robins a digest before repeated work', async () => {
     const clock = new FakeClock();
     const order: ObserverJobName[] = [];
