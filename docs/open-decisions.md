@@ -1321,6 +1321,12 @@ ID: OD-081
 영향 문서/파일: plugins/, docs/platform-capabilities.md §3.3, docs/ops/channel-adapter-acceptance.md
 검증 방법: 관리자 권한으로 정책 파일을 쓴 뒤 대화형 세션에서 daemon probe receipt가 도달하는지 확인한다.
            `-p` 비대화형은 channel 이벤트가 도달하지 않으므로 수용 경로가 아니다.
+검증 결과(2026-08-28): **등록은 확인됐다.** 정책 파일 전 두 번의 동일 실행은 debug log에
+           `Channel notifications` 0건이었고, 정책 파일 뒤 같은 명령이
+           `Channel notifications re-registered after reconnect`를 남겼다. development flag와 확인
+           대화상자 없이 등록된다. **event 도달은 아직 미확인이다** — `-p`는 도달 경로가 아니고
+           대화형 세션 관측이 남아 있다. daemon에는 Adapter 연결·probe를 나타내는 log event가 없어
+           daemon 쪽에서 이 구간을 관측할 수단이 현재 없다.
 결정일: 2026-08-28
 ```
 

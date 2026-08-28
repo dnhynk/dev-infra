@@ -402,7 +402,12 @@ claude --dangerously-load-development-channels server:<mcp-server-name>  # 개�
 ```
 
 - bare MCP server는 development flag 경로뿐이다. development flag는 **확인 프롬프트 후에** allowlist를 우회하며, 그 프롬프트는 세션마다 뜨고 기억되지 않는다.
-- **plugin 경로의 allowlist는 managed settings로 대체할 수 있다.** 설정 key는
+- **plugin 경로의 allowlist는 managed settings로 대체할 수 있다. 2026-08-28 이 호스트에서 실측했다.**
+  `C:\Program Files\ClaudeCode\managed-settings.json`에 `channelsEnabled`와 `allowedChannelPlugins`를
+  넣기 전에는 같은 명령이 채널을 등록하지 않았고(debug log에 `Channel notifications` 0건, 2회 반복),
+  넣은 뒤 같은 명령이 `Channel notifications re-registered after reconnect`를 남겼다. development flag도
+  확인 대화상자도 없었다. 등록까지가 실측 범위이며, 실제 event 도달은 대화형 세션에서 확인해야 한다.
+  설정 key는
   `allowedChannelPlugins`이고 값은 `{marketplace, plugin}` 객체 배열이다. 설치된 2.1.246의 스키마
   설명이 *"When set, replaces the default Anthropic allowlist — admins decide which plugins may push
   inbound messages. Undefined falls back to the default. Requires channelsEnabled: true."* 라고 명시하고,
