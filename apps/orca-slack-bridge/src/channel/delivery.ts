@@ -51,6 +51,13 @@ export type GateChannelDeliveryEngineOptions = {
   readonly reconcileDeadlineMs?: number;
   /** Bounded codes only. No downstream message or payload is exposed. */
   readonly onError?: (code: GateChannelDeliveryErrorCode) => void;
+  /**
+   * Reports each durable delivery transition. Without it the whole daemon→Adapter→coordinator
+   * round trip leaves no operational trace, so a coordinator that never wakes cannot be
+   * distinguished from one that was never notified (DL-031). Carries the gate key only; the
+   * logger hashes it at the persistence boundary.
+   */
+  readonly onTransition?: (state: 'attempted' | 'receipted' | 'consumed', gateKey: string) => void;
   /** Test seam; production always uses the strict persisted resume engine. */
   readonly resume?: Pick<GateResumeEngine, 'ensureBaseline' | 'reconcile'>;
 };
@@ -87,6 +94,7 @@ export class GateChannelDeliveryEngine {
   readonly #concurrency: number;
   readonly #reconcileDeadlineMs: number;
   readonly #onError: (code: GateChannelDeliveryErrorCode) => void;
+  readonly #onTransition: (state: 'attempted' | 'receipted' | 'consumed', gateKey: string) => void;
   readonly #resume: Pick<GateResumeEngine, 'ensureBaseline' | 'reconcile'>;
   #singleSlotPrefersSeed = true;
 
@@ -125,6 +133,7 @@ export class GateChannelDeliveryEngine {
       throw new TypeError('delivery_reconcile_deadline_must_precede_lease_expiry');
     }
     this.#onError = options.onError ?? (() => undefined);
+    this.#onTransition = options.onTransition ?? (() => undefined);
     this.#resume = options.resume ?? new GateResumeEngine({
       store: options.store,
       orca: options.orca,
@@ -252,6 +261,11 @@ export class GateChannelDeliveryEngine {
    * Adapter-confirmed MCP transport write only: no Orca call or receipt authority, and the row
    * retains a finite attempt retry deadline so this historical fact cannot suppress replay.
    */
+  /** Reporting never breaks delivery. A sink failure must not roll back a committed transition. */
+  #report(state: 'attempted' | 'receipted' | 'consumed', gateKey: string): void {
+    try { this.#onTransition(state, gateKey); } catch { /* observability is not a delivery fence */ }
+  }
+
   recordAttempted(
     event: ChannelProductionDeliveryEvent,
     commitFence?: ChannelProductionCommitFence,
@@ -272,6 +286,7 @@ export class GateChannelDeliveryEngine {
       commitFence,
     );
     if (attempted === null) throw new Error('delivery_not_found');
+    this.#report('attempted', key);
     return attempted;
   }
 
@@ -292,6 +307,7 @@ export class GateChannelDeliveryEngine {
     // The pipe withholds its ACK when this throws, so an unknown production Gate can never be
     // acknowledged without corresponding durable state.
     if (receipted === null) throw new Error('delivery_not_found');
+    this.#report('receipted', key);
     return receipted;
   }
 
@@ -415,6 +431,7 @@ export class GateChannelDeliveryEngine {
             this.#now().toISOString(),
           );
           if (consume.kind === 'consumed' || consume.kind === 'duplicate') {
+            if (consume.kind === 'consumed') this.#report('consumed', candidate.gateKey);
             released = true;
             return;
           }

@@ -279,10 +279,8 @@ export function renderCard(input: RenderInput): RenderedCard {
     ].join('\n')));
   } else {
     blocks.push(
-      labelled('요약 실패', [
-        '이 카드는 요약 없이 관찰된 사실만 담는다. 제목은 PR 원문 제목이다.',
-        `사유: ${esc(cut(summary.reason, FAILURE_REASON_CAP))}`,
-      ]),
+      // 요약이 없다는 사실과 그 사유만 남긴다. 카드가 자기 구성을 설명하지 않는다.
+      labelled('요약 실패', [esc(cut(summary.reason, FAILURE_REASON_CAP))]),
     );
   }
 

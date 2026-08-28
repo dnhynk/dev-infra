@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   GateChannelDeliveryEngine,
+  type GateChannelDeliveryEngineOptions,
   type GateChannelDeliveryErrorCode,
   type GateChannelDeliveryTransport,
 } from '../src/channel/delivery.js';
@@ -356,7 +357,11 @@ function engine(
   transport: GateChannelDeliveryTransport,
   time: ReturnType<typeof clock>,
   errors: GateChannelDeliveryErrorCode[] = [],
-  bounds: { concurrency?: number; reconcileDeadlineMs?: number } = {},
+  bounds: {
+    concurrency?: number;
+    reconcileDeadlineMs?: number;
+    onTransition?: NonNullable<GateChannelDeliveryEngineOptions['onTransition']>;
+  } = {},
 ): GateChannelDeliveryEngine {
   const ensureBaseline = (
     delivery: GateChannelDelivery,
@@ -439,6 +444,55 @@ describe('durable Channel delivery engine', () => {
     ]);
     expect(delivery.recordReceipted(callback())?.state).toBe('consumed');
     expect(delivery.recordAttempted(callback())?.state).toBe('consumed');
+    store.close();
+  });
+
+  it('reports every durable transition so the round trip leaves an operational trace', async () => {
+    // Before this the whole daemon -> Adapter -> coordinator round trip wrote nothing an operator
+    // could read: every job reported `succeeded` while a coordinator silently never woke. That is
+    // the same shape as the status owner that stayed dead for ten hours (DL-031).
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    resolveD2(store);
+    const orca = new FakeOrca();
+    const transport = new FakeTransport();
+    const time = clock();
+    const seen: string[] = [];
+    const delivery = engine(store, orca, transport, time, [], {
+      onTransition: (state, gateKey) => { seen.push(`${state}:${gateKey}`); },
+    });
+
+    await delivery.reconcile();
+    expect(seen).toEqual([]);
+
+    time.advance(10);
+    delivery.recordAttempted(callback());
+    time.advance(10);
+    delivery.recordReceipted(callback());
+    await delivery.reconcile();
+
+    expect(seen).toEqual([
+      `attempted:${GATE}`,
+      `receipted:${GATE}`,
+      `consumed:${GATE}`,
+    ]);
+    expect(store.findGateChannelDelivery(GATE)?.state).toBe('consumed');
+    store.close();
+  });
+
+  it('never lets a failing transition sink roll back a committed delivery', async () => {
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    resolveD2(store);
+    const orca = new FakeOrca();
+    const transport = new FakeTransport();
+    const time = clock();
+    const delivery = engine(store, orca, transport, time, [], {
+      onTransition: () => { throw new Error('sink exploded'); },
+    });
+
+    await delivery.reconcile();
+    time.advance(10);
+    expect(() => delivery.recordAttempted(callback())).not.toThrow();
+    expect(store.findGateChannelDelivery(GATE)?.state).toBe('attempted');
     store.close();
   });
 

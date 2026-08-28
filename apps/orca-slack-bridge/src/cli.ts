@@ -99,6 +99,7 @@ import {
 import {
   OPERATIONAL_JOB_NAMES,
   OperationalNdjsonLogger,
+  entityIdentity,
   resolveOperationalLogDir,
   type OperationalTelemetrySink,
 } from './operational/logger.js';
@@ -1384,7 +1385,37 @@ export async function runDaemonCommand(
     // here and cannot become either the Channel owner or an interactive consumer.
     channelServer = dependencies.channelServer ?? new ChannelPipeServer({ orca });
     channelDelivery = dependencies.createChannelDelivery?.(store, orca, channelServer) ??
-      new GateChannelDeliveryEngine({ store, orca, transport: channelServer });
+      new GateChannelDeliveryEngine({
+        store,
+        orca,
+        transport: channelServer,
+        // The Channel round trip was the one production path with no operational trace at all.
+        // Without these the daemon reports every job `succeeded` while a coordinator silently
+        // never wakes, which is exactly the failure shape DL-031 forbids.
+        // `route_*` means no coordinator session could be reached; everything else is the delivery
+        // machinery itself failing. An operator needs those two apart — the first is "boot a
+        // coordinator", the second is "something is broken". The raw code carries an unbounded
+        // suffix, so only these two fixed codes are persisted.
+        onError: (code) => {
+          void health?.event({
+            level: 'warn',
+            event: 'channel.delivery',
+            outcome: 'failed',
+            errorCode: code.startsWith('route_')
+              ? 'channel.route_unavailable'
+              : 'channel.delivery_failed',
+            retryable: true,
+          }).catch(() => { /* reporting never fences delivery */ });
+        },
+        onTransition: (state, gateKey) => {
+          void health?.event({
+            level: 'info',
+            event: 'channel.delivery',
+            outcome: state === 'attempted' ? 'started' : state === 'receipted' ? 'running' : 'succeeded',
+            entityIdentity: entityIdentity(gateKey),
+          }).catch(() => { /* reporting never fences delivery */ });
+        },
+      });
     channelServer.setProductionDeliveryHandlers?.({
       attempted: (event: ChannelProductionDeliveryEvent, commitFence) => {
         channelDelivery?.recordAttempted(event, commitFence);
