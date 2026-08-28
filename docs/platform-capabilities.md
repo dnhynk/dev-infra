@@ -401,8 +401,21 @@ claude --channels plugin:<name>@<marketplace>                            # allow
 claude --dangerously-load-development-channels server:<mcp-server-name>  # 개발 중인 custom server
 ```
 
-- preview 동안 `--channels`는 **Anthropic 관리 allowlist의 plugin만** 받는다. bare MCP server는 development flag 경로다.
-- development flag는 **확인 프롬프트 후에** allowlist를 우회한다.
+- bare MCP server는 development flag 경로뿐이다. development flag는 **확인 프롬프트 후에** allowlist를 우회하며, 그 프롬프트는 세션마다 뜨고 기억되지 않는다.
+- **plugin 경로의 allowlist는 managed settings로 대체할 수 있다.** 설정 key는
+  `allowedChannelPlugins`이고 값은 `{marketplace, plugin}` 객체 배열이다. 설치된 2.1.246의 스키마
+  설명이 *"When set, replaces the default Anthropic allowlist — admins decide which plugins may push
+  inbound messages. Undefined falls back to the default. Requires channelsEnabled: true."* 라고 명시하고,
+  판정 코드도 `allowedChannelPlugins`가 있으면 그것만 조회하고 기본 목록(ledger)은 읽지 않는다.
+  즉 **Anthropic allowlist 등재 없이도 자작 plugin으로 channel을 켤 수 있으며 세션마다의 확인
+  프롬프트가 없다.** marketplace는 로컬 디렉터리로 만들 수 있다(`plugin marketplace add <path>`).
+- managed settings source는 Windows에서 `HKLM\SOFTWARE\Policies\ClaudeCode`,
+  `C:\Program Files\ClaudeCode\managed-settings.json`, `HKCU\SOFTWARE\Policies\ClaudeCode` 셋이며
+  **전부 관리자 권한이 필요하다.** `HKCU\SOFTWARE\Policies`도 Windows가 보호하는 브랜치라 일반
+  사용자 권한으로는 키를 만들 수 없다(실측). 등재는 일회성 관리자 작업이고 세션마다 반복되지 않는다.
+- `--managed-settings <json>`는 파일 경로가 아니라 **인라인 JSON만** 받고, policy layer에는 반영되지
+  않는다. `disableAllHooks`를 이 flag로 넣어도 hook이 그대로 실행되는 것을 실측했다. 문서 문자열도
+  "HKCU and --managed-settings never take part in the merge"라고 적는다. 정책 우회 수단이 아니다.
 - `.mcp.json` 등록만으로는 push가 활성화되지 않는다. 반드시 flag로 지정해야 한다.
 - 두 flag 모두 `claude --help`에 노출되지 않는다. 공식 문서가 "The flags work even though they aren't listed"라고 명시한다.
 - 조직 정책 `channelsEnabled`가 꺼져 있으면 MCP는 연결되고 tool도 동작하지만 channel 메시지는 도착하지 않는다. 조직 없는 Pro/Max는 이 검사를 건너뛴다.

@@ -89,6 +89,7 @@
 | OD-071 | modal submission validation error를 modal에 유지·표시하는 UX | D2 전 | DECIDED |
 | OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED |
 | OD-080 | 등록 Run이 0인 구간에서도 미등록 사실이 도달할 게시 표면 | D1 전 | DECIDED |
+| OD-081 | custom channel plugin을 세션 확인 없이 켜는 배포 경로 | D3 재수용 전 | DECIDED |
 
 ## Gate와 Channel
 
@@ -1293,6 +1294,34 @@ ID: OD-056
                 docs/architecture/orca-slack-bridge.md §3, docs/traceability.md
 검증 방법: 별도 D3 Run 착수 전 대상 Claude Code 버전에서 배포 경로와 확인 UX를 재검증하고 별도 size gate를 기록한다.
 결정일: 2026-08-23
+후속: "development flag가 유일한 경로"는 OD-081이 대체했다. 2.1.246에서 managed settings의
+      `allowedChannelPlugins`가 Anthropic allowlist를 통째로 대체하며, 자작 marketplace의 plugin으로
+      확인 대화상자 없이 channel을 켤 수 있음을 확인했다. D3를 별도 Run으로 분리한 결정 자체는 유효하다.
+```
+
+```text
+ID: OD-081
+상태: DECIDED
+결정: Adapter를 자작 marketplace의 plugin으로 배포하고, managed settings에 `channelsEnabled: true`와
+      `allowedChannelPlugins: [{marketplace, plugin}]`를 넣어 `--channels plugin:<name>@<marketplace>`로
+      켠다. development flag와 그 세션마다의 확인 대화상자를 쓰지 않는다.
+근거:
+  - 설치된 2.1.246 스키마 설명이 `allowedChannelPlugins`를 "When set, replaces the default Anthropic
+    allowlist ... Requires channelsEnabled: true."로 정의한다. 판정 코드도 이 값이 있으면 그것만 조회하고
+    기본 목록을 읽지 않는다. 즉 Anthropic 등재가 전제조건이 아니다.
+  - `plugin marketplace add <path>`로 로컬 디렉터리 marketplace를 만들 수 있고, 그 marketplace의 plugin이
+    실제로 설치·연결되는 것을 확인했다(`plugin:orca-slack-channel:orca-slack`, protocolEra `legacy`).
+  - 개인 Max는 org policy 게이트를 통과한다. 판정은 team/enterprise일 때만 `channelsEnabled`를 요구한다.
+대안과 기각 이유:
+  - development flag 유지: 세션마다 사람 확인이 필요해 무인 운영과 충돌. 이것이 OD-056의 원래 제약이다.
+  - `--managed-settings` flag로 정책 주입: policy layer에 반영되지 않는다. `disableAllHooks`를 이 flag로
+    넣어도 hook이 실행되는 것을 실측했고 문서 문자열도 merge에 참여하지 않는다고 적는다. 기각.
+  - HKCU 정책으로 관리자 권한 회피: `HKCU\SOFTWARE\Policies`가 보호 브랜치라 일반 사용자 권한으로
+    키를 만들 수 없다(실측). 기각.
+영향 문서/파일: plugins/, docs/platform-capabilities.md §3.3, docs/ops/channel-adapter-acceptance.md
+검증 방법: 관리자 권한으로 정책 파일을 쓴 뒤 대화형 세션에서 daemon probe receipt가 도달하는지 확인한다.
+           `-p` 비대화형은 channel 이벤트가 도달하지 않으므로 수용 경로가 아니다.
+결정일: 2026-08-28
 ```
 
 ```text

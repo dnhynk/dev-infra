@@ -1,0 +1,14 @@
+{
+  "name": "orca-slack-channel",
+  "version": "0.1.0",
+  "description": "Orca Slack Bridge Channel Adapter. Delivers resolved Gate IDs from the Bridge daemon into this coordinator session.",
+  "author": {
+    "name": "dnhynk"
+  },
+  "keywords": [
+    "orca",
+    "slack",
+    "channel",
+    "orchestration"
+  ]
+}
