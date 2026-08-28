@@ -1,6 +1,6 @@
 # `orca-slack-bridge` Umbrella 스펙
 
-상태: **Draft · C1~D3 및 O1 hermetic/Windows disposable PASS 반영, production smoke·D3 exact-build live acceptance 대기**
+상태: **Draft · C1~D3와 O1 구현 완료. O1-7 production acceptance PASS, D3는 exact-build live acceptance 대기(`LIVE_CHANNEL_UNVERIFIED`)**
 해결 대상: **C + D**  
 예정 위치: `dev-infra/apps/orca-slack-bridge`
 

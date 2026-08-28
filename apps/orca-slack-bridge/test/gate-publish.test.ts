@@ -250,10 +250,13 @@ function insertSidecar(store: SqliteDigestStore): void {
   });
 }
 
+/** 이 카드가 상호작용 요소를 하나도 싣지 않았는지. section/context/divider는 모두 비-상호작용이다. */
+const INERT_BLOCK_TYPES = new Set(['section', 'context', 'divider']);
+
 function noActionBlocks(input: { readonly blocks: readonly Record<string, unknown>[] }): boolean {
   const encoded = JSON.stringify(input.blocks);
   return (
-    input.blocks.every((block) => block['type'] === 'section') &&
+    input.blocks.every((block) => INERT_BLOCK_TYPES.has(String(block['type']))) &&
     !encoded.includes('"type":"actions"') &&
     !encoded.includes('"type":"button"') &&
     !encoded.includes('action_id')

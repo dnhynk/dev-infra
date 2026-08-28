@@ -1,7 +1,7 @@
 # dev-infra 문서 인덱스
 
-상태: **C1~D3 구현·offline 검증 완료, D3 `LIVE_CHANNEL_UNVERIFIED` 유지, O1-1~6 merged · O1-7 Windows disposable PASS/production 배포 대기**
-기준일: **2026-08-26**
+상태: **AB(`/init-orchestrate`+rollover) 구현 완료 · C1~D3·O1 구현 완료 · O1-7 production acceptance PASS · D3는 `LIVE_CHANNEL_UNVERIFIED` 유지**
+기준일: **2026-08-28**
 
 이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
 

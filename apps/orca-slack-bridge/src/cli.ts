@@ -1308,6 +1308,21 @@ export async function runDaemonCommand(
       store,
       capabilityPath: statusCapabilityPath,
       ...(nativeStatusStore === null ? {} : { capabilityStore: nativeStatusStore }),
+      // A refresh that keeps failing leaves `status` permanently unavailable while every other
+      // subsystem stays healthy. Report it on a bounded cadence so the operator sees it (DL-031).
+      onRefreshFailure: (consecutiveFailures) => {
+        if (telemetry === null) return;
+        if (consecutiveFailures !== 1 && consecutiveFailures !== 10 &&
+            consecutiveFailures !== 60 && consecutiveFailures % 300 !== 0) return;
+        void telemetry.log({
+          level: 'warn',
+          event: 'status.owner_degraded',
+          outcome: 'degraded',
+          errorCode: 'status.owner_refresh_failed',
+          retryable: true,
+          attempt: consecutiveFailures,
+        }).catch(() => { /* reporting never breaks the owner */ });
+      },
     });
     await statusOwnerServer.start();
     statusSnapshotLease.assertHeld();

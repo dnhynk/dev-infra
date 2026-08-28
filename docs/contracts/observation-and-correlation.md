@@ -1,6 +1,6 @@
 # Orchestration 관찰·상관관계 계약
 
-상태: **Draft · O1 strict discovery/routing·capacity 계약 구현, production deployment 표본 대기**
+상태: **Draft · O1 strict discovery/routing·capacity 계약 구현. production deployment 표본으로 확인됨(O1-7 PASS)**
 
 이 문서는 `/init-orchestrate`, worker, coordinator, Orca, GitHub, Bridge 사이에서 관찰 가능해야 하는 의미를 정의한다. 구현자가 ID 연결을 추측하지 않게 하는 것이 목적이다.
 

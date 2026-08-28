@@ -1,6 +1,6 @@
 # 플랫폼 역량과 제약
 
-기준일: **2026-08-22**
+기준일: **2026-08-28**
 
 이 문서는 Bridge와 orchestration이 의존하는 외부 플랫폼의 **현재 계약**을 정리한다. 각 항목은 공식 문서 확인 또는 로컬 실측에 근거한다. 외부 제품은 바뀌므로 구현 시작과 release 전 다시 확인한다.
 
@@ -11,13 +11,13 @@
 | 도구 | 버전 | 비고 |
 |---|---|---|
 | Orca | `1.4.187` | `C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready |
-| Claude Code | `2.1.238` | `C:\Users\dongh\.local\bin\claude.exe` |
+| Claude Code | `2.1.246` | `C:\Users\dongh\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 production code는 `2.1.243` target surface에 고정돼 있다. research preview이므로 D3 재수용 전에 이 버전에서 다시 검증한다 |
 | codex-cli | `0.149.0` | `C:\Users\dongh\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
 | gh | `2.98.0` | |
 | git | `2.55.0.windows.4` | |
 | pnpm | `11.22.0` | |
 | Python | `3.13.15` | |
-| Node.js | `v26.7.0` | nvm-windows 관리. 실제 경로는 `C:\nvm4w\nodejs`이며 `NVM_SYMLINK`로 PATH에 연결된다. §6 참조 |
+| Node.js | `v26.8.1` | nvm-windows 관리. 실제 경로는 `C:\nvm4w\nodejs`이며 `NVM_SYMLINK`로 PATH에 연결된다. 설치된 daemon도 이 버전을 쓴다. §6 참조 |
 
 `ORCA_CLI_COMMAND`와 `ORCA_DEV_REPO_ROOT`는 unset이다. Claude 계정은 조직에 속하지 않은 개인 Max이고, Codex는 oauth로 인증돼 있다.
 

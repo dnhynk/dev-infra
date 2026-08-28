@@ -7,5 +7,5 @@ export default defineConfig({
   define: { 'import.meta.main': 'false' },
   // Several acceptance files exercise the same production singleton pipe and OS capability names.
   // Run files serially so the full suite validates lifecycle handoff instead of racing global resources.
-  test: { fileParallelism: false },
+  test: { fileParallelism: false, setupFiles: ['./test/setup-isolation.ts'] },
 });

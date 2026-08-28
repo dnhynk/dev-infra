@@ -48,9 +48,16 @@ function text(card: ReturnType<typeof renderGateDecisionCard>): string {
   return card.blocks
     .map((block) => {
       const raw = block['text'];
-      return typeof raw === 'object' && raw !== null && 'text' in raw
-        ? String((raw as { text: unknown }).text)
-        : '';
+      if (typeof raw === 'object' && raw !== null && 'text' in raw) {
+        return String((raw as { text: unknown }).text);
+      }
+      // context blocks carry their text in `elements`, not `text`.
+      if (block['type'] === 'context' && Array.isArray(block['elements'])) {
+        return (block['elements'] as readonly Record<string, unknown>[])
+          .map((element) => String(element['text'] ?? ''))
+          .join('\n');
+      }
+      return '';
     })
     .join('\n');
 }
