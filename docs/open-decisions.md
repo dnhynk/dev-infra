@@ -1321,12 +1321,18 @@ ID: OD-081
 영향 문서/파일: plugins/, docs/platform-capabilities.md §3.3, docs/ops/channel-adapter-acceptance.md
 검증 방법: 관리자 권한으로 정책 파일을 쓴 뒤 대화형 세션에서 daemon probe receipt가 도달하는지 확인한다.
            `-p` 비대화형은 channel 이벤트가 도달하지 않으므로 수용 경로가 아니다.
-검증 결과(2026-08-28): **등록은 확인됐다.** 정책 파일 전 두 번의 동일 실행은 debug log에
+검증 결과(2026-08-28): **왕복까지 확인됐다.** 정책 파일 전 두 번의 동일 실행은 debug log에
            `Channel notifications` 0건이었고, 정책 파일 뒤 같은 명령이
-           `Channel notifications re-registered after reconnect`를 남겼다. development flag와 확인
-           대화상자 없이 등록된다. **event 도달은 아직 미확인이다** — `-p`는 도달 경로가 아니고
-           대화형 세션 관측이 남아 있다. daemon에는 Adapter 연결·probe를 나타내는 log event가 없어
-           daemon 쪽에서 이 구간을 관측할 수단이 현재 없다.
+           `Channel notifications re-registered after reconnect`를 남겼다. 이어서 Claude Code 2.1.246
+           대화형 세션에서 **확인 대화상자 없이** 배너가 뜨고, daemon probe가
+           `Channel event received (gate_id …, empty body)`로 도달했으며, `orca_channel_receipt`가
+           `receipt_accepted`를 반환했다. 같은 gate_id의 중복 이벤트에는 두 번째 receipt를 보내지
+           않아 OD-057 멱등성도 함께 관측됐다.
+           남은 것은 production Gate 하나로 resolve→재조회→후속 Task 재개→기존 Slack card 갱신까지
+           잇는 관측이다. 이 probe는 opt-in 증거이지 resume 증거가 아니다.
+관측 공백: daemon에는 Adapter 연결·probe·receipt를 나타내는 log event가 없다. 위 왕복은 세션 화면과
+           `receipt_accepted` 반환값으로만 확인됐고 daemon 쪽 흔적은 남지 않는다. 무인 운영에서 이
+           구간이 실패하면 추적할 수단이 없다.
 결정일: 2026-08-28
 ```
 

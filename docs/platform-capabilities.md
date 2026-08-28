@@ -405,8 +405,9 @@ claude --dangerously-load-development-channels server:<mcp-server-name>  # 개�
 - **plugin 경로의 allowlist는 managed settings로 대체할 수 있다. 2026-08-28 이 호스트에서 실측했다.**
   `C:\Program Files\ClaudeCode\managed-settings.json`에 `channelsEnabled`와 `allowedChannelPlugins`를
   넣기 전에는 같은 명령이 채널을 등록하지 않았고(debug log에 `Channel notifications` 0건, 2회 반복),
-  넣은 뒤 같은 명령이 `Channel notifications re-registered after reconnect`를 남겼다. development flag도
-  확인 대화상자도 없었다. 등록까지가 실측 범위이며, 실제 event 도달은 대화형 세션에서 확인해야 한다.
+  넣은 뒤 같은 명령이 `Channel notifications re-registered after reconnect`를 남겼다. 이어서 2.1.246
+  대화형 세션에서 확인 대화상자 없이 배너가 뜨고 daemon probe가 실제로 도달했으며 receipt가
+  `receipt_accepted`로 돌아왔다. 중복 이벤트에는 receipt를 다시 보내지 않았다.
   설정 key는
   `allowedChannelPlugins`이고 값은 `{marketplace, plugin}` 객체 배열이다. 설치된 2.1.246의 스키마
   설명이 *"When set, replaces the default Anthropic allowlist — admins decide which plugins may push
