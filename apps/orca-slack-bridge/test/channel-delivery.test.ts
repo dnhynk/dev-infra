@@ -360,7 +360,9 @@ function engine(
   bounds: {
     concurrency?: number;
     reconcileDeadlineMs?: number;
+    resumeBaselineDeadlineMs?: number;
     onTransition?: NonNullable<GateChannelDeliveryEngineOptions['onTransition']>;
+    resume?: NonNullable<GateChannelDeliveryEngineOptions['resume']>;
   } = {},
 ): GateChannelDeliveryEngine {
   const ensureBaseline = (
@@ -385,8 +387,8 @@ function engine(
     routeRetryMs: 1_000,
     receiptBackoffMs: 3_000,
     attemptDelaysMs: [1_000, 2_000],
-    ...bounds,
     resume: { ensureBaseline, reconcile: () => Promise.resolve() },
+    ...bounds,
     onError: (code) => errors.push(code),
   });
 }
@@ -476,6 +478,42 @@ describe('durable Channel delivery engine', () => {
       `consumed:${GATE}`,
     ]);
     expect(store.findGateChannelDelivery(GATE)?.state).toBe('consumed');
+    store.close();
+  });
+
+  it('gives up an unreadable baseline at the deadline instead of retrying forever', async () => {
+    // 실측: 사흘 된 delivery 하나가 5초마다 영원히 재시도했다. 의존 Task들이 그동안 완료되고
+    // worker가 release되어 strict correlation이 다시는 성립할 수 없었는데, 포기 경로가 없었다.
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    resolveD2(store);
+    const orca = new FakeOrca();
+    const transport = new FakeTransport();
+    const time = clock();
+    const delivery = engine(store, orca, transport, time, [], {
+      // baseline은 언제나 읽히지 않는다. 다만 `unavailable`로 넘어간 뒤에는 실제 engine처럼
+      // 그대로 통과시킨다 — 그것이 "전달은 살리고 증거만 포기한다"의 뜻이다.
+      resume: {
+        ensureBaseline: (d) =>
+          Promise.resolve(d.resumeBaselineState === 'unavailable' ? d : null),
+        reconcile: () => Promise.resolve(),
+      },
+      resumeBaselineDeadlineMs: 60_000,
+    });
+
+    // 마감 안에서는 포기하지 않는다. Orca 일시 실패를 증거 포기로 바꾸면 안 된다.
+    await delivery.reconcile();
+    expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+      resumeBaselineState: 'required', state: 'pending',
+    });
+
+    // 마감을 넘기면 `unavailable`로 넘어가고 전달이 다시 진행된다.
+    time.advance(60_001);
+    await delivery.reconcile();
+    expect(store.findGateChannelDelivery(GATE)?.resumeBaselineState).toBe('unavailable');
+
+    time.advance(60_000);
+    await delivery.reconcile();
+    expect(transport.calls.length).toBeGreaterThan(0);
     store.close();
   });
 
