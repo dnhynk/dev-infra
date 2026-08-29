@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { publishRunCard, publishRunCollection } from '../src/run/publish.js';
 import type { RunPublishOptions } from '../src/run/publish.js';
 import type { RunCardInput } from '../src/run/render.js';
+import { SlackApiError } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 import type {
@@ -55,7 +56,12 @@ class FakeSlack implements SlackPoster {
     this.seq += 1;
     return { channel: input.channel, ts: `1787403740.00000${this.seq}` };
   }
+  /** 이 ts를 갱신하려 하면 Slack이 지워진 메시지라고 답한다. */
+  failUpdateFor: string | null = null;
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
+    if (this.failUpdateFor !== null && input.ts === this.failUpdateFor) {
+      throw new SlackApiError('chat.update', 'message_not_found');
+    }
     this.updates.push(input);
     return { channel: input.channel, ts: input.ts };
   }
@@ -294,6 +300,39 @@ describe('컬렉션 게시', () => {
     unregistered: { count: 0, runs: [] },
     degraded: [],
     ...over,
+  });
+
+  it('카드 하나의 Slack 실패가 나머지 카드를 멈추지 않는다', async () => {
+    /*
+     * 지워진 메시지 하나가 관찰 전체를 멈춘 실패를 잡는다.
+     *
+     * `chat.update`가 `message_not_found`로 던지면 게시 루프가 그 자리에서 끝나고, 관찰 job이
+     * 실패로 끝나 다음 주기에도 같은 카드에서 다시 멈춘다. 실측에서 Run 카드 22장이 세 시간
+     * 동안 갱신되지 않았고 그동안 daemon 상태는 healthy였다.
+     */
+    const store = new SqliteDigestStore(dbPath);
+    const slack = new FakeSlack();
+
+    await publishRunCollection(options(store, slack), collection());
+    const firstTs = store.findRunMessage(runKey(RUN_ID))?.messageTs ?? '';
+    expect(firstTs).not.toBe('');
+    slack.failUpdateFor = firstTs;
+
+    // 두 카드 모두 갱신이 필요하도록 사실을 움직인다.
+    const moved = [
+      facts({ tasks: { total: 99, byStatus: [] } }),
+      facts({ tasks: { total: 98, byStatus: [] } }, OTHER_RUN_ID),
+    ];
+    const result = await publishRunCollection(options(store, slack), collection({ runs: moved }));
+    store.close();
+
+    const actions = result.runs.map((entry) => entry.action);
+    expect(actions).toContain('failed');
+    // 두 번째 카드는 그대로 갱신된다. 이것이 없으면 카드 하나가 나머지를 인질로 잡는다.
+    expect(actions).toContain('update');
+    const failure = result.runs.find((entry) => entry.action === 'failed');
+    // 코드를 남긴다. "메시지가 지워졌다"와 "채널에 없다"는 운영자가 할 일이 다르다.
+    expect(failure?.errorCode).toBe('message_not_found');
   });
 
   it('등록된 Run마다 카드 하나를 만든다', async () => {
