@@ -418,7 +418,15 @@ describe('컬렉션 게시', () => {
     store.close();
 
     const text = (slack.posts[1]?.blocks ?? [])
-      .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
+      .map((b) => {
+        const direct = (b['text'] as { text?: string } | undefined)?.text;
+        if (direct !== undefined) return direct;
+        const elements = b['elements'];
+        return Array.isArray(elements)
+          ? (elements as readonly Record<string, unknown>[])
+            .map((e) => String(e['text'] ?? '')).join(String.fromCharCode(10))
+          : '';
+      })
       .join('\n');
     expect(text).toContain('store에 기록된 PR 없음');
     expect(text).not.toContain('#26');
