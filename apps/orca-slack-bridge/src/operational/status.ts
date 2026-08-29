@@ -2036,9 +2036,13 @@ export async function inspectOperationalStatus(
     if (daemon.lastErrorCode !== null) add('daemon.degraded', 1);
   }
 
+  // automation을 끄면 observer supervisor 자체가 서지 않으므로 이 job들의 부재는 정상이다.
+  // `terminal-prompt`도 같은 supervisor가 돌리므로 같은 자리에 있어야 한다.
   const disabledObserverJobs = config.automation.enabled
     ? new Set<DaemonJobName>()
-    : new Set<DaemonJobName>(['repository-discovery', 'run-observer', 'pr-digest']);
+    : new Set<DaemonJobName>([
+        'repository-discovery', 'run-observer', 'pr-digest', 'terminal-prompt',
+      ]);
   for (const job of snapshot.value.jobs) {
     if (disabledObserverJobs.has(job.job)) continue;
     if (job.state === 'absent') add('job.absent', 1);

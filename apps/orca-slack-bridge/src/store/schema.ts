@@ -723,10 +723,27 @@ CREATE TABLE daemon_health (
           AND updated_at >= clean_stopped_at))
 )`;
 
+/**
+ * v15가 이 표를 다시 만든 이유.
+ *
+ * `job_name`의 CHECK에 새 job 이름을 넣으려면 CHECK를 바꿔야 하고, CHECK 변경은 컬럼 추가로
+ * 되지 않는다. MIGRATIONS는 덧붙이기만 다루므로 OD-043이 "파괴적 변경이 필요해지면 그때 정한다"로
+ * 비워 둔 자리다. 여기서 정한다: **이 표는 다시 만든다.**
+ *
+ * 이 표가 담는 것은 job 스케줄 상태(시도 수, backoff, checkpoint)뿐이고 전부 다시 만들어진다.
+ * 잃어도 되는 것을 위해 새 job을 관측 불가로 남기는 것이 더 나쁜 거래다. 행은 그대로 옮기므로
+ * 실제로는 잃는 것도 없다.
+ *
+ * 표를 다시 만들 때 `ALTER TABLE ... RENAME TO`로 **새 이름을 만들지 않는다.** SQLite가 rename
+ * 시 저장된 DDL의 표 이름을 따옴표로 다시 쓰기 때문에, 그렇게 만든 파일은 새로 만든 파일과
+ * DDL 문자열이 달라지고 `validateCurrentOperationalStore`가 둘 중 하나를 거부한다. 옛 표를
+ * 옆으로 밀고, 새 표를 정확한 DDL로 만들고, 옮기고, 옛 표를 지운다.
+ */
 const DAEMON_JOB_OUTCOME_TABLE = `
 CREATE TABLE daemon_job_outcome (
   job_name             TEXT PRIMARY KEY CHECK (job_name IN
-    ('repository-discovery','run-observer','pr-digest','gate-reconcile','channel-delivery')),
+    ('repository-discovery','run-observer','pr-digest','gate-reconcile','channel-delivery',
+     'terminal-prompt')),
   revision             INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
   state                TEXT NOT NULL CHECK (state IN ('running','succeeded','failed','backoff')),
   attempt              INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 9007199254740991),
@@ -759,6 +776,13 @@ CREATE TABLE daemon_job_outcome (
       AND consecutive_failures >= 1 AND next_run_at >= updated_at)
   )
 )`;
+
+
+/** v15 이전에 배포된 정확한 table DDL. 옛 파일이 이 문자열로 만들어졌다. */
+const DAEMON_JOB_OUTCOME_V14_TABLE = DAEMON_JOB_OUTCOME_TABLE.replace(
+  "'channel-delivery',\n     'terminal-prompt')),",
+  "'channel-delivery')),",
+);
 
 const DAEMON_JOB_OUTCOME_STATE_INDEX = `
 CREATE INDEX daemon_job_outcome_state
@@ -1146,7 +1170,7 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     REPOSITORY_DISCOVERY_ISSUE_TABLE,
     REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX,
     DAEMON_HEALTH_TABLE,
-    DAEMON_JOB_OUTCOME_TABLE,
+    DAEMON_JOB_OUTCOME_V14_TABLE,
     DAEMON_JOB_OUTCOME_STATE_INDEX,
     SLACK_ROOT_INTENT_TABLE,
     SLACK_ROOT_INTENT_STATE_INDEX,
@@ -1159,6 +1183,13 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // v14 → v15: agent 터미널의 대화형 프롬프트를 durable하게 관측하고 답한다. 표 추가뿐이라
   // 기존 행은 그대로 남는다.
   [
+    // 새 job 이름을 받으려면 job_name의 CHECK를 바꿔야 하고, 그것은 표를 다시 만드는 일이다.
+    // 위 DAEMON_JOB_OUTCOME_TABLE 주석에 왜 rename을 쓰지 않는지 적어 두었다.
+    'ALTER TABLE daemon_job_outcome RENAME TO daemon_job_outcome_pre_v15',
+    DAEMON_JOB_OUTCOME_TABLE,
+    `INSERT INTO daemon_job_outcome SELECT * FROM daemon_job_outcome_pre_v15`,
+    'DROP TABLE daemon_job_outcome_pre_v15',
+    DAEMON_JOB_OUTCOME_STATE_INDEX,
     TERMINAL_PROMPT_TABLE,
     TERMINAL_PROMPT_ACTIVE_INDEX,
     TERMINAL_PROMPT_RUN_INDEX,

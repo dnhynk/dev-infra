@@ -3147,7 +3147,7 @@ describe('read-only operational status classification', () => {
     });
     expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
     expect(report.jobs.filter((job) => job.state === 'absent').map((job) => job.job)).toEqual([
-      'repository-discovery', 'run-observer', 'pr-digest',
+      'repository-discovery', 'run-observer', 'pr-digest', 'terminal-prompt',
     ]);
 
     rmSync(statePath, { force: true });

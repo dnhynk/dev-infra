@@ -176,6 +176,7 @@ const PARSED_INPUT_FIELDS = [
 ] as const;
 export const OPERATIONAL_JOB_NAMES: readonly DaemonJobName[] = [
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
+  'terminal-prompt',
 ];
 const MAX_COUNT = 1_000_000_000;
 const MAX_ENTITY_IDENTITY_BYTES = 4 * 1024;

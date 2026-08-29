@@ -1850,6 +1850,7 @@ const OPERATIONAL_ISSUE_CATEGORIES = new Set<RepositoryDiscoveryIssueCategory>([
 
 const OPERATIONAL_JOB_NAMES = new Set<DaemonJobName>([
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
+  'terminal-prompt',
 ]);
 
 const OPERATIONAL_FAILURE_CODE_SET = new Set<OperationalFailureCode>(OPERATIONAL_FAILURE_CODES);

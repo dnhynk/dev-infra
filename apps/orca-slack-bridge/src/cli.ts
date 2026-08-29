@@ -1904,7 +1904,7 @@ export async function runDaemonCommand(
         jobs: observerJobs,
         clock: observerClock,
         initialState: Object.fromEntries([
-          'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest',
+          'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest', 'terminal-prompt',
         ].map((name) => {
           const prior = daemonStore.findDaemonJobOutcome(name as ObserverJobName);
           return [name, {
