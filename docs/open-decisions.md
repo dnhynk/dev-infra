@@ -90,6 +90,7 @@
 | OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED |
 | OD-080 | 등록 Run이 0인 구간에서도 미등록 사실이 도달할 게시 표면 | D1 전 | DECIDED |
 | OD-081 | custom channel plugin을 세션 확인 없이 켜는 배포 경로 | D3 재수용 전 | DECIDED |
+| OD-082 | daemon digest가 summarizer를 부를지 | O1 운영 전 | DECIDED |
 
 ## Gate와 Channel
 
@@ -1334,6 +1335,26 @@ ID: OD-081
            `receipt_accepted` 반환값으로만 확인됐고 daemon 쪽 흔적은 남지 않는다. 무인 운영에서 이
            구간이 실패하면 추적할 수단이 없다.
 결정일: 2026-08-28
+```
+
+```text
+ID: OD-082
+상태: DECIDED
+결정: daemon digest도 one-shot과 같은 model summary 경로를 쓴다.
+      `automation.deterministicNoLlm`은 스케줄링·라우팅 판정에만 적용한다.
+근거:
+  - 제품 목적이 "PR 상태 변화를 사람이 10초 안에 이해하는 카드"다(스펙 §5.3). 운영에서 보이는 카드는
+    전부 daemon이 만든다. daemon이 요약하지 않으면 그 목적이 운영에서 성립하지 않는다.
+  - 비용 우려는 근거가 없다. 게이트 A가 `factsFingerprint`로 호출을 막으므로(OD-035) 주기가 아니라
+    요약 입력이 바뀌었을 때만 부른다. 기본 모델은 `gpt-5.6-luna`다(DL-026).
+  - `deterministicNoLlm`의 원래 주석이 "scheduling/routing must never consult an LLM"이다. 그 범위를
+    카드 본문 생성까지 넓힌 것은 기록된 결정이 아니라 구현 중 들어간 서술이었다.
+이전 상태: `f481cea`(O1-5)가 `summaryMode: 'facts_only'`와 architecture 문장을 함께 넣었고 이 결정을
+      기록한 OD 항목은 없었다. "미정 사항을 구현자가 조용히 채우지 않는다"는 작업 규약을 거치지 않았다.
+영향 문서/파일: apps/orca-slack-bridge/src/cli.ts, docs/architecture/orca-slack-bridge.md
+검증 방법: 운영 daemon이 새 요약을 생성하고, 사실이 그대로인 다음 주기에는 provider를 부르지 않는 것을
+      `digest` 보고의 재사용 표시로 확인한다.
+결정일: 2026-08-29
 ```
 
 ```text

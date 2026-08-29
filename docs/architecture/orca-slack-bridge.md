@@ -441,9 +441,11 @@ observer의 GitHub 경계는 daemon 전체 token bucket 2,000 commands/hour, RES
 1,000의 floor, 5분 quota cache, command당 20초와 8 MiB, 동시 실행 2개를 적용한다. PR은 repository당 최대
 10개, fair cycle 전체 최대 100개이며 repository의 모든 GitHub 사실을 먼저 수집한 뒤에만 그 repository의
 Slack write를 시작한다. quota/budget/deadline 또는 repository-local 실패는 해당 repository를 부분 게시하지
-않고 durable deferred count와 bounded backoff로 남긴다. daemon digest는 deterministic facts-only 결과만
-만들며 model provider module을 runtime import·생성·호출하지 않는다. 기존 one-shot digest의 model summary
-경로는 별도로 유지된다.
+않고 durable deferred count와 bounded backoff로 남긴다. daemon digest도 one-shot과 같은 model summary
+경로를 쓴다. 호출량은 주기가 아니라 게이트 A가 정한다 — `factsFingerprint`가 같으면 저장된 요약을
+재사용하고 provider를 부르지 않으므로(OD-035), 15분 주기라도 실제 호출은 요약 입력이 바뀐 PR에만
+발생한다. `automation.deterministicNoLlm`은 이름 그대로 **스케줄링·라우팅 판정**에만 적용되며 카드
+본문 생성과는 무관하다(OD-082).
 
 PR, Run, Run collection의 새 Slack root는 모두 `slack_root_intent` pending 준비와 sending claim을 durable하게
 commit한 뒤 `chat.postMessage`를 한 번만 시도한다. exact success response의 channel/ts와 기존 mapping, posted

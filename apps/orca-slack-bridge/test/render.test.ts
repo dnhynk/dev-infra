@@ -557,11 +557,9 @@ describe('renderCard · section text 3000자 상한', () => {
   const LONG = 'ㄱ'.repeat(5000);
   const MARK = '표시 한도 3000자를 넘어 잘림';
 
+  // worker 보고 본문은 여기 없다. 그 값은 section 상한이 아니라 자기 상한(WORKER_BODY_CAP)에서
+  // 먼저 잘리므로 이 절이 검증하는 경로에 닿지 않는다. 그 자름은 아래 별도 test가 고정한다.
   const overflowing: Readonly<Record<string, RenderInput>> = {
-    'worker 보고 본문': {
-      pr: { ...basePr, workerReport: { outcome: 'succeeded', body: LONG } },
-      summary: failedSummary,
-    },
     'PR 제목': { pr: { ...basePr, title: LONG }, summary: failedSummary },
     '모델 title': { pr: basePr, summary: { ...okSummary, draft: { ...okDraft, title: LONG } } },
     '요약 what': { pr: basePr, summary: { ...okSummary, draft: { ...okDraft, what: LONG } } },
@@ -584,6 +582,20 @@ describe('renderCard · section text 3000자 상한', () => {
       expect(contains(renderCard(input), MARK)).toBe(true);
     });
   }
+
+  it('worker 보고 본문은 카드를 삼키기 전에 자기 상한에서 잘린다', () => {
+    // 계약은 세 문장이지만(contracts §3) 실제 worker는 지키지 않는다. 실측에서 한 건이 1,000자를
+    // 넘어 카드 전체가 그 덤프가 됐다. section 상한(3000)까지 기다리면 카드 하나를 통째로 먹는다.
+    const card = renderCard({
+      pr: { ...basePr, workerReport: { outcome: 'succeeded', body: LONG } },
+      summary: failedSummary,
+    });
+    const worker = sectionTexts(card).find((t) => t.startsWith('*worker 보고*'));
+    expect(worker).toBeDefined();
+    expect((worker as string).length).toBeLessThan(600);
+    // 자른 사실은 드러낸다. 조용히 지우지 않는다.
+    expect(worker as string).toContain('…');
+  });
 
   it('상한 안이면 자르지도 표시를 붙이지도 않는다', () => {
     for (const input of Object.values(cases)) {

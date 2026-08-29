@@ -1751,7 +1751,14 @@ export async function runDaemonCommand(
                   store: daemonStore,
                   slack,
                   thread: threadPoster,
-                  summaryMode: 'facts_only',
+                  // daemon도 model 경로를 쓴다. 이 제품의 목적이 "PR 상태 변화를 사람이 10초
+                  // 안에 이해하는 카드"이고, 요약이 없으면 카드는 사실 나열로 남는다.
+                  //
+                  // 호출 비용은 주기가 아니라 게이트 A가 정한다. `factsFingerprint`가 같으면
+                  // 저장된 요약을 재사용하고 provider를 부르지 않으므로(OD-035), 15분 주기라도
+                  // 실제 호출은 요약 입력이 바뀐 PR에만 발생한다.
+                  summaryMode: 'model',
+                  provider: await summaryProvider(process.env),
                   prLimit: cycle.prLimit,
                   onlyPr: null,
                   now: observerClock.wallNow,

@@ -109,6 +109,14 @@ const FINDING_SUMMARY_CAP = 200;
 const FAILURE_REASON_CAP = 300;
 
 /**
+ * 요약 실패 카드가 싣는 worker 본문 상한.
+ *
+ * 계약은 정확히 세 문장이지만(contracts §3) 실제 worker는 지키지 않는다. 실측에서 한 건이
+ * 1,000자를 넘어 카드 전체가 그 덤프가 됐다. 사실을 지우지 않되 카드를 삼키지도 않는다.
+ */
+const WORKER_BODY_CAP = 400;
+
+/**
  * section block `text`의 문자 수 상한.
  *
  * Slack이 고정한 값이다. "Minimum length for the `text` in this field is 1 and maximum length
@@ -337,7 +345,7 @@ export function renderCard(input: RenderInput): RenderedCard {
   // worker 보고 본문은 요약이 실패했을 때만 사실 텍스트로 필요하다. 성공했다면 그 본문은 이미
   // 위 요약의 입력이었으므로 결과 한 마디만 남기고 작은 글씨로 내린다.
   const workerBody = pr.workerReport !== null && summary.kind === 'failed'
-    ? esc(pr.workerReport.body)
+    ? esc(cut(pr.workerReport.body, WORKER_BODY_CAP))
     : null;
   // worker-read fallback을 쓰지 않으므로 없음이 곧 최종 관찰이다(OD-025, OD-070).
   const workerLine = pr.workerReport === null
@@ -408,6 +416,25 @@ type TransitionLine = {
   readonly label: string;
   readonly detail: string;
 };
+
+/**
+ * 채널에도 함께 띄울 전이(Slack `reply_broadcast`).
+ *
+ * thread reply는 그 thread를 따르지 않는 사람에게 알림을 보내지 않고 채널에도 나타나지 않는다.
+ * 자리에 없는 owner에게는 사실상 보이지 않는다는 뜻이다.
+ *
+ * OD-072를 좁게 읽으면 owner 개입이 필수인 사실만 알려야 하고 PR 전이는 전부 coordinator가
+ * 처리하므로 하나도 해당되지 않는다. 그러나 owner가 "리뷰 요청·CI 실패·merge 준비는 알림으로
+ * 받고 싶다"고 명시적으로 요구했다. 그래서 그 셋만 켠다.
+ *
+ * `review_approved`와 `merged`는 끈다. 앞의 셋과 함께 켜면 PR 하나가 채널 알림 다섯 개가 되고,
+ * 그러면 정작 결정이 필요한 Gate가 그 안에 묻힌다.
+ */
+export const BROADCAST_TRANSITIONS: ReadonlySet<PrTransitionKind> = new Set([
+  'review_changes_requested',
+  'checks_failing',
+  'checks_passing',
+]);
 
 const TRANSITION_LINE: Readonly<Record<PrTransitionKind, TransitionLine>> = {
   review_changes_requested: {
