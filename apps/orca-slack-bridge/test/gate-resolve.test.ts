@@ -1368,7 +1368,7 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
         teamId: 'T0TEAM',
         apiAppId: 'A0APP',
         ownerUserIds: ['U0OWNER'],
-        channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+        channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
       };
       const actionBody = (
         optionId: 'keep' | 'change',

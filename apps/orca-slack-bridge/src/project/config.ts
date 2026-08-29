@@ -131,6 +131,16 @@ export type SlackConfig = {
   readonly channels: {
     readonly prDigest: string;
     readonly agentRuns: string;
+    /**
+     * 사람이 답해야 하는 카드만 가는 채널.
+     *
+     * `agentRuns`와 나누는 이유는 Slack이 메시지를 게시 순서로 고정하기 때문이다. 상태 카드는
+     * 제자리에서 갱신되므로 아래로 내려오지 않고, 답할 카드가 그 사이에 섞이면 둘 다 스크롤로
+     * 찾아야 한다. 이 채널은 **맨 아래가 항상 지금 할 일**이 되도록 답할 카드만 받는다.
+     *
+     * 없으면 `agentRuns`를 쓴다. 채널을 만들지 않은 설치에서 기능이 사라지지 않게 한다.
+     */
+    readonly decisions: string;
   };
 };
 
@@ -518,6 +528,14 @@ function parseSlack(raw: unknown): SlackConfig | null {
     }
     return v;
   };
+  const optionalChannel = (key: string): string | null => {
+    const v = ch[key];
+    if (v === undefined) return null;
+    if (typeof v !== 'string' || !/^[CG]/.test(v)) {
+      throw new TypeError(`slack.channels.${key}가 채널 ID가 아니다. 이름이 아니라 ID를 쓴다`);
+    }
+    return v;
+  };
   const apiAppId = raw['apiAppId'];
   if (apiAppId !== undefined && (typeof apiAppId !== 'string' || !apiAppId.startsWith('A'))) {
     throw new TypeError('slack.apiAppId가 A로 시작하는 App ID가 아니다');
@@ -526,7 +544,12 @@ function parseSlack(raw: unknown): SlackConfig | null {
     teamId: id('teamId', 'T'),
     ...(typeof apiAppId === 'string' ? { apiAppId } : {}),
     ownerUserIds,
-    channels: { prDigest: channel('prDigest'), agentRuns: channel('agentRuns') },
+    channels: {
+      prDigest: channel('prDigest'),
+      agentRuns: channel('agentRuns'),
+      // 설정하지 않으면 지금까지와 같은 자리로 간다.
+      decisions: optionalChannel('decisions') ?? channel('agentRuns'),
+    },
   };
 }
 

@@ -1718,12 +1718,12 @@ export async function runDaemonCommand(
               const candidates = await collectTerminalCandidates({
                 orca: scoped,
                 store: daemonStore,
+                decisionsChannel: config.slack!.channels.decisions,
               });
               const report = await runTerminalPromptPass({
                 orca: scoped,
                 store: daemonStore,
                 slack,
-                thread: threadPoster,
                 candidates,
                 now: observerClock.wallNow,
                 // TUI가 다시 그려질 틈을 준다. 이 대기가 없으면 이동 직후 옛 화면을 읽는다.

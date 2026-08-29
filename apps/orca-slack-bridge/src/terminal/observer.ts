@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type { OrcaRunner } from '../orca/client.js';
-import type { SlackPoster, ThreadPoster } from '../slack/post.js';
+import type { SlackPoster } from '../slack/post.js';
 import type { RunKey } from '../identity/keys.js';
 import { answerTerminalPrompt } from './answer.js';
 import { readTerminalScreen } from './client.js';
@@ -26,9 +26,14 @@ export type TerminalPromptCandidate = {
   readonly dispatchId: string | null;
   /** 카드 머리글에 쓸 Run 이름. */
   readonly runLabel: string;
-  /** 카드를 매달 Run 루트 메시지. 없으면 카드를 만들지 않는다. */
+  /**
+   * 카드를 게시할 채널. 답할 카드만 오는 채널이라 **최상위 메시지로** 게시한다.
+   *
+   * 스레드 답글이 아니다. 답글은 스레드를 따르지 않는 사람에게 알림이 가지 않고, 알림을 위해
+   * broadcast를 켜면 그 복사본이 상태 카드 사이에 섞인다. 답할 카드는 그 채널의 맨 아래에
+   * 혼자 있어야 폰에서 열자마자 보인다.
+   */
   readonly channelId: string;
-  readonly threadTs: string;
 };
 
 export type TerminalPromptStore = {
@@ -72,8 +77,6 @@ export type TerminalPromptPassDeps = {
   readonly orca: OrcaRunner;
   readonly store: TerminalPromptStore;
   readonly slack: SlackPoster;
-  /** null이면 카드를 만들지 않는다. 관측은 그대로 durable하게 남는다. */
-  readonly thread: ThreadPoster | null;
   /** 이번 pass에서 볼 터미널. 호출자가 Run과 Dispatch에서 만들어 넘긴다. */
   readonly candidates: readonly TerminalPromptCandidate[];
   readonly now: () => Date;
@@ -211,21 +214,18 @@ async function publishCard(
   const fingerprint = renderFingerprint(card.text, card.blocks);
 
   if (record.messageTs === null) {
-    if (deps.thread === null) return 'skipped';
     try {
-      const posted = await deps.thread.reply({
+      const posted = await deps.slack.post({
         channel: candidate.channelId,
-        threadTs: candidate.threadTs,
         text: card.text,
         blocks: card.blocks,
-        // 사람의 답을 기다리는 카드다. thread를 따르지 않는 사람에게도 닿아야 한다.
-        broadcast: record.state === 'open',
       });
       deps.store.recordTerminalPromptCard({
         handle: record.terminalHandle,
         fingerprint: record.fingerprint,
         channelId: candidate.channelId,
-        threadTs: candidate.threadTs,
+        // 스레드가 없다. 매핑의 세 값은 함께 있거나 함께 없어야 하므로 자기 자신을 쓴다.
+        threadTs: posted.ts,
         messageTs: posted.ts,
         renderFingerprint: fingerprint,
         at,

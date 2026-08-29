@@ -325,7 +325,7 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
         teamId: 'T0TEAM',
         apiAppId: 'A01BRIDGE',
         ownerUserIds: ['U0OWNER'],
-        channels: { prDigest: 'C0PRDIGEST', agentRuns: channel },
+        channels: { prDigest: 'C0PRDIGEST', agentRuns: channel , decisions: channel },
       },
       projects: [],
       correlationKeys: DEFAULT_CORRELATION_KEYS,

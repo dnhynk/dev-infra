@@ -52,7 +52,7 @@ const AT = '2026-08-24T10:00:00.000Z';
 const CONFIG: BridgeConfig = {
   slack: {
     teamId: 'T0TEAM', apiAppId: 'A0APP', ownerUserIds: ['U0OWNER'],
-    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
   },
   projects: [],
   correlationKeys: DEFAULT_CORRELATION_KEYS,

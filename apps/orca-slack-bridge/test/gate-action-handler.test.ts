@@ -26,7 +26,7 @@ const CONFIG: SlackConfig = {
   teamId: 'T0TEAM',
   apiAppId: 'A0APP',
   ownerUserIds: ['U0OWNER', 'U0SECOND'],
-  channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+  channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
 };
 
 let dir: string;

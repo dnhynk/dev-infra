@@ -55,7 +55,7 @@ const CONFIG: SlackConfig = {
   teamId: TEAM,
   apiAppId: APP,
   ownerUserIds: [OWNER, OTHER_OWNER],
-  channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+  channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
 };
 
 let dir: string;
@@ -409,7 +409,7 @@ describe('Gate direct-input Socket Mode boundary', () => {
     const acks: unknown[] = [];
     const changed: SlackConfig = {
       ...CONFIG,
-      channels: { ...CONFIG.channels, agentRuns: 'C0OTHERCHANNEL' },
+      channels: { ...CONFIG.channels, agentRuns: 'C0OTHERCHANNEL' , decisions: 'C0OTHERCHANNEL' },
     };
     expect(await directHandler(store, new FakeOpener(), [], [], { config: changed }).handle(
       event(submissionBody('stale channel 결정'), (response) => { acks.push(response); }),

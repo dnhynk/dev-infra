@@ -38,7 +38,7 @@ const CONFIG: BridgeConfig = {
   slack: {
     teamId: 'T0TEAM',
     ownerUserIds: ['U0OWNER'],
-    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
   },
   projects: [
     { name: 'dev-infra', repositories: ['dnhynk/dev-infra'], orcaRepositoryIds: [REPO_ID] },

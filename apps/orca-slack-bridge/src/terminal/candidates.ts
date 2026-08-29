@@ -25,6 +25,8 @@ export type TerminalCandidateStore = {
 export type TerminalCandidateDeps = {
   readonly orca: OrcaRunner;
   readonly store: TerminalCandidateStore;
+  /** 답할 카드를 게시할 채널. 이 채널의 맨 아래가 항상 지금 할 일이다. */
+  readonly decisionsChannel: string;
   /** 이 pass에서 볼 최대 터미널 수. 한 pass가 무한정 길어지지 않게 한다. */
   readonly limit?: number;
 };
@@ -35,6 +37,7 @@ export async function collectTerminalCandidates(
   deps: TerminalCandidateDeps,
 ): Promise<readonly TerminalPromptCandidate[]> {
   const limit = deps.limit ?? DEFAULT_LIMIT;
+  const decisionsChannel = deps.decisionsChannel;
   // 죽은 handle을 읽지 않는다. Run row의 coordinator_handle은 세션이 끝나도 남는다.
   const live = new Set((await listTerminals(deps.orca)).map((terminal) => terminal.handle));
   const runs = await listRuns(deps.orca);
@@ -55,8 +58,7 @@ export async function collectTerminalCandidates(
         role: 'coordinator',
         dispatchId: null,
         runLabel,
-        channelId: root.channelId,
-        threadTs: root.messageTs,
+        channelId: decisionsChannel,
       });
     }
 
@@ -78,8 +80,7 @@ export async function collectTerminalCandidates(
         role: 'worker',
         dispatchId: worker.dispatchId,
         runLabel,
-        channelId: root.channelId,
-        threadTs: root.messageTs,
+        channelId: decisionsChannel,
       });
     }
   }
