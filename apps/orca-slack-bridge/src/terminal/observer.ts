@@ -5,7 +5,7 @@ import type { SlackPoster, ThreadPoster } from '../slack/post.js';
 import type { RunKey } from '../identity/keys.js';
 import { answerTerminalPrompt } from './answer.js';
 import { readTerminalScreen } from './client.js';
-import { parseTerminalPrompt } from './prompt.js';
+import { hasPromptAnchor, parseTerminalPrompt } from './prompt.js';
 import { renderTerminalPromptCard } from './render.js';
 import type { ObservedTerminalPrompt, TerminalPromptRecord, TerminalRole } from './types.js';
 
@@ -84,6 +84,8 @@ export type TerminalPromptPassDeps = {
 
 export type TerminalPromptPassReport = {
   readonly observed: number;
+  /** 프롬프트가 떠 있는데 화면에서 선택지를 만들지 못한 터미널 수. 사라진 것과 다르다. */
+  readonly unreadable: number;
   readonly posted: number;
   readonly updated: number;
   readonly answered: number;
@@ -103,6 +105,7 @@ export async function runTerminalPromptPass(
   signal?: AbortSignal,
 ): Promise<TerminalPromptPassReport> {
   let observed = 0;
+  let unreadable = 0;
   let posted = 0;
   let updated = 0;
   let answered = 0;
@@ -126,6 +129,13 @@ export async function runTerminalPromptPass(
     }
     const prompt = rows === null ? null : parseTerminalPrompt(rows);
     if (prompt === null) {
+      // 프롬프트가 떠 있는데 읽지 못한 경우와 사라진 경우를 구분한다. 앞의 경우를 닫으면
+      // 카드가 "이미 처리됨"이라고 말하는데 코디네이터는 그대로 막혀 있다.
+      if (rows !== null && hasPromptAnchor(rows)) {
+        unreadable += 1;
+        deps.onError?.('terminal.prompt_unreadable');
+        continue;
+      }
       deps.store.markTerminalPromptGone(candidate.handle, at);
       continue;
     }
@@ -182,7 +192,7 @@ export async function runTerminalPromptPass(
     }
   }
 
-  return { observed, posted, updated, answered, refused, failed };
+  return { observed, unreadable, posted, updated, answered, refused, failed };
 }
 
 /**

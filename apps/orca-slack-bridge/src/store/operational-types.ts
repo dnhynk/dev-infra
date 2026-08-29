@@ -132,6 +132,9 @@ export const OPERATIONAL_FAILURE_CODES = [
   'gate.reconcile_failed',
   // 한 pass 안에서 터미널 하나를 읽거나 카드를 올리지 못했다. pass 자체는 계속한다.
   'terminal.pass_degraded',
+  // 프롬프트가 떠 있는데 화면에서 선택지를 만들지 못했다. 사라진 것과 다르고, 이 코드가 없으면
+  // 그 구분이 운영에서 보이지 않는다.
+  'terminal.prompt_unreadable',
   // 확정된 답을 보내지 못했다. 화면이 바뀌어 거절한 경우가 여기 대부분이고, 그것이 정상 동작이다.
   'terminal.answer_refused',
   'terminal.query_failed',

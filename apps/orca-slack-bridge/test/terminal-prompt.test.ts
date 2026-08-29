@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { cursorDelta, parseTerminalPrompt } from '../src/terminal/prompt.js';
+import { cursorDelta, hasPromptAnchor, parseTerminalPrompt } from '../src/terminal/prompt.js';
 
 /**
  * 실제 Claude Code 세션 화면.
@@ -98,6 +98,25 @@ describe('agent 터미널 화면의 선택 프롬프트', () => {
       '  2. 둘',
       'Enter to select · ↑/↓ to navigate',
     ])).toBeNull();
+  });
+
+  it('프롬프트가 떠 있으면 선택지를 읽지 못해도 그 사실을 구분한다', () => {
+    // 커서가 아래쪽 선택지로 내려가면 화면이 스크롤되어 1번이 화면 밖으로 밀린다. 그때 목록을
+    // 만들 수 없는데, 그것을 "프롬프트가 사라졌다"로 처리하면 카드가 "이미 처리됨"이라고
+    // 말하면서 코디네이터는 그대로 막혀 있다. 실제로 그렇게 됐다.
+    const scrolled = [
+      '❯ 4. Type something.',
+      '─'.repeat(60),
+      '  5. Chat about this',
+      'Enter to select · ↑/↓ to navigate · Esc to cancel',
+    ];
+    expect(parseTerminalPrompt(scrolled)).toBeNull();
+    expect(hasPromptAnchor(scrolled)).toBe(true);
+
+    // 프롬프트가 정말 사라진 화면과는 구분된다.
+    const finished = ['● 작업을 계속합니다.', '  Ran 2 shell commands'];
+    expect(parseTerminalPrompt(finished)).toBeNull();
+    expect(hasPromptAnchor(finished)).toBe(false);
   });
 
   it('질문만 있고 선택지 형식이 성한 최소 화면을 읽는다', () => {

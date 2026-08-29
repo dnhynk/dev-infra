@@ -121,6 +121,18 @@ function fingerprintOf(regionRows: readonly string[]): string {
   return createHash('sha256').update(normalized.join('\n'), 'utf8').digest('hex').slice(0, 32);
 }
 
+/**
+ * 화면에 선택 프롬프트가 떠 있는가. 선택지를 읽을 수 있는지와는 다른 질문이다.
+ *
+ * 이 둘을 구분하지 않으면 "읽지 못했다"가 "사라졌다"로 처리된다. 실제로 그랬다 — 커서가
+ * 아래쪽 선택지로 내려가 화면이 스크롤되면서 1번이 화면 밖으로 밀렸고, 목록을 만들지 못한
+ * 관측이 그 프롬프트를 처리 완료로 닫아 카드가 "이미 처리됨"이라고 말했다. 코디네이터는
+ * 그대로 막혀 있었다.
+ */
+export function hasPromptAnchor(rows: readonly string[]): boolean {
+  return lastAnchor(rows) !== null;
+}
+
 /** 화면에 여러 번 나올 수 있으므로 가장 아래 것을 현재 프롬프트로 본다. */
 function lastAnchor(rows: readonly string[]): number | null {
   for (let i = rows.length - 1; i >= 0; i -= 1) {

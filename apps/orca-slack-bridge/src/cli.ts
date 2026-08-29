@@ -1729,14 +1729,18 @@ export async function runDaemonCommand(
                 // TUI가 다시 그려질 틈을 준다. 이 대기가 없으면 이동 직후 옛 화면을 읽는다.
                 settle: () => new Promise((resolve) => { setTimeout(resolve, 400); }),
                 onError: (code) => {
+                  // 읽지 못한 프롬프트는 다른 사실이다. 같은 코드로 접으면 "코디네이터가 막혀
+                  // 있는데 카드를 못 만들고 있다"가 운영에서 보이지 않는다.
+                  const persisted: OperationalFailureCode = code === 'terminal.prompt_unreadable'
+                    ? 'terminal.prompt_unreadable'
+                    : 'terminal.pass_degraded';
                   void health?.event({
                     level: 'warn',
                     event: 'terminal.prompt',
                     outcome: 'failed',
-                    errorCode: 'terminal.pass_degraded',
+                    errorCode: persisted,
                     retryable: true,
                   }).catch(() => { /* reporting never fences the pass */ });
-                  void code;
                 },
               }, signal);
               return {
