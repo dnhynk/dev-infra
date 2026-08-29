@@ -1235,6 +1235,43 @@ export async function runDaemonCommand(
   let deliveryReconciliation: Promise<void> | null = null;
   const pending = new Set<Promise<void>>();
   const inbound = new Set<Promise<void>>();
+
+  /*
+   * try/catch를 우회하는 죽음을 로그에 남긴다.
+   *
+   * daemon이 두 번 사라졌는데 운영 로그에는 성공한 job이 마지막 줄이었다. `runDaemonCommand`의
+   * catch도, 그 catch가 남기는 `daemon.failed`도 발화하지 않았다. 그 말은 예외가 그 promise
+   * 사슬 밖에서 났다는 뜻이다 — uncaught exception이나 주인 없는 rejection은 Node가 프로세스를
+   * 그대로 끝낸다. Task로 띄운 daemon은 stderr가 어디에도 수집되지 않으므로 그 순간이 통째로
+   * 증거 없이 지나갔다.
+   *
+   * 여기서 잡는 것은 복구가 아니라 **관측**이다. 한 줄을 남기고 원래대로 죽는다. 살려 두면
+   * 어떤 상태가 깨진 채로 계속 도는지 알 수 없다.
+   *
+   * 예외 본문은 싣지 않는다. 이 경로에는 카드 내용과 사용자 결정이 들어갈 수 있다.
+   */
+  const crashCodes: Readonly<Record<'uncaughtException' | 'unhandledRejection', string>> = {
+    uncaughtException: 'daemon.uncaught_exception',
+    unhandledRejection: 'daemon.unhandled_rejection',
+  };
+  let crashReported = false;
+  const reportCrash = (kind: 'uncaughtException' | 'unhandledRejection'): void => {
+    if (crashReported) return;
+    crashReported = true;
+    process.stderr.write(`${crashCodes[kind]}\n`);
+    void health?.event({
+      level: 'error',
+      event: 'daemon.failed',
+      outcome: 'failed',
+      errorCode: crashCodes[kind] as OperationalFailureCode,
+      retryable: true,
+    }).catch(() => { /* 죽는 중이다. 보고 실패가 종료를 막지 않는다. */ })
+      .finally(() => { process.exit(1); });
+  };
+  const onUncaught = (): void => { reportCrash('uncaughtException'); };
+  const onUnhandled = (): void => { reportCrash('unhandledRejection'); };
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onUnhandled);
   const inboundAbort = new AbortController();
   const reconciliationAbort = new AbortController();
   const acceptedWorkAbort = new AbortController();
@@ -2077,6 +2114,8 @@ export async function runDaemonCommand(
     reportFailure();
     return 1;
   } finally {
+    process.off('uncaughtException', onUncaught);
+    process.off('unhandledRejection', onUnhandled);
     acceptingInbound = false;
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
     reconciliationAbort.abort();

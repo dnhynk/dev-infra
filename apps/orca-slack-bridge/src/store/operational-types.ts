@@ -107,6 +107,9 @@ export const OPERATIONAL_FAILURE_CODES = [
   'schema.drift',
   'daemon.startup_failed',
   'daemon.heartbeat_failed',
+  // try/catch 밖에서 난 죽음. 이 둘이 없으면 daemon이 사라진 순간이 로그에 남지 않는다.
+  'daemon.uncaught_exception',
+  'daemon.unhandled_rejection',
   'logger.write_failed',
   'discovery.no_remote',
   'discovery.unsupported_remote',

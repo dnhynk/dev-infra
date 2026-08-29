@@ -174,7 +174,9 @@ type CollectedOptions = {
  * 숫자 줄이 딸려 오는 것은 "1..N이 빠짐없이 이어질 것"으로 막는다.
  */
 function collectOptions(rows: readonly string[], anchor: number): CollectedOptions | null {
-  const found: { row: number; index: number; label: string; selected: boolean }[] = [];
+  const found: {
+    row: number; index: number; label: string; selected: boolean; labelColumn: number;
+  }[] = [];
   let firstRow = -1;
   for (let i = anchor - 1; i >= 0; i -= 1) {
     const row = rows[i];
@@ -185,7 +187,11 @@ function collectOptions(rows: readonly string[], anchor: number): CollectedOptio
     if (!Number.isSafeInteger(index) || index < 1 || index > MAX_OPTIONS) return null;
     const label = collapse(match[4] ?? '');
     if (label === '' || label.length > LABEL_CAP) return null;
-    found.push({ row: i, index, label, selected: (match[2] ?? '') !== '' });
+    // label이 시작하는 열. 설명 줄은 이 열 이상으로 들여쓴 줄만 인정한다.
+    const labelColumn = row.length - (match[4] ?? '').length;
+    found.push({
+      row: i, index, label, selected: (match[2] ?? '') !== '', labelColumn,
+    });
     firstRow = i;
     if (index === 1) break;
   }
@@ -201,24 +207,37 @@ function collectOptions(rows: readonly string[], anchor: number): CollectedOptio
   const entries = found.map((option, position) => ({
     index: option.index,
     label: option.label,
-    description: readDescription(rows, option.row, found[position + 1]?.row ?? Number.NaN),
+    description: readDescription(
+      rows, option.row, found[position + 1]?.row ?? Number.NaN, option.labelColumn,
+    ),
     selected: option.selected,
   }));
   return { entries, firstRow, lastRow: found[found.length - 1]!.row };
 }
 
-/** 선택지 줄 다음부터 다음 선택지 줄 전까지의 들여쓴 줄을 설명으로 본다. */
+/**
+ * 선택지 줄 다음의 이어지는 설명.
+ *
+ * **label이 시작하는 열 이상으로 들여쓴 줄만 인정한다.** 이것이 없으면 마지막 선택지의 설명이
+ * 화면 아래쪽 내용을 전부 삼킨다. 실제로 카드에 `← orca-slack:` 줄이 마지막 선택지의 설명으로
+ * 실렸다 — 목록 다음에 오는 것이 전부 그 선택지의 설명은 아니다.
+ */
 function readDescription(
   rows: readonly string[],
   optionRow: number,
   nextOptionRow: number,
+  labelColumn: number,
 ): string | null {
   const end = Number.isSafeInteger(nextOptionRow) ? nextOptionRow : rows.length;
   const lines: string[] = [];
   for (let i = optionRow + 1; i < end; i += 1) {
     const row = rows[i];
-    if (row === undefined || row.trim() === '' || SEPARATOR.test(row)) continue;
+    if (row === undefined) break;
+    if (row.trim() === '' || SEPARATOR.test(row)) continue;
     if (ANCHOR.test(row)) break;
+    const indent = row.length - row.trimStart().length;
+    // 덜 들여쓴 줄에서 이 선택지의 설명은 끝난다.
+    if (indent < labelColumn) break;
     lines.push(row.trim());
   }
   if (lines.length === 0) return null;
