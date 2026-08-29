@@ -1384,6 +1384,8 @@ export async function runDaemonCommand(
     // Acquire the single fixed pipe before recovery or Slack ingress. A second daemon fails closed
     // here and cannot become either the Channel owner or an interactive consumer.
     channelServer = dependencies.channelServer ?? new ChannelPipeServer({ orca });
+    /** 코드별 연속 실패 수. 5초 재시도를 무제한으로 적으면 로그가 운영 이력을 밀어낸다. */
+    const channelFailureStreak = new Map<OperationalFailureCode, number>();
     channelDelivery = dependencies.createChannelDelivery?.(store, orca, channelServer) ??
       new GateChannelDeliveryEngine({
         store,
@@ -1397,17 +1399,27 @@ export async function runDaemonCommand(
         // coordinator", the second is "something is broken". The raw code carries an unbounded
         // suffix, so only these two fixed codes are persisted.
         onError: (code) => {
+          const persisted: OperationalFailureCode = code.startsWith('route_')
+            ? 'channel.route_unavailable'
+            : 'channel.delivery_failed';
+          // 재시도는 5초 주기라 무제한으로 적으면 로그가 실제 운영 이력을 밀어낸다. 실측에서
+          // 막힌 delivery 하나가 23분에 134줄을 냈고 파일이 5 MiB 회전 한계에 닿았다.
+          // 상태 owner와 같은 cadence로 접는다 — 처음, 10회, 60회, 이후 300회마다.
+          const streak = (channelFailureStreak.get(persisted) ?? 0) + 1;
+          channelFailureStreak.set(persisted, streak);
+          if (streak !== 1 && streak !== 10 && streak !== 60 && streak % 300 !== 0) return;
           void health?.event({
             level: 'warn',
             event: 'channel.delivery',
             outcome: 'failed',
-            errorCode: code.startsWith('route_')
-              ? 'channel.route_unavailable'
-              : 'channel.delivery_failed',
+            errorCode: persisted,
             retryable: true,
+            attempt: streak,
           }).catch(() => { /* reporting never fences delivery */ });
         },
         onTransition: (state, gateKey) => {
+          // 전이가 났다는 것은 그 delivery가 다시 움직였다는 뜻이다. 실패 streak을 접는다.
+          channelFailureStreak.clear();
           void health?.event({
             level: 'info',
             event: 'channel.delivery',
