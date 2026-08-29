@@ -62,13 +62,47 @@ export class TerminalPromptActionHandler {
     this.now = options.now ?? (() => new Date());
   }
 
+  /**
+   * **이 함수는 던지지 않는다.**
+   *
+   * 반환한 promise는 Socket transport로 그대로 올라간다. 여기서 reject하면 그 rejection을 받는
+   * 곳이 없어 daemon 프로세스가 죽는다. 사람이 폰에서 버튼 하나를 누른 것이 관측 전체를
+   * 멈추는 일이 되어서는 안 된다. Gate handler가 `ack_failed`를 outcome으로 두는 것과 같은
+   * 계약이고, 이 handler에는 그것이 빠져 있었다.
+   */
   async handle(event: SocketSlackEvent): Promise<void> {
-    const outcome = this.claim(event);
-    this.options.onOutcome?.(outcome);
+    let outcome: string;
+    try {
+      outcome = this.claim(event);
+    } catch {
+      outcome = 'claim_failed';
+    }
+    this.report(outcome);
     // ACK는 판정과 무관하게 한 번 한다. ACK하지 않으면 Slack이 같은 클릭을 재전송하고, 재전송은
     // 이미 확정된 선택을 다시 확정하려 한다.
-    await event.ack();
-    if (outcome === 'claimed') this.options.wake?.();
+    try {
+      await event.ack();
+    } catch {
+      // ACK가 실패해도 확정은 durable하게 남았다. Slack 재전송은 중복으로 판정된다.
+      this.report('ack_failed');
+      return;
+    }
+    if (outcome !== 'claimed') return;
+    try {
+      this.options.wake?.();
+    } catch {
+      // 다음 정기 pass가 같은 확정을 처리한다.
+      this.report('wake_failed');
+    }
+  }
+
+  /** 보고 자체가 handler를 깨뜨리지 않는다. */
+  private report(outcome: string): void {
+    try {
+      this.options.onOutcome?.(outcome);
+    } catch {
+      // 보고 실패는 클릭 처리와 무관하다.
+    }
   }
 
   private claim(event: SocketSlackEvent): string {

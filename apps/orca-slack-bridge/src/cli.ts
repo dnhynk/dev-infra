@@ -1985,7 +1985,17 @@ export async function runDaemonCommand(
           : isGateDirectInputEvent(event)
             ? directHandler
             : handler;
-        const task = consumer.handle(event).then(() => undefined).finally(() => inbound.delete(task));
+        /*
+         * ingress handler의 실패가 daemon을 죽이지 못하게 한다.
+         *
+         * 이 promise는 Socket transport로 올라간다. 여기서 reject를 흘리면 그것을 받는 곳이
+         * 없어 프로세스가 죽고, 관측 전체가 멈춘다. handler 각자가 던지지 않는 것이 계약이지만
+         * 계약을 어긴 handler 하나가 daemon을 내리는 구조를 남겨 두지 않는다.
+         */
+        const task = consumer.handle(event)
+          .then(() => undefined)
+          .catch(() => undefined)
+          .finally(() => inbound.delete(task));
         inbound.add(task);
         return task;
       },
@@ -2047,6 +2057,23 @@ export async function runDaemonCommand(
     return stopReason === 'pipe_failure' || observerDrainTimedOut || fatalOperationalFailure ? 1 : 0;
   } catch {
     commandFailed = true;
+    /*
+     * 크래시를 운영 로그에 남긴다.
+     *
+     * 이것이 없으면 daemon이 죽어도 로그에 아무 줄도 없다. 실측에서 daemon이 exit 1로 사라졌고,
+     * 마지막 줄은 성공한 job이었으며, stderr는 어디에도 수집되지 않아 원인을 남기지 않았다.
+     * 그 사이 사용자가 폰에서 누른 답은 처리되지 않은 채로 남아 있었다.
+     *
+     * 예외 본문은 싣지 않는다. 이 경로의 오류 문구에는 카드 내용과 사용자 결정이 들어갈 수
+     * 있다. 남기는 것은 "죽었다"는 사실이고, 그것만으로 운영자가 다음 행동을 정할 수 있다.
+     */
+    await health?.event({
+      level: 'error',
+      event: 'daemon.failed',
+      outcome: 'failed',
+      errorCode: 'daemon.startup_failed',
+      retryable: true,
+    }).catch(() => { /* 죽는 중이다. 보고 실패가 종료를 막지 않는다. */ });
     reportFailure();
     return 1;
   } finally {

@@ -163,6 +163,61 @@ describe('터미널 프롬프트 버튼 처리', () => {
     }
   });
 
+  it('ACK가 실패해도 던지지 않는다', async () => {
+    /*
+     * 이 promise는 Socket transport로 올라간다. 여기서 reject하면 받는 곳이 없어 daemon
+     * 프로세스가 죽고, 사람이 폰에서 버튼 하나를 누른 것이 관측 전체를 멈추는 일이 된다.
+     * Gate handler가 `ack_failed`를 outcome으로 두는 것과 같은 계약이다.
+     *
+     * 확정은 ACK보다 먼저 durable하게 남으므로, ACK 실패는 답변을 잃지 않는다.
+     */
+    const store = new SqliteDigestStore(path);
+    try {
+      const card = seed(store);
+      const button = buttonFromCard(card, 1);
+      const outcomes: string[] = [];
+      const handler = new TerminalPromptActionHandler({
+        config: CONFIG, store, now: () => new Date(AT),
+        onOutcome: (outcome) => outcomes.push(outcome),
+      });
+
+      await expect(handler.handle({
+        type: 'interactive',
+        body: clickPayload(button.actionId, button.value),
+        ack: () => { throw new Error('slack ack transport down'); },
+      })).resolves.toBeUndefined();
+
+      expect(outcomes).toEqual(['claimed', 'ack_failed']);
+      // 확정은 남는다. 다음 pass가 그 답을 보낸다.
+      expect(store.findActiveTerminalPrompt(HANDLE)).toMatchObject({
+        state: 'claimed', claimedOption: 1,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('보고와 깨우기가 던져도 클릭 처리를 깨뜨리지 않는다', async () => {
+    const store = new SqliteDigestStore(path);
+    try {
+      const card = seed(store);
+      const button = buttonFromCard(card, 2);
+      const handler = new TerminalPromptActionHandler({
+        config: CONFIG, store, now: () => new Date(AT),
+        onOutcome: () => { throw new Error('telemetry down'); },
+        wake: () => { throw new Error('supervisor down'); },
+      });
+      await expect(handler.handle({
+        type: 'interactive',
+        body: clickPayload(button.actionId, button.value),
+        ack: () => {},
+      })).resolves.toBeUndefined();
+      expect(store.findActiveTerminalPrompt(HANDLE)?.claimedOption).toBe(2);
+    } finally {
+      store.close();
+    }
+  });
+
   it('다른 워크스페이스의 클릭을 받지 않는다', async () => {
     const store = new SqliteDigestStore(path);
     try {
