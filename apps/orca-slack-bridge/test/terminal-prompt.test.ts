@@ -14,6 +14,10 @@ const LIVE_SCREEN: readonly string[] = JSON.parse(
   readFileSync(fileURLToPath(new URL('./fixtures/claude-code-option-prompt.json', import.meta.url)), 'utf8'),
 ) as string[];
 
+const SUBMIT_SCREEN: readonly string[] = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./fixtures/claude-code-submit-prompt.json', import.meta.url)), 'utf8'),
+) as string[];
+
 describe('agent 터미널 화면의 선택 프롬프트', () => {
   it('실제 Claude Code 화면에서 질문과 선택지를 읽는다', () => {
     const prompt = parseTerminalPrompt(LIVE_SCREEN);
@@ -70,8 +74,8 @@ describe('agent 터미널 화면의 선택 프롬프트', () => {
   });
 
   it('모양이 맞지 않으면 null이다', () => {
-    // anchor가 없다.
-    expect(parseTerminalPrompt(LIVE_SCREEN.slice(0, 37))).toBeNull();
+    // 선택지 목록이 잘려 1번이 화면에 없다.
+    expect(parseTerminalPrompt(LIVE_SCREEN.slice(28))).toBeNull();
     // 선택지가 하나뿐이다.
     expect(parseTerminalPrompt([
       '│ 질문',
@@ -98,6 +102,21 @@ describe('agent 터미널 화면의 선택 프롬프트', () => {
       '  2. 둘',
       'Enter to select · ↑/↓ to navigate',
     ])).toBeNull();
+  });
+
+  it('안내 문구가 없는 제출 확인 화면도 읽는다', () => {
+    /*
+     * 여러 질문에 답한 뒤 나오는 제출 확인 화면에는 `Enter to select …` 줄이 없다. 목록과
+     * 커서만 있다. 그 화면을 못 읽으면 사람은 마지막 한 번을 터미널에서 눌러야 하는데,
+     * 그럴 수 있었으면 이 기능이 필요 없다. 실제로 그렇게 막혔다.
+     */
+    const prompt = parseTerminalPrompt(SUBMIT_SCREEN);
+    if (prompt === null) throw new Error('제출 확인 화면을 읽지 못했다');
+    expect(prompt.question).toBe('Ready to submit your answers?');
+    expect(prompt.options.map((option) => option.label)).toEqual(['Submit answers', 'Cancel']);
+    expect(prompt.cursorIndex).toBe(1);
+    // 이전 질문과 답이 질문으로 딸려 들어오지 않는다.
+    expect(prompt.question).not.toContain('두 번째 기기');
   });
 
   it('프롬프트가 떠 있으면 선택지를 읽지 못해도 그 사실을 구분한다', () => {

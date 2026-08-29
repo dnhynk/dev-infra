@@ -82,14 +82,23 @@ function collapse(value: string): string {
  * 만들지 않고 지금까지의 badge 경로를 그대로 쓴다.
  */
 export function parseTerminalPrompt(rows: readonly string[]): TerminalPrompt | null {
-  const anchor = lastAnchor(rows);
-  if (anchor === null) return null;
-
-  const options = collectOptions(rows, anchor);
+  /*
+   * 기준은 선택지 목록이지 화면의 안내 문구가 아니다.
+   *
+   * 처음에는 `Enter to select …` 푸터를 필수로 봤는데, 그 줄이 없는 선택 화면이 실제로 있다.
+   * 여러 질문에 답한 뒤 나오는 제출 확인 화면이 그렇다 — 목록과 커서는 있고 푸터는 없다.
+   * 그 화면을 못 읽으면 사람은 마지막 한 번을 터미널에서 눌러야 하는데, 그럴 수 있었으면
+   * 이 기능이 필요 없다.
+   *
+   * 그래서 판정은 목록의 모양에 건다: `❯ <n>.` 커서가 정확히 하나이고 번호가 1..N으로
+   * 이어질 것. 푸터는 있으면 영역에 포함하고 없으면 넘어간다.
+   */
+  const options = collectOptions(rows, rows.length);
   if (options === null) return null;
 
+  const anchor = anchorBelow(rows, options.lastRow);
   const start = questionStart(rows, options.firstRow);
-  const regionRows = rows.slice(start, anchor + 1);
+  const regionRows = rows.slice(start, (anchor ?? options.lastRow) + 1);
   if (regionRows.length === 0) return null;
 
   const { title, question } = readQuestion(rows.slice(start, options.firstRow));
@@ -130,21 +139,32 @@ function fingerprintOf(regionRows: readonly string[]): string {
  * 그대로 막혀 있었다.
  */
 export function hasPromptAnchor(rows: readonly string[]): boolean {
-  return lastAnchor(rows) !== null;
+  if (anyAnchor(rows)) return true;
+  // 푸터가 없는 화면도 있다. 커서가 붙은 번호 줄이 보이면 무엇인가 고르기를 기다리는 중이다.
+  return rows.some((row) => /^\s*❯\s*\d{1,2}\.\s+\S/.test(row));
 }
 
-/** 화면에 여러 번 나올 수 있으므로 가장 아래 것을 현재 프롬프트로 본다. */
-function lastAnchor(rows: readonly string[]): number | null {
-  for (let i = rows.length - 1; i >= 0; i -= 1) {
+/** 목록 바로 아래의 안내 문구. 없으면 null이고, 없는 화면도 정상이다. */
+function anchorBelow(rows: readonly string[], lastOptionRow: number): number | null {
+  for (let i = lastOptionRow + 1; i < rows.length; i += 1) {
     const row = rows[i];
-    if (row !== undefined && ANCHOR.test(row) && NAVIGATE.test(row)) return i;
+    if (row === undefined) continue;
+    if (ANCHOR.test(row) && NAVIGATE.test(row)) return i;
+    // 안내 문구는 목록 바로 뒤에 온다. 빈 줄과 구분선만 사이에 허용한다.
+    if (row.trim() !== '' && !SEPARATOR.test(row)) return null;
   }
   return null;
+}
+
+/** 화면에 선택 프롬프트가 떠 있는가. 선택지를 읽을 수 있는지와는 다른 질문이다. */
+function anyAnchor(rows: readonly string[]): boolean {
+  return rows.some((row) => ANCHOR.test(row) && NAVIGATE.test(row));
 }
 
 type CollectedOptions = {
   readonly entries: readonly TerminalPromptOption[];
   readonly firstRow: number;
+  readonly lastRow: number;
 };
 
 /**
@@ -184,7 +204,7 @@ function collectOptions(rows: readonly string[], anchor: number): CollectedOptio
     description: readDescription(rows, option.row, found[position + 1]?.row ?? Number.NaN),
     selected: option.selected,
   }));
-  return { entries, firstRow };
+  return { entries, firstRow, lastRow: found[found.length - 1]!.row };
 }
 
 /** 선택지 줄 다음부터 다음 선택지 줄 전까지의 들여쓴 줄을 설명으로 본다. */
@@ -209,11 +229,15 @@ function readDescription(
 /** 첫 선택지 위쪽에서 질문 블록이 시작하는 행. 구분선이나 다른 내용에서 멈춘다. */
 function questionStart(rows: readonly string[], firstOptionRow: number): number {
   let start = firstOptionRow;
+  let sawStructured = false;
   for (let i = firstOptionRow - 1; i >= 0; i -= 1) {
     const row = rows[i];
     if (row === undefined) break;
     if (row.trim() === '') { start = i; continue; }
-    if (QUESTION_LINE.test(row) || TITLE_LINE.test(row)) { start = i; continue; }
+    if (QUESTION_LINE.test(row) || TITLE_LINE.test(row)) { start = i; sawStructured = true; continue; }
+    // `│` 형식이 없는 화면에서는 목록 바로 위 한 줄까지만 가져온다. 더 올라가면 이전 대화가
+    // 질문으로 딸려 들어온다.
+    if (!sawStructured && !SEPARATOR.test(row)) { start = i; }
     break;
   }
   return start;
@@ -231,7 +255,16 @@ function readQuestion(block: readonly string[]): { title: string | null; questio
     const questionMatch = QUESTION_LINE.exec(row);
     if (questionMatch !== null) lines.push(questionMatch[1] ?? '');
   }
-  return { title, question: collapse(lines.join(' ')).slice(0, QUESTION_CAP) };
+  if (lines.length > 0) {
+    return { title, question: collapse(lines.join(' ')).slice(0, QUESTION_CAP) };
+  }
+  // `│` 형식이 없는 화면이 있다. 그때는 목록 바로 위의 마지막 문장이 질문이다.
+  for (let i = block.length - 1; i >= 0; i -= 1) {
+    const row = block[i];
+    if (row === undefined || row.trim() === '' || SEPARATOR.test(row)) continue;
+    return { title, question: collapse(row).slice(0, QUESTION_CAP) };
+  }
+  return { title, question: '' };
 }
 
 /**
