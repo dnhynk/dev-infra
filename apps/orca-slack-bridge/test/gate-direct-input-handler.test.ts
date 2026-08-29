@@ -81,6 +81,7 @@ function seed(
     runKey: RUN,
     taskKey: TASK,
     dispatchKey: dispatchKey('ctx_direct'),
+    source: 'registered',
     askMessageId: 'msg_direct',
     questionThreadId: 'thread_direct',
     options: [

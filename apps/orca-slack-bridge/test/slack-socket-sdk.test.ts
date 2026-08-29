@@ -336,6 +336,7 @@ describe('@slack/socket-mode 3.0.0 lifecycle fence', () => {
       runKey: run,
       taskKey: task,
       dispatchKey: dispatchKey('ctx_sdk_direct'),
+      source: 'registered',
       askMessageId: 'msg_sdk_direct',
       questionThreadId: 'thread_sdk_direct',
       options: [{

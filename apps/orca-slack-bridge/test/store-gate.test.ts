@@ -159,6 +159,7 @@ function metadata(over: Partial<GateMetadata> = {}): GateMetadata {
     runKey: RUN,
     taskKey: TASK,
     dispatchKey: dispatchKey('ctx_gate'),
+    source: 'registered',
     askMessageId: 'msg_gate',
     questionThreadId: 'msg_gate',
     options: [
@@ -179,7 +180,7 @@ describe('schema v6 → current', () => {
     const fresh = join(dir, 'fresh', 'state.db');
     new SqliteDigestStore(fresh).close();
 
-    expect(SCHEMA_VERSION).toBe(13);
+    expect(SCHEMA_VERSION).toBe(14);
     expect(gateMasterShape(dbPath)).toEqual(gateMasterShape(fresh));
     expect(schemaShape(dbPath)).toEqual(schemaShape(fresh));
     expect(schemaShape(dbPath).map(({ table }) => table)).toContain('gate_metadata');
@@ -200,7 +201,7 @@ describe('schema v6 → current', () => {
     store.close();
 
     const db = new DatabaseSync(dbPath);
-    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 13 });
+    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 14 });
     db.close();
   });
 

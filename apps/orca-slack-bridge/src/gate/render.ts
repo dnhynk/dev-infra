@@ -135,9 +135,9 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
     gate.metadataState === 'matched' &&
     gate.correlation !== null &&
     gate.options.length > 0 &&
-    gate.options.every(
-      (option) => option.id !== null && option.description !== null && option.resolution !== null,
-    );
+    // 설명은 카드를 읽는 데 쓰이지 누르는 데 쓰이지 않는다. 파생 행에는 설명이 없으므로
+    // 여기서 요구하면 등록을 빠뜨린 Gate가 다시 누를 수 없는 카드가 된다.
+    gate.options.every((option) => option.id !== null && option.resolution !== null);
   if (actionable) {
     blocks.push({
       type: 'actions',

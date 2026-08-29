@@ -91,6 +91,7 @@
 | OD-080 | 등록 Run이 0인 구간에서도 미등록 사실이 도달할 게시 표면 | D1 전 | DECIDED |
 | OD-081 | custom channel plugin을 세션 확인 없이 켜는 배포 경로 | D3 재수용 전 | DECIDED |
 | OD-082 | daemon digest가 summarizer를 부를지 | O1 운영 전 | DECIDED |
+| OD-083 | sidecar 없는 Gate를 Slack에서 해결할 수 있는지 | D3 운영 전 | DECIDED |
 
 ## Gate와 Channel
 
@@ -1354,6 +1355,35 @@ ID: OD-082
 영향 문서/파일: apps/orca-slack-bridge/src/cli.ts, docs/architecture/orca-slack-bridge.md
 검증 방법: 운영 daemon이 새 요약을 생성하고, 사실이 그대로인 다음 주기에는 provider를 부르지 않는 것을
       `digest` 보고의 재사용 표시로 확인한다.
+결정일: 2026-08-29
+```
+
+```text
+ID: OD-083
+상태: DECIDED
+결정: sidecar가 등록되지 않은 Gate는 관측이 Orca `options`만으로 파생 metadata 행을 만들어
+      durable하게 남긴다. 파생 행은 `gate_metadata.source='derived'`로 구분하고, option ID는
+      label에서 결정하며 resolution은 label 그대로다. 설명·recommendation·impact는 없다.
+      나중에 도착한 `gate-register`가 파생 행을 대체한다.
+근거:
+  - 제품 목적이 "사용자가 이동 중에 Slack만으로 blocking 결정을 해결한다"다. `gate-create`만 하고
+    등록을 빠뜨리면 카드에 선택지 버튼도 직접 입력 버튼도 없어(`render.ts`의 `actionable`/
+    `directActionable`) 그 Gate는 Slack에서 해결할 수 없다. coordinator가 한 번 빠뜨리는 것으로
+    무인 루프가 멈추는 실패 모드를 남기지 않는다.
+  - 버튼만 그리는 것으로는 부족하다. 클릭 검증(`claimGateResolution`)이 durable metadata 행과
+    `metadataState='matched'`를 요구하므로, 렌더 시점 합성은 눌렀을 때 `sidecar_not_matched`로
+    거부된다. 그래서 행을 실제로 남긴다.
+  - Orca에는 Gate를 수정하는 명령이 없어 label이 불변이다. 그래서 label에서 정한 option ID가
+    같은 Gate를 다시 관측해도 같다.
+  - OD-050은 그대로다. sidecar가 있으면 그것이 권위이고, 파생은 등록을 빠뜨렸을 때의 대체물이다.
+    등록이 파생을 대체하는 방향만 있고 반대는 없다.
+한계: `options`를 읽지 못했거나 label이 등록 문서와 같은 75자 상한을 넘으면 파생하지 않는다.
+      자르면 Orca에 쓰는 resolution이 사용자가 고른 원문과 달라지기 때문이다. 그 Gate는 지금처럼
+      누를 수 없는 카드로 남는다.
+영향 문서/파일: apps/orca-slack-bridge/src/gate/derive.ts, src/gate/project.ts, src/gate/render.ts,
+      src/gate/register.ts, src/run/collect.ts, src/store/schema.ts(v14), src/store/sqlite.ts
+검증 방법: sidecar 없는 Gate가 버튼 있는 카드로 뜨고, 그 버튼으로 Orca Gate가 resolved 되는 것을
+      관측한다. 이어서 같은 Gate에 `gate-register`를 하면 설명과 권장안이 붙은 카드로 바뀐다.
 결정일: 2026-08-29
 ```
 

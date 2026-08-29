@@ -64,6 +64,7 @@ function resolveD2(store: SqliteDigestStore): void {
     runKey: RUN,
     taskKey: TASK,
     dispatchKey: dispatchKey('ctx_delivery'),
+    source: 'registered',
     askMessageId: 'msg_delivery',
     questionThreadId: 'thread_delivery',
     options: [
@@ -160,6 +161,7 @@ function resolveAdditionalD2(
     ...before, status: 'resolved', resolution: '현행 유지', resolvedAt: RESOLVED_AT,
   };
   store.insertGateMetadata({
+    source: 'registered',
     gateKey: gate, runKey: RUN, taskKey: task, dispatchKey: dispatchKey(input.dispatchId),
     askMessageId: `msg_${input.messageSuffix}`,
     questionThreadId: `thread_${input.messageSuffix}`,

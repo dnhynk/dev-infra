@@ -352,6 +352,7 @@ function seedStatefulResolvedGate(path: string): void {
       runKey: STATEFUL_RUN_KEY,
       taskKey: STATEFUL_TASK_KEY,
       dispatchKey: dispatchKey(STATEFUL_SOURCE_DISPATCH_ID),
+      source: 'registered',
       askMessageId: 'msg_d3_stateful',
       questionThreadId: 'thread_d3_stateful',
       options: [

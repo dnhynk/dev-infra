@@ -42,6 +42,7 @@ function seed(store: SqliteDigestStore, over: {
   readonly mappingState?: 'matched' | 'missing' | 'mismatched';
 } = {}): void {
   store.insertGateMetadata({
+    source: 'registered',
     gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_action'),
     askMessageId: 'msg_action', questionThreadId: 'thread_action',
     options: [
@@ -709,6 +710,7 @@ describe('fixed-option Slack Gate action boundary', () => {
 
     const missingObservation = new SqliteDigestStore(join(dir, 'missing-observation.db'));
     missingObservation.insertGateMetadata({
+      source: 'registered',
       gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_action'),
       askMessageId: 'msg_action', questionThreadId: 'thread_action',
       options: [{ id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' }],

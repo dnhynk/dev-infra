@@ -152,6 +152,12 @@ LLM structured output은 다음 네 필드뿐이다.
 }
 ```
 
+위 예시가 요구 문체다. 요약은 **번역이지 발췌가 아니다.** 내부 용어와 약어를 그대로 옮기거나 파일
+경로·함수명·테이블명을 나열하면 실패다. 읽는 사람은 코드도 저장소도 보고 있지 않으므로, 어디를
+고쳤는지가 아니라 무엇이 전과 다르게 동작하는지를 써야 한다. 이 문체 요구는 `SYSTEM_PROMPT`가
+강제하고, 요구가 바뀌면 `SUMMARY_CONTRACT_REVISION`을 올린다. 그 값은 `factsFingerprint`에 들어가므로
+이미 요약한 PR도 새 계약으로 한 번 다시 요약된다. 이것이 없으면 프롬프트를 고쳐도 옛 요약이 남는다.
+
 `status`는 관찰한 PR·Orca 사실에서 코드가 파생하고, `risk`는 `reviewer_result.findings[].severity`를 코드가 집계해 파생한다. 모델에 두 판정을 맡기지 않는다. provider는 OpenAI API, 기본 모델은 설정으로 교체 가능한 `gpt-5.6-luna`, 출력 언어는 한국어다. 출력은 strict JSON Schema로 검증하며 검증 실패는 한 번 재시도하고, 재시도도 실패하면 요약 없이 사실만 담은 축소 카드를 만들고 "요약 실패"를 표시한다(OD-034~037, DL-026~027).
 
 Renderer는 다음을 보장해야 한다.
@@ -228,6 +234,12 @@ coordinator가 코드와 문서만으로 결정할 수 없는 사항을 Orca Gat
 Orca Gate의 `question`과 `options`에는 사람이 읽는 짧은 요약만 둔다. 안정적 option ID, 설명,
 recommendation, impact는 Bridge sidecar에 저장하고 Gate ID로 연결한다. button·modal의 기계 판정은 이
 metadata를 사용하며 question/options 자유 텍스트를 parsing하지 않는다(OD-050).
+
+sidecar가 등록되지 않은 Gate는 관측이 Orca `options`만으로 파생 행을 만들어 durable하게 남긴다
+(`source='derived'`). 파생 행의 option ID는 label에서 결정되고 resolution은 label 그대로이며
+설명·recommendation·impact는 없다. 카드는 그만큼 얇지만 누를 수 있다. 나중에 들어온 `gate-register`가
+파생 행을 대체한다. `options`를 읽지 못했거나 label이 75자 상한을 넘으면 파생하지 않고, 그 Gate는
+누를 수 없는 카드로 남는다(OD-083).
 
 ask를 사람용 Gate로 승격할 때 Bridge는 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}`를
 durable하게 저장하고 이를 권위 correlation으로 쓴다. Gate question은 표시용이며 correlation source가 아니다(OD-019).

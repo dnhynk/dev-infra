@@ -121,6 +121,7 @@ afterEach(() => {
 function seed(): void {
   const store = new SqliteDigestStore(statePath);
   store.insertGateMetadata({
+    source: 'registered',
     gateKey: GATE, runKey: runKey(RUN_ID), taskKey: taskKey(TASK_ID),
     dispatchKey: dispatchKey('ctx_daemon'), askMessageId: 'msg_daemon',
     questionThreadId: 'thread_daemon',

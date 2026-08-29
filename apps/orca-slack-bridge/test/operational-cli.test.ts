@@ -81,7 +81,7 @@ describe('status/logs CLI wiring', () => {
   it('runs logs without loading config and outputs only reserialized safe records', async () => {
     const safe = {
       ts: '2026-08-26T00:00:00.000Z', level: 'info', service: 'orca-slack-bridge',
-      schemaVersion: 13, build: 'a'.repeat(12), event: 'job.succeeded',
+      schemaVersion: 14, build: 'a'.repeat(12), event: 'job.succeeded',
       job: 'pr-digest', outcome: 'succeeded', attempt: 1,
     };
     const rawSecret = 'SENTINEL_RAW_BODY';

@@ -74,7 +74,7 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -298,7 +298,21 @@ CREATE TABLE run_collection_message (
  * Coordinator가 등록한 ask↔Gate mapping과 option metadata. Orca 원문을 복제해 대체하지 않고,
  * Gate ID에 없는 안정적 option identity/recommendation/impact만 보존한다(DL-040).
  */
-const GATE_METADATA_TABLE = `
+/**
+ * v14가 붙인 한 컬럼. 등록하지 않은 Gate도 Slack에서 누를 수 있게 하려면 관측이 파생 행을
+ * 남겨야 하고, 그 행을 등록된 행과 구분할 자리가 필요하다. 기존 행은 전부 `gate-register`가
+ * 쓴 것이므로 기본값이 그대로 맞다.
+ *
+ * `recommendation_option_id`/`recommendation_reason`/`impact`는 파생 행에서 의미가 없지만
+ * NOT NULL로 남는다. NOT NULL을 nullable로 바꾸는 것은 파괴적 변경이라 MIGRATIONS가 다루지
+ * 않는다. 파생 행은 그 자리를 빈 문자열로 두고, 읽는 쪽(sqlite.ts의 toGateMetadata)이
+ * source를 보고 null로 노출한다.
+ */
+const GATE_METADATA_SOURCE_COLUMN =
+  "source TEXT NOT NULL DEFAULT 'registered' CHECK (source IN ('registered','derived'))";
+
+/** v14 이전에 배포된 정확한 table DDL. 여기 있는 파일은 이 문자열로 만들어졌다. */
+const GATE_METADATA_V13_TABLE = `
 CREATE TABLE gate_metadata (
   gate_key                 TEXT PRIMARY KEY,
   run_key                  TEXT NOT NULL,
@@ -312,6 +326,16 @@ CREATE TABLE gate_metadata (
   impact                    TEXT NOT NULL,
   registered_at             TEXT NOT NULL
 )`;
+
+/**
+ * `ALTER TABLE ... ADD COLUMN`이 v13 DDL에 남기는 정확한 결과. 손으로 옮겨 적으면 새로 만든
+ * 파일과 올린 파일의 persisted DDL이 갈라져 `validateCurrentGateStore`가 둘 중 하나를 거부한다.
+ * 그래서 새 shape을 옛 shape에서 파생시켜 두 경로가 구조적으로 같아지게 한다.
+ */
+const GATE_METADATA_TABLE = GATE_METADATA_V13_TABLE.replace(
+  /\n\)$/,
+  `\n, ${GATE_METADATA_SOURCE_COLUMN})`,
+);
 
 /** 같은 Run의 metadata를 Gate key 순서로 읽는 production projector용 index. */
 const GATE_METADATA_RUN_INDEX = `
@@ -807,7 +831,7 @@ export const OPERATIONAL_V13_SCHEMA_OBJECTS: Readonly<Record<string, string>> = 
 
 /** Exact code-owned v8 objects. Startup compares normalized sqlite_master SQL fail-closed. */
 export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
-  gate_metadata: GATE_METADATA_TABLE,
+  gate_metadata: GATE_METADATA_V13_TABLE,
   gate_metadata_run_key: GATE_METADATA_RUN_INDEX,
   gate_message: GATE_MESSAGE_TABLE,
   gate_message_slack_identity: GATE_MESSAGE_INDEX,
@@ -846,6 +870,12 @@ export const GATE_V12_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_channel_delivery: GATE_CHANNEL_DELIVERY_TABLE,
   gate_resume_observation: GATE_RESUME_OBSERVATION_TABLE,
   gate_resume_observation_due: GATE_RESUME_OBSERVATION_DUE_INDEX,
+};
+
+/** v14 adds only the derived/registered sidecar distinction; 다른 Gate 의미는 그대로다. */
+export const GATE_V14_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  // Override the deployed v13 table in the merged current-object map after ALTER ADD COLUMN.
+  gate_metadata: GATE_METADATA_TABLE,
 };
 
 /**
@@ -977,7 +1007,7 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   [RUN_COLLECTION_MESSAGE_TABLE],
   // v6 → v7: sidecar producer와 정적 Gate thread consumer가 즉시 쓰는 두 표만 붙인다(D2-A).
   // 기존 PR/Run/collection 행은 건드리지 않고, 과거 Gate metadata나 Slack reply를 추측해 채우지 않는다.
-  [GATE_METADATA_TABLE, GATE_METADATA_RUN_INDEX, GATE_MESSAGE_TABLE, GATE_MESSAGE_INDEX],
+  [GATE_METADATA_V13_TABLE, GATE_METADATA_RUN_INDEX, GATE_MESSAGE_TABLE, GATE_MESSAGE_INDEX],
   // v7 → v8: one immutable Gate-local winner, exact observations, bounded append-only evidence,
   // and replayable D2 card/notification projection. No existing row is inferred or rewritten.
   [
@@ -1027,6 +1057,10 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     SLACK_ROOT_INTENT_STATE_INDEX,
     SLACK_ROOT_INTENT_SLACK_INDEX,
   ],
+  // v13 → v14: sidecar를 등록하지 않은 Gate도 Slack에서 누를 수 있도록, 관측이 Orca
+  // options만으로 채운 파생 행을 구분한다. 기존 행은 모두 `gate-register`가 쓴 것이므로
+  // 기본값 'registered'가 그대로 맞다.
+  [`ALTER TABLE gate_metadata ADD COLUMN ${GATE_METADATA_SOURCE_COLUMN}`],
 ];
 
 /**

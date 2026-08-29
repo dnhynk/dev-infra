@@ -7,6 +7,7 @@ import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { SCHEMA_VERSION } from '../src/store/schema.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
+import { downgradeGateMetadataToV13 } from './fixtures/schema-downgrade.js';
 
 const GATE = gateKey('gate_d2c');
 const RUN = runKey('run_d2c');
@@ -53,6 +54,7 @@ function insertMetadata(store: SqliteDigestStore): void {
     runKey: RUN,
     taskKey: TASK,
     dispatchKey: dispatchKey('ctx_d2c'),
+    source: 'registered',
     askMessageId: 'msg_d2c',
     questionThreadId: 'thread_d2c',
     options: [
@@ -122,6 +124,7 @@ describe('strict persisted Gate schema', () => {
       DROP TABLE orca_repository_binding;
       DROP TABLE repository_registry;
     `);
+    downgradeGateMetadataToV13(raw);
     raw.prepare('UPDATE schema_version SET version = 7 WHERE id = 1').run();
     raw.close();
 
@@ -130,8 +133,8 @@ describe('strict persisted Gate schema', () => {
     const tables = (migrated.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'gate_resolution%' ORDER BY name",
     ).all() as { readonly name: string }[]).map((row) => row.name);
-    expect(SCHEMA_VERSION).toBe(13);
-    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 13 });
+    expect(SCHEMA_VERSION).toBe(14);
+    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 14 });
     expect(tables).toEqual([
       'gate_resolution',
       'gate_resolution_attempt',
@@ -156,6 +159,7 @@ describe('strict persisted Gate schema', () => {
        DROP TABLE repository_discovery_issue; DROP TABLE orca_repository_binding;
        DROP TABLE repository_registry`,
     );
+    downgradeGateMetadataToV13(raw);
     raw.prepare('UPDATE schema_version SET version = 8 WHERE id = 1').run();
     raw.close();
 
@@ -460,6 +464,7 @@ describe('strict persisted Gate schema', () => {
       runKey: RUN,
       taskKey: TASK,
       dispatchKey: dispatchKey('ctx_d2c'),
+      source: 'registered',
       askMessageId: 'msg_d2c',
       questionThreadId: 'thread_d2c',
       options: [

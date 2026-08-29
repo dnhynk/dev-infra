@@ -33,6 +33,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 function seed(path: string): SqliteDigestStore {
   const store = new SqliteDigestStore(path);
   store.insertGateMetadata({
+    source: 'registered',
     gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_resolve'),
     askMessageId: 'msg_resolve', questionThreadId: 'thread_resolve',
     options: [
@@ -1059,6 +1060,7 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
       observationOwnerAlive: () => true,
     });
     ordinary.insertGateMetadata({
+      source: 'registered',
       gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_resolve'),
       askMessageId: 'msg_resolve', questionThreadId: 'thread_resolve',
       options: [
@@ -1261,6 +1263,7 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
       observationOwnerAlive: () => true,
     });
     staleOwner.insertGateMetadata({
+      source: 'registered',
       gateKey: GATE, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_resolve'),
       askMessageId: 'msg_resolve', questionThreadId: 'thread_resolve',
       options: [
@@ -1545,6 +1548,7 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     const laterGate = gateKey('z_later');
     const laterMessageTs = '1787554800.000003';
     firstStore.insertGateMetadata({
+      source: 'registered',
       gateKey: laterGate, runKey: RUN, taskKey: TASK, dispatchKey: dispatchKey('ctx_later'),
       askMessageId: 'msg_later', questionThreadId: 'thread_later',
       options: [{ id: 'keep', label: '현행 유지', description: '호환성', resolution: '현행 유지' }],

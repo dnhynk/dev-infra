@@ -69,6 +69,7 @@ import {
   GATE_V10_SCHEMA_OBJECTS,
   GATE_V11_SCHEMA_OBJECTS,
   GATE_V12_SCHEMA_OBJECTS,
+  GATE_V14_SCHEMA_OBJECTS,
   MIGRATIONS,
   OPERATIONAL_V13_SCHEMA_OBJECTS,
   SCHEMA_DDL,
@@ -387,20 +388,23 @@ UPDATE run_collection_message SET render_fingerprint = ?, updated_at = ? WHERE i
 
 const SELECT_GATE_METADATA = `
 SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-       options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+       options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+       source
   FROM gate_metadata WHERE gate_key = ?`;
 
 const SELECT_RUN_GATE_METADATA = `
 SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-       options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+       options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+       source
   FROM gate_metadata WHERE run_key = ?
  ORDER BY gate_key`;
 
 const INSERT_GATE_METADATA = `
 INSERT INTO gate_metadata
   (gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-   options_json, recommendation_option_id, recommendation_reason, impact, registered_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+   options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+   source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 const SELECT_GATE_MESSAGE = `
 SELECT gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint,
@@ -833,6 +837,7 @@ type GateMetadataRow = {
   readonly recommendation_reason: string;
   readonly impact: string;
   readonly registered_at: string;
+  readonly source: string;
 };
 
 type GateMessageRow = {
@@ -2133,8 +2138,13 @@ function toGateMetadata(row: GateMetadataRow): GateMetadata {
       { cause: e },
     );
   }
-  const options = parseGateOptionMetadataArray(parsed, `${row.gate_key}.options_json`);
-  if (!options.some((option) => option.id === row.recommendation_option_id)) {
+  const options = parseGateOptionMetadataArray(parsed, `${row.gate_key}.options_json`, true);
+  if (row.source !== 'registered' && row.source !== 'derived') {
+    throw new TypeError(`${row.gate_key}의 gate_metadata.source가 알 수 없는 값이다: ${row.source}`);
+  }
+  const derived = row.source === 'derived';
+  // 파생 행에는 권장안이 없다. 등록 행에서만 recommendation identity를 강제한다.
+  if (!derived && !options.some((option) => option.id === row.recommendation_option_id)) {
     throw new TypeError(
       `${row.gate_key}의 recommendation_option_id가 options_json에 없다: ${row.recommendation_option_id}`,
     );
@@ -2151,11 +2161,18 @@ function toGateMetadata(row: GateMetadataRow): GateMetadata {
     askMessageId: storedText(row.ask_message_id, `${row.gate_key}.ask_message_id`),
     questionThreadId: storedText(row.question_thread_id, `${row.gate_key}.question_thread_id`),
     options,
-    recommendation: {
-      optionId: row.recommendation_option_id,
-      reason: storedText(row.recommendation_reason, `${row.gate_key}.recommendation_reason`, 3000),
-    },
-    impact: storedText(row.impact, `${row.gate_key}.impact`, 3000),
+    source: derived ? 'derived' : 'registered',
+    recommendation: derived
+      ? null
+      : {
+          optionId: row.recommendation_option_id,
+          reason: storedText(
+            row.recommendation_reason,
+            `${row.gate_key}.recommendation_reason`,
+            3000,
+          ),
+        },
+    impact: derived ? null : storedText(row.impact, `${row.gate_key}.impact`, 3000),
     registeredAt: storedIso(row.registered_at, `${row.gate_key}.registered_at`),
   };
 }
@@ -2652,6 +2669,12 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   insertGateMetadata(metadata: GateMetadata): void {
     const optionsJson = JSON.stringify(metadata.options);
+    // 파생 행에는 권장안과 영향이 없다. 컬럼은 NOT NULL이므로 빈 문자열로 남기고, 읽는 쪽이
+    // `source`를 보고 null로 노출한다. 빈 문자열은 option ID 형식과 겹치지 않아 실제 값과
+    // 혼동되지 않는다.
+    const recommendationOptionId = metadata.recommendation?.optionId ?? '';
+    const recommendationReason = metadata.recommendation?.reason ?? '';
+    const impact = metadata.impact ?? '';
     toGateMetadata({
       gate_key: metadata.gateKey,
       run_key: metadata.runKey,
@@ -2660,13 +2683,21 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       ask_message_id: metadata.askMessageId,
       question_thread_id: metadata.questionThreadId,
       options_json: optionsJson,
-      recommendation_option_id: metadata.recommendation.optionId,
-      recommendation_reason: metadata.recommendation.reason,
-      impact: metadata.impact,
+      recommendation_option_id: recommendationOptionId,
+      recommendation_reason: recommendationReason,
+      impact,
       registered_at: metadata.registeredAt,
+      source: metadata.source,
     });
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      // 관측이 만든 파생 행은 등록을 막지 않는다. coordinator가 뒤늦게 `gate-register`를 해도
+      // 그때 더 나은 카드로 바뀌어야 한다. 등록된 행은 여기서 지우지 않으므로 덮어쓰기가 아니다.
+      if (metadata.source === 'registered') {
+        this.db.prepare(
+          "DELETE FROM gate_metadata WHERE gate_key = ? AND source = 'derived'",
+        ).run(metadata.gateKey);
+      }
       this.db
         .prepare(INSERT_GATE_METADATA)
         .run(
@@ -2677,10 +2708,11 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           metadata.askMessageId,
           metadata.questionThreadId,
           optionsJson,
-          metadata.recommendation.optionId,
-          metadata.recommendation.reason,
-          metadata.impact,
+          recommendationOptionId,
+          recommendationReason,
+          impact,
           metadata.registeredAt,
+          metadata.source,
         );
       const observation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(metadata.gateKey) as
         | GateLocalObservationRow
@@ -7039,7 +7071,7 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   gate_metadata: [
     'gate_key', 'run_key', 'task_key', 'dispatch_key', 'ask_message_id',
     'question_thread_id', 'options_json', 'recommendation_option_id',
-    'recommendation_reason', 'impact', 'registered_at',
+    'recommendation_reason', 'impact', 'registered_at', 'source',
   ],
   gate_message: [
     'gate_key', 'run_key', 'channel_id', 'thread_ts', 'message_ts',
@@ -7236,6 +7268,7 @@ function validateCurrentGateStore(
     ...GATE_V10_SCHEMA_OBJECTS,
     ...GATE_V11_SCHEMA_OBJECTS,
     ...GATE_V12_SCHEMA_OBJECTS,
+    ...GATE_V14_SCHEMA_OBJECTS,
   };
   for (const [name, expected] of Object.entries(gateSchemaObjects)) {
     const row = db.prepare(
@@ -7272,7 +7305,8 @@ function validateCurrentGateStore(
   }
   const metadatas = (db.prepare(
     `SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-            options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+            options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+            source
        FROM gate_metadata ORDER BY gate_key`,
   ).all() as GateMetadataRow[]).map(toGateMetadata);
   const messages = (db.prepare(

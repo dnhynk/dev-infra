@@ -53,6 +53,7 @@ function metadata(over: Partial<GateMetadata> = {}): GateMetadata {
     runKey: runKey(RUN_ID),
     taskKey: taskKey(GATE_TASK),
     dispatchKey: dispatchKey('ctx_gate'),
+    source: 'registered',
     askMessageId: 'msg_ask',
     questionThreadId: 'thread_question',
     options: [
