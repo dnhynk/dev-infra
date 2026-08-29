@@ -98,6 +98,36 @@ describe('parseOrcaRepositoryList', () => {
     expect(got.diagnostics).toEqual([{ rowIndex: 0, code: 'no_remote', effect: 'row_blocked' }]);
   });
 
+  it('accepts an Orca canonicalKey that differs only by case', () => {
+    // Orca preserves the repository's original case; the Bridge canonical key is lowercased by
+    // contract. Comparing them exactly blocked every repository with an uppercase letter in its
+    // name — three of eleven on the operator's machine, permanently and silently.
+    const got = parseOrcaRepositoryList(envelope([row({
+      gitRemoteIdentity: {
+        canonicalKey: 'github.com/dnhynk/Academic-Platform',
+        remoteName: 'origin',
+        remoteUrl: 'https://github.com/dnhynk/Academic-Platform.git',
+      },
+    })]));
+    expect(got.rows[0]).toMatchObject({
+      status: 'valid',
+      identity: { canonicalKey: 'github.com/dnhynk/academic-platform' },
+    });
+    expect(got.diagnostics).toEqual([]);
+  });
+
+  it('still blocks a canonicalKey that names a different repository', () => {
+    // Case folding must not weaken what this check exists for: two sides naming different repos.
+    const got = parseOrcaRepositoryList(envelope([row({
+      gitRemoteIdentity: {
+        canonicalKey: 'github.com/dnhynk/OTHER-Platform',
+        remoteName: 'origin',
+        remoteUrl: 'https://github.com/dnhynk/Academic-Platform.git',
+      },
+    })]));
+    expect(got.rows[0]).toMatchObject({ status: 'canonical_conflict' });
+  });
+
   it('represents canonical mismatch as row-local conflict without guessing a binding', () => {
     const got = parseOrcaRepositoryList(envelope([row({
       gitRemoteIdentity: {

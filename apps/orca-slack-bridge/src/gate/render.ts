@@ -126,7 +126,7 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
   if (gate.unclassifiedTasks.length > 0) {
     blocked.push(`*dependency 판정 불가* (${gate.unclassifiedTasks.length}건)`);
     blocked.push(...taskLines(gate.unclassifiedTasks));
-    blocked.push('deps를 읽지 못했거나 dependency row가 없어 independent로 접지 않았다');
+    blocked.push('_independent로 접지 않았다_');
   }
   blocks.push(section(blocked.join('\n')));
 

@@ -303,7 +303,7 @@ describe('Dispatch attempts 분리 (OD-069)', () => {
 
   it('retry가 Task 수를 늘리지 않는다는 것을 카드가 말한다', () => {
     expect(sectionWith(renderRunCard(input()), 'Dispatch attempts')).toContain(
-      'retry는 Task 수를 늘리지 않으므로',
+      'retry는 Task 수를 늘리지 않는다',
     );
   });
 
@@ -387,14 +387,30 @@ describe('누적 이력과 현재 blocker 구분 (run/types.ts)', () => {
     );
     expect(history).toContain('failed Dispatch 13');
     expect(history).toContain('escalation 1');
-    expect(history).toContain('만료가 없는 수다');
-    expect(history).toContain('지금 막혀 있다는 뜻이 아니다');
+    // 요구는 이 수가 현재 blocker가 아님을 카드가 말하는 것이다. 절 라벨이 그 말을 하고 있으면
+    // 같은 내용을 문단으로 반복할 필요가 없다.
+    expect(history).toContain('현재 blocker가 아니다');
   });
 
-  it('ask는 관찰 창 절에 있고 확정으로 읽지 말라고 적는다', () => {
-    const windowed = sectionWith(renderRunCard(input()), 'blocker · 관찰 창 안에서만 판정');
+  it('ask는 관찰 창 절에 있고, inbox 포화일 때만 확정으로 읽지 말라고 적는다', () => {
+    const base = input();
+
+    // 포화가 관측된 Run에서만 경고가 붙는다. 이 수를 확정으로 읽으면 안 되는 조건이 그때 성립한다.
+    const saturated = renderRunCard({
+      ...base,
+      run: {
+        ...base.run,
+        degraded: [{ kind: 'inbox_saturated', detail: 'inbox가 상한에 닿았다' }],
+      },
+    });
+    const windowed = sectionWith(saturated, 'blocker · 관찰 창 안에서만 판정');
     expect(windowed).toContain('inbox_saturated');
     expect(windowed).toContain('확정으로 읽지 않는다');
+
+    // 포화가 아니면 붙이지 않는다. 해당되지 않는 카드에서 사실을 밀어내지 않기 위해서다.
+    const clean = renderRunCard({ ...base, run: { ...base.run, degraded: [] } });
+    expect(sectionWith(clean, 'blocker · 관찰 창 안에서만 판정'))
+      .not.toContain('확정으로 읽지 않는다');
   });
 });
 
@@ -531,7 +547,7 @@ describe('관련 PR 상태', () => {
 
   it('관측 경계를 카드가 숨기지 않는다', () => {
     const section = sectionWith(renderRunCard(input({ pullRequests: [pr()] })), 'PR');
-    expect(section).toContain('digest가 관측하고 correlation에 성공한 PR만 여기 있다');
+    expect(section).toContain('correlation에 성공한 PR만');
   });
 });
 
@@ -599,7 +615,9 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
     expect(section).toContain('run_aaa');
     expect(section).toContain('other-id');
     expect(section).toContain('run_bbb');
-    expect(section).toContain('projects[].orcaRepositoryIds');
+    // 요구는 수와 관측된 id가 함께 드러나는 것이다. 설정 key 이름을 카드가 가르치는 것이 아니다.
+    expect(section).toContain('2');
+    expect(section).toContain('관측된 Orca repository id');
   });
 
   it('구조화 ref가 지원 상한을 넘으면 누락 수를 밝히고 Slack 한계를 지킨다', () => {
@@ -635,11 +653,12 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
     });
     const text = cardText(card);
 
-    expect(text).toContain('observedRepositories=257');
-    expect(text).toContain('omittedRefs=1');
+    // 요구는 전체 규모와 누락 수를 숨기지 않는 것이다. 표기는 사람이 읽는 우리말 절이다.
+    expect(text).toContain('관측된 repository 257');
+    expect(text).toContain('1건은 싣지 않았다');
     expect(text).toContain(refs[255]);
     expect(text).not.toContain(refs[256]);
-    expect(text.indexOf('observedRepositories=257')).toBeLessThan(text.indexOf(refs[0] as string));
+    expect(text.indexOf('관측된 repository 257')).toBeLessThan(text.indexOf(refs[0] as string));
     expect(card.blocks.length).toBeLessThanOrEqual(50);
     for (const block of card.blocks) {
       const sectionText = (block['text'] as { text?: string } | undefined)?.text;
@@ -726,7 +745,11 @@ describe('degraded와 미등록 Run (OD-072, OD-078)', () => {
       ),
       '등록되지 않은 Run',
     );
-    expect(section).toContain('query_failed는 조회가 실패해 등록 여부를 아직 판정하지 못한 것이다');
+    // 요구는 조회 실패를 미등록으로 단정하지 않는 것이다. 각 줄이 자기 kind를 밝히면 족하고,
+    // 카드가 kind의 뜻을 설명할 필요는 없다.
+    expect(section).toContain('query_failed');
+    expect(section).not.toContain('등록해야');
+    expect(section).not.toContain('등록하라');
   });
 });
 

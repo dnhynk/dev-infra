@@ -131,6 +131,7 @@ export const OPERATIONAL_FAILURE_CODES = [
   'digest.capacity_deferred',
   'gate.reconcile_failed',
   'channel.delivery_failed',
+  'channel.route_unavailable',
   'scheduler.timeout',
   'scheduler.aborted',
   'status.owner_refresh_failed',

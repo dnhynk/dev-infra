@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "orca-slack": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/launch-adapter.mjs"
+      ]
+    }
+  }
+}
