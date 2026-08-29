@@ -469,6 +469,9 @@ function referenceLines(label: string, refs: readonly string[]): string[] {
   const ordered = [...new Set(refs)].sort();
   const visible = ordered.slice(0, STRUCTURED_REF_CAP);
   const omitted = ordered.length - visible.length;
+  // 참조가 없으면 줄을 만들지 않는다. "참조 0건"은 사실을 더하지 않으면서 미등록 Run마다
+  // 한 줄씩 차지했다.
+  if (ordered.length === 0) return [];
   const summary = `    ↳ ${label} ${ordered.length}건` +
     (omitted === 0 ? '' : ` · ${omitted}건은 싣지 않았다`);
   if (visible.length === 0) return [summary];
@@ -685,9 +688,10 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
     );
   }
 
-  // 지나간 일이다. 항목을 두 건까지만 보이고 나머지는 수로 남긴다 — 13건을 전부 펼치면 카드가
-  // 현재 상태보다 이력으로 채워진다.
-  const history = badgeLines(run.blockers.badges, HISTORY_SOURCES, 2);
+  // 지나간 일이다. 원천당 한 건만 보이고 나머지는 수로 남긴다. 실측에서 escalation 6과
+  // failed Dispatch 33이 각각 다섯 줄씩 펼쳐져, 카드가 현재 상태보다 이력으로 채워졌다.
+  // OD-067이 요구하는 것은 원천별 badge와 연결 ID이고, 한 건이면 그 요구를 만족한다.
+  const history = badgeLines(run.blockers.badges, HISTORY_SOURCES, 1);
   if (history.length > 0) {
     blocks.push(
       // 라벨의 "(현재 blocker가 아니다)"가 이미 오독을 막는다.
@@ -718,8 +722,14 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   const degradedLines: string[] = ['*degraded*'];
   degradedLines.push(run.degraded.length === 0 ? '이 Run · 없음' : '이 Run');
   if (run.degraded.length > 0) degradedLines.push(...run.degraded.map(degradedLine));
-  degradedLines.push(collection.degraded.length === 0 ? '관찰 전체 · 없음' : '관찰 전체');
-  if (collection.degraded.length > 0) degradedLines.push(...collection.degraded.map(degradedLine));
+  // 관찰 전체 degraded는 모든 Run 카드에 같은 내용으로 실린다. 종류와 수만 남기고 상세는
+  // 컬렉션 카드에 둔다 — 카드마다 같은 문장을 펼치면 그 Run의 사실이 밀려난다.
+  degradedLines.push(
+    collection.degraded.length === 0
+      ? '관찰 전체 · 없음'
+      : `관찰 전체 · ${collection.degraded.length}건 · ` +
+        `${[...new Set(collection.degraded.map((d) => d.kind))].map((k) => `[${esc(k)}]`).join(' ')}`,
+  );
   // 운영자가 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다. 지우지 않고 내린다.
   blocks.push(contextLines(degradedLines));
 
@@ -728,6 +738,10 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    *
    * 이 수가 오르는 것이 "등록 열쇠가 어긋나 Run이 조용히 사라진다"를 관측 가능하게 만드는
    * 유일한 장치다. 절을 조건부로 만들면 그 장치가 조건부가 된다.
+   *
+   * **수로 접지 않는다.** 조회 실패·빈 Run·등록 없음은 서로 다른 사건이고, 카드가 그 셋을 같은
+   * 모양으로 그리면 렌더 지문도 같아진다. 지문이 같으면 게시 경계가 갱신을 건너뛰므로 그
+   * 구분은 Slack에 아예 도달하지 않는다. 부피는 아래 참조 줄에서 줄인다.
    */
   blocks.push(...labelledSections('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
 

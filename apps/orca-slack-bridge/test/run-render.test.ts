@@ -353,8 +353,8 @@ describe('blocker badge (OD-067)', () => {
   it('항목이 많은 badge는 자른 사실을 드러낸다', () => {
     const history = sectionWith(renderRunCard(input()), 'blocker · 누적 이력 (현재 blocker가 아니다)');
     expect(history).toContain('failed Dispatch 13');
-    // 누적 이력은 두 건까지만 보인다. 잘린 사실을 드러낸다는 요구는 그대로다.
-    expect(history).toContain('외 11건은 카드에 싣지 않았다');
+    // 누적 이력은 원천당 한 건만 보인다. 잘린 사실을 드러낸다는 요구는 그대로다.
+    expect(history).toContain('외 12건은 카드에 싣지 않았다');
   });
 
   it('관측 불가는 0건 badge로 그리지 않는다', () => {
