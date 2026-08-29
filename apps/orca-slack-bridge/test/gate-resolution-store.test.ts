@@ -137,8 +137,8 @@ describe('strict persisted Gate schema', () => {
     const tables = (migrated.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'gate_resolution%' ORDER BY name",
     ).all() as { readonly name: string }[]).map((row) => row.name);
-    expect(SCHEMA_VERSION).toBe(15);
-    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 15 });
+    expect(SCHEMA_VERSION).toBe(16);
+    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 16 });
     expect(tables).toEqual([
       'gate_resolution',
       'gate_resolution_attempt',

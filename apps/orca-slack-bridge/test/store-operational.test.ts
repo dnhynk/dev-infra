@@ -117,7 +117,7 @@ describe('additive v13 operational schema', () => {
     new SqliteDigestStore(migrated).close();
     new SqliteDigestStore(path).close();
 
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(objectMap(migrated)).toEqual(objectMap(path));
     const structural = new DatabaseSync(migrated, { readOnly: true });
     expect(structural.prepare('PRAGMA foreign_key_list(orca_repository_binding)').all())
@@ -156,7 +156,7 @@ describe('additive v13 operational schema', () => {
   it('rejects future schemas and malformed operational rows with static errors', () => {
     new SqliteDigestStore(path).close();
     const future = new DatabaseSync(path);
-    future.prepare('UPDATE schema_version SET version = 16 WHERE id = 1').run();
+    future.prepare('UPDATE schema_version SET version = 17 WHERE id = 1').run();
     future.close();
     expect(() => new SqliteDigestStore(path)).toThrow(SchemaVersionError);
 

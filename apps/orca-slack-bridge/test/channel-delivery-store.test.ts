@@ -346,7 +346,7 @@ describe('additive v12 Channel resume schema', () => {
 
     const postMigration = new DatabaseSync(migratedPath, { readOnly: true });
     expect(postMigration.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({
-      version: 15,
+      version: 16,
     });
     expect(postMigration.prepare('SELECT * FROM gate_resolution_outbox').get()).toEqual(outboxBefore);
     expect(postMigration.prepare(
@@ -356,7 +356,7 @@ describe('additive v12 Channel resume schema', () => {
 
     const freshPath = join(dir, 'fresh.db');
     new SqliteDigestStore(freshPath).close();
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(deliverySchemaShape(migratedPath)).toEqual(deliverySchemaShape(freshPath));
 
     const lazy = new SqliteDigestStore(migratedPath);
@@ -421,7 +421,7 @@ describe('additive v12 Channel resume schema', () => {
   it('fails closed on future schema instead of rewriting or downgrading it', () => {
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path);
-    raw.prepare('UPDATE schema_version SET version = 16 WHERE id = 1').run();
+    raw.prepare('UPDATE schema_version SET version = 17 WHERE id = 1').run();
     raw.close();
     expect(() => new SqliteDigestStore(path)).toThrow(SchemaVersionError);
   });

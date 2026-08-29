@@ -74,7 +74,7 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -724,7 +724,7 @@ CREATE TABLE daemon_health (
 )`;
 
 /**
- * v15가 이 표를 다시 만든 이유.
+ * v16이 이 표를 다시 만든 이유.
  *
  * `job_name`의 CHECK에 새 job 이름을 넣으려면 CHECK를 바꿔야 하고, CHECK 변경은 컬럼 추가로
  * 되지 않는다. MIGRATIONS는 덧붙이기만 다루므로 OD-043이 "파괴적 변경이 필요해지면 그때 정한다"로
@@ -778,8 +778,8 @@ CREATE TABLE daemon_job_outcome (
 )`;
 
 
-/** v15 이전에 배포된 정확한 table DDL. 옛 파일이 이 문자열로 만들어졌다. */
-const DAEMON_JOB_OUTCOME_V14_TABLE = DAEMON_JOB_OUTCOME_TABLE.replace(
+/** v16 이전에 배포된 정확한 table DDL. 그 이전 파일이 이 문자열로 만들어졌다. */
+const DAEMON_JOB_OUTCOME_V15_TABLE = DAEMON_JOB_OUTCOME_TABLE.replace(
   "'channel-delivery',\n     'terminal-prompt')),",
   "'channel-delivery')),",
 );
@@ -1170,7 +1170,7 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     REPOSITORY_DISCOVERY_ISSUE_TABLE,
     REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX,
     DAEMON_HEALTH_TABLE,
-    DAEMON_JOB_OUTCOME_V14_TABLE,
+    DAEMON_JOB_OUTCOME_V15_TABLE,
     DAEMON_JOB_OUTCOME_STATE_INDEX,
     SLACK_ROOT_INTENT_TABLE,
     SLACK_ROOT_INTENT_STATE_INDEX,
@@ -1183,19 +1183,29 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // v14 → v15: agent 터미널의 대화형 프롬프트를 durable하게 관측하고 답한다. 표 추가뿐이라
   // 기존 행은 그대로 남는다.
   [
-    // 새 job 이름을 받으려면 job_name의 CHECK를 바꿔야 하고, 그것은 표를 다시 만드는 일이다.
-    // 위 DAEMON_JOB_OUTCOME_TABLE 주석에 왜 rename을 쓰지 않는지 적어 두었다.
-    'ALTER TABLE daemon_job_outcome RENAME TO daemon_job_outcome_pre_v15',
-    DAEMON_JOB_OUTCOME_TABLE,
-    `INSERT INTO daemon_job_outcome SELECT * FROM daemon_job_outcome_pre_v15`,
-    'DROP TABLE daemon_job_outcome_pre_v15',
-    DAEMON_JOB_OUTCOME_STATE_INDEX,
     TERMINAL_PROMPT_TABLE,
     TERMINAL_PROMPT_ACTIVE_INDEX,
     TERMINAL_PROMPT_RUN_INDEX,
     TERMINAL_PROMPT_STATE_INDEX,
     TERMINAL_PROMPT_ATTEMPT_TABLE,
     TERMINAL_PROMPT_ATTEMPT_INDEX,
+  ],
+  // v15 → v16: `daemon_job_outcome.job_name`의 CHECK에 새 job 이름을 넣는다.
+  //
+  // **이 단계가 v15와 따로인 이유.** v15는 이미 배포된 파일에 적용됐다. 적용이 끝난 단계에
+  // 문장을 더하면 그 파일은 새 문장을 영영 받지 못하고, 코드가 기대하는 shape과 갈라진 채로
+  // 남는다. 실제로 그렇게 만들어 배포가 한 번 막혔다. 덧붙이기는 배열의 **모양**이 아니라
+  // **효과**에 대한 규칙이다.
+  //
+  // CHECK 변경은 표를 다시 만드는 일이라 덧붙이기가 아니다. OD-043이 "파괴적 변경이 필요해지면
+  // 그때 정한다"로 비워 둔 자리이고, 여기서 정한다: 이 표는 다시 만든다. 담는 것이 job 스케줄
+  // 상태뿐이고 행은 그대로 옮기므로 잃는 것이 없다.
+  [
+    'ALTER TABLE daemon_job_outcome RENAME TO daemon_job_outcome_pre_v16',
+    DAEMON_JOB_OUTCOME_TABLE,
+    'INSERT INTO daemon_job_outcome SELECT * FROM daemon_job_outcome_pre_v16',
+    'DROP TABLE daemon_job_outcome_pre_v16',
+    DAEMON_JOB_OUTCOME_STATE_INDEX,
   ],
 ];
 

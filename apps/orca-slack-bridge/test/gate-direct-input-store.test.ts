@@ -220,9 +220,9 @@ describe('D2-D durable modal schema', () => {
 
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path, { readOnly: true });
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(raw.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({
-      version: 15,
+      version: 16,
     });
     const columns = (raw.prepare('PRAGMA table_info(gate_direct_modal)').all() as {
       readonly name: string;

@@ -1240,7 +1240,7 @@ describe('v12 durable resume evidence and existing-card projection', () => {
 
     const nowAt = '2026-08-24T11:00:00.000Z';
     store = new SqliteDigestStore(path);
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
       resumeBaselineState: 'unavailable',
       state: legacyState,

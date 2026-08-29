@@ -180,7 +180,7 @@ describe('schema v6 → current', () => {
     const fresh = join(dir, 'fresh', 'state.db');
     new SqliteDigestStore(fresh).close();
 
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(gateMasterShape(dbPath)).toEqual(gateMasterShape(fresh));
     expect(schemaShape(dbPath)).toEqual(schemaShape(fresh));
     expect(schemaShape(dbPath).map(({ table }) => table)).toContain('gate_metadata');
@@ -201,7 +201,7 @@ describe('schema v6 → current', () => {
     store.close();
 
     const db = new DatabaseSync(dbPath);
-    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 15 });
+    expect(db.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 16 });
     db.close();
   });
 
