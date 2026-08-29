@@ -689,7 +689,9 @@ describe('collectRunFacts (OD-068, OD-072, OD-078)', () => {
   it('미검증 플랫폼 가정을 항상 degraded로 싣는다', async () => {
     const c = await collect();
     expect(c.degraded.map((d) => d.kind)).toContain('unverified_platform_assumption');
-    expect(c.degraded[0]?.detail).toContain('platform-capabilities.md');
+    // 요구는 이 판정이 미검증 가정 위에 있다는 사실을 싣는 것이다. 근거 문서 경로는 카드에
+    // 넣지 않는다 — 읽는 사람이 Slack에서 열 수 없는 경로다.
+    expect(c.degraded[0]?.detail).toContain('미검증');
   });
 
   it('Run 하나의 조회 실패를 0건으로 그리지 않고 degraded로 남긴다', async () => {

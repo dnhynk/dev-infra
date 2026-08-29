@@ -508,9 +508,9 @@ export async function collectRunFacts(
   const degraded: RunDegraded[] = [
     {
       kind: 'unverified_platform_assumption',
-      detail:
-        'live/stale 판정은 run-use가 consumer_generation을 올린다는 미검증 가정 위에 있다' +
-        '(docs/platform-capabilities.md §7.2). 플랫폼 동작이 바뀌면 이 판정이 깨진다',
+      // 문서 경로를 카드에 싣지 않는다. 근거는 platform-capabilities §7.2에 있고, 카드가 말해야
+      // 하는 것은 "이 판정이 미검증 가정 위에 있다"는 사실 한 줄이다.
+      detail: 'live/stale 판정은 미검증 플랫폼 가정 위에 있다',
     },
   ];
 

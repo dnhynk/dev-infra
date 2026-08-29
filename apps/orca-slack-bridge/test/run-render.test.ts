@@ -387,14 +387,30 @@ describe('누적 이력과 현재 blocker 구분 (run/types.ts)', () => {
     );
     expect(history).toContain('failed Dispatch 13');
     expect(history).toContain('escalation 1');
-    expect(history).toContain('만료가 없는 수다');
-    expect(history).toContain('지금 막혀 있다는 뜻이 아니다');
+    // 요구는 이 수가 현재 blocker가 아님을 카드가 말하는 것이다. 절 라벨이 그 말을 하고 있으면
+    // 같은 내용을 문단으로 반복할 필요가 없다.
+    expect(history).toContain('현재 blocker가 아니다');
   });
 
-  it('ask는 관찰 창 절에 있고 확정으로 읽지 말라고 적는다', () => {
-    const windowed = sectionWith(renderRunCard(input()), 'blocker · 관찰 창 안에서만 판정');
+  it('ask는 관찰 창 절에 있고, inbox 포화일 때만 확정으로 읽지 말라고 적는다', () => {
+    const base = input();
+
+    // 포화가 관측된 Run에서만 경고가 붙는다. 이 수를 확정으로 읽으면 안 되는 조건이 그때 성립한다.
+    const saturated = renderRunCard({
+      ...base,
+      run: {
+        ...base.run,
+        degraded: [{ kind: 'inbox_saturated', detail: 'inbox가 상한에 닿았다' }],
+      },
+    });
+    const windowed = sectionWith(saturated, 'blocker · 관찰 창 안에서만 판정');
     expect(windowed).toContain('inbox_saturated');
     expect(windowed).toContain('확정으로 읽지 않는다');
+
+    // 포화가 아니면 붙이지 않는다. 해당되지 않는 카드에서 사실을 밀어내지 않기 위해서다.
+    const clean = renderRunCard({ ...base, run: { ...base.run, degraded: [] } });
+    expect(sectionWith(clean, 'blocker · 관찰 창 안에서만 판정'))
+      .not.toContain('확정으로 읽지 않는다');
   });
 });
 

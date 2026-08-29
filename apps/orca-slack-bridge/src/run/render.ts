@@ -163,6 +163,19 @@ function context(lines: readonly string[]): SlackBlock {
   };
 }
 
+/**
+ * 여러 줄을 그대로 유지하는 작은 글씨 블록.
+ *
+ * `context`는 한 줄로 잇는다. 목록을 그렇게 이으면 binding 네 개가 가운뎃점으로 이어진 한
+ * 문단이 되어 어느 것이 어느 세대인지 읽을 수 없다. 항목이 여럿인 사실은 줄을 지켜야 한다.
+ */
+function contextLines(lines: readonly string[]): SlackBlock {
+  return {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: capSectionText(lines.join('\n')) }],
+  };
+}
+
 /** Splits logical lines across section blocks without ever slicing a structured ref token. */
 function labelledSections(label: string, lines: readonly string[]): SlackBlock[] {
   const blocks: SlackBlock[] = [];
@@ -569,7 +582,7 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   }
   // binding 계보는 소유권을 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다.
   // liveness 판정 자체는 위 헤더 줄에 이미 라벨로 나와 있고, 여기에는 그 판정의 근거가 남는다.
-  blocks.push(context(['*Run identity*', ...identityLines]));
+  blocks.push(contextLines(['*Run identity*', ...identityLines]));
 
   /*
    * 진행 절(OD-069).
@@ -599,7 +612,7 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   // OD-069. 두 수를 더해 읽는 것을 막는 유일한 문구다.
   dispatchLines.push('_retry는 Task 수를 늘리지 않는다_');
   // 작은 글씨로 둔다. 진행 절과 시각적으로도 다른 무게가 되어야 두 수를 더해 읽지 않는다.
-  blocks.push(context(['*Dispatch attempts*', ...dispatchLines]));
+  blocks.push(contextLines(['*Dispatch attempts*', ...dispatchLines]));
 
   // PR 절. 재료는 store에 있는 것뿐이고 그 경계를 같은 자리에서 밝힌다.
   const prLines =
@@ -619,22 +632,20 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   const windowed = badgeLines(run.blockers.badges, WINDOWED_SOURCES);
   if (windowed.length > 0) {
     blocks.push(
-      labelled('blocker · 관찰 창 안에서만 판정', [
-        ...windowed,
-        '미답 여부를 inbox 조회 창 안에서만 판정했다. degraded에 inbox_saturated가 있으면 이 수를' +
-          ' 확정으로 읽지 않는다',
-      ]),
+      // 라벨이 이미 "관찰 창 안에서만 판정"이라고 말하므로 같은 말을 문단으로 반복하지 않는다.
+      // 다만 inbox가 실제로 포화됐을 때는 이 수를 확정으로 읽으면 안 된다는 사실이 추가되므로
+      // **그때만** 한 줄 덧붙인다. 늘 붙이면 해당되지 않는 카드에서도 사실이 밀려난다.
+      labelled('blocker · 관찰 창 안에서만 판정', run.degraded.some(
+        (d) => d.kind === 'inbox_saturated',
+      ) ? [...windowed, '_inbox_saturated — 확정으로 읽지 않는다_'] : windowed),
     );
   }
 
   const history = badgeLines(run.blockers.badges, HISTORY_SOURCES);
   if (history.length > 0) {
     blocks.push(
-      labelled('blocker · 누적 이력 (현재 blocker가 아니다)', [
-        ...history,
-        '만료가 없는 수다. 이미 retry로 완료된 Task의 과거 실패와 이미 해소된 escalation도 계속' +
-          ' 셈된다. 지금 막혀 있다는 뜻이 아니다',
-      ]),
+      // 라벨의 "(현재 blocker가 아니다)"가 이미 오독을 막는다.
+      labelled('blocker · 누적 이력 (현재 blocker가 아니다)', history),
     );
   }
 
