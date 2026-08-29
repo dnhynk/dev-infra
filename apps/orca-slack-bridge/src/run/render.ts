@@ -163,6 +163,9 @@ function context(lines: readonly string[]): SlackBlock {
   };
 }
 
+/** 결정에 쓰는 절과 그 뒤의 운영 사실을 눈으로 가른다. */
+const DIVIDER: SlackBlock = { type: 'divider' };
+
 /**
  * 여러 줄을 그대로 유지하는 작은 글씨 블록.
  *
@@ -292,6 +295,13 @@ export type RunCardInput = {
    */
   readonly pullRequests: readonly RunPullRequestRecord[];
   readonly collection: RunCollectionContext;
+  /**
+   * 지금 사람의 답을 기다리는 터미널 수.
+   *
+   * 프롬프트 자체는 이 Run 스레드의 별도 카드로 간다. 여기에는 수만 둔다 — Run 카드를 훑는
+   * 사람이 "이 Run은 사람이 필요하다"를 스레드를 열지 않고 알아야 하기 때문이다.
+   */
+  readonly waitingPrompts?: number;
 };
 
 /**
@@ -561,6 +571,27 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   blocks.push(section(`${live.emoji} *${escapedObjective}*`));
   blocks.push(context([escapedIdentity, esc(id.runId), `${live.emoji} ${live.label}`]));
 
+  /*
+   * 사람이 필요한 것을 맨 위에 둔다.
+   *
+   * 이 카드를 이동 중에 훑는 사람이 찾는 것은 단 하나 — "내가 지금 해야 할 일이 있나"다. 그
+   * 답이 운영 사실 여러 절 아래에 있으면 카드를 끝까지 읽어야 알 수 있고, 그러면 읽지 않는다.
+   * 아래 절들의 사실은 하나도 지우지 않고 순서와 무게만 바꾼다.
+   */
+  const waiting = input.waitingPrompts ?? 0;
+  const current = badgeLines(run.blockers.badges, CURRENT_SOURCES);
+  const needsPerson = waiting > 0 || current.length > 0;
+  if (needsPerson) {
+    const lines: string[] = [];
+    if (waiting > 0) {
+      lines.push(`• 터미널 ${waiting}대가 답을 기다린다 — 이 스레드의 카드에서 고르면 된다`);
+    }
+    lines.push(...current);
+    blocks.push(labelled('사람이 필요하다', lines));
+  }
+
+  blocks.push(DIVIDER);
+
   // Run identity 절. 판정과 그 판정이 선 근거를 같은 자리에 둔다.
   const identityLines = [
     `Run ID ${esc(id.runId)}`,
@@ -625,9 +656,13 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    * blocker 절(OD-067).
    *
    * 원천별 badge를 시제별로 세 무리로 나눈다. **고유 총합을 만들지 않는다.**
+   *
+   * 현재 시제는 위 "사람이 필요하다"로 올라갔다. 거기 없을 때만 여기서 "없음"을 밝힌다 —
+   * 0건과 관측 불가를 구분하는 것이 이 절의 목적이라 조건부로 지우지 않는다.
    */
-  const current = badgeLines(run.blockers.badges, CURRENT_SOURCES);
-  blocks.push(labelled('blocker · 현재 상태', current.length === 0 ? ['관측된 원천 없음'] : current));
+  if (!needsPerson) {
+    blocks.push(contextLines(['*blocker · 현재 상태*', '관측된 원천 없음']));
+  }
 
   const windowed = badgeLines(run.blockers.badges, WINDOWED_SOURCES);
   if (windowed.length > 0) {
@@ -635,9 +670,9 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
       // 라벨이 이미 "관찰 창 안에서만 판정"이라고 말하므로 같은 말을 문단으로 반복하지 않는다.
       // 다만 inbox가 실제로 포화됐을 때는 이 수를 확정으로 읽으면 안 된다는 사실이 추가되므로
       // **그때만** 한 줄 덧붙인다. 늘 붙이면 해당되지 않는 카드에서도 사실이 밀려난다.
-      labelled('blocker · 관찰 창 안에서만 판정', run.degraded.some(
+      contextLines(['*blocker · 관찰 창 안에서만 판정*', ...(run.degraded.some(
         (d) => d.kind === 'inbox_saturated',
-      ) ? [...windowed, '_inbox_saturated — 확정으로 읽지 않는다_'] : windowed),
+      ) ? [...windowed, '_inbox_saturated — 확정으로 읽지 않는다_'] : windowed)]),
     );
   }
 
@@ -645,19 +680,19 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   if (history.length > 0) {
     blocks.push(
       // 라벨의 "(현재 blocker가 아니다)"가 이미 오독을 막는다.
-      labelled('blocker · 누적 이력 (현재 blocker가 아니다)', history),
+      contextLines(['*blocker · 누적 이력 (현재 blocker가 아니다)*', ...history]),
     );
   }
 
   // 0건 badge로 그리지 않는다. 0건과 관측 불가는 다르다.
   if (run.blockers.notObservable.length > 0) {
     blocks.push(
-      labelled(
-        'blocker · 이 관측 표면에서 만들 수 없음',
-        run.blockers.notObservable.map(
+      contextLines([
+        '*blocker · 이 관측 표면에서 만들 수 없음*',
+        ...run.blockers.notObservable.map(
           (n) => `• ${esc(n.source)} — ${esc(cut(n.reason, DETAIL_CAP))}`,
         ),
-      ),
+      ]),
     );
   }
 
@@ -673,7 +708,8 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   degradedLines.push(
     ...(collection.degraded.length === 0 ? ['• 없음'] : collection.degraded.map(degradedLine)),
   );
-  blocks.push(labelled('degraded', degradedLines));
+  // 운영자가 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다. 지우지 않고 내린다.
+  blocks.push(contextLines(['*degraded*', ...degradedLines]));
 
   /*
    * 미등록 Run 절(OD-078). **0이어도 그린다.**

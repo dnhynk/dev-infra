@@ -50,6 +50,12 @@ import type { DigestStore, GateStore, RunStore } from './store/schema.js';
 import type { SummaryProvider } from './summarize/openai.js';
 import { GateActionHandler } from './gate/action-handler.js';
 import {
+  TerminalPromptActionHandler,
+  isTerminalPromptEvent,
+} from './terminal/action-handler.js';
+import { collectTerminalCandidates } from './terminal/candidates.js';
+import { runTerminalPromptPass } from './terminal/observer.js';
+import {
   GateDirectInputHandler,
   isGateDirectInputEvent,
 } from './gate/direct-input-handler.js';
@@ -1380,6 +1386,29 @@ export async function runDaemonCommand(
       schedule,
       abortSignal: inboundAbort.signal,
     });
+    /**
+     * 터미널 프롬프트 버튼.
+     *
+     * Gate와 다른 handler인 것이 의도다. Gate 버튼은 Orca Gate를 해결하고 이 버튼은 살아 있는
+     * 세션에 입력을 넣는다. 결과가 다르므로 한 handler가 둘을 구분하게 두지 않는다.
+     */
+    const promptHandler = new TerminalPromptActionHandler({
+      config: config.slack,
+      store,
+      now: () => observerClock.wallNow(),
+      // 확정 직후 다음 pass를 앞당긴다. 없으면 사용자가 누른 뒤 최대 한 주기를 기다린다.
+      wake: () => observerSupervisor?.markDue('terminal-prompt'),
+      onOutcome: (outcome) => {
+        if (outcome === 'claimed' || outcome === 'duplicate') return;
+        void health?.event({
+          level: 'warn',
+          event: 'terminal.prompt_action',
+          outcome: 'failed',
+          errorCode: 'terminal.action_rejected',
+          retryable: false,
+        }).catch(() => { /* reporting never fences the ACK */ });
+      },
+    });
 
     // Acquire the single fixed pipe before recovery or Slack ingress. A second daemon fails closed
     // here and cannot become either the Channel owner or an interactive consumer.
@@ -1673,6 +1702,59 @@ export async function runDaemonCommand(
           },
         },
         {
+          /**
+           * 막힌 agent 터미널을 카드로 올리고, 확정된 답을 보낸다.
+           *
+           * 관측과 답변이 한 job인 것이 의도다. 둘 다 같은 터미널의 화면을 만지므로 나누면
+           * 서로의 중간 상태를 본다.
+           */
+          name: 'terminal-prompt' as const,
+          intervalMs: automation.terminalPrompt.intervalSeconds * 1_000,
+          timeoutMs: automation.terminalPrompt.timeoutSeconds * 1_000,
+          backoffCapMs: 5 * 60_000,
+          run: async (signal: AbortSignal) => {
+            const scoped = scopedOrcaRunner(orca, signal);
+            try {
+              const candidates = await collectTerminalCandidates({
+                orca: scoped,
+                store: daemonStore,
+              });
+              const report = await runTerminalPromptPass({
+                orca: scoped,
+                store: daemonStore,
+                slack,
+                thread: threadPoster,
+                candidates,
+                now: observerClock.wallNow,
+                // TUI가 다시 그려질 틈을 준다. 이 대기가 없으면 이동 직후 옛 화면을 읽는다.
+                settle: () => new Promise((resolve) => { setTimeout(resolve, 400); }),
+                onError: (code) => {
+                  void health?.event({
+                    level: 'warn',
+                    event: 'terminal.prompt',
+                    outcome: 'failed',
+                    errorCode: 'terminal.pass_degraded',
+                    retryable: true,
+                  }).catch(() => { /* reporting never fences the pass */ });
+                  void code;
+                },
+              }, signal);
+              return {
+                processedCount: report.observed,
+                deferredCount: report.refused + report.failed,
+              };
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              if (observerInvariantError(error)) {
+                throw new ObserverJobFailure('terminal.schema_drift', {}, true);
+              }
+              throw new ObserverJobFailure(
+                signal.aborted ? 'terminal.timeout' : 'terminal.query_failed',
+              );
+            }
+          },
+        },
+        {
           name: 'run-observer' as const,
           intervalMs: automation.runObserver.intervalSeconds * 1_000,
           timeoutMs: automation.runObserver.timeoutSeconds * 1_000,
@@ -1894,7 +1976,11 @@ export async function runDaemonCommand(
         // A connection may invoke a retained callback while its bounded close is still draining.
         // Leave that envelope unACKed for Slack redelivery instead of starting work after stop.
         if (!acceptingInbound) return Promise.resolve();
-        const consumer = isGateDirectInputEvent(event) ? directHandler : handler;
+        const consumer = isTerminalPromptEvent(event)
+          ? promptHandler
+          : isGateDirectInputEvent(event)
+            ? directHandler
+            : handler;
         const task = consumer.handle(event).then(() => undefined).finally(() => inbound.delete(task));
         inbound.add(task);
         return task;

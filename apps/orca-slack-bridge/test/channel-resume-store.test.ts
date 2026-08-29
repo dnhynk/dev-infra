@@ -34,7 +34,10 @@ import {
 } from '../src/store/schema.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import type { OrcaRunner } from '../src/orca/client.js';
-import { downgradeGateMetadataToV13 } from './fixtures/schema-downgrade.js';
+import {
+  downgradeGateMetadataToV13,
+  dropTerminalPromptTables,
+} from './fixtures/schema-downgrade.js';
 
 const GATE = gateKey('gate_resume_store');
 const RUN = runKey('run_resume_store');
@@ -463,6 +466,7 @@ function downgradeDeliveryDatabaseToV11(): string {
     `INSERT INTO gate_channel_delivery (${legacyColumns.join(', ')})
      VALUES (${legacyColumns.map(() => '?').join(', ')})`,
   ).run(...legacyColumns.map((column) => legacyRow[column] as never));
+  dropTerminalPromptTables(raw);
   downgradeGateMetadataToV13(raw);
   raw.prepare('UPDATE schema_version SET version = 11 WHERE id = 1').run();
   raw.exec('BEGIN');
@@ -1236,7 +1240,7 @@ describe('v12 durable resume evidence and existing-card projection', () => {
 
     const nowAt = '2026-08-24T11:00:00.000Z';
     store = new SqliteDigestStore(path);
-    expect(SCHEMA_VERSION).toBe(14);
+    expect(SCHEMA_VERSION).toBe(15);
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
       resumeBaselineState: 'unavailable',
       state: legacyState,

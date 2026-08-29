@@ -11,6 +11,7 @@ import {
   postSlackRootAtMostOnce,
   type SlackRootIntentRuntime,
 } from '../slack/root-intent.js';
+import type { RunKey } from '../identity/keys.js';
 import type { GateStore, RunStore } from '../store/schema.js';
 import { collectRunFacts, type RunRoutingConfig } from './collect.js';
 import {
@@ -141,6 +142,25 @@ export type RunPublishOptions = {
  * 아닌 곳의 메시지를 고치고, 새로 post하면 루트가 둘이 된다. 어느 쪽도 이 관찰이 결정할 일이
  * 아니므로 사실만 돌려준다.
  */
+/**
+ * 이 Run에서 답을 기다리는 터미널 수.
+ *
+ * store가 이 조회를 갖지 않는 구성에서는 0이다. 카드의 다른 절은 그대로이므로 이 값 하나가
+ * 없다고 관측이 실패하지 않는다.
+ */
+function countWaitingPrompts(store: unknown, key: RunKey): number {
+  const reader = store as {
+    listTerminalPrompts?: (runKey: RunKey) => readonly { readonly state: string }[];
+  };
+  if (typeof reader.listTerminalPrompts !== 'function') return 0;
+  try {
+    return reader.listTerminalPrompts(key)
+      .filter((prompt) => prompt.state === 'open' || prompt.state === 'claimed').length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function publishRunCard(
   options: RunPublishOptions,
   input: RunCardInput,
@@ -315,6 +335,9 @@ export async function publishRunCollection(
       run,
       pullRequests: options.store.listRunPullRequests(run.identity.key),
       collection: context,
+      // 답을 기다리는 터미널 수. store가 그 수를 세지 못하는 구성(dry-run 등)에서는 0이고,
+      // 그때 카드에서 이 줄이 빠질 뿐 다른 절은 그대로다.
+      waitingPrompts: countWaitingPrompts(options.store, run.identity.key),
     });
     results.push(root);
     const rootMessageTs = root.action === 'channel_mismatch' ? null : root.messageTs;

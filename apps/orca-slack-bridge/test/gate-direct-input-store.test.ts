@@ -22,7 +22,10 @@ import {
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { SCHEMA_VERSION } from '../src/store/schema.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
-import { downgradeGateMetadataToV13 } from './fixtures/schema-downgrade.js';
+import {
+  downgradeGateMetadataToV13,
+  dropTerminalPromptTables,
+} from './fixtures/schema-downgrade.js';
 
 const GATE = gateKey('gate_d2d');
 const RUN = runKey('run_d2d');
@@ -210,15 +213,16 @@ describe('D2-D durable modal schema', () => {
       DROP TABLE slack_root_intent; DROP TABLE daemon_job_outcome; DROP TABLE daemon_health;
       DROP TABLE repository_discovery_issue; DROP TABLE orca_repository_binding;
       DROP TABLE repository_registry`);
+    dropTerminalPromptTables(v9);
     downgradeGateMetadataToV13(v9);
     v9.prepare('UPDATE schema_version SET version = 9 WHERE id = 1').run();
     v9.close();
 
     new SqliteDigestStore(path).close();
     const raw = new DatabaseSync(path, { readOnly: true });
-    expect(SCHEMA_VERSION).toBe(14);
+    expect(SCHEMA_VERSION).toBe(15);
     expect(raw.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({
-      version: 14,
+      version: 15,
     });
     const columns = (raw.prepare('PRAGMA table_info(gate_direct_modal)').all() as {
       readonly name: string;
@@ -240,6 +244,7 @@ describe('D2-D durable modal schema', () => {
       DROP TABLE slack_root_intent; DROP TABLE daemon_job_outcome; DROP TABLE daemon_health;
       DROP TABLE repository_discovery_issue; DROP TABLE orca_repository_binding;
       DROP TABLE repository_registry`);
+    dropTerminalPromptTables(conflicted);
     downgradeGateMetadataToV13(conflicted);
     conflicted.prepare('UPDATE schema_version SET version = 9 WHERE id = 1').run();
     conflicted.exec('CREATE TABLE gate_direct_modal (unexpected TEXT)');

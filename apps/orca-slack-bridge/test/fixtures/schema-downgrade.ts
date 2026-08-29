@@ -26,3 +26,16 @@ export function downgradeGateMetadataToV13(db: DatabaseSync): void {
     ${GATE_V8_SCHEMA_OBJECTS['gate_metadata_run_key']};
   `);
 }
+
+/**
+ * v15가 붙인 표를 지운다.
+ *
+ * 옛 버전 파일을 만드는 테스트는 현재 스키마로 만든 뒤 새 표를 지우고 version을 내린다. 새
+ * 버전마다 이 목록이 늘어난다.
+ */
+export function dropTerminalPromptTables(db: DatabaseSync): void {
+  db.exec(`
+    DROP TABLE terminal_prompt_attempt;
+    DROP TABLE terminal_prompt;
+  `);
+}

@@ -74,7 +74,7 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -764,6 +764,95 @@ const DAEMON_JOB_OUTCOME_STATE_INDEX = `
 CREATE INDEX daemon_job_outcome_state
   ON daemon_job_outcome (state, next_run_at, job_name)`;
 
+/**
+ * 살아 있는 agent 터미널 하나에서 관측한 대화형 선택 프롬프트와 그 답변 진행.
+ *
+ * Gate와 다른 표다. Gate는 coordinator가 만들기로 **결정한** 것이고, 이것은 agent가 화면에
+ * 띄워 **막혀 있는** 것이다. 무인 운용에서 멈춤은 대부분 후자로 나타나는데 지금까지 그 자리는
+ * badge 한 줄이었다.
+ *
+ * `fingerprint`가 이 표의 안전장치다. 답을 보내기 직전에 화면을 다시 읽어 이 값과 대조하고,
+ * 다르면 보내지 않는다. 그 사이 프롬프트가 바뀌었으면 같은 답이 다른 질문에 들어가기 때문이다.
+ */
+const TERMINAL_PROMPT_TABLE = `
+CREATE TABLE terminal_prompt (
+  -- Orca가 발급한 terminal handle.
+  terminal_handle    TEXT NOT NULL,
+  run_key            TEXT NOT NULL,
+  -- coordinator인지 worker인지. 카드의 문구가 갈리고, coordinator는 Run당 하나뿐이다.
+  role               TEXT NOT NULL CHECK (role IN ('coordinator','worker')),
+  -- worker 프롬프트일 때의 Dispatch. coordinator는 NULL이다.
+  dispatch_key       TEXT,
+  -- 프롬프트 영역만의 지문. 화면 전체가 아니다.
+  fingerprint        TEXT NOT NULL CHECK (length(fingerprint) = 32),
+  -- 관측한 질문/선택지 스냅샷. 카드는 이것으로 그린다.
+  prompt_json        TEXT NOT NULL,
+  channel_id         TEXT,
+  thread_ts          TEXT,
+  message_ts         TEXT,
+  render_fingerprint TEXT,
+  state              TEXT NOT NULL
+    CHECK (state IN ('open','claimed','answered','failed','gone')),
+  -- 사용자가 고른 선택지 번호. claimed 이후에만 있다.
+  claimed_option     INTEGER CHECK (claimed_option IS NULL OR claimed_option BETWEEN 1 AND 25),
+  claimed_by         TEXT,
+  claimed_at         TEXT,
+  settled_at         TEXT,
+  last_error_code    TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  -- claim은 선택지와 주체를 함께 남긴다. 셋 중 하나만 있는 행은 어느 답을 누가 골랐는지 모른다.
+  CHECK ((claimed_option IS NULL AND claimed_by IS NULL AND claimed_at IS NULL)
+      OR (claimed_option IS NOT NULL AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL)),
+  CHECK (state <> 'claimed' OR claimed_option IS NOT NULL),
+  CHECK (state NOT IN ('answered','failed') OR settled_at IS NOT NULL),
+  -- 카드 매핑은 셋이 함께 있거나 함께 없다. 일부만 있으면 어디를 갱신할지 알 수 없다.
+  CHECK ((channel_id IS NULL AND thread_ts IS NULL AND message_ts IS NULL)
+      OR (channel_id IS NOT NULL AND thread_ts IS NOT NULL AND message_ts IS NOT NULL)),
+  -- 지문이 다르면 다른 질문이다. 같은 터미널이라도 행과 카드가 따로여야 지나간 질문의 카드가
+  -- 새 질문으로 바뀌지 않는다.
+  PRIMARY KEY (terminal_handle, fingerprint)
+)`;
+
+/**
+ * 한 터미널에 답할 수 있는 프롬프트는 한 번에 하나다.
+ *
+ * 부분 index인 것이 요점이다. 지나간 프롬프트 행은 남되 활성 행과 경쟁하지 않는다.
+ */
+const TERMINAL_PROMPT_ACTIVE_INDEX = `
+CREATE UNIQUE INDEX terminal_prompt_active
+  ON terminal_prompt (terminal_handle) WHERE state IN ('open','claimed')`;
+
+/** Run 단위로 프롬프트를 읽는 카드 렌더용 index. */
+const TERMINAL_PROMPT_RUN_INDEX = `
+CREATE INDEX terminal_prompt_run ON terminal_prompt (run_key, terminal_handle)`;
+
+/** 처리할 프롬프트를 고르는 daemon용 index. */
+const TERMINAL_PROMPT_STATE_INDEX = `
+CREATE INDEX terminal_prompt_state ON terminal_prompt (state, updated_at)`;
+
+/**
+ * 답변 시도 한 번의 결과. 살아 있는 세션에 입력을 쓴 사실은 지워지지 않아야 한다.
+ *
+ * `outcome`이 `refused`인 행이 이 기능이 제대로 작동한다는 증거다 — 화면이 바뀌었을 때 보내지
+ * 않았다는 뜻이기 때문이다.
+ */
+const TERMINAL_PROMPT_ATTEMPT_TABLE = `
+CREATE TABLE terminal_prompt_attempt (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  terminal_handle  TEXT NOT NULL,
+  fingerprint      TEXT NOT NULL,
+  option_index     INTEGER NOT NULL,
+  outcome          TEXT NOT NULL
+    CHECK (outcome IN ('sent','refused','failed')),
+  reason           TEXT CHECK (reason IS NULL OR length(reason) BETWEEN 1 AND 80),
+  at               TEXT NOT NULL
+)`;
+
+const TERMINAL_PROMPT_ATTEMPT_INDEX = `
+CREATE INDEX terminal_prompt_attempt_handle
+  ON terminal_prompt_attempt (terminal_handle, id)`;
+
 const SLACK_ROOT_INTENT_TABLE = `
 CREATE TABLE slack_root_intent (
   entity_kind          TEXT NOT NULL CHECK (entity_kind IN ('pr','run','run_collection')),
@@ -962,6 +1051,12 @@ ${DAEMON_JOB_OUTCOME_STATE_INDEX};
 ${SLACK_ROOT_INTENT_TABLE};
 ${SLACK_ROOT_INTENT_STATE_INDEX};
 ${SLACK_ROOT_INTENT_SLACK_INDEX};
+${TERMINAL_PROMPT_TABLE};
+${TERMINAL_PROMPT_ACTIVE_INDEX};
+${TERMINAL_PROMPT_RUN_INDEX};
+${TERMINAL_PROMPT_STATE_INDEX};
+${TERMINAL_PROMPT_ATTEMPT_TABLE};
+${TERMINAL_PROMPT_ATTEMPT_INDEX};
 `;
 
 /**
@@ -1061,6 +1156,16 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   // options만으로 채운 파생 행을 구분한다. 기존 행은 모두 `gate-register`가 쓴 것이므로
   // 기본값 'registered'가 그대로 맞다.
   [`ALTER TABLE gate_metadata ADD COLUMN ${GATE_METADATA_SOURCE_COLUMN}`],
+  // v14 → v15: agent 터미널의 대화형 프롬프트를 durable하게 관측하고 답한다. 표 추가뿐이라
+  // 기존 행은 그대로 남는다.
+  [
+    TERMINAL_PROMPT_TABLE,
+    TERMINAL_PROMPT_ACTIVE_INDEX,
+    TERMINAL_PROMPT_RUN_INDEX,
+    TERMINAL_PROMPT_STATE_INDEX,
+    TERMINAL_PROMPT_ATTEMPT_TABLE,
+    TERMINAL_PROMPT_ATTEMPT_INDEX,
+  ],
 ];
 
 /**

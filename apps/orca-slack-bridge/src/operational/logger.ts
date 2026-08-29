@@ -43,6 +43,10 @@ export const OPERATIONAL_LOG_EVENTS = [
   // 않아, 무인 운영에서 coordinator가 안 깨어난 이유를 추적할 수단이 사라진다(DL-031).
   'channel.adapter',
   'channel.delivery',
+  // 막힌 터미널 구간. 이것이 없으면 사람이 폰에서 누른 답이 왜 들어가지 않았는지 — 화면이
+  // 바뀌어 거절됐는지, 전송이 실패했는지 — 를 추적할 수단이 없다.
+  'terminal.prompt',
+  'terminal.prompt_action',
   'logger.failed',
   'telemetry.rejected',
   'log.corrupt_line',

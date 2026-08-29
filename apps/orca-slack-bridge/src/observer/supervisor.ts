@@ -3,7 +3,7 @@ import type { DaemonJobName, OperationalFailureCode } from '../store/operational
 
 export type ObserverJobName = Extract<
   DaemonJobName,
-  'repository-discovery' | 'run-observer' | 'gate-reconcile' | 'pr-digest'
+  'repository-discovery' | 'run-observer' | 'gate-reconcile' | 'pr-digest' | 'terminal-prompt'
 >;
 
 export type ObserverTimer = ReturnType<typeof setTimeout>;
@@ -86,7 +86,7 @@ export type ObserverSupervisorOptions = {
  * Every job this supervisor can schedule must appear.
  */
 const FAIR_ORDER: readonly ObserverJobName[] = [
-  'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest',
+  'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest', 'terminal-prompt',
 ];
 
 /**

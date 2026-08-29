@@ -130,6 +130,15 @@ export const OPERATIONAL_FAILURE_CODES = [
   'digest.timeout',
   'digest.capacity_deferred',
   'gate.reconcile_failed',
+  // 한 pass 안에서 터미널 하나를 읽거나 카드를 올리지 못했다. pass 자체는 계속한다.
+  'terminal.pass_degraded',
+  // 확정된 답을 보내지 못했다. 화면이 바뀌어 거절한 경우가 여기 대부분이고, 그것이 정상 동작이다.
+  'terminal.answer_refused',
+  'terminal.query_failed',
+  'terminal.timeout',
+  'terminal.schema_drift',
+  // Slack 버튼 클릭을 받아들이지 않았다.
+  'terminal.action_rejected',
   'channel.delivery_failed',
   'channel.route_unavailable',
   'scheduler.timeout',
@@ -168,7 +177,8 @@ export type DaemonJobName =
   | 'run-observer'
   | 'pr-digest'
   | 'gate-reconcile'
-  | 'channel-delivery';
+  | 'channel-delivery'
+  | 'terminal-prompt';
 
 export type DaemonJobState = 'running' | 'succeeded' | 'failed' | 'backoff';
 

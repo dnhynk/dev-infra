@@ -12,6 +12,13 @@ import {
 import { normalizeGithubNameWithOwner } from '../discovery/github-remote.js';
 import { parseGateOptionMetadataArray } from '../gate/register.js';
 import type { GateMetadata } from '../gate/types.js';
+import type { TerminalPromptOption } from '../terminal/prompt.js';
+import type {
+  ObservedTerminalPrompt,
+  TerminalPromptAttemptOutcome,
+  TerminalPromptClaim,
+  TerminalPromptRecord,
+} from '../terminal/types.js';
 import {
   gateActionId,
   gateBlockId,
@@ -59,7 +66,7 @@ import {
   type GateResolveResult,
   type GateSnapshot,
 } from '../gate/resolution-types.js';
-import { pullRequestKey, pullRequestNumber, runKey } from '../identity/keys.js';
+import { dispatchKey, pullRequestKey, pullRequestNumber, runKey } from '../identity/keys.js';
 import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
@@ -783,6 +790,62 @@ SELECT job_name, revision, state, attempt, consecutive_failures, started_at, com
        processed_count, deferred_count, checkpoint, updated_at
   FROM daemon_job_outcome ORDER BY job_name`;
 
+const TERMINAL_PROMPT_COLUMNS =
+  `terminal_handle, run_key, role, dispatch_key, fingerprint, prompt_json, channel_id, thread_ts,
+   message_ts, render_fingerprint, state, claimed_option, claimed_by, claimed_at, settled_at,
+   last_error_code, created_at, updated_at`;
+
+const SELECT_TERMINAL_PROMPT = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE terminal_handle = ? AND fingerprint = ?`;
+
+const SELECT_ACTIVE_TERMINAL_PROMPT = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE terminal_handle = ? AND state IN ('open','claimed')`;
+
+const SELECT_RUN_TERMINAL_PROMPTS = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE run_key = ? AND state <> 'gone'
+ ORDER BY terminal_handle, created_at`;
+
+const SELECT_TERMINAL_PROMPTS_BY_STATE = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE state = ? ORDER BY updated_at, terminal_handle`;
+
+const INSERT_TERMINAL_PROMPT = `
+INSERT INTO terminal_prompt
+  (terminal_handle, run_key, role, dispatch_key, fingerprint, prompt_json, channel_id, thread_ts,
+   message_ts, render_fingerprint, state, claimed_option, claimed_by, claimed_at, settled_at,
+   last_error_code, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 'open', NULL, NULL, NULL, NULL, NULL, ?, ?)`;
+
+const INSERT_TERMINAL_PROMPT_ATTEMPT = `
+INSERT INTO terminal_prompt_attempt (terminal_handle, fingerprint, option_index, outcome, reason, at)
+VALUES (?, ?, ?, ?, ?, ?)`;
+
+const CLOSE_ACTIVE_TERMINAL_PROMPTS = `
+UPDATE terminal_prompt SET state = 'gone', settled_at = ?, updated_at = ?
+ WHERE terminal_handle = ? AND state IN ('open','claimed')`;
+
+const RECORD_TERMINAL_PROMPT_CARD = `
+UPDATE terminal_prompt
+   SET channel_id = ?, thread_ts = ?, message_ts = ?, render_fingerprint = ?, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND message_ts IS NULL`;
+
+const UPDATE_TERMINAL_PROMPT_CARD = `
+UPDATE terminal_prompt SET render_fingerprint = ?, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND message_ts IS NOT NULL`;
+
+const CLAIM_TERMINAL_PROMPT = `
+UPDATE terminal_prompt
+   SET state = 'claimed', claimed_option = ?, claimed_by = ?, claimed_at = ?,
+       last_error_code = NULL, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND state = 'open'`;
+
+const SETTLE_TERMINAL_PROMPT = `
+UPDATE terminal_prompt SET state = ?, settled_at = ?, last_error_code = ?, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND state = 'claimed'`;
+
 const SELECT_SLACK_ROOT_INTENT = `
 SELECT entity_kind, entity_key, revision, channel_id, render_fingerprint, state, attempt_count,
        sending_instance_id, message_ts, prepared_at, last_attempt_at, posted_at, uncertain_at,
@@ -794,6 +857,27 @@ SELECT entity_kind, entity_key, revision, channel_id, render_fingerprint, state,
        sending_instance_id, message_ts, prepared_at, last_attempt_at, posted_at, uncertain_at,
        last_error_code, updated_at
   FROM slack_root_intent ORDER BY entity_kind, entity_key`;
+
+type TerminalPromptRow = {
+  readonly terminal_handle: string;
+  readonly run_key: string;
+  readonly role: string;
+  readonly dispatch_key: string | null;
+  readonly fingerprint: string;
+  readonly prompt_json: string;
+  readonly channel_id: string | null;
+  readonly thread_ts: string | null;
+  readonly message_ts: string | null;
+  readonly render_fingerprint: string | null;
+  readonly state: string;
+  readonly claimed_option: number | null;
+  readonly claimed_by: string | null;
+  readonly claimed_at: string | null;
+  readonly settled_at: string | null;
+  readonly last_error_code: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
 
 /** sqlite가 돌려주는 run_message 한 행. 컬럼명 그대로다. */
 type RunMessageRow = {
@@ -2177,6 +2261,86 @@ function toGateMetadata(row: GateMetadataRow): GateMetadata {
   };
 }
 
+function toTerminalPrompt(row: TerminalPromptRow): TerminalPromptRecord {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.prompt_json);
+  } catch (e) {
+    throw new TypeError(
+      `${row.terminal_handle}의 terminal_prompt.prompt_json이 JSON이 아니다`,
+      { cause: e },
+    );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError(`${row.terminal_handle}의 terminal_prompt.prompt_json이 객체가 아니다`);
+  }
+  const snapshot = parsed as Record<string, unknown>;
+  const rawOptions = snapshot['options'];
+  if (!Array.isArray(rawOptions) || rawOptions.length < 2 || rawOptions.length > 25) {
+    throw new TypeError(`${row.terminal_handle}의 prompt options가 2..25개 array가 아니다`);
+  }
+  const options = rawOptions.map((raw, position): TerminalPromptOption => {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option[${position}]이 객체가 아니다`);
+    }
+    const option = raw as Record<string, unknown>;
+    const index = option['index'];
+    const label = option['label'];
+    const description = option['description'];
+    if (typeof index !== 'number' || !Number.isSafeInteger(index) || index !== position + 1) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option 번호가 1..N으로 이어지지 않는다`);
+    }
+    if (typeof label !== 'string' || label === '' || label.length > 75) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option label이 1..75자가 아니다`);
+    }
+    if (description !== null && (typeof description !== 'string' || description.length > 3000)) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option description이 잘못됐다`);
+    }
+    return { index, label, description, selected: option['selected'] === true };
+  });
+  const cursorIndex = snapshot['cursorIndex'];
+  if (typeof cursorIndex !== 'number' || !options.some((option) => option.index === cursorIndex)) {
+    throw new TypeError(`${row.terminal_handle}의 prompt cursorIndex가 options에 없다`);
+  }
+  if (row.role !== 'coordinator' && row.role !== 'worker') {
+    throw new TypeError(`${row.terminal_handle}의 terminal_prompt.role이 알 수 없는 값이다`);
+  }
+  const state = row.state;
+  if (state !== 'open' && state !== 'claimed' && state !== 'answered' &&
+      state !== 'failed' && state !== 'gone') {
+    throw new TypeError(`${row.terminal_handle}의 terminal_prompt.state가 알 수 없는 값이다`);
+  }
+  return {
+    terminalHandle: storedText(row.terminal_handle, 'terminal_prompt.terminal_handle'),
+    runKey: storedKey(row.run_key, 'run:', `${row.terminal_handle}.run_key`) as RunKey,
+    role: row.role,
+    dispatchId: row.dispatch_key === null
+      ? null
+      : storedKey(
+          row.dispatch_key,
+          'dispatch:',
+          `${row.terminal_handle}.dispatch_key`,
+        ).slice('dispatch:'.length),
+    fingerprint: storedText(row.fingerprint, `${row.terminal_handle}.fingerprint`, 32),
+    title: typeof snapshot['title'] === 'string' ? snapshot['title'] : null,
+    question: typeof snapshot['question'] === 'string' ? snapshot['question'] : '',
+    options,
+    cursorIndex,
+    channelId: row.channel_id,
+    threadTs: row.thread_ts,
+    messageTs: row.message_ts,
+    renderFingerprint: row.render_fingerprint,
+    state,
+    claimedOption: row.claimed_option,
+    claimedBy: row.claimed_by,
+    claimedAt: row.claimed_at,
+    settledAt: row.settled_at,
+    lastErrorCode: row.last_error_code,
+    createdAt: storedIso(row.created_at, `${row.terminal_handle}.created_at`),
+    updatedAt: storedIso(row.updated_at, `${row.terminal_handle}.updated_at`),
+  };
+}
+
 function toGateMessage(row: GateMessageRow): GateMessageRecord {
   if (
     !/^[CG][A-Z0-9]+$/.test(row.channel_id) ||
@@ -2654,6 +2818,196 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       // 갱신할 행이 없다는 것은 호출 순서가 깨졌다는 뜻이다. 새 행을 만들어 덮지 않는다.
       throw new Error('컬렉션 루트의 매핑 행이 없어 관찰 결과를 갱신할 수 없다');
     }
+  }
+
+  /** 이 Run에서 지나가지 않은 프롬프트 전부. 카드를 그리는 쪽이 쓴다. */
+  listTerminalPrompts(runKey: RunKey): readonly TerminalPromptRecord[] {
+    return (this.db.prepare(SELECT_RUN_TERMINAL_PROMPTS).all(runKey) as TerminalPromptRow[])
+      .map(toTerminalPrompt);
+  }
+
+  /** 한 상태의 프롬프트를 오래된 것부터. daemon이 처리 대상을 고를 때 쓴다. */
+  listTerminalPromptsByState(state: string): readonly TerminalPromptRecord[] {
+    return (this.db.prepare(SELECT_TERMINAL_PROMPTS_BY_STATE).all(state) as TerminalPromptRow[])
+      .map(toTerminalPrompt);
+  }
+
+  findTerminalPrompt(handle: string, fingerprint: string): TerminalPromptRecord | null {
+    const row = this.db.prepare(SELECT_TERMINAL_PROMPT).get(handle, fingerprint) as
+      | TerminalPromptRow
+      | undefined;
+    return row === undefined ? null : toTerminalPrompt(row);
+  }
+
+  /** 이 터미널에서 지금 답할 수 있는 프롬프트. 없으면 null이다. */
+  findActiveTerminalPrompt(handle: string): TerminalPromptRecord | null {
+    const row = this.db.prepare(SELECT_ACTIVE_TERMINAL_PROMPT).get(handle) as
+      | TerminalPromptRow
+      | undefined;
+    return row === undefined ? null : toTerminalPrompt(row);
+  }
+
+  /**
+   * 관측 한 번을 반영한다. 이미 있는 지문이면 아무것도 하지 않는다.
+   *
+   * 관측은 답변 상태도 카드 매핑도 건드리지 않는다. 같은 프롬프트를 다시 봤다는 사실만으로
+   * 진행 중인 답변을 되돌리면 안 되기 때문이다. 지문이 다르면 **다른 질문**이므로, 같은
+   * 터미널의 열린 행을 먼저 닫고 새 행을 만든다.
+   */
+  observeTerminalPrompt(input: ObservedTerminalPrompt, at: string): TerminalPromptRecord {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.terminalHandle, input.fingerprint) as TerminalPromptRow | undefined;
+      if (existing !== undefined) {
+        this.db.exec('COMMIT');
+        return toTerminalPrompt(existing);
+      }
+      // 같은 터미널의 옛 프롬프트를 닫는다. 화면에서 사라졌으므로 더는 답할 수 없다.
+      this.db.prepare(CLOSE_ACTIVE_TERMINAL_PROMPTS).run(at, at, input.terminalHandle);
+      const snapshot = JSON.stringify({
+        title: input.title,
+        question: input.question,
+        options: input.options,
+        cursorIndex: input.cursorIndex,
+      });
+      this.db.prepare(INSERT_TERMINAL_PROMPT).run(
+        input.terminalHandle,
+        input.runKey,
+        input.role,
+        input.dispatchId === null ? null : dispatchKey(input.dispatchId),
+        input.fingerprint,
+        snapshot,
+        at,
+        at,
+      );
+      const created = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.terminalHandle, input.fingerprint) as TerminalPromptRow;
+      this.db.exec('COMMIT');
+      return toTerminalPrompt(created);
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${input.terminalHandle}의 terminal prompt 관측을 기록할 수 없다: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+        { cause: e },
+      );
+    }
+  }
+
+  /** 화면에서 프롬프트가 사라졌다. 사람이 터미널에서 직접 답한 경우가 대부분이다. */
+  markTerminalPromptGone(handle: string, at: string): void {
+    this.db.prepare(CLOSE_ACTIVE_TERMINAL_PROMPTS).run(at, at, handle);
+  }
+
+  /** 카드를 처음 게시한 뒤 매핑을 남긴다. 남길 행이 없으면 던진다. */
+  recordTerminalPromptCard(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly channelId: string;
+    readonly threadTs: string;
+    readonly messageTs: string;
+    readonly renderFingerprint: string;
+    readonly at: string;
+  }): void {
+    const result = this.db.prepare(RECORD_TERMINAL_PROMPT_CARD).run(
+      input.channelId, input.threadTs, input.messageTs, input.renderFingerprint, input.at,
+      input.handle, input.fingerprint,
+    );
+    if (Number(result.changes) === 0) {
+      throw new Error(`${input.handle}의 prompt 카드 매핑을 남길 행이 없다`);
+    }
+  }
+
+  /** 이미 게시한 카드의 렌더 지문만 갱신한다. message identity는 건드리지 않는다. */
+  updateTerminalPromptCard(
+    handle: string,
+    fingerprint: string,
+    renderFingerprint: string,
+    at: string,
+  ): void {
+    this.db.prepare(UPDATE_TERMINAL_PROMPT_CARD).run(renderFingerprint, at, handle, fingerprint);
+  }
+
+  /**
+   * Slack 버튼 한 번을 durable하게 확정한다.
+   *
+   * `open`이고 지문이 정확히 같을 때만 이긴다. 지문이 다르면 그 사이 화면이 바뀐 것이고, 그때
+   * 보내면 같은 답이 다른 질문에 들어간다. 여기서 거절하는 것이 이 기능의 안전성이다.
+   */
+  claimTerminalPromptAnswer(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly optionIndex: number;
+    readonly owner: string;
+    readonly at: string;
+  }): TerminalPromptClaim {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.handle, input.fingerprint) as TerminalPromptRow | undefined;
+      if (row === undefined) {
+        this.db.exec('COMMIT');
+        return { kind: 'stale', reason: 'prompt_not_found' };
+      }
+      const current = toTerminalPrompt(row);
+      if (current.state !== 'open') {
+        this.db.exec('COMMIT');
+        // 같은 사람이 같은 선택지를 다시 누른 것은 중복이지 경쟁이 아니다.
+        if (current.state === 'claimed' && current.claimedOption === input.optionIndex &&
+            current.claimedBy === input.owner) {
+          return { kind: 'duplicate', record: current };
+        }
+        return { kind: 'stale', reason: `prompt_${current.state}` };
+      }
+      if (!current.options.some((option) => option.index === input.optionIndex)) {
+        this.db.exec('COMMIT');
+        return { kind: 'stale', reason: 'unknown_option' };
+      }
+      this.db.prepare(CLAIM_TERMINAL_PROMPT).run(
+        input.optionIndex, input.owner, input.at, input.at, input.handle, input.fingerprint,
+      );
+      const claimed = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.handle, input.fingerprint) as TerminalPromptRow;
+      this.db.exec('COMMIT');
+      return { kind: 'claimed', record: toTerminalPrompt(claimed) };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${input.handle}의 prompt 답변을 확정할 수 없다: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+        { cause: e },
+      );
+    }
+  }
+
+  /** 답변 시도 결과로 상태를 닫는다. `failed`는 자동으로 다시 시도하지 않는다. */
+  settleTerminalPromptAnswer(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly outcome: 'answered' | 'failed';
+    readonly errorCode: string | null;
+    readonly at: string;
+  }): void {
+    this.db.prepare(SETTLE_TERMINAL_PROMPT).run(
+      input.outcome, input.at, input.errorCode, input.at, input.handle, input.fingerprint,
+    );
+  }
+
+  /** 살아 있는 세션에 입력을 쓴 사실은 결과와 무관하게 남긴다. */
+  recordTerminalPromptAttempt(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly optionIndex: number;
+    readonly outcome: TerminalPromptAttemptOutcome;
+    readonly reason: string | null;
+    readonly at: string;
+  }): void {
+    this.db.prepare(INSERT_TERMINAL_PROMPT_ATTEMPT).run(
+      input.handle, input.fingerprint, input.optionIndex, input.outcome, input.reason, input.at,
+    );
   }
 
   findGateMetadata(gateKey: GateKey): GateMetadata | null {

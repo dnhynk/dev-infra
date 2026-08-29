@@ -42,6 +42,16 @@ export type AutomationConfig = {
     readonly intervalSeconds: number;
     readonly timeoutSeconds: number;
   };
+  /**
+   * 막힌 agent 터미널의 대화형 프롬프트를 읽고, 확정된 답을 보낸다.
+   *
+   * 무인 운용에서 멈춤은 대부분 터미널 프롬프트로 나타난다. 이 주기가 곧 "사람이 막힌 것을
+   * 알게 되기까지의 시간"이라 Gate 재조정보다 짧게 둔다.
+   */
+  readonly terminalPrompt: {
+    readonly intervalSeconds: number;
+    readonly timeoutSeconds: number;
+  };
   readonly prDigest: {
     readonly intervalSeconds: number;
     readonly timeoutSeconds: number;
@@ -78,6 +88,9 @@ export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = Object.freeze({
   // 60s so a stuck decision converges well inside the owner's attention span; the engine's own
   // 20s reconcile deadline bounds one pass.
   gateReconcile: Object.freeze({ intervalSeconds: 60, timeoutSeconds: 30 }),
+  // 30s. 이 값이 사람이 막힘을 알게 되기까지의 지연이다. 한 pass는 터미널 수만큼의 read이고
+  // 실측에서 16대가 있었으므로 이 주기에서 비용이 문제 되지 않는다.
+  terminalPrompt: Object.freeze({ intervalSeconds: 30, timeoutSeconds: 120 }),
   prDigest: Object.freeze({
     intervalSeconds: 900,
     timeoutSeconds: 300,
@@ -234,6 +247,7 @@ function parseAutomation(value: unknown): AutomationConfig {
       'repositoryDiscovery',
       'runObserver',
       'gateReconcile',
+      'terminalPrompt',
       'prDigest',
       'github',
       'scheduler',
@@ -253,6 +267,7 @@ function parseAutomation(value: unknown): AutomationConfig {
   ]);
   const runObserver = section(value, 'runObserver', ['intervalSeconds', 'timeoutSeconds']);
   const gateReconcile = section(value, 'gateReconcile', ['intervalSeconds', 'timeoutSeconds']);
+  const terminalPrompt = section(value, 'terminalPrompt', ['intervalSeconds', 'timeoutSeconds']);
   const prDigest = section(value, 'prDigest', [
     'intervalSeconds',
     'timeoutSeconds',
@@ -334,6 +349,22 @@ function parseAutomation(value: unknown): AutomationConfig {
         DEFAULT_AUTOMATION_CONFIG.gateReconcile.timeoutSeconds,
         'automation.gateReconcile.timeoutSeconds',
         10,
+        300,
+      ),
+    },
+    terminalPrompt: {
+      intervalSeconds: boundedNumber(
+        terminalPrompt['intervalSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.terminalPrompt.intervalSeconds,
+        'automation.terminalPrompt.intervalSeconds',
+        10,
+        900,
+      ),
+      timeoutSeconds: boundedNumber(
+        terminalPrompt['timeoutSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.terminalPrompt.timeoutSeconds,
+        'automation.terminalPrompt.timeoutSeconds',
+        15,
         300,
       ),
     },

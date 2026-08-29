@@ -235,6 +235,28 @@ Orca Gate의 `question`과 `options`에는 사람이 읽는 짧은 요약만 둔
 recommendation, impact는 Bridge sidecar에 저장하고 Gate ID로 연결한다. button·modal의 기계 판정은 이
 metadata를 사용하며 question/options 자유 텍스트를 parsing하지 않는다(OD-050).
 
+### 6.2b 막힌 터미널
+
+무인 운용에서 멈춤은 대부분 Gate가 아니라 **agent 터미널의 대화형 프롬프트**로 나타난다. Gate는
+coordinator가 만들기로 결정한 것이라 자발성에 기대고, 그 자발성이 깨지면 멈춤이 어디에도 나타나지
+않는다. 그래서 Bridge는 살아 있는 터미널의 화면을 직접 읽는다(OD-084).
+
+대상은 Run의 `coordinator_handle`과 dispatched worker의 `agent_terminal_handle`이다. coordinator는
+Dispatch가 아니라 `worker-show`의 `agentWait`에 잡히지 않으므로, 이 경로가 없으면 coordinator의
+멈춤은 관측 표면 어디에도 없다.
+
+카드의 버튼은 `orca terminal send`로 답한다. 순서가 안전성 전부다.
+
+1. 화면을 다시 읽어 지문을 대조한다. 다르면 보내지 않는다.
+2. 커서를 목표까지 옮긴다. 이동은 선택이 아니라 되돌릴 수 있다.
+3. 다시 읽어 커서가 목표에 있는지 확인한다. 아니면 멈춘다.
+4. 확인된 뒤에만 Enter를 보낸다.
+
+지문은 프롬프트 영역만 쓰고 커서 표시는 뺀다. 화면 아래 로그는 프롬프트와 무관하게 움직이고,
+커서는 이 절차 자신이 옮기기 때문이다. 화면 모양이 어긋나면 카드를 만들지 않고 기존 badge 경로로
+남는다. 자유 입력으로 들어가는 선택지는 버튼으로 만들지 않는다 — Slack에서 그 상태를 끝낼 수 없어
+더 나쁜 막힘이 된다.
+
 sidecar가 등록되지 않은 Gate는 관측이 Orca `options`만으로 파생 행을 만들어 durable하게 남긴다
 (`source='derived'`). 파생 행의 option ID는 label에서 결정되고 resolution은 label 그대로이며
 설명·recommendation·impact는 없다. 카드는 그만큼 얇지만 누를 수 있다. 나중에 들어온 `gate-register`가

@@ -353,8 +353,18 @@ describe('컬렉션 게시', () => {
     store.close();
 
     for (const post of slack.posts) {
+      // degraded는 카드 아래쪽 작은 글씨(context)로 내려갔다. 사실이 실린다는 요구는 그대로이므로
+      // 두 블록 종류를 모두 훑는다.
       const text = post.blocks
-        .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
+        .map((b) => {
+          const direct = (b['text'] as { text?: string } | undefined)?.text;
+          if (direct !== undefined) return direct;
+          const elements = b['elements'];
+          return Array.isArray(elements)
+            ? (elements as readonly Record<string, unknown>[])
+              .map((e) => String(e['text'] ?? '')).join('\n')
+            : '';
+        })
         .join('\n');
       expect(text).toContain('[unverified_platform_assumption]');
     }

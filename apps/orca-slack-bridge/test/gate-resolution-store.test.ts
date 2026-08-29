@@ -7,7 +7,10 @@ import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { SCHEMA_VERSION } from '../src/store/schema.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
-import { downgradeGateMetadataToV13 } from './fixtures/schema-downgrade.js';
+import {
+  downgradeGateMetadataToV13,
+  dropTerminalPromptTables,
+} from './fixtures/schema-downgrade.js';
 
 const GATE = gateKey('gate_d2c');
 const RUN = runKey('run_d2c');
@@ -124,6 +127,7 @@ describe('strict persisted Gate schema', () => {
       DROP TABLE orca_repository_binding;
       DROP TABLE repository_registry;
     `);
+    dropTerminalPromptTables(raw);
     downgradeGateMetadataToV13(raw);
     raw.prepare('UPDATE schema_version SET version = 7 WHERE id = 1').run();
     raw.close();
@@ -133,8 +137,8 @@ describe('strict persisted Gate schema', () => {
     const tables = (migrated.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'gate_resolution%' ORDER BY name",
     ).all() as { readonly name: string }[]).map((row) => row.name);
-    expect(SCHEMA_VERSION).toBe(14);
-    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 14 });
+    expect(SCHEMA_VERSION).toBe(15);
+    expect(migrated.prepare('SELECT version FROM schema_version WHERE id = 1').get()).toEqual({ version: 15 });
     expect(tables).toEqual([
       'gate_resolution',
       'gate_resolution_attempt',
@@ -159,6 +163,7 @@ describe('strict persisted Gate schema', () => {
        DROP TABLE repository_discovery_issue; DROP TABLE orca_repository_binding;
        DROP TABLE repository_registry`,
     );
+    dropTerminalPromptTables(raw);
     downgradeGateMetadataToV13(raw);
     raw.prepare('UPDATE schema_version SET version = 8 WHERE id = 1').run();
     raw.close();

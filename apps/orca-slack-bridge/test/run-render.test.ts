@@ -315,7 +315,9 @@ describe('Dispatch attempts 분리 (OD-069)', () => {
 
 describe('blocker badge (OD-067)', () => {
   it('원천별 badge에 연결 ID가 함께 나온다', () => {
-    const current = sectionWith(renderRunCard(input()), 'blocker · 현재 상태');
+    // 현재 시제 blocker는 카드 맨 위 "사람이 필요하다" 절로 올라갔다. 절 이름이 바뀌었을 뿐
+    // 원천별 badge와 연결 ID를 함께 싣는다는 요구는 그대로다.
+    const current = sectionWith(renderRunCard(input()), '사람이 필요하다');
 
     expect(current).toContain('open Gate 2');
     expect(current).toContain('gate gate_a1');
@@ -373,7 +375,7 @@ describe('blocker badge (OD-067)', () => {
 describe('누적 이력과 현재 blocker 구분 (run/types.ts)', () => {
   it('failedDispatch와 escalation이 현재 상태 절에 나오지 않는다', () => {
     const card = renderRunCard(input());
-    const current = sectionWith(card, 'blocker · 현재 상태');
+    const current = sectionWith(card, '사람이 필요하다');
 
     expect(current).not.toContain('failed Dispatch');
     expect(current).not.toContain('escalation');
