@@ -6644,6 +6644,56 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     });
   }
 
+  /**
+   * Slack에서 사라진 루트의 매핑과 intent를 함께 버린다.
+   *
+   * ## 왜 둘 다인가
+   *
+   * 매핑만 지우면 `prepareSlackRootIntent`가 `posted` intent를 만나 지문이 달라졌다고 판정하고
+   * `OPERATIONAL_CONFLICT`로 던진다. intent만 지우면 매핑이 남아 `mappingExists`에서 같은 결과가
+   * 된다. 하나만 지우는 것은 두 상태를 갈라놓는 것이고, 그러면 그 카드는 영원히 다시 만들어지지
+   * 않는다. 그래서 한 트랜잭션에서 둘 다 버린다.
+   *
+   * ## 언제 부르는가
+   *
+   * 사람이 Slack UI에서 카드를 지웠을 때다. `chat.update`가 `message_not_found`로 답하는 것이
+   * 그 관측이고, 그때 우리가 든 ts는 가리킬 곳이 없는 값이다. 다른 오류에는 부르지 않는다 —
+   * 일시적 실패로 durable 증거를 지우면 다음 관찰이 루트를 하나 더 만든다.
+   *
+   * 지운 것이 있으면 true다. 없어도 실패가 아니다.
+   */
+  forgetSlackRoot(entity: SlackRootEntity): boolean {
+    const validated = operationalEntity(entity);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const intent = this.db.prepare(
+        'DELETE FROM slack_root_intent WHERE entity_kind = ? AND entity_key = ?',
+      ).run(validated.kind, validated.key);
+      let mapping = 0;
+      if (validated.kind === 'run') {
+        mapping = Number(
+          this.db.prepare('DELETE FROM run_message WHERE run_key = ?').run(validated.key).changes,
+        );
+      } else if (validated.kind === 'run_collection') {
+        mapping = Number(
+          this.db.prepare('DELETE FROM run_collection_message WHERE id = 1').run().changes,
+        );
+      } else {
+        mapping = Number(
+          this.db.prepare('DELETE FROM pr_message WHERE pr_key = ?').run(validated.key).changes,
+        );
+      }
+      this.db.exec('COMMIT');
+      return Number(intent.changes) > 0 || mapping > 0;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${validated.kind} 루트 매핑을 버릴 수 없다: ${e instanceof Error ? e.message : String(e)}`,
+        { cause: e },
+      );
+    }
+  }
+
   prepareSlackRootIntent(input: PrepareSlackRootIntentInput): SlackRootIntentRecord {
     const entity = operationalEntity(input);
     const channelId = operationalInputText(input.channelId, 200);

@@ -13,7 +13,8 @@ import {
   postSlackRootAtMostOnce,
   type SlackRootIntentRuntime,
 } from '../slack/root-intent.js';
-import type { RunKey } from '../identity/keys.js';
+import type { GateKey, RunKey } from '../identity/keys.js';
+import type { SlackRootEntity } from '../store/operational-types.js';
 import type { GateStore, RunStore } from '../store/schema.js';
 import { collectRunFacts, type RunRoutingConfig } from './collect.js';
 import {
@@ -79,7 +80,15 @@ export type RunPublishAction =
    * Run 카드 22장이 세 시간 동안 갱신되지 않았다. 컬렉션 카드를 먼저 게시하는 것과 같은
    * 이유이고, 그 이유를 Run 카드 목록에도 적용한 것이다.
    */
-  | 'failed';
+  | 'failed'
+  /**
+   * 사람이 Slack에서 카드를 지웠다. 가리킬 곳이 없어진 매핑을 버렸고, 다음 관찰이 새로 만든다.
+   *
+   * 이것이 없으면 지워진 카드의 매핑이 영원히 남아 매 관찰마다 같은 오류를 낸다. 카드는
+   * 사실의 투영이지 사람이 쓴 글이 아니므로, Run이 살아 있는 한 다음 관찰에서 다시 나타나는
+   * 것이 맞다.
+   */
+  | 'relinked';
 
 /**
  * 카드 한 장에 대한 결정과 그 결정이 만든 값.
@@ -236,13 +245,21 @@ export async function publishRunCard(
     return { ...base, action: 'create', messageTs: created.message.ts };
   }
 
-  const updated = await boundedSlackUpdate(options.slack, {
-    channel: existing.channelId,
-    ts: existing.messageTs,
-    text: card.text,
-    blocks: card.blocks,
-    ...(signal === undefined ? {} : { signal }),
-  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  let updated;
+  try {
+    updated = await boundedSlackUpdate(options.slack, {
+      channel: existing.channelId,
+      ts: existing.messageTs,
+      text: card.text,
+      blocks: card.blocks,
+      ...(signal === undefined ? {} : { signal }),
+    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  } catch (error) {
+    if (!deletedInSlack(error)) throw error;
+    // 사람이 지웠다. 우리가 든 ts는 가리킬 곳이 없으므로 매핑을 버린다. 다음 관찰이 새로 만든다.
+    forgetRoot(options.store, { kind: 'run', key: runKey });
+    return { ...base, action: 'relinked', messageTs: null };
+  }
   options.store.updateRunObservation(runKey, fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
 }
@@ -311,15 +328,43 @@ export async function publishRunCollectionCard(
     return { ...base, action: 'create', messageTs: created.message.ts };
   }
 
-  const updated = await boundedSlackUpdate(options.slack, {
-    channel: existing.channelId,
-    ts: existing.messageTs,
-    text: card.text,
-    blocks: card.blocks,
-    ...(signal === undefined ? {} : { signal }),
-  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  let updated;
+  try {
+    updated = await boundedSlackUpdate(options.slack, {
+      channel: existing.channelId,
+      ts: existing.messageTs,
+      text: card.text,
+      blocks: card.blocks,
+      ...(signal === undefined ? {} : { signal }),
+    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  } catch (error) {
+    if (!deletedInSlack(error)) throw error;
+    forgetRoot(options.store, { kind: 'run_collection', key: 'run_collection' });
+    return { ...base, action: 'relinked', messageTs: null };
+  }
   options.store.updateRunCollectionObservation(fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
+}
+
+/** Slack이 "그 메시지가 없다"고 답했는가. 다른 오류와 섞지 않는다. */
+function deletedInSlack(error: unknown): boolean {
+  return error instanceof SlackApiError && error.code === 'message_not_found';
+}
+
+/**
+ * 루트 매핑과 intent를 함께 버린다. store가 이 연산을 갖지 않으면 아무것도 하지 않는다.
+ *
+ * 버리지 못해도 던지지 않는다. 이 자리는 이미 한 카드의 실패를 처리하는 중이고, 정리에
+ * 실패했다고 나머지 카드까지 멈추면 원래 고치려던 문제로 돌아간다.
+ */
+function forgetRoot(store: unknown, entity: SlackRootEntity): void {
+  const forgetful = store as { forgetSlackRoot?: (target: SlackRootEntity) => boolean };
+  if (typeof forgetful.forgetSlackRoot !== 'function') return;
+  try {
+    forgetful.forgetSlackRoot(entity);
+  } catch {
+    // 다음 관찰이 같은 판정에 다시 도달한다.
+  }
 }
 
 /**

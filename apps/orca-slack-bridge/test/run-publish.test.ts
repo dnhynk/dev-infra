@@ -56,11 +56,12 @@ class FakeSlack implements SlackPoster {
     this.seq += 1;
     return { channel: input.channel, ts: `1787403740.00000${this.seq}` };
   }
-  /** 이 ts를 갱신하려 하면 Slack이 지워진 메시지라고 답한다. */
+  /** 이 ts를 갱신하려 하면 Slack이 아래 코드로 실패한다. */
   failUpdateFor: string | null = null;
+  failUpdateCode = 'message_not_found';
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
     if (this.failUpdateFor !== null && input.ts === this.failUpdateFor) {
-      throw new SlackApiError('chat.update', 'message_not_found');
+      throw new SlackApiError('chat.update', this.failUpdateCode);
     }
     this.updates.push(input);
     return { channel: input.channel, ts: input.ts };
@@ -302,13 +303,13 @@ describe('컬렉션 게시', () => {
     ...over,
   });
 
-  it('카드 하나의 Slack 실패가 나머지 카드를 멈추지 않는다', async () => {
+  it('사람이 지운 카드는 매핑을 버리고 다음 관찰이 다시 만든다', async () => {
     /*
-     * 지워진 메시지 하나가 관찰 전체를 멈춘 실패를 잡는다.
+     * 사람이 Slack UI에서 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 그 매핑을 그대로 두면
+     * 매 관찰마다 같은 오류가 나고, 실제로 Run 카드 22장이 세 시간 동안 갱신되지 않았다.
      *
-     * `chat.update`가 `message_not_found`로 던지면 게시 루프가 그 자리에서 끝나고, 관찰 job이
-     * 실패로 끝나 다음 주기에도 같은 카드에서 다시 멈춘다. 실측에서 Run 카드 22장이 세 시간
-     * 동안 갱신되지 않았고 그동안 daemon 상태는 healthy였다.
+     * 매핑과 root intent를 함께 버려야 한다. 하나만 버리면 다음 관찰이 `OPERATIONAL_CONFLICT`로
+     * 막혀 그 카드는 영원히 다시 만들어지지 않는다.
      */
     const store = new SqliteDigestStore(dbPath);
     const slack = new FakeSlack();
@@ -318,7 +319,41 @@ describe('컬렉션 게시', () => {
     expect(firstTs).not.toBe('');
     slack.failUpdateFor = firstTs;
 
-    // 두 카드 모두 갱신이 필요하도록 사실을 움직인다.
+    const moved = [
+      facts({ tasks: { total: 99, byStatus: [] } }),
+      facts({ tasks: { total: 98, byStatus: [] } }, OTHER_RUN_ID),
+    ];
+    const relinking = await publishRunCollection(
+      options(store, slack), collection({ runs: moved }),
+    );
+    const actions = relinking.runs.map((entry) => entry.action);
+    expect(actions).toContain('relinked');
+    // 두 번째 카드는 그대로 갱신된다. 이것이 없으면 카드 하나가 나머지를 인질로 잡는다.
+    expect(actions).toContain('update');
+    expect(store.findRunMessage(runKey(RUN_ID))).toBeNull();
+
+    // 다음 관찰이 새 루트를 만든다.
+    slack.failUpdateFor = null;
+    const recreated = await publishRunCollection(
+      options(store, slack), collection({ runs: moved }),
+    );
+    expect(recreated.runs.find((entry) => entry.run.identity.runId === RUN_ID)?.action)
+      .toBe('create');
+    expect(store.findRunMessage(runKey(RUN_ID))?.messageTs).not.toBe(firstTs);
+    store.close();
+  });
+
+  it('지워짐이 아닌 Slack 실패는 그 카드에 가두고 코드를 남긴다', async () => {
+    // 일시적 실패로 durable 매핑을 지우면 다음 관찰이 루트를 하나 더 만든다. 그래서 지워짐만
+    // 매핑을 버리고, 나머지는 그 카드의 실패로만 남는다.
+    const store = new SqliteDigestStore(dbPath);
+    const slack = new FakeSlack();
+
+    await publishRunCollection(options(store, slack), collection());
+    const firstTs = store.findRunMessage(runKey(RUN_ID))?.messageTs ?? '';
+    slack.failUpdateFor = firstTs;
+    slack.failUpdateCode = 'ratelimited';
+
     const moved = [
       facts({ tasks: { total: 99, byStatus: [] } }),
       facts({ tasks: { total: 98, byStatus: [] } }, OTHER_RUN_ID),
@@ -326,13 +361,9 @@ describe('컬렉션 게시', () => {
     const result = await publishRunCollection(options(store, slack), collection({ runs: moved }));
     store.close();
 
-    const actions = result.runs.map((entry) => entry.action);
-    expect(actions).toContain('failed');
-    // 두 번째 카드는 그대로 갱신된다. 이것이 없으면 카드 하나가 나머지를 인질로 잡는다.
-    expect(actions).toContain('update');
     const failure = result.runs.find((entry) => entry.action === 'failed');
-    // 코드를 남긴다. "메시지가 지워졌다"와 "채널에 없다"는 운영자가 할 일이 다르다.
-    expect(failure?.errorCode).toBe('message_not_found');
+    expect(failure?.errorCode).toBe('ratelimited');
+    expect(result.runs.map((entry) => entry.action)).toContain('update');
   });
 
   it('등록된 Run마다 카드 하나를 만든다', async () => {
