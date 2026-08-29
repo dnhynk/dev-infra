@@ -204,6 +204,10 @@ export class ObserverSupervisor {
     // owns: an action whose Orca mutation died mid-flight left an intent behind, and waiting one
     // full interval leaves the owner staring at a pressed button for that whole window.
     this.markDue('gate-reconcile');
+    // 막힌 터미널도 즉시 한 번 훑는다. 이 job은 이전 실행 기록이 없으면 deferred schedule도
+    // 없어서, 여기서 due로 표시하지 않으면 첫 타이머를 영영 받지 못한다. 재시작 직후가 바로
+    // 사람이 답을 기다리는 화면이 떠 있을 수 있는 구간이다.
+    this.markDue('terminal-prompt');
     const digestDelay = finiteMilliseconds('digestDelayMs', digestDelayMs);
     this.installTimer('pr-digest', {
       wallDeadlineMs: this.clock.wallNow().getTime() + digestDelay,
