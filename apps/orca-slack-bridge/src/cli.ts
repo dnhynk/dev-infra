@@ -1259,14 +1259,23 @@ export async function runDaemonCommand(
     if (crashReported) return;
     crashReported = true;
     process.stderr.write(`${crashCodes[kind]}\n`);
-    void health?.event({
-      level: 'error',
-      event: 'daemon.failed',
-      outcome: 'failed',
-      errorCode: crashCodes[kind] as OperationalFailureCode,
-      retryable: true,
-    }).catch(() => { /* 죽는 중이다. 보고 실패가 종료를 막지 않는다. */ })
-      .finally(() => { process.exit(1); });
+    /*
+     * 보고가 실패해도, 보고할 곳이 없어도 반드시 죽는다.
+     *
+     * `health`가 아직 null인 구간이 있다. 옵셔널 호출의 결과에 그대로 `.catch`를 붙이면 그
+     * 자리에서 TypeError가 나고, 그것이 uncaughtException 핸들러 안이라 프로세스가 아무 줄도
+     * 남기지 않고 끝난다. 관측하려고 놓은 덫이 관측을 지우는 셈이다.
+     */
+    const reported = (async (): Promise<void> => {
+      await health?.event({
+        level: 'error',
+        event: 'daemon.failed',
+        outcome: 'failed',
+        errorCode: crashCodes[kind] as OperationalFailureCode,
+        retryable: true,
+      });
+    })().catch(() => undefined);
+    void reported.finally(() => { process.exit(1); });
   };
   const onUncaught = (): void => { reportCrash('uncaughtException'); };
   const onUnhandled = (): void => { reportCrash('unhandledRejection'); };

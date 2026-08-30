@@ -669,11 +669,51 @@ try {
   }
   $start.EnvironmentVariables[$buildIdentityName] = [string]$runtime.releaseDigest
 
+  # daemon이 죽은 순간의 흔적을 남긴다.
+  #
+  # 지금까지 daemon이 사라져도 stderr가 어디에도 수집되지 않았다. Task로 뜬 프로세스에는 콘솔이
+  # 없어 그대로 버려진다. 그래서 두 번의 죽음 모두 운영 로그에 성공한 job이 마지막 줄이었고,
+  # 원인을 볼 수단이 없었다. 여기서 파일로 받는다.
+  #
+  # 비동기로 읽는다. 동기로 읽으면 파이프 버퍼가 차는 순간 daemon이 쓰기에서 막힌다 — 계측이
+  # 대상을 멈추게 하는 것이 가장 나쁜 종류다.
+  $start.RedirectStandardError = $true
+  $stderrPath = [IO.Path]::Combine([string]$runtime.logDirectory, 'daemon-stderr.log')
+  $stderrWriter = $null
+  $stderrSubscription = $null
+  try {
+    $stderrWriter = [IO.StreamWriter]::new($stderrPath, $true)
+    $stderrWriter.AutoFlush = $true
+  } catch { $stderrWriter = $null }
+
   $daemon = [Diagnostics.Process]::new()
   $daemon.StartInfo = $start
+  if ($null -ne $stderrWriter) {
+    $stderrSubscription = Register-ObjectEvent -InputObject $daemon -EventName ErrorDataReceived -MessageData $stderrWriter -Action {
+      $line = $EventArgs.Data
+      if ($null -eq $line) { return }
+      try {
+        # 무한히 커지지 않게 상한을 둔다. 넘으면 새로 시작한다 — 최근 것이 원인에 가깝다.
+        $writer = $Event.MessageData
+        if ($writer.BaseStream.Length -gt 4194304) { $writer.BaseStream.SetLength(0) }
+        $writer.WriteLine(('{0:o} {1}' -f (Get-Date).ToUniversalTime(), $line))
+      } catch { }
+    }
+  }
+  $daemon.EnableRaisingEvents = $true
   if (-not $daemon.Start()) { throw 'daemon start' }
+  if ($null -ne $stderrWriter) { $daemon.BeginErrorReadLine() }
   $daemon.WaitForExit()
   $exitCode = $daemon.ExitCode
+  if ($null -ne $stderrSubscription) {
+    try { Unregister-Event -SourceIdentifier $stderrSubscription.Name -ErrorAction SilentlyContinue } catch { }
+  }
+  if ($null -ne $stderrWriter) {
+    try {
+      $stderrWriter.WriteLine(('{0:o} daemon exited code={1}' -f (Get-Date).ToUniversalTime(), $exitCode))
+      $stderrWriter.Dispose()
+    } catch { }
+  }
   $daemon.Dispose()
   exit $exitCode
 } catch {
