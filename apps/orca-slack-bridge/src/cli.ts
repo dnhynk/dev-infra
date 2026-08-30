@@ -1293,10 +1293,31 @@ export async function runDaemonCommand(
     reconciliationAbort.abort();
     resolveStop();
   };
-  const reportFailure = (): void => {
+  /**
+   * 죽은 자리를 stderr에 남긴다.
+   *
+   * **프레임만 적고 메시지는 적지 않는다.** 이 경로의 오류 문구에는 카드 내용과 사용자 결정이
+   * 들어갈 수 있고, stderr는 파일로 수집된다. 필요한 것은 "어디서 던졌나"이고 그것은 프레임에
+   * 있다. 이것이 없어 같은 죽음을 세 번 놓쳤다 — 문구 없이 코드만으로는 자리를 좁힐 수 없었다.
+   */
+  const reportFailure = (error?: unknown): void => {
     if (failureReported) return;
     failureReported = true;
     process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
+    // 던진 값이 없는 호출자도 있다. 그때는 지금까지와 같은 한 줄만 남긴다.
+    if (error === undefined) return;
+    if (!(error instanceof Error)) {
+      process.stderr.write(`daemon.failure kind=${typeof error}\n`);
+      return;
+    }
+    process.stderr.write(`daemon.failure name=${error.name}\n`);
+    const frames = (error.stack ?? '')
+      .split('\n')
+      .filter((line) => line.trimStart().startsWith('at '))
+      .slice(0, 12);
+    for (const frame of frames) process.stderr.write(`  ${frame.trim()}\n`);
+    const cause: unknown = (error as { cause?: unknown }).cause;
+    if (cause instanceof Error) process.stderr.write(`daemon.failure cause=${cause.name}\n`);
   };
   if (processStopLatch !== null) {
     void processStopLatch.promise.then(() => requestStop('requested'));
@@ -2101,7 +2122,7 @@ export async function runDaemonCommand(
     await channelServer.stop();
     channelServer = null;
     return stopReason === 'pipe_failure' || observerDrainTimedOut || fatalOperationalFailure ? 1 : 0;
-  } catch {
+  } catch (failure) {
     commandFailed = true;
     /*
      * 크래시를 운영 로그에 남긴다.
@@ -2120,7 +2141,7 @@ export async function runDaemonCommand(
       errorCode: 'daemon.startup_failed',
       retryable: true,
     }).catch(() => { /* 죽는 중이다. 보고 실패가 종료를 막지 않는다. */ });
-    reportFailure();
+    reportFailure(failure);
     return 1;
   } finally {
     process.off('uncaughtException', onUncaught);
