@@ -1835,6 +1835,9 @@ export async function runDaemonCommand(
               const report = await runRunObserver(scopedOrcaRunner(orca, signal), {
                 config: effectiveConfig,
                 channel: config.slack!.channels.agentRuns,
+                // Gate 카드는 답할 카드만 오는 채널로 간다. 설정하지 않으면 이 값이
+                // `agentRuns`와 같아 지금까지와 같은 자리에 남는다.
+                decisionsChannel: config.slack!.channels.decisions,
                 store: daemonStore,
                 slack,
                 thread: threadPoster,

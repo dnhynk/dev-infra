@@ -134,6 +134,13 @@ export type RunCollectionPublishResult = {
 export type RunPublishOptions = {
   readonly store: RunStore & GateStore;
   /**
+   * 답할 카드(Gate)를 놓을 채널. 없으면 Run 카드와 같은 채널의 스레드에 놓는다.
+   *
+   * Slack은 메시지를 게시 순서로 고정한다. 상태 카드는 제자리에서 갱신되므로 아래로 내려오지
+   * 않고, 답할 카드가 그 사이에 섞이면 둘 다 스크롤로 찾아야 한다.
+   */
+  readonly decisionsChannel?: string;
+  /**
    * Slack write 경계. **null이면 dry-run이다** — Slack도 store도 건드리지 않고 결정만 돌려준다.
    *
    * `digest`가 `slack: null`을 dry-run 신호로 쓰는 것과 같은 모양이다. 두 경로가 다른 신호를
@@ -445,7 +452,12 @@ export async function publishRunCollection(
             store: options.store,
             slack: options.slack,
             thread: options.thread,
-            channel: options.channel,
+            // 답할 카드는 답할 카드만 오는 채널에 최상위로 놓는다. 설정하지 않은 설치에서는
+            // 이 값이 `agentRuns`와 같아 지금까지와 같은 자리로 간다.
+            channel: options.decisionsChannel ?? options.channel,
+            ...(options.decisionsChannel === undefined
+              ? {}
+              : { placement: 'channel' as const }),
             now: options.now,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.slackTimeoutMs === undefined
@@ -473,6 +485,8 @@ export type RunObserveOptions = {
   readonly config: RunRoutingConfig;
   /** 게시 대상 채널 ID. 설정의 `slack.channels.agentRuns`에서만 온다. 여기서 만들지 않는다. */
   readonly channel: string;
+  /** 답할 카드(Gate)를 놓을 채널. 설정의 `slack.channels.decisions`에서만 온다. */
+  readonly decisionsChannel?: string;
   readonly store: RunStore & GateStore;
   /** Slack write 경계. **null이면 dry-run이다.** */
   readonly slack: SlackPoster | null;

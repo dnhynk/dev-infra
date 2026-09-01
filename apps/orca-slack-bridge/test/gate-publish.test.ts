@@ -23,6 +23,7 @@ import { publishGateCard } from '../src/gate/publish.js';
 const RUN_ID = 'run_d2a';
 const GATE_ID = 'gate_static';
 const GATE_TASK = 'task_gate';
+const DECISIONS_CHANNEL = 'C0DECISIONS1';
 const RAW_ONLY_GATE = 'gate_without_sidecar';
 // options를 읽지 못하면 파생도 등록도 할 수 없다. 파생이 생긴 뒤에도 missing이 남는 유일한 경우다.
 const UNREADABLE_GATE = 'gate_unreadable_options';
@@ -363,6 +364,59 @@ describe('collect → project → render → existing Run thread publish', () =>
       expect(store.findGateLocalObservation(gateKey(GATE_ID))).toMatchObject({
         status: 'pending', metadataState: 'matched', mappingState: 'matched',
       });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('답할 카드 채널이 설정되면 Gate를 그 채널에 최상위로 놓는다', async () => {
+    /*
+     * Slack은 메시지를 게시 순서로 고정한다. 상태 카드는 제자리에서 갱신되므로 아래로 내려오지
+     * 않고, 답할 카드가 그 사이에 섞이면 둘 다 스크롤로 찾아야 한다. 폰에서 채널을 열었을 때
+     * 맨 아래가 지금 할 일이 아니면 이 기능의 목적이 성립하지 않는다.
+     *
+     * 최상위 메시지 자체가 알림이므로 broadcast가 필요 없다. 스레드 답글은 스레드를 따르지
+     * 않는 사람에게 알림이 가지 않고, 알림을 위해 broadcast를 켜면 그 복사본이 다시 상태 카드
+     * 사이에 섞인다.
+     */
+    const store = new SqliteDigestStore(dbPath);
+    const orca = new MutableFakeOrca();
+    const slack = new FakeSlack();
+    insertSidecar(store);
+    try {
+      const report = await runRunObserver(orca, {
+        config: CONFIG,
+        channel: CHANNEL,
+        decisionsChannel: DECISIONS_CHANNEL,
+        store,
+        slack,
+        thread: slack,
+        now: () => new Date(AT),
+      });
+
+      expect(report.published.gates.every((gate) => gate.action !== 'root_unavailable')).toBe(true);
+      // Gate 카드가 답할 카드 채널의 최상위 메시지로 간다. Run 카드 채널에는 답글이 없다.
+      const decisionPosts = slack.posts.filter((post) => post.channel === DECISIONS_CHANNEL);
+      expect(decisionPosts.length).toBeGreaterThan(0);
+      expect(slack.replies).toHaveLength(0);
+
+      // 매핑은 그 채널을 가리키고, 자기 자신이 루트다.
+      const mapped = store.findGateMessage(gateKey(GATE_ID));
+      expect(mapped?.channelId).toBe(DECISIONS_CHANNEL);
+      expect(mapped?.threadTs).toBe(mapped?.messageTs);
+
+      // 재관찰이 같은 카드를 다시 만들지 않는다.
+      const again = await runRunObserver(orca, {
+        config: CONFIG,
+        channel: CHANNEL,
+        decisionsChannel: DECISIONS_CHANNEL,
+        store,
+        slack,
+        thread: slack,
+        now: () => new Date(AT),
+      });
+      expect(again.published.gates.map((gate) => gate.action)).not.toContain('create');
+      expect(store.findGateMessage(gateKey(GATE_ID))?.messageTs).toBe(mapped?.messageTs);
     } finally {
       store.close();
     }

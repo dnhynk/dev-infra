@@ -2342,6 +2342,27 @@ function toTerminalPrompt(row: TerminalPromptRow): TerminalPromptRecord {
   };
 }
 
+/**
+ * 이미 durable한 카드가 이 관측이 기대하던 그 카드인가.
+ *
+ * 최상위 카드에는 대조할 루트 ts가 없다. 그 경우 신원은 채널과 Run이고, thread ts는 자기
+ * 자신이라 비교에 아무 것도 더하지 않는다.
+ */
+function mappedIdentity(
+  message: GateMessageRecord,
+  runKey: RunKey,
+  expected: {
+    readonly channelId: string;
+    readonly threadTs: string | null;
+    readonly placement?: 'thread' | 'channel';
+  },
+): 'matched' | 'mismatched' | 'missing' {
+  if (message.runKey !== runKey || message.channelId !== expected.channelId) return 'mismatched';
+  if (expected.placement === 'channel') return 'matched';
+  if (expected.threadTs === null) return 'missing';
+  return message.threadTs === expected.threadTs ? 'matched' : 'mismatched';
+}
+
 function toGateMessage(row: GateMessageRow): GateMessageRecord {
   if (
     !/^[CG][A-Z0-9]+$/.test(row.channel_id) ||
@@ -3429,7 +3450,18 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   saveGateLocalObservation(
     observation: GateLocalObservation,
-    expectedFirstMessage?: { readonly channelId: string; readonly threadTs: string | null },
+    expectedFirstMessage?: {
+      readonly channelId: string;
+      readonly threadTs: string | null;
+      /**
+       * 카드가 어디에 놓이는가.
+       *
+       * `thread`는 Run 루트 아래 답글이고 그 루트의 ts가 신원의 일부다. `channel`은 자기 자신이
+       * 루트인 최상위 메시지라 대조할 상대 ts가 없다 — 그때 신원은 채널과 Run이다. 이 구분이
+       * 없으면 최상위 카드가 늘 `missing`으로 접힌다.
+       */
+      readonly placement?: 'thread' | 'channel';
+    },
     expectedRevision?: number,
   ): GateObservationSaveResult {
     if (expectedRevision !== undefined) {
@@ -3449,14 +3481,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           const message = toGateMessage(currentMessage);
           reconciledObservation = {
             ...observation,
-            mappingState:
-              expectedFirstMessage.threadTs === null
-                ? 'missing'
-                : message.runKey === observation.runKey &&
-                    message.channelId === expectedFirstMessage.channelId &&
-                    message.threadTs === expectedFirstMessage.threadTs
-                  ? 'matched'
-                  : 'mismatched',
+            mappingState: mappedIdentity(message, observation.runKey, expectedFirstMessage),
           };
         }
       }
@@ -5366,6 +5391,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     expectedMessageIdentity?: {
       readonly channelId: string;
       readonly threadTs: string | null;
+      /** `channel`이면 자기 자신이 루트라 대조할 상대 ts가 없다. 신원은 채널과 Run이다. */
+      readonly placement?: 'thread' | 'channel';
     },
   ): boolean {
     storedIso(at, `${gateKey}.ordinary Gate write fence at`);
@@ -5414,11 +5441,13 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         | undefined;
       const messageIdentityMatched =
         expectedMessageIdentity !== undefined &&
-        expectedMessageIdentity.threadTs !== null &&
         messageRow !== undefined &&
         messageRow.run_key === expectedObservation.runKey &&
         messageRow.channel_id === expectedMessageIdentity.channelId &&
-        messageRow.thread_ts === expectedMessageIdentity.threadTs;
+        (expectedMessageIdentity.placement === 'channel'
+          ? true
+          : expectedMessageIdentity.threadTs !== null &&
+            messageRow.thread_ts === expectedMessageIdentity.threadTs);
       if (
         expectedMessageIdentity !== undefined &&
         !messageIdentityMatched
