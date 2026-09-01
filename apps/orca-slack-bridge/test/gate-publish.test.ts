@@ -15,6 +15,7 @@ import type {
   ThreadReplyInput,
   UpdateMessageInput,
 } from '../src/slack/post.js';
+import { SlackApiError } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
@@ -161,7 +162,12 @@ class FakeSlack implements SlackPoster, ThreadPoster {
     return { channel: input.channel, ts: `1787554800.${String(this.posts.length).padStart(6, '0')}` };
   }
 
+  /** 이 ts를 갱신하려 하면 Slack이 지워진 메시지라고 답한다. */
+  deletedTs: string | null = null;
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
+    if (this.deletedTs !== null && input.ts === this.deletedTs) {
+      throw new SlackApiError('chat.update', 'message_not_found');
+    }
     this.updates.push(input);
     return { channel: input.channel, ts: input.ts };
   }
@@ -417,6 +423,53 @@ describe('collect → project → render → existing Run thread publish', () =>
       });
       expect(again.published.gates.map((gate) => gate.action)).not.toContain('create');
       expect(store.findGateMessage(gateKey(GATE_ID))?.messageTs).toBe(mapped?.messageTs);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('사람이 지운 Gate 카드는 매핑만 버리고 관측을 멈추지 않는다', async () => {
+    /*
+     * 사람이 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 던지게 두면 Gate 게시 루프가 그
+     * 자리에서 끝나고 관측 job이 실패로 끝나, 다음 주기에도 같은 카드에서 다시 멈춘다. 카드
+     * 한 장이 나머지 전부를 인질로 잡는다.
+     *
+     * 이미 끝난 Gate는 카드를 되살리지 않는다. 카드는 사람이 결정하라고 있는 것이고, 결정된
+     * Gate의 카드는 이력이다. 사람이 그 이력을 지웠으면 되살릴 이유가 없다.
+     */
+    const store = new SqliteDigestStore(dbPath);
+    const orca = new MutableFakeOrca();
+    const slack = new FakeSlack();
+    insertSidecar(store);
+    try {
+      await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack, thread: slack,
+        now: () => new Date(AT),
+      });
+      const mapped = store.findGateMessage(gateKey(GATE_ID));
+      expect(mapped).not.toBeNull();
+
+      // Gate가 끝나고, 그 사이 사람이 카드를 지웠다.
+      orca.gateStatus = 'resolved';
+      orca.gateResolution = 'A 유지';
+      slack.deletedTs = mapped!.messageTs;
+
+      const report = await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack, thread: slack,
+        now: () => new Date(AT),
+      });
+      const outcome = report.published.gates.find((g) => g.gate.gateId === GATE_ID);
+      expect(outcome?.action).toBe('relinked');
+      expect(store.findGateMessage(gateKey(GATE_ID))).toBeNull();
+
+      // 다음 관측이 끝난 Gate의 카드를 되살리지 않는다.
+      slack.deletedTs = null;
+      const again = await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack, thread: slack,
+        now: () => new Date(AT),
+      });
+      expect(again.published.gates.find((g) => g.gate.gateId === GATE_ID)?.action).toBe('skip');
+      expect(store.findGateMessage(gateKey(GATE_ID))).toBeNull();
     } finally {
       store.close();
     }

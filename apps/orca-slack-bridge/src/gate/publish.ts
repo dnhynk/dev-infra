@@ -4,6 +4,7 @@ import {
   boundedSlackReply,
   boundedSlackUpdate,
   DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  SlackApiError,
   type SlackPoster,
   type ThreadPoster,
 } from '../slack/post.js';
@@ -20,7 +21,14 @@ export type GatePublishAction =
   | 'skip'
   | 'channel_mismatch'
   | 'thread_mismatch'
-  | 'root_unavailable';
+  | 'root_unavailable'
+  /**
+   * 사람이 카드를 지웠다. 가리킬 곳이 없어진 매핑을 버렸다.
+   *
+   * 아직 열린 Gate면 다음 관측이 새로 만들고, 이미 끝난 Gate면 만들지 않는다. 이 값이 없으면
+   * 지워진 카드 한 장이 관측 pass 전체를 영원히 멈춘다.
+   */
+  | 'relinked';
 
 export type GatePublishResult = {
   readonly gate: GateDecisionFacts;
@@ -226,6 +234,16 @@ export async function publishGateCard(
   }
 
   const at = options.now().toISOString();
+  if (existing === null && gate.status !== 'pending') {
+    /*
+     * 끝난 Gate에 카드를 새로 만들지 않는다.
+     *
+     * 카드는 사람이 결정하라고 있는 것이고, 이미 결정된 Gate의 카드는 이력이다. 사람이 그
+     * 이력을 지웠으면 다음 관측이 되살릴 이유가 없다. 이것이 없으면 지운 카드가 채널마다
+     * 계속 다시 나타난다.
+     */
+    return { ...base, action: 'skip', messageTs: null };
+  }
   if (existing === null) {
     const stagedCard = stagedGateCard(card);
     const stagedFingerprint = renderFingerprint(stagedCard);
@@ -326,6 +344,12 @@ export async function publishGateCard(
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);
+    if (e instanceof SlackApiError && e.code === 'message_not_found') {
+      // 사람이 카드를 지웠다. 가리킬 곳이 없어진 매핑을 버린다. 던지면 이 Gate 하나가 관측
+      // pass 전체를 멈춘다.
+      options.store.forgetGateMessage(gate.key);
+      return { ...base, action: 'relinked', messageTs: null };
+    }
     throw e;
   }
   await options.fault?.('after_static_slack_before_observation', gate.key);

@@ -3119,6 +3119,41 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     return row === undefined ? null : toGateMessage(row);
   }
 
+  /**
+   * Slack에서 사라진 Gate 카드의 매핑을 버린다.
+   *
+   * 사람이 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 그 매핑을 그대로 두면 매 관측마다
+   * `chat.update`가 `message_not_found`로 던지고, Gate 게시 루프는 감싸져 있지 않으므로 관측
+   * pass 전체가 죽는다. 카드 한 장이 나머지 전부를 인질로 잡는다.
+   *
+   * 관측 행은 남긴다. 그 행은 Gate의 사실이지 카드의 사실이 아니다. 매핑만 없어지므로 다음
+   * 관측은 카드가 없는 상태에서 시작한다.
+   */
+  forgetGateMessage(gateKey: GateKey): boolean {
+    const key = storedKey(gateKey, 'gate:', 'forgetGateMessage.gateKey') as GateKey;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const removed = Number(
+        this.db.prepare('DELETE FROM gate_message WHERE gate_key = ?').run(key).changes,
+      );
+      if (removed > 0) {
+        this.db.prepare(
+          `UPDATE gate_local_observation SET mapping_state = 'missing', write_owner = NULL,
+                  write_expires_at = NULL
+            WHERE gate_key = ?`,
+        ).run(key);
+      }
+      this.db.exec('COMMIT');
+      return removed > 0;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${key}의 Gate 카드 매핑을 버릴 수 없다: ${e instanceof Error ? e.message : String(e)}`,
+        { cause: e },
+      );
+    }
+  }
+
   insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void {
     toGateMessage({
       gate_key: message.gateKey,
@@ -7139,6 +7174,10 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
 
   insertRunCollectionMessage(): void {
     throw new Error(`dry-run은 store에 쓰지 않는다. 컬렉션 루트 매핑을 기록하려 했다: ${this.path}`);
+  }
+
+  forgetGateMessage(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate 카드 매핑을 버리려 했다: ${this.path}`);
   }
 
   updateRunCollectionObservation(): void {

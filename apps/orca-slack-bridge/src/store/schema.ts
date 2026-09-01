@@ -1551,6 +1551,13 @@ export interface GateStore
    * transaction before any action controls are exposed.
    */
   insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void;
+  /**
+   * Slack에서 사라진 Gate 카드의 매핑을 버린다. 지운 것이 있으면 true다.
+   *
+   * 사람이 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 그 매핑을 두면 매 관측마다
+   * `chat.update`가 `message_not_found`로 던지고, 카드 한 장이 관측 pass 전체를 멈춘다.
+   */
+  forgetGateMessage(gateKey: GateKey): boolean;
   /** Settle an ordinary write fence and atomically record the exact observation it projected. */
   updateGateObservation(
     gateKey: GateKey,
