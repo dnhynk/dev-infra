@@ -221,6 +221,20 @@ function parseAction(body: unknown): { readonly value: ParsedAction } | { readon
 }
 
 /** ACK-once fixed-option consumer. Every remote operation is scheduled strictly after ACK success. */
+/**
+ * Gate 카드가 놓일 수 있는 채널인가.
+ *
+ * 답할 카드는 `decisions` 채널로 옮겼지만, 그 전에 만들어진 카드는 `agentRuns`에 남아 있다.
+ * 한 쪽만 인정하면 다른 쪽 카드의 버튼이 전부 거절된다 — 실제로 옮긴 직후 `channel_mismatch`로
+ * 그렇게 됐다.
+ *
+ * **아무 채널이나 받는 것이 아니다.** 설정에 있는 두 채널만 인정한다. 그 밖의 채널에서 온
+ * 클릭은 우리가 카드를 놓은 적이 없는 자리이므로 여전히 거절이다.
+ */
+function isGateCardChannel(config: SlackConfig, channelId: string): boolean {
+  return channelId === config.channels.agentRuns || channelId === config.channels.decisions;
+}
+
 export class GateActionHandler {
   private readonly now: () => Date;
   private readonly monotonic: () => number;
@@ -335,7 +349,7 @@ export class GateActionHandler {
           : this.options.config.apiAppId !== undefined &&
               action.apiAppId !== this.options.config.apiAppId
             ? 'api_app_mismatch'
-            : action.channelId !== this.options.config.channels.agentRuns
+            : !isGateCardChannel(this.options.config, action.channelId)
               ? 'channel_mismatch'
               : null;
     if (identityReason !== null) {
