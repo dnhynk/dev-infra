@@ -47,6 +47,16 @@ export const OPERATIONAL_LOG_EVENTS = [
   // 바뀌어 거절됐는지, 전송이 실패했는지 — 를 추적할 수단이 없다.
   'terminal.prompt',
   'terminal.prompt_action',
+  /*
+   * Slack이 보낸 상호작용 envelope이 daemon에 도착했다는 사실.
+   *
+   * 이것이 없으면 "폰에서 눌렀는데 아무 일도 없다"에서 클릭이 도착조차 안 한 것인지, 도착해서
+   * 거절된 것인지, 애초에 눌리지 않은 것인지를 가릴 수 없다. 실측에서 이 구분이 안 돼 소켓·
+   * 핸들러·라우팅을 전부 다시 검증하고서야 "클릭이 없었다"에 도달했다.
+   *
+   * 처리 결과는 남기지 않는다 — 그건 gate audit과 `terminal.prompt_action`이 이미 남긴다.
+   */
+  'slack.ingress',
   'logger.failed',
   'telemetry.rejected',
   'log.corrupt_line',

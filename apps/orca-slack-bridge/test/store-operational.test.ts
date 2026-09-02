@@ -850,6 +850,48 @@ describe('daemon health and monotonic job outcomes', () => {
     store.close();
   });
 
+  it('죽은 instance가 남긴 running 행을 기동 회수로만 되찾는다', () => {
+    /*
+     * daemon이 job 도중 비정상 종료하면 그 행은 `running`으로 남는다. 이 회수 경로가 없었을 때
+     * 이후 뜨는 daemon은 그 job을 claim하지 못했고, claim 거부는 fatal이라 스스로 종료했다 —
+     * 회수 수단이 없는 무한 크래시 루프였다.
+     *
+     * 회수는 기동 pass에만 허용된다. 평시 claim은 여전히 거절이어야 한다. 그렇지 않으면 한
+     * lane에서 도는 job을 다른 호출이 가로챌 수 있다.
+     */
+    const store = new SqliteDigestStore(path);
+    const abandoned = store.startDaemonJob('gate-reconcile', AT0);
+    expect(abandoned).not.toBeNull();
+    expect(store.findDaemonJobOutcome('gate-reconcile')).toMatchObject({ state: 'running' });
+
+    // 평시 claim은 살아 있는 job을 가로채지 않는다.
+    expect(store.startDaemonJob('gate-reconcile', AT2)).toBeNull();
+
+    const reclaimed = store.startDaemonJob('gate-reconcile', AT2, { startupTakeover: true });
+    expect(reclaimed).not.toBeNull();
+    expect(reclaimed!.revision).toBeGreaterThan(abandoned!.revision);
+    expect(store.findDaemonJobOutcome('gate-reconcile')).toMatchObject({
+      state: 'running', attempt: 2,
+    });
+
+    // 죽은 instance의 claim으로는 더 이상 완료를 쓸 수 없다.
+    expect(store.completeDaemonJobSuccess({
+      claim: abandoned!,
+      at: AT3,
+      nextRunAt: '2026-08-26T00:30:00.000Z',
+      durationMs: 1_000,
+      checkpoint: 0,
+    })).toBeNull();
+    expect(store.completeDaemonJobSuccess({
+      claim: reclaimed!,
+      at: AT3,
+      nextRunAt: '2026-08-26T00:30:00.000Z',
+      durationMs: 1_000,
+      checkpoint: 0,
+    })).toMatchObject({ state: 'succeeded', attempt: 2 });
+    store.close();
+  });
+
   it('accepts only the finite redacted failure-code catalog in every operational writer and row', () => {
     const store = new SqliteDigestStore(path);
     const job = store.startDaemonJob('repository-discovery', AT0)!;

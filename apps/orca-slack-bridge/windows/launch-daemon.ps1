@@ -669,6 +669,16 @@ try {
   }
   $start.EnvironmentVariables[$buildIdentityName] = [string]$runtime.releaseDigest
 
+  # daemon은 이 launcher가 살아 있는 동안만 산다.
+  #
+  # Task Scheduler가 task를 멈추면 launcher만 종료되고 daemon은 고아로 남는다. 실측에서 task가
+  # Ready인데 daemon이 Slack Socket과 상태 DB를 계속 쥐고 있었고, 그 위에 배포가 진행됐다.
+  #
+  # stdin을 파이프로 넘긴다. launcher가 어떤 방식으로 죽든 OS가 쓰기 끝을 닫고, daemon은 그
+  # EOF를 정상 종료 신호로 읽는다. 여기서 아무것도 쓰지 않는다 — 파이프의 존재 자체가 신호다.
+  $start.EnvironmentVariables['ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT'] = '1'
+  $start.RedirectStandardInput = $true
+
   # daemon이 죽은 순간의 흔적을 남긴다.
   #
   # 지금까지 daemon이 사라져도 stderr가 어디에도 수집되지 않았다. Task로 뜬 프로세스에는 콘솔이

@@ -363,6 +363,8 @@ function engine(
     concurrency?: number;
     reconcileDeadlineMs?: number;
     resumeBaselineDeadlineMs?: number;
+    routeSteadyAfterMs?: number;
+    routeSteadyRetryMs?: number;
     onTransition?: NonNullable<GateChannelDeliveryEngineOptions['onTransition']>;
     resume?: NonNullable<GateChannelDeliveryEngineOptions['resume']>;
   } = {},
@@ -396,6 +398,43 @@ function engine(
 }
 
 describe('durable Channel delivery engine', () => {
+  it('경로를 못 찾는 delivery는 나이가 들면 정상 상태 간격으로 물러난다', async () => {
+    /*
+     * 재시도 간격이 고정이었다. 받을 코디네이터가 없는 delivery 하나가 같은 간격으로 영원히
+     * 재시도하며 실패를 기록했고, 실측에서 6일 된 행 세 개가 그렇게 돌아 운영 로그가 회전
+     * 한계에 닿았다.
+     *
+     * 포기하지는 않는다 — 코디네이터는 돌아올 수 있다. 바뀌는 것은 간격뿐이고, 짧은 부재는
+     * 여전히 짧은 간격으로 회복한다.
+     */
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    resolveD2(store);
+    const orca = new FakeOrca();
+    const transport = new FakeTransport();
+    const time = clock();
+    const delivery = engine(store, orca, transport, time, [], {
+      routeSteadyAfterMs: 60_000,
+      routeSteadyRetryMs: 600_000,
+    });
+
+    transport.result = { kind: 'pending', code: 'no_candidate' };
+    await delivery.reconcile();
+    const young = store.findGateChannelDelivery(GATE)!;
+    expect(young.lastErrorCode).toBe('route_pending_no_candidate');
+    const youngGap = new Date(young.nextAttemptAt!).getTime() - time.now().getTime();
+    expect(youngGap).toBe(1_000);
+
+    // 마감을 넘긴 뒤에는 같은 실패라도 간격이 물러난다.
+    time.advance(60_000);
+    await delivery.reconcile();
+    const aged = store.findGateChannelDelivery(GATE)!;
+    expect(aged.lastErrorCode).toBe('route_pending_no_candidate');
+    expect(aged.state).toBe('pending');
+    const agedGap = new Date(aged.nextAttemptAt!).getTime() - time.now().getTime();
+    expect(agedGap).toBe(600_000);
+    store.close();
+  });
+
   it('keeps send, attempted, receipt, and exact Gate effect consumption distinct', async () => {
     const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
     resolveD2(store);

@@ -1023,7 +1023,11 @@ describe('daemon production wiring', () => {
         statePath,
         'a'.repeat(64),
       )).toBeNull();
+      // 어느 조건으로 죽었는지까지 남긴다. 셋 다 exit 1로 합류하므로 이 줄이 없으면 store
+      // 닫기 실패인지, observer drain timeout인지, 운영 fatal인지 구분할 수단이 없다.
       expect(diagnostics).toEqual([
+        'daemon.stop_flags store_uncertain=true observer_drain_timeout=false'
+        + ' fatal_operational=false stop_reason=requested\n',
         'daemon이 strict startup 또는 Gate reconciliation에 실패했다\n',
       ]);
       expect(diagnostics.join('')).not.toContain(privateDetail);

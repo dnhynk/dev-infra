@@ -83,6 +83,7 @@ function gateRow(
   question: string,
   options: readonly string[],
   status = 'pending',
+  resolution: string | null = null,
 ): Record<string, unknown> {
   return {
     id,
@@ -91,7 +92,7 @@ function gateRow(
     question,
     options: JSON.stringify(options),
     status,
-    resolution: null,
+    resolution,
     created_at: '2026-08-24T05:00:00Z',
     resolved_at: null,
   };
@@ -100,6 +101,7 @@ function gateRow(
 class MutableFakeOrca implements OrcaRunner {
   gateQuestion = '정적 Gate card를 이 경로로 게시할까?';
   gateStatus = 'pending';
+  gateResolution: string | null = null;
   readonly calls: string[][] = [];
 
   run(args: readonly string[]): Promise<string> {
@@ -133,7 +135,10 @@ class MutableFakeOrca implements OrcaRunner {
     } else if (command === 'gate-list') {
       result = {
         gates: [
-          gateRow(GATE_ID, GATE_TASK, this.gateQuestion, ['기존 유지', '변경'], this.gateStatus),
+          gateRow(
+            GATE_ID, GATE_TASK, this.gateQuestion, ['기존 유지', '변경'],
+            this.gateStatus, this.gateResolution,
+          ),
           gateRow(RAW_ONLY_GATE, RAW_ONLY_TASK, 'sidecar가 없는 Gate', ['예', '아니오']),
           {
             ...gateRow(UNREADABLE_GATE, UNREADABLE_TASK, 'options를 읽지 못하는 Gate', []),

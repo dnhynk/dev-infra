@@ -1085,6 +1085,14 @@ type ProcessStopLatch = {
   dispose(): void;
 };
 
+/**
+ * 부모가 사라지면 daemon도 멈춘다는 신호를 켤지 여부.
+ *
+ * launcher가 stdin을 파이프로 넘길 때만 '1'이다. 파이프 없이 이 감시를 켜면 stdin이 이미 닫힌
+ * 실행(콘솔 없는 서비스, 수동 포그라운드 실행)에서 즉시 종료로 오인한다.
+ */
+const STOP_ON_PARENT_EXIT = 'ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT';
+
 function processStop(): ProcessStopLatch {
   let dispose = (): void => undefined;
   const promise = new Promise<void>((resolve) => {
@@ -1095,12 +1103,33 @@ function processStop(): ProcessStopLatch {
       dispose();
       resolve();
     };
+    /*
+     * 부모(launcher)가 죽으면 stdin 파이프의 쓰기 끝이 닫히고 여기서 EOF로 관측된다.
+     *
+     * Windows Task Scheduler가 task를 멈추면 launcher만 종료되고 daemon은 고아로 살아남는다.
+     * 실측에서 task 상태가 Ready인데 daemon이 Socket과 상태 DB를 계속 쥐고 있었다. 배포가
+     * 옛 daemon을 남긴 채 진행되는 구조다.
+     *
+     * Job Object 강제 종료 대신 이 경로를 쓰는 이유는 정상 종료이기 때문이다. 강제 종료는 job
+     * 행을 `running`인 채로 남기고, 그 행은 다음 daemon의 claim을 거부해 크래시 루프를 만든다.
+     */
+    const watchParent = process.env[STOP_ON_PARENT_EXIT] === '1';
     dispose = (): void => {
       process.off('SIGINT', stop);
       process.off('SIGTERM', stop);
+      if (watchParent) {
+        process.stdin.off('end', stop);
+        process.stdin.off('close', stop);
+        process.stdin.pause();
+      }
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
+    if (watchParent) {
+      process.stdin.once('end', stop);
+      process.stdin.once('close', stop);
+      process.stdin.resume();
+    }
   });
   return { promise, dispose: () => dispose() };
 }
@@ -1229,6 +1258,12 @@ export async function runDaemonCommand(
   let daemonHealthStarted = false;
   let observerDrainTimedOut = false;
   let fatalOperationalFailure = false;
+  /*
+   * observer supervisor가 넘겨주는 fatal 원인. 지금까지 이 값을 버렸고, 그래서 daemon이 죽어도
+   * 종료 경로가 남기는 것은 "실패했다" 한 줄뿐이었다. 실측에서 daemon이 기동 40초 뒤 반복해서
+   * 사라졌는데 stderr·운영 로그 어디에도 원인이 없었다.
+   */
+  let observerFatalCause: unknown;
   let commandFailed = false;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
@@ -1969,8 +2004,15 @@ export async function runDaemonCommand(
           },
         },
       ] as const;
+      /*
+       * 기동 시 한 번 회수를 허용할 job. 여기 없는 job은 이전 instance가 남긴 `running` 행을
+       * 회수하지 못하고, 그 job의 claim 거부가 daemon 전체를 죽인다.
+       *
+       * 위 initialState와 같은 다섯 개를 모두 적는다. 실측에서 `gate-reconcile`이 빠져 있어
+       * 강제 종료 한 번이 daemon을 무한 크래시 루프에 빠뜨렸다.
+       */
       const startupClaims = new Set<ObserverJobName>([
-        'repository-discovery', 'run-observer', 'pr-digest',
+        'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest', 'terminal-prompt',
       ]);
       observerSupervisor = new ObserverSupervisor({
         installationSeed: dependencies.installationSeed ?? resolvedStatePath,
@@ -2033,8 +2075,9 @@ export async function runDaemonCommand(
             throw new Error('daemon_job_backoff_rejected');
           }
         },
-        onFatal: () => {
+        onFatal: (error) => {
           fatalOperationalFailure = true;
+          observerFatalCause ??= error;
           requestStop('requested');
         },
       });
@@ -2050,6 +2093,15 @@ export async function runDaemonCommand(
         // A connection may invoke a retained callback while its bounded close is still draining.
         // Leave that envelope unACKed for Slack redelivery instead of starting work after stop.
         if (!acceptingInbound) return Promise.resolve();
+        /*
+         * 도착 사실을 먼저 남긴다. 처리 결과가 아니라 도착 여부다.
+         *
+         * 이 줄이 없으면 "폰에서 눌렀는데 아무 일도 없다"를 받았을 때 클릭이 daemon까지 왔는지
+         * 조차 알 수 없다. 기록을 기다리지 않는다 — Slack ACK 예산을 로깅에 쓰지 않는다.
+         */
+        void health?.event({
+          level: 'info', event: 'slack.ingress', outcome: 'started', counts: { processed: 1 },
+        }).catch(() => undefined);
         const consumer = isTerminalPromptEvent(event)
           ? promptHandler
           : isGateDirectInputEvent(event)
@@ -2223,7 +2275,17 @@ export async function runDaemonCommand(
     if (writableStoreClosureUncertain || observerDrainTimedOut || fatalOperationalFailure) {
       // Do not release or discard the descriptor/mutex when the writable handle may still be live.
       // The CLI entrypoint exits nonzero immediately after this bounded static diagnostic.
-      reportFailure();
+      //
+      // 어느 조건으로 죽었는지까지 남긴다. 셋 다 exit 1로 합류하므로 이 줄이 없으면 store 닫기
+      // 실패인지, observer drain timeout인지, 운영 fatal인지 구분할 수단이 없다.
+      process.stderr.write(
+        `daemon.stop_flags store_uncertain=${writableStoreClosureUncertain}`
+        + ` observer_drain_timeout=${observerDrainTimedOut}`
+        + ` fatal_operational=${fatalOperationalFailure}`
+        + ` stop_reason=${stopReason ?? 'none'}
+`,
+      );
+      reportFailure(observerFatalCause);
       return 1;
     }
   }

@@ -13,6 +13,15 @@ import { GateResumeEngine } from './resume.js';
 
 export const DEFAULT_DELIVERY_ATTEMPT_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
 export const DEFAULT_DELIVERY_RECEIPT_BACKOFF_MS = 30_000;
+/**
+ * 경로를 찾지 못한 delivery가 정상 상태 간격으로 물러나기까지의 나이.
+ *
+ * 코디네이터 재시작 같은 일시적 부재는 5초 재시도로 곧 회복된다. 그 창을 넘긴 부재는 성격이
+ * 다르다 — 코디네이터가 아예 없거나 영영 돌아오지 않는 경우다.
+ */
+export const DEFAULT_DELIVERY_ROUTE_STEADY_AFTER_MS = 5 * 60_000;
+/** 위 나이를 넘긴 delivery의 재시도 간격. */
+export const DEFAULT_DELIVERY_ROUTE_STEADY_RETRY_MS = 10 * 60_000;
 export const DEFAULT_DELIVERY_RECONCILE_DEADLINE_MS = 20_000;
 export const DEFAULT_DELIVERY_CONCURRENCY = 8;
 /**
@@ -51,6 +60,8 @@ export type GateChannelDeliveryEngineOptions = {
   readonly monotonicNow?: () => number;
   readonly leaseMs?: number;
   readonly routeRetryMs?: number;
+  readonly routeSteadyAfterMs?: number;
+  readonly routeSteadyRetryMs?: number;
   readonly receiptBackoffMs?: number;
   readonly attemptDelaysMs?: readonly number[];
   readonly batchLimit?: number;
@@ -96,6 +107,8 @@ export class GateChannelDeliveryEngine {
   readonly #monotonicNow: () => number;
   readonly #leaseMs: number;
   readonly #routeRetryMs: number;
+  readonly #routeSteadyAfterMs: number;
+  readonly #routeSteadyRetryMs: number;
   readonly #receiptBackoffMs: number;
   readonly #attemptDelaysMs: readonly number[];
   readonly #batchLimit: number;
@@ -116,6 +129,14 @@ export class GateChannelDeliveryEngine {
       (() => Number(process.hrtime.bigint()) / 1_000_000);
     this.#leaseMs = finiteMs(options.leaseMs ?? 30_000, 'delivery_lease_invalid');
     this.#routeRetryMs = finiteMs(options.routeRetryMs ?? 5_000, 'delivery_route_retry_invalid');
+    this.#routeSteadyAfterMs = finiteMs(
+      options.routeSteadyAfterMs ?? DEFAULT_DELIVERY_ROUTE_STEADY_AFTER_MS,
+      'delivery_route_steady_after_invalid',
+    );
+    this.#routeSteadyRetryMs = finiteMs(
+      options.routeSteadyRetryMs ?? DEFAULT_DELIVERY_ROUTE_STEADY_RETRY_MS,
+      'delivery_route_steady_retry_invalid',
+    );
     this.#receiptBackoffMs = finiteMs(
       options.receiptBackoffMs ?? DEFAULT_DELIVERY_RECEIPT_BACKOFF_MS,
       'delivery_receipt_backoff_invalid',
@@ -530,8 +551,21 @@ export class GateChannelDeliveryEngine {
     }
   }
 
+  /*
+   * 경로를 못 찾는 delivery는 나이가 들면 물러난다.
+   *
+   * 이 간격이 고정 5초였다. 그래서 받을 코디네이터가 없는 delivery 하나가 시간당 700줄 넘게
+   * 실패를 남기며 영원히 재시도했다 — 실측에서 6일 된 행 세 개가 그렇게 돌고 있었고, 운영
+   * 로그가 회전 한계에 닿아 실제 이력을 밀어냈다.
+   *
+   * 포기하지는 않는다. 코디네이터는 돌아올 수 있고, 그때 깨우는 것이 이 경로의 목적이다.
+   * 바꾸는 것은 간격뿐이다.
+   */
   #retryDelay(delivery: GateChannelDelivery): number {
-    return delivery.state === 'receipted' ? this.#receiptBackoffMs : this.#routeRetryMs;
+    if (delivery.state === 'receipted') return this.#receiptBackoffMs;
+    const age = this.#now().getTime() - new Date(delivery.createdAt).getTime();
+    if (!Number.isFinite(age) || age < this.#routeSteadyAfterMs) return this.#routeRetryMs;
+    return this.#routeSteadyRetryMs;
   }
 
   #defer(

@@ -6513,7 +6513,20 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         | DaemonJobOutcomeRow | undefined;
       if (existingRow !== undefined) {
         const existing = toDaemonJobOutcome(existingRow);
-        if (existing.state === 'running' || existing.updatedAt > safeAt ||
+        /*
+         * 죽은 instance가 남긴 `running` 행은 startup takeover가 회수한다.
+         *
+         * 이 조건이 무조건 거부였을 때, daemon이 job 도중 비정상 종료하면 그 행이 영원히
+         * `running`으로 남았다. 이후 뜨는 daemon은 그 job을 claim하지 못하고, claim 거부는
+         * fatal이라 스스로 종료했다 — 회수 경로가 없는 무한 크래시 루프다. 실측에서 daemon이
+         * 기동 40초 뒤 반복해서 사라졌고 원인은 `gate-reconcile`의 잔류 `running` 행이었다.
+         *
+         * 회수해도 안전한 근거는 상호배제다. daemon은 고정 pipe와 status snapshot lease를
+         * 배타적으로 쥐고서야 job을 돌린다. 그러므로 새로 뜬 daemon이 보는 `running` 행의
+         * 주인은 이미 존재하지 않는다. takeover는 job당 기동 1회로 제한된다(`startupClaims`).
+         */
+        const staleRunning = options.startupTakeover === true && existing.state === 'running';
+        if ((existing.state === 'running' && !staleRunning) || existing.updatedAt > safeAt ||
             (options.startupTakeover !== true &&
              existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
           this.db.exec('COMMIT');
@@ -6524,8 +6537,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
              SET revision = revision + 1, state = 'running', attempt = attempt + 1,
                  started_at = ?, completed_at = NULL, duration_ms = NULL, next_run_at = NULL,
                  error_code = NULL, processed_count = 0, deferred_count = 0, updated_at = ?
-           WHERE job_name = ? AND revision = ? AND state <> 'running' AND updated_at <= ?`)
-          .run(safeAt, safeAt, safeJob, existing.revision, safeAt);
+           WHERE job_name = ? AND revision = ? AND updated_at <= ?
+             AND (state <> 'running' OR ? = 1)`)
+          .run(safeAt, safeAt, safeJob, existing.revision, safeAt, staleRunning ? 1 : 0);
         if (Number(result.changes) !== 1) {
           this.db.exec('ROLLBACK');
           return null;
