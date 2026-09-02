@@ -109,6 +109,40 @@ function handler(
 }
 
 describe('fixed-option Slack Gate action boundary', () => {
+  it('최상위 메시지에 놓인 카드의 버튼도 받는다', async () => {
+    /*
+     * 답할 카드는 답할 카드만 오는 채널에 최상위 메시지로 놓는다. Slack은 최상위 메시지에
+     * `thread_ts`를 보내지 않는데 신원 검사가 그 필드를 필수로 요구하고 있었다. 그래서 옮긴
+     * 직후 그 채널의 Gate 버튼이 전부 `missing_identity_value`로 거절됐다 — 카드는 떴고
+     * 눌리는데 아무 일도 일어나지 않았다.
+     *
+     * 최상위 메시지는 자기 자신이 스레드 루트다. 카드 매핑을 저장할 때 쓴 규약과 같다.
+     * 스레드에 놓인 카드에서 이 필드가 빠지면 저장된 루트와 어긋나므로 여전히 거절된다 —
+     * 이 완화가 fence를 넓히지 않는다.
+     */
+    const store = new SqliteDigestStore(join(dir, 'state.db'));
+    seed(store);
+    // 매핑을 최상위 규약으로 바꾼다: 스레드 루트가 자기 자신이다.
+    store.forgetGateMessage(GATE);
+    store.insertGateMessage({
+      gateKey: GATE, runKey: RUN, channelId: CHANNEL,
+      threadTs: MESSAGE_TS, messageTs: MESSAGE_TS, renderFingerprint: 'fp', at: AT,
+    }, {
+      gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+      resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+    });
+
+    const topLevel = body();
+    delete (topLevel['message'] as Record<string, unknown>)['thread_ts'];
+    const engineCalls: string[] = [];
+    const outcome = await handler(store, engineCalls).handle(event(topLevel, () => {}));
+    store.close();
+
+    expect(outcome).not.toBe('rejected');
+    expect(engineCalls).toHaveLength(1);
+  });
+
+
   it('persists the winner before ACK and schedules remote work only after one timely ACK', async () => {
     const store = new SqliteDigestStore(join(dir, 'state.db'));
     seed(store);

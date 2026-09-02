@@ -167,21 +167,35 @@ function parseAction(body: unknown): { readonly value: ParsedAction } | { readon
   const containerThreadTs =
     container['thread_ts'] === undefined ? null : boundedText(container['thread_ts'], 32);
   const messageTs = boundedText(message['ts'], 32);
-  const messageThreadTs = boundedText(message['thread_ts'], 32);
+  /*
+   * 최상위 메시지에는 `thread_ts`가 없다.
+   *
+   * Slack에서 최상위 메시지는 **자기 자신이 스레드 루트**다. 그래서 그 자리를 자기 ts로
+   * 채운다. 카드 매핑을 저장할 때 쓴 규약과 같은 규약이고, 그래야 claim의 신원 비교가
+   * 맞는다. 이 처리가 없으면 답할 카드 채널에 최상위로 놓은 Gate의 버튼이 전부
+   * `missing_identity_value`로 거절된다 — 실제로 그렇게 됐다.
+   *
+   * 필드가 **있는데** 형식이 어긋나는 것은 여전히 거절이다. 없는 것과 잘못된 것은 다르다.
+   */
+  const messageThreadProvided = message['thread_ts'] !== undefined;
+  const parsedMessageThreadTs = messageThreadProvided
+    ? boundedText(message['thread_ts'], 32)
+    : null;
   const blockId = boundedText(action['block_id'], 255);
   const actionId = boundedText(action['action_id'], 255);
   const actionValue = boundedText(action['value'], 64);
   if (
     teamId === null || userId === null || channelId === null ||
     containerChannelId === null || containerMessageTs === null ||
-    messageTs === null || messageThreadTs === null || blockId === null || actionId === null ||
-    actionValue === null
+    messageTs === null || (messageThreadProvided && parsedMessageThreadTs === null) ||
+    blockId === null || actionId === null || actionValue === null
   ) {
     return { reason: 'missing_identity_value' };
   }
   if (user['team_id'] !== undefined && (userTeamId === null || userTeamId !== teamId)) {
     return { reason: 'user_team_mismatch' };
   }
+  const messageThreadTs = parsedMessageThreadTs ?? messageTs;
   if (
     container['type'] !== 'message' ||
     container['is_ephemeral'] !== false ||

@@ -247,7 +247,15 @@ function parseButton(body: unknown): ParsedButton | null {
     ? null
     : boundedText(container['thread_ts'], 32);
   const messageTs = boundedText(message['ts'], 32);
-  const threadTs = boundedText(message['thread_ts'], 32);
+  /*
+   * 최상위 메시지에는 `thread_ts`가 없다. 그 메시지가 곧 스레드 루트이므로 자기 ts로 채운다.
+   * 카드 매핑을 저장할 때 쓴 규약과 같아야 신원 비교가 맞는다(`action-handler.ts` 주석 참고).
+   *
+   * 필드가 있는데 형식이 어긋나는 것은 여전히 거절이다.
+   */
+  const threadProvided = message['thread_ts'] !== undefined;
+  const parsedThreadTs = threadProvided ? boundedText(message['thread_ts'], 32) : null;
+  const threadTs = parsedThreadTs ?? messageTs;
   const blockId = boundedText(action['block_id'], 255);
   const actionId = boundedText(action['action_id'], 255);
   const actionValue = boundedText(action['value'], 255);
@@ -256,7 +264,8 @@ function parseButton(body: unknown): ParsedButton | null {
   if (
     teamId === null || ownerUserId === null || userTeamId !== teamId || apiAppId === null ||
     channelId === null || containerChannelId !== channelId || containerMessageTs === null ||
-    messageTs !== containerMessageTs || threadTs === null || blockId === null || actionId === null ||
+    messageTs !== containerMessageTs || (threadProvided && parsedThreadTs === null) ||
+    threadTs === null || blockId === null || actionId === null ||
     actionValue === null || actionTs === null || triggerId === null ||
     container['type'] !== 'message' || container['is_ephemeral'] !== false ||
     (containerThreadTs !== null && containerThreadTs !== threadTs)
