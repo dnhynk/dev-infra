@@ -39,8 +39,9 @@ export type OrcaFacts = {
    * 없다"와 "충분히 멀리 보지 못했다"를 가를 수 있다. 배열만 받으면 호출자가 그 사실을
    * 떨어뜨린 채 부재로 판정할 수 있다.
    *
-   * `listWorkerDone`이 모든 Run의 메시지를 주므로 Run 필터는 `pickWorkerReport`가 건다.
-   * `worker-read` fallback은 쓰지 않는다(OD-025).
+   * 이 Run 하나를 수신자로 좁혀 읽은 결과다. 그래도 Run 필터는 `pickWorkerReport`가 다시
+   * 건다 — task id는 Run 사이에서 유일하다고 보장되지 않으므로, 좁혀 읽었다는 사실에 판정을
+   * 맡기지 않는다. `worker-read` fallback은 쓰지 않는다(OD-025).
    */
   readonly workerDone: WorkerDoneInbox;
 };
@@ -127,8 +128,8 @@ export function pickReviewerResult(
 /**
  * correlation의 Task가 보낸 `worker_done`을 찾는다.
  *
- * Run 필터도 여기서 건다. `inbox`에는 `--run`이 없어 다른 Run의 메시지가 섞여 오고, task id는
- * Run 사이에서 유일하다고 보장되지 않는다.
+ * Run 필터도 여기서 건다. 호출자가 Run을 수신자로 좁혀 읽지만, task id는 Run 사이에서
+ * 유일하다고 보장되지 않으므로 판정을 좁혀 읽었다는 사실에 맡기지 않는다.
  *
  * 계약상 Dispatch마다 정확히 한 번이지만 재dispatch가 있으면 같은 Task에 여러 건이 남는다.
  * 그때는 가장 최근 것을 쓴다.
@@ -155,9 +156,9 @@ export function pickWorkerReport(
     if (inbox.saturated) {
       throw new Error(
         `${origin.task}의 worker_done 부재를 증명할 수 없다: ` +
-          `inbox가 요청 상한 ${inbox.limit}행에 닿아 더 오래된 메시지가 잘렸을 수 있는데 ` +
-          `그 안에서 이 Task의 worker_done을 찾지 못했다. ` +
-          `inbox에는 --run 필터도 pagination도 없으므로 --limit을 올려 다시 관찰해라`,
+          `${origin.run} 하나로 좁혀 읽은 inbox가 요청 상한 ${inbox.limit}행에 닿아 ` +
+          `더 오래된 메시지가 잘렸을 수 있는데 그 안에서 이 Task의 worker_done을 찾지 못했다. ` +
+          `inbox에는 pagination이 없으므로 이 Run의 메시지가 상한을 넘었다면 --limit을 올려라`,
       );
     }
     return null;

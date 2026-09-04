@@ -3,14 +3,16 @@ import { resolveCorrelation } from '../correlate/resolve.js';
 import { listPullRequests, type PullRequestFacts } from '../github/pull-request.js';
 import { fetchRepositoryIdentity } from '../github/repository.js';
 import type { GhRunner } from '../github/runner.js';
-import { runKey, taskKey, type PullRequestKey } from '../identity/keys.js';
+import { runKey, taskKey, type PullRequestKey, type RunKey } from '../identity/keys.js';
 import {
+  INBOX_LIMIT,
   listWorkerDone,
   unreadableGateFields,
   unreadableTaskFields,
   type OrcaRunner,
   type OrcaTask,
   type UnreadableField,
+  type WorkerDoneInbox,
 } from '../orca/client.js';
 import type { BridgeConfig } from '../project/config.js';
 import {
@@ -268,6 +270,18 @@ function isDigestInvariantError(error: unknown): boolean {
     error instanceof TypeError || error instanceof SyntaxError || error instanceof RangeError;
 }
 
+/**
+ * Run을 모르는 PR에 넘기는 빈 관측.
+ *
+ * 포화 아님이다. 읽은 범위가 비어 있다는 뜻이고, 이 값이 실제로 읽히는 경로는 correlated뿐이다.
+ */
+const EMPTY_WORKER_DONE: WorkerDoneInbox = {
+  messages: [],
+  unreadable: [],
+  saturated: false,
+  limit: INBOX_LIMIT,
+};
+
 export async function runDigest(
   orca: OrcaRunner,
   gh: GhRunner,
@@ -276,8 +290,21 @@ export async function runDigest(
   const { config } = options;
   const runs = await collectRuns(orca);
   const view = buildCorrelationView(runs);
-  // 관찰 1회에 inbox도 1회만 읽는다. 포화 판정은 `pickWorkerReport`가 한다.
-  const inbox = await listWorkerDone(orca);
+  /*
+   * inbox는 Run 하나씩 읽는다. 전역으로 읽으면 모든 Run과 heartbeat가 한 배열로 와서 상한에
+   * 닿고, 포화한 순간 부재를 증명할 수 없어 digest 전체가 멈춘다 — 실측에서 전역 6,220행 중
+   * heartbeat가 4,736행이었다.
+   *
+   * Run마다 한 번만 읽고 캐시한다. 같은 Run의 PR이 여러 개여도 관찰은 1회다.
+   */
+  const inboxByRun = new Map<RunKey, WorkerDoneInbox>();
+  const inboxFor = async (run: RunKey): Promise<WorkerDoneInbox> => {
+    const cached = inboxByRun.get(run);
+    if (cached !== undefined) return cached;
+    const read = await listWorkerDone(orca, INBOX_LIMIT, run);
+    inboxByRun.set(run, read);
+    return read;
+  };
   const tasksByRun = new Map(runs.map((r) => [runKey(r.run.id), r.tasks]));
 
   const results: DigestResult[] = [];
@@ -315,11 +342,16 @@ export async function runDigest(
       // correlated가 아니면 Run을 모른다. projection이 그 경우를 먼저 skip하므로 빈 목록이 맞다.
       const tasks =
         correlation.kind === 'correlated' ? (tasksByRun.get(correlation.run) ?? []) : [];
+      // 같은 이유로 Run을 모르면 읽을 inbox도 없다. 포화 아님으로 두는 것이 맞다 —
+      // 이 값이 읽히는 경로는 correlated뿐이고, projection이 그 전에 skip한다.
+      const workerDone = correlation.kind === 'correlated'
+        ? await inboxFor(correlation.run)
+        : EMPTY_WORKER_DONE;
       const projection = projectPullRequest(
         repository,
         source,
         correlation,
-        { tasks, workerDone: inbox },
+        { tasks, workerDone },
         config,
       );
       if (projection.kind === 'skipped') {
@@ -340,7 +372,8 @@ export async function runDigest(
         ...unreadableTaskFields(r.tasks),
         ...unreadableGateFields(r.gates),
       ]),
-      ...inbox.unreadable,
+      // 실제로 읽은 Run의 관측만 싣는다. 읽지 않은 Run의 행은 관측한 적이 없으므로 없다.
+      ...[...inboxByRun.values()].flatMap((observed) => observed.unreadable),
     ],
     results,
     ...(options.isolateRepositoryFailures === true ? { repositoryFailures } : {}),
