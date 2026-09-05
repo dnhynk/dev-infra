@@ -827,6 +827,9 @@ const CLOSE_ACTIVE_TERMINAL_PROMPTS = `
 UPDATE terminal_prompt SET state = 'gone', settled_at = ?, updated_at = ?
  WHERE terminal_handle = ? AND state IN ('open','claimed')`;
 
+/** 위와 같되 닫은 행을 돌려준다. 호출자가 그 카드를 다시 그려야 하기 때문이다. */
+const CLOSE_ACTIVE_TERMINAL_PROMPTS_RETURNING = `${CLOSE_ACTIVE_TERMINAL_PROMPTS} RETURNING *`;
+
 const RECORD_TERMINAL_PROMPT_CARD = `
 UPDATE terminal_prompt
    SET channel_id = ?, thread_ts = ?, message_ts = ?, render_fingerprint = ?, updated_at = ?
@@ -2919,8 +2922,17 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   }
 
   /** 화면에서 프롬프트가 사라졌다. 사람이 터미널에서 직접 답한 경우가 대부분이다. */
-  markTerminalPromptGone(handle: string, at: string): void {
-    this.db.prepare(CLOSE_ACTIVE_TERMINAL_PROMPTS).run(at, at, handle);
+  /**
+   * 이 터미널의 살아 있는 프롬프트를 전부 닫고, **닫은 것을 돌려준다.**
+   *
+   * 돌려주는 이유는 카드다. 상태만 바꾸고 끝내면 durable 상태는 `gone`인데 Slack 카드에는
+   * 버튼이 그대로 남는다. 실측에서 사라진 프롬프트의 카드를 두 시간 뒤에 눌렀고, 클릭은
+   * daemon까지 도착했지만 stale로 거절돼 아무 일도 일어나지 않았다.
+   */
+  markTerminalPromptGone(handle: string, at: string): readonly TerminalPromptRecord[] {
+    return (this.db.prepare(CLOSE_ACTIVE_TERMINAL_PROMPTS_RETURNING)
+      .all(at, at, handle) as TerminalPromptRow[])
+      .map(toTerminalPrompt);
   }
 
   /** 카드를 처음 게시한 뒤 매핑을 남긴다. 남길 행이 없으면 던진다. */

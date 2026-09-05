@@ -145,6 +145,14 @@ export const OPERATIONAL_FAILURE_CODES = [
   'terminal.schema_drift',
   // Slack 버튼 클릭을 받아들이지 않았다.
   'terminal.action_rejected',
+  /*
+   * 카드는 살아 있는데 그 프롬프트가 이미 지나간 경우. 고장이 아니다.
+   *
+   * `action_rejected`와 나누는 이유는 다음 행동이 다르기 때문이다. 이 코드는 카드가
+   * 뒤처졌다는 뜻이고, 앞의 코드는 신원이나 형식이 어긋났다는 뜻이다. 한 코드로 묶여
+   * 있었을 때 실측에서 둘을 가르는 데 로그가 아무 도움도 되지 못했다.
+   */
+  'terminal.action_stale',
   'channel.delivery_failed',
   'channel.route_unavailable',
   'scheduler.timeout',

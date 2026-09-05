@@ -1502,11 +1502,13 @@ export async function runDaemonCommand(
       wake: () => observerSupervisor?.markDue('terminal-prompt'),
       onOutcome: (outcome) => {
         if (outcome === 'claimed' || outcome === 'duplicate') return;
+        // 카드가 뒤처진 것과 신원·형식이 어긋난 것을 나눈다. 앞은 정상 동작이고 뒤는 고장이다.
+        const stale = outcome.startsWith('stale_');
         void health?.event({
           level: 'warn',
           event: 'terminal.prompt_action',
           outcome: 'failed',
-          errorCode: 'terminal.action_rejected',
+          errorCode: stale ? 'terminal.action_stale' : 'terminal.action_rejected',
           retryable: false,
         }).catch(() => { /* reporting never fences the ACK */ });
       },

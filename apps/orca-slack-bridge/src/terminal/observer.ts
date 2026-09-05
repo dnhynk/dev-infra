@@ -38,7 +38,8 @@ export type TerminalPromptCandidate = {
 
 export type TerminalPromptStore = {
   observeTerminalPrompt(input: ObservedTerminalPrompt, at: string): TerminalPromptRecord;
-  markTerminalPromptGone(handle: string, at: string): void;
+  /** 닫은 프롬프트를 돌려준다. 호출자가 그 카드에서 버튼을 걷어내야 하기 때문이다. */
+  markTerminalPromptGone(handle: string, at: string): readonly TerminalPromptRecord[];
   findTerminalPrompt(handle: string, fingerprint: string): TerminalPromptRecord | null;
   listTerminalPromptsByState(state: string): readonly TerminalPromptRecord[];
   recordTerminalPromptCard(input: {
@@ -139,7 +140,20 @@ export async function runTerminalPromptPass(
         deps.onError?.('terminal.prompt_unreadable');
         continue;
       }
-      deps.store.markTerminalPromptGone(candidate.handle, at);
+      /*
+       * 사라진 프롬프트의 카드를 반드시 다시 그린다.
+       *
+       * 상태만 닫고 넘어가면 Slack 카드에는 버튼이 그대로 남는다. 실측에서 프롬프트가 사라진
+       * 지 두 시간 뒤에 그 버튼을 눌렀고, 클릭은 daemon까지 도착했지만 stale로 거절돼 화면에
+       * 아무 변화도 없었다 — 사람에게는 "눌러도 안 눌린다"로 보인다.
+       *
+       * 여기가 마지막 기회다. 터미널이 끝나면 다음 pass의 candidate 목록에서 빠지므로, 그
+       * 뒤에는 이 카드를 갱신할 경로가 없다.
+       */
+      for (const closed of deps.store.markTerminalPromptGone(candidate.handle, at)) {
+        if (closed.messageTs === null) continue;
+        await publishCard(deps, candidate, closed, at);
+      }
       continue;
     }
     observed += 1;
