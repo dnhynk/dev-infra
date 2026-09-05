@@ -40,6 +40,10 @@ import {
   parseWindowsRuntimeManifest,
   serializeWindowsRuntimeManifest,
 } from '../src/windows/runtime-manifest.js';
+import {
+  downgradeGateMetadataToV13,
+  dropTerminalPromptTables,
+} from './fixtures/schema-downgrade.js';
 
 let root: string;
 let releaseSequence: number;
@@ -212,6 +216,8 @@ function downgradeToV12(path: string): void {
     DROP TABLE orca_repository_binding;
     DROP TABLE repository_registry;
   `);
+  dropTerminalPromptTables(db);
+  downgradeGateMetadataToV13(db);
   db.prepare('UPDATE schema_version SET version = 12 WHERE id = 1').run();
   db.close();
 }
@@ -502,7 +508,7 @@ describe('prebuilt Windows deployment preflight', () => {
   });
 
   // node:sqlite backup is one libuv work item and can wait behind unrelated parallel test workers.
-  it('checkpoints and verifies a timestamped backup outside the release before first v13 migration', async () => {
+  it('checkpoints and verifies a timestamped backup outside the release before first v16 migration', async () => {
     const fixture = createRelease();
     const deployment = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     downgradeToV12(fixture.pathAccess.toNativePath(deployment.paths.statePath));
@@ -520,7 +526,7 @@ describe('prebuilt Windows deployment preflight', () => {
       expect(prepared.backupPath).not.toBeNull();
       expect(prepared.backupPath?.startsWith(deployment.paths.appRoot)).toBe(false);
       expect(schemaVersion(fixture.pathAccess.toNativePath(prepared.backupPath!))).toBe(12);
-      expect(schemaVersion(fixture.pathAccess.toNativePath(deployment.paths.statePath))).toBe(13);
+      expect(schemaVersion(fixture.pathAccess.toNativePath(deployment.paths.statePath))).toBe(16);
       expect(order).toEqual(['backup', 'migrate-12']);
     } finally {
       await prepared.release();
@@ -539,7 +545,7 @@ describe('prebuilt Windows deployment preflight', () => {
     expect(existsSync(fixture.pathAccess.toNativePath(deployment.paths.statePath))).toBe(false);
   });
 
-  it('creates v13 only when the state path is truly absent', async () => {
+  it('creates v16 only when the state path is truly absent', async () => {
     const fixture = createRelease();
     const deployment = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     const nativeStatePath = fixture.pathAccess.toNativePath(deployment.paths.statePath);
@@ -552,7 +558,7 @@ describe('prebuilt Windows deployment preflight', () => {
     });
     try {
       expect(prepared.backupPath).toBeNull();
-      expect(schemaVersion(nativeStatePath)).toBe(13);
+      expect(schemaVersion(nativeStatePath)).toBe(16);
     } finally {
       await prepared.release();
     }

@@ -211,7 +211,7 @@ describe('channel-adapter production CLI wiring', () => {
         teamId: 'T0TEAM',
         apiAppId: 'A0APP',
         ownerUserIds: ['U0OWNER'],
-        channels: { prDigest: 'C0PRDIGEST', agentRuns: 'C0AGENTRUNS' },
+        channels: { prDigest: 'C0PRDIGEST', agentRuns: 'C0AGENTRUNS' , decisions: 'C0AGENTRUNS' },
       },
       projects: [],
     }));

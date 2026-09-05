@@ -40,7 +40,7 @@ function xml(value: WindowsTaskDefinition, schemaVersion = '1.2'): string {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="${schemaVersion}" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger></Triggers>
+  <Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger><RegistrationTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled></RegistrationTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -69,7 +69,7 @@ function canonicalRegisteredXml(value: WindowsTaskDefinition): string {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval></Repetition><UserId>${e(ACCOUNT)}</UserId></LogonTrigger></Triggers>
+  <Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval></Repetition><UserId>${e(ACCOUNT)}</UserId></LogonTrigger><RegistrationTrigger><Repetition><Interval>PT1M</Interval></Repetition></RegistrationTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals>
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
   <Actions Context="Author"><Exec><Command>${e(value.action.execute)}</Command><Arguments>${e(value.action.arguments)}</Arguments><WorkingDirectory>${e(value.action.workingDirectory)}</WorkingDirectory></Exec></Actions>
@@ -365,7 +365,7 @@ describe('Windows Scheduled Task semantic contract', () => {
       .replace('<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
         '<t:Task version="1.2" xmlns:t="http://schemas.microsoft.com/windows/2004/02/mit/task">')
       .replace('</Task>', '</t:Task>')
-      .replace(/<(\/)?(RegistrationInfo|Description|Triggers|LogonTrigger|Repetition|Enabled|UserId|Principals|Principal|LogonType|RunLevel|Settings|MultipleInstancesPolicy|DisallowStartIfOnBatteries|StopIfGoingOnBatteries|AllowHardTerminate|StartWhenAvailable|RunOnlyIfNetworkAvailable|IdleSettings|Duration|WaitTimeout|StopOnIdleEnd|RestartOnIdle|StopAtDurationEnd|AllowStartOnDemand|Hidden|RunOnlyIfIdle|WakeToRun|ExecutionTimeLimit|Priority|RestartOnFailure|Interval|Count|Actions|Exec|Command|Arguments|WorkingDirectory)(?=[ >])/gu,
+      .replace(/<(\/)?(RegistrationInfo|Description|Triggers|LogonTrigger|RegistrationTrigger|Repetition|Enabled|UserId|Principals|Principal|LogonType|RunLevel|Settings|MultipleInstancesPolicy|DisallowStartIfOnBatteries|StopIfGoingOnBatteries|AllowHardTerminate|StartWhenAvailable|RunOnlyIfNetworkAvailable|IdleSettings|Duration|WaitTimeout|StopOnIdleEnd|RestartOnIdle|StopAtDurationEnd|AllowStartOnDemand|Hidden|RunOnlyIfIdle|WakeToRun|ExecutionTimeLimit|Priority|RestartOnFailure|Interval|Count|Actions|Exec|Command|Arguments|WorkingDirectory)(?=[ >])/gu,
         '<$1t:$2');
     expect(parseWindowsTaskXml(prefixed)).toEqual(expected);
     expect(parseWindowsTaskXml(xml(expected).replace(
@@ -374,7 +374,8 @@ describe('Windows Scheduled Task semantic contract', () => {
     ))).toBeNull();
     expect(parseWindowsTaskXml(xml(expected).replace(
       '</Triggers>',
-      '<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-18</UserId></LogonTrigger></Triggers>',
+      '<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-18</UserId></LogonTrigger>' +
+      '<RegistrationTrigger><Repetition><Interval>PT1M</Interval></Repetition></RegistrationTrigger></Triggers>',
     ))).toBeNull();
     expect(parseWindowsTaskXml(xml(expected).replace(
       '</Principals>',

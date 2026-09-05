@@ -89,6 +89,10 @@
 | OD-071 | modal submission validation error를 modal에 유지·표시하는 UX | D2 전 | DECIDED |
 | OD-072 | correlation/summarizer/source stale/Channel pending 등 degraded owner 알림 정책 | C1/D1/D2 전 | DECIDED |
 | OD-080 | 등록 Run이 0인 구간에서도 미등록 사실이 도달할 게시 표면 | D1 전 | DECIDED |
+| OD-081 | custom channel plugin을 세션 확인 없이 켜는 배포 경로 | D3 재수용 전 | DECIDED |
+| OD-082 | daemon digest가 summarizer를 부를지 | O1 운영 전 | DECIDED |
+| OD-083 | sidecar 없는 Gate를 Slack에서 해결할 수 있는지 | D3 운영 전 | DECIDED |
+| OD-084 | 막힌 agent 터미널의 대화형 프롬프트를 Slack에서 답할 수 있는지 | 무인 운용 전 | DECIDED |
 
 ## Gate와 Channel
 
@@ -1293,6 +1297,132 @@ ID: OD-056
                 docs/architecture/orca-slack-bridge.md §3, docs/traceability.md
 검증 방법: 별도 D3 Run 착수 전 대상 Claude Code 버전에서 배포 경로와 확인 UX를 재검증하고 별도 size gate를 기록한다.
 결정일: 2026-08-23
+후속: "development flag가 유일한 경로"는 OD-081이 대체했다. 2.1.246에서 managed settings의
+      `allowedChannelPlugins`가 Anthropic allowlist를 통째로 대체하며, 자작 marketplace의 plugin으로
+      확인 대화상자 없이 channel을 켤 수 있음을 확인했다. D3를 별도 Run으로 분리한 결정 자체는 유효하다.
+```
+
+```text
+ID: OD-081
+상태: DECIDED
+결정: Adapter를 자작 marketplace의 plugin으로 배포하고, managed settings에 `channelsEnabled: true`와
+      `allowedChannelPlugins: [{marketplace, plugin}]`를 넣어 `--channels plugin:<name>@<marketplace>`로
+      켠다. development flag와 그 세션마다의 확인 대화상자를 쓰지 않는다.
+근거:
+  - 설치된 2.1.246 스키마 설명이 `allowedChannelPlugins`를 "When set, replaces the default Anthropic
+    allowlist ... Requires channelsEnabled: true."로 정의한다. 판정 코드도 이 값이 있으면 그것만 조회하고
+    기본 목록을 읽지 않는다. 즉 Anthropic 등재가 전제조건이 아니다.
+  - `plugin marketplace add <path>`로 로컬 디렉터리 marketplace를 만들 수 있고, 그 marketplace의 plugin이
+    실제로 설치·연결되는 것을 확인했다(`plugin:orca-slack-channel:orca-slack`, protocolEra `legacy`).
+  - 개인 Max는 org policy 게이트를 통과한다. 판정은 team/enterprise일 때만 `channelsEnabled`를 요구한다.
+대안과 기각 이유:
+  - development flag 유지: 세션마다 사람 확인이 필요해 무인 운영과 충돌. 이것이 OD-056의 원래 제약이다.
+  - `--managed-settings` flag로 정책 주입: policy layer에 반영되지 않는다. `disableAllHooks`를 이 flag로
+    넣어도 hook이 실행되는 것을 실측했고 문서 문자열도 merge에 참여하지 않는다고 적는다. 기각.
+  - HKCU 정책으로 관리자 권한 회피: `HKCU\SOFTWARE\Policies`가 보호 브랜치라 일반 사용자 권한으로
+    키를 만들 수 없다(실측). 기각.
+영향 문서/파일: plugins/, docs/platform-capabilities.md §3.3, docs/ops/channel-adapter-acceptance.md
+검증 방법: 관리자 권한으로 정책 파일을 쓴 뒤 대화형 세션에서 daemon probe receipt가 도달하는지 확인한다.
+           `-p` 비대화형은 channel 이벤트가 도달하지 않으므로 수용 경로가 아니다.
+검증 결과(2026-08-28): **왕복까지 확인됐다.** 정책 파일 전 두 번의 동일 실행은 debug log에
+           `Channel notifications` 0건이었고, 정책 파일 뒤 같은 명령이
+           `Channel notifications re-registered after reconnect`를 남겼다. 이어서 Claude Code 2.1.246
+           대화형 세션에서 **확인 대화상자 없이** 배너가 뜨고, daemon probe가
+           `Channel event received (gate_id …, empty body)`로 도달했으며, `orca_channel_receipt`가
+           `receipt_accepted`를 반환했다. 같은 gate_id의 중복 이벤트에는 두 번째 receipt를 보내지
+           않아 OD-057 멱등성도 함께 관측됐다.
+           남은 것은 production Gate 하나로 resolve→재조회→후속 Task 재개→기존 Slack card 갱신까지
+           잇는 관측이다. 이 probe는 opt-in 증거이지 resume 증거가 아니다.
+관측 공백: daemon에는 Adapter 연결·probe·receipt를 나타내는 log event가 없다. 위 왕복은 세션 화면과
+           `receipt_accepted` 반환값으로만 확인됐고 daemon 쪽 흔적은 남지 않는다. 무인 운영에서 이
+           구간이 실패하면 추적할 수단이 없다.
+결정일: 2026-08-28
+```
+
+```text
+ID: OD-082
+상태: DECIDED
+결정: daemon digest도 one-shot과 같은 model summary 경로를 쓴다.
+      `automation.deterministicNoLlm`은 스케줄링·라우팅 판정에만 적용한다.
+근거:
+  - 제품 목적이 "PR 상태 변화를 사람이 10초 안에 이해하는 카드"다(스펙 §5.3). 운영에서 보이는 카드는
+    전부 daemon이 만든다. daemon이 요약하지 않으면 그 목적이 운영에서 성립하지 않는다.
+  - 비용 우려는 근거가 없다. 게이트 A가 `factsFingerprint`로 호출을 막으므로(OD-035) 주기가 아니라
+    요약 입력이 바뀌었을 때만 부른다. 기본 모델은 `gpt-5.6-luna`다(DL-026).
+  - `deterministicNoLlm`의 원래 주석이 "scheduling/routing must never consult an LLM"이다. 그 범위를
+    카드 본문 생성까지 넓힌 것은 기록된 결정이 아니라 구현 중 들어간 서술이었다.
+이전 상태: `f481cea`(O1-5)가 `summaryMode: 'facts_only'`와 architecture 문장을 함께 넣었고 이 결정을
+      기록한 OD 항목은 없었다. "미정 사항을 구현자가 조용히 채우지 않는다"는 작업 규약을 거치지 않았다.
+영향 문서/파일: apps/orca-slack-bridge/src/cli.ts, docs/architecture/orca-slack-bridge.md
+검증 방법: 운영 daemon이 새 요약을 생성하고, 사실이 그대로인 다음 주기에는 provider를 부르지 않는 것을
+      `digest` 보고의 재사용 표시로 확인한다.
+결정일: 2026-08-29
+```
+
+```text
+ID: OD-083
+상태: DECIDED
+결정: sidecar가 등록되지 않은 Gate는 관측이 Orca `options`만으로 파생 metadata 행을 만들어
+      durable하게 남긴다. 파생 행은 `gate_metadata.source='derived'`로 구분하고, option ID는
+      label에서 결정하며 resolution은 label 그대로다. 설명·recommendation·impact는 없다.
+      나중에 도착한 `gate-register`가 파생 행을 대체한다.
+근거:
+  - 제품 목적이 "사용자가 이동 중에 Slack만으로 blocking 결정을 해결한다"다. `gate-create`만 하고
+    등록을 빠뜨리면 카드에 선택지 버튼도 직접 입력 버튼도 없어(`render.ts`의 `actionable`/
+    `directActionable`) 그 Gate는 Slack에서 해결할 수 없다. coordinator가 한 번 빠뜨리는 것으로
+    무인 루프가 멈추는 실패 모드를 남기지 않는다.
+  - 버튼만 그리는 것으로는 부족하다. 클릭 검증(`claimGateResolution`)이 durable metadata 행과
+    `metadataState='matched'`를 요구하므로, 렌더 시점 합성은 눌렀을 때 `sidecar_not_matched`로
+    거부된다. 그래서 행을 실제로 남긴다.
+  - Orca에는 Gate를 수정하는 명령이 없어 label이 불변이다. 그래서 label에서 정한 option ID가
+    같은 Gate를 다시 관측해도 같다.
+  - OD-050은 그대로다. sidecar가 있으면 그것이 권위이고, 파생은 등록을 빠뜨렸을 때의 대체물이다.
+    등록이 파생을 대체하는 방향만 있고 반대는 없다.
+한계: `options`를 읽지 못했거나 label이 등록 문서와 같은 75자 상한을 넘으면 파생하지 않는다.
+      자르면 Orca에 쓰는 resolution이 사용자가 고른 원문과 달라지기 때문이다. 그 Gate는 지금처럼
+      누를 수 없는 카드로 남는다.
+영향 문서/파일: apps/orca-slack-bridge/src/gate/derive.ts, src/gate/project.ts, src/gate/render.ts,
+      src/gate/register.ts, src/run/collect.ts, src/store/schema.ts(v14), src/store/sqlite.ts
+검증 방법: sidecar 없는 Gate가 버튼 있는 카드로 뜨고, 그 버튼으로 Orca Gate가 resolved 되는 것을
+      관측한다. 이어서 같은 Gate에 `gate-register`를 하면 설명과 권장안이 붙은 카드로 바뀐다.
+결정일: 2026-08-29
+```
+
+```text
+ID: OD-084
+상태: DECIDED
+결정: 살아 있는 agent 터미널의 화면을 읽어 대화형 선택 프롬프트를 카드로 올리고, 버튼으로
+      `orca terminal send`를 통해 답한다. 대상은 Run의 `coordinator_handle`과 dispatched
+      worker의 `agent_terminal_handle`이다.
+근거:
+  - 무인 운용에서 멈춤은 대부분 터미널 프롬프트로 나타난다. Gate는 coordinator가 만들기로
+    **결정한** 것이라 자발성에 기대고, 그 자발성이 깨지면 아무 데도 나타나지 않는다. 실제로
+    2026-08-29에 Academic coordinator가 SQLCipher 설치 결정을 터미널 프롬프트로 띄웠고 Slack에
+    아무것도 오지 않았다.
+  - 기존 관측은 `worker-show`의 `agentWait` 하나였고 그것은 `{source, reason}` 두 문자열이다.
+    무엇을 묻는지도, 답할 방법도 없었다. 게다가 coordinator는 Dispatch가 아니라 그 조회에
+    잡히지 않아, 가장 비싼 멈춤이 유일하게 보이지 않는 멈춤이었다.
+  - Orca가 필요한 표면을 이미 갖고 있다: `terminal read --screen`, `terminal send`,
+    `terminal wait --for tui-idle`.
+측정(2026-08-29, 실제 막힌 coordinator 터미널과 probe 터미널):
+  - `terminal read --screen`이 질문 전문·선택지·설명·`Enter to select` 안내를 그대로 준다.
+  - 프롬프트가 열려 있는 동안 화면은 3회 읽기(9초)에 걸쳐 바이트 단위로 동일하다.
+  - `terminal send --text`가 raw byte를 전달한다: `"2"`→`[50]`, ESC `[B`→`[27,91,66]`,
+    `--enter`→`[13]`. escape sequence가 통과하므로 방향키로 옮기고 Enter로 확정할 수 있다.
+안전장치: 지문 대조 → 커서 이동 → 이동 확인 → Enter 순서로만 커밋한다. 지문은 프롬프트 영역만
+      쓰고 커서 표시는 뺀다(화면 아래 로그는 무관하게 움직이고, 커서는 우리가 옮기기 때문).
+      Enter 앞의 모든 단계는 관측 가능하고 되돌릴 수 있다. 어긋나면 보내지 않는 쪽으로 닫는다.
+한계:
+  - 화면 파싱이다. `❯ <n>.` 구조는 Claude Code의 UI이지 계약이 아니다. 모양이 어긋나면 카드를
+    만들지 않고 지금까지의 badge 경로로 남는다.
+  - 자유 입력으로 들어가는 선택지("Type something.", "Chat about this")는 버튼으로 만들지
+    않는다. Slack에서 그 상태를 끝낼 수 없어 더 나쁜 막힘이 된다. 목록에는 싣고 표시만 한다.
+    자유형 답변을 Slack에서 받는 것은 아직 없다.
+영향 문서/파일: apps/orca-slack-bridge/src/terminal/*, src/cli.ts, src/store/schema.ts(v15)
+검증 방법: 막힌 coordinator 터미널이 `#agent-runs`의 그 Run 스레드에 버튼 카드로 뜨고, 버튼을
+      누르면 터미널의 선택이 실제로 바뀌는 것을 관측한다. 화면이 바뀐 뒤 누른 클릭은
+      `terminal_prompt_attempt`에 `refused`로 남는다.
+결정일: 2026-08-29
 ```
 
 ```text

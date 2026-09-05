@@ -175,6 +175,37 @@ Run이 끝날 때는 §8의 정리 대기가 없음을 먼저 확인하고 hando
   절차로 정리하고, 정리 결과를 재조회한 다음 다음 ready task를 자동으로 지시한다.
 - 한 Task가 사람 결정을 기다려도 그 결정과 독립인 ready task와 worker는 계속 실행한다.
 
+### 관찰 가능성 — worker에게 반드시 전달할 두 규칙
+
+외부 Observer(Slack Bridge 등)가 PR과 Run을 잇는 연결점은 이 둘뿐이다. 둘 중 하나라도 빠지면
+그 PR은 어떤 Run에도 연결되지 않고, Observer는 **추측해서 잇지 않으므로** 조용히 누락된다.
+증상은 "PR은 만들어졌는데 어디에도 안 뜬다"이고, 원인이 드러나지 않는다.
+
+**1. PR body 맨 끝에 correlation metadata를 붙인다.** 사람이 읽는 내용을 밀어내지 않는 위치다.
+
+```html
+<!-- orca-run: run_xxxxxxxxxxxx -->
+<!-- orca-task: task_xxxxxxxxxxxx -->
+<!-- orca-dispatch: dispatch_xxxxxxxxxxxx -->
+```
+
+`orca-run`과 `orca-task`는 **필수**, `orca-dispatch`는 선택이다. 값은 Orca가 dispatch preamble로
+주입하므로 worker가 자기 값을 안다. PR identity를 `worker_done` 본문에 싣지 않는다 — 연결 방향은
+PR → Task이고 이 블록이 유일한 연결점이다.
+
+**2. `worker_done`에 `--task-id`와 `--dispatch-id`를 준다.**
+
+```bash
+orca orchestration send --type worker_done --subject "<한 줄>" --body "<3문장>" \
+  --task-id <task_id> --dispatch-id <dispatch_id> --outcome succeeded|failed \
+  --files-modified "path/a,path/b" --json
+```
+
+두 값이 없으면 완료 보고가 어느 Task의 것인지 기계적으로 판정할 수 없다.
+
+key 이름(`orca-run`/`orca-task`/`orca-dispatch`)은 이 스킬의 기본값이다. 대상 repository가 자기
+계약으로 다른 key를 정했으면 그쪽이 우선한다.
+
 ### 턴 계약 — 무인 운용의 성립 조건
 
 무인 운용은 이 규칙 하나에 달려 있다. **도구 호출 없이 텍스트를 내면 그 턴은 거기서 끝나고
@@ -228,6 +259,15 @@ Delivery의 모든 메시지를 처리하고 아래 정리 결정을 끝냈으�
 **PR 없는 Task를 정리 대상에서 빠뜨리지 않는다.** reviewer worktree는 merge에 도달하지 않으므로
 merge만 트리거로 쓰면 Run이 끝날 때까지 남는다.
 
+**빌드 lane도 Task가 만든 리소스다.** Task 명세는 build/temp lane을 다음 위치로만 발행한다.
+
+- Windows: `D:\orca-build\<repo>\<task>\{target,temp}` — `CARGO_TARGET_DIR`과 `TEMP`/`TMP`를 함께 지정한다
+- WSL native 검증: `/home/<user>/<task>` 아래에 만들고 검증 직후 제거한다
+
+`%TEMP%`, `~\orca\targets`, worktree 내부, 그 밖의 C: 경로에는 lane을 만들지 않는다. Task마다 lane을
+격리하는 것은 편의가 아니라 clean-build 증거 요건이므로 lane은 Task 간에 공유하지 않는다. 재컴파일
+비용은 lane 공유가 아니라 공유 `sccache`와 공유 cargo registry 캐시로 줄인다.
+
 다음 순서를 지킨다. PR이 없는 Task는 2번과 5번의 PR head branch 항목을 건너뛴다.
 
 1. 수락한 `worker_done`마다 같은 agent에 같은 배치의 즉시 후속 Task가 있으면 새 Dispatch로 terminal
@@ -246,6 +286,11 @@ merge만 트리거로 쓰면 Run이 끝날 때까지 남는다.
    `orca worktree rm --worktree id:<repo-id>::<path> --run-hooks --json`으로 제거한다. `--force`를 기본값으로
    쓰지 않으며 coordinator/active worktree, 기존 worktree, 다른 Run이나 사용자가 인수한 worktree는
    제거하지 않는다.
+
+   같은 단계에서 이 Task의 빌드 lane도 제거한다. Windows lane 디렉터리와, native 검증을 했다면 그 WSL
+   lane을 삭제하고 두 경로가 없음을 재조회로 확인한다. 보존할 증거는 lane이 아니라 Task 보고서와
+   아카이브에 있다. lane에서 실행 중인 빌드가 있거나 경로 ownership을 증명할 수 없으면 강제하지 않고
+   `cleanup_pending`으로 남긴다.
 5. worktree 제거를 확인한 뒤 2번에서 확인한 정확한 PR head branch만 local과 해당 head repository의
    remote에서 삭제한다. base·default·protected·현재 branch와 Run 전에 존재하던 branch는 건드리지 않는다.
    먼저 안전 삭제를 시도하되 squash/rebase merge라서 거부되면, PR이 실제 `MERGED`이고 branch identity가
@@ -263,12 +308,28 @@ merge만 트리거로 쓰면 Run이 끝날 때까지 남는다.
    의도적으로 retained됐고, worktree와 branch가 제거됐거나 근거 있는 예외로 기록됐을 때만 Task 정리를
    완료로 표시한다. 명령이 중간에 실패해도 확인된 단계부터 멱등하게 재개한다.
 
-### worker 질문과 사람용 Gate
+### 사용자에게 묻는 유일한 경로는 Orca Gate다
+
+사용자는 이 터미널을 보고 있지 않다. 이동 중에 Slack만 본다.
+
+Bridge가 막힌 터미널의 화면을 읽어 선택 프롬프트를 Slack 카드로 올리기는 한다(OD-084). 그러나
+그것은 **안전망이지 경로가 아니다.** 화면 파싱이라 모양이 어긋나면 카드가 만들어지지 않고,
+자유 입력으로 들어가는 선택지는 버튼이 되지 않는다. 그 안전망에 기대고 프롬프트로 물으면
+질문이 도달하지 않을 수 있고, 그때 Run 전체가 그 자리에서 멈춘다.
+
+- **사용자 판단이 필요하면 언제나 `gate-create`로 올린다.** 대화형 프롬프트로 선택지를 띄우거나
+  답을 기다리지 않는다. 이 규칙에 예외는 없고, 질문이 worker에게서 왔는지 coordinator 자신의
+  판단에서 나왔는지도 가리지 않는다.
+- 사용자 머신 변경, 비용 발생, 제품 방향, 되돌리기 어려운 선택은 전부 여기 해당한다.
+- Gate를 만든 뒤 그 결정에 의존하지 않는 Task는 계속 진행한다. 멈추는 것은 의존 Task뿐이다.
+- Gate의 `--options`는 사용자가 Slack에서 그대로 누를 문구다. 짧고 서로 배타적으로 쓴다.
+  선택지 하나는 75자를 넘기지 않는다. 넘으면 Bridge가 그 Gate를 누를 수 없는 카드로 만든다.
+
+### worker 질문
 
 - worker의 불명확성은 먼저 coordinator에게 `ask`로 온다.
 - 확정 스펙, 코드, live 상태, 공인 자료로 답할 수 있으면 `reply`하고 Gate를 만들지 않는다.
-- **사용자의 제품 판단 없이는 결정할 수 없을 때만** 해당 Task에 Orca Gate를 만든다.
-- Gate가 열리면 그 결정에 의존하는 Task만 멈춘다. 독립 Task는 계속한다.
+- 그렇게 답할 수 없으면 위 규칙대로 Gate로 올린다.
 
 ## 9. Agent 배치 정책
 
@@ -411,7 +472,6 @@ TUI 판정에 쓸 수 없다.
 다음은 대상 repository의 계약에 속한다. 이 스킬이 값을 정하지 않으며, 계약이 없으면 묻는다.
 
 - handoff 문서의 정확한 schema와 archive 정책
-- PR에 실을 Run/Task/Dispatch correlation metadata 형식
 - worker `ask`와 생성된 Gate를 잇는 correlation 형식
 - reviewer 판정을 어디에 durable하게 기록할지
 - 컨텍스트 열화 임계값의 구체적 수치

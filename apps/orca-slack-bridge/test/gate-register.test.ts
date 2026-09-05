@@ -471,6 +471,7 @@ describe('gate-register production CLI path', () => {
       runKey: runKey(RUN_ID),
       taskKey: taskKey(TASK_ID),
       dispatchKey: dispatchKey('ctx_gate'),
+      source: 'registered',
       askMessageId: 'msg_ask_1',
       questionThreadId: 'thread_question_1',
       options: document().options,

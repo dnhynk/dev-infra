@@ -225,9 +225,13 @@ export function projectGateDecisions(
         );
       }
 
-      const recommendation = stored.options.find(
-        (option) => option.id === stored.recommendation.optionId,
-      );
+      // 파생 행에는 권장안이 없다. 없는 것을 없다고 표시하는 것과, 등록 행에서 권장안이
+      // options와 어긋나는 것은 다른 사실이므로 분기를 합치지 않는다.
+      const storedRecommendation = stored.recommendation;
+      const recommendation =
+        storedRecommendation === null
+          ? null
+          : stored.options.find((option) => option.id === storedRecommendation.optionId);
       // Registration and store reads both validate this. Keep the guard so a hand-built test double cannot
       // turn an invalid recommendation into a guessed label.
       if (recommendation === undefined) {
@@ -247,13 +251,21 @@ export function projectGateDecisions(
           gateId: gate.id,
         },
         options: stored.options.map((option) => ({ ...option })),
-        recommendation: {
-          optionId: recommendation.id,
-          label: recommendation.label,
-          reason: stored.recommendation.reason,
-        },
+        recommendation:
+          recommendation === null || storedRecommendation === null
+            ? null
+            : {
+                optionId: recommendation.id,
+                label: recommendation.label,
+                reason: storedRecommendation.reason,
+              },
         impact: stored.impact,
-        degraded: [...classification.degraded].sort(compare),
+        degraded: [
+          ...classification.degraded,
+          ...(stored.source === 'derived'
+            ? [`Gate ${gate.id}: coordinator가 sidecar metadata를 등록하지 않아 Orca 선택지만 표시한다`]
+            : []),
+        ].sort(compare),
       };
     });
 }

@@ -25,9 +25,10 @@ import {
 import { isEffectiveBridgeConfig } from '../discovery/effective-config.js';
 import { redactedEntityRef } from '../discovery/redaction.js';
 import type { EffectiveBridgeConfig } from '../discovery/types.js';
+import { deriveGateMetadata } from '../gate/derive.js';
 import { projectGateDecisions } from '../gate/project.js';
 import type { GateMetadata } from '../gate/types.js';
-import { runKey } from '../identity/keys.js';
+import { gateKey, runKey } from '../identity/keys.js';
 import type { GateStore } from '../store/schema.js';
 import { OperationalStoreError } from '../store/sqlite.js';
 import { aggregateBlockers, aggregateDispatches, aggregateTasks } from './aggregate.js';
@@ -109,7 +110,7 @@ function unreadableDegraded(f: UnreadableField, redact = false): RunDegraded {
   if (redact) {
     return {
       kind: 'unreadable_field',
-      detail: 'an Orca Run source field was unreadable',
+      detail: 'Orca Run 원천의 필드를 읽지 못했다',
       entityRefs: [redactedEntityRef(
         'orca-unreadable-field',
         [f.subject, f.id, f.field, f.reason].join('\u0000'),
@@ -126,7 +127,7 @@ function unreadableDegraded(f: UnreadableField, redact = false): RunDegraded {
 function redactedSourceFailure(row: RunDegraded): RunDegraded {
   return {
     kind: row.kind,
-    detail: 'an Orca Run source query failed',
+    detail: 'Orca Run 원천 조회가 실패했다',
     entityRefs: [redactedEntityRef('orca-run-source-failure', row.detail)],
     counts: { failedSources: 1 },
   };
@@ -154,10 +155,31 @@ function byId<T>(pick: (row: T) => string): (a: T, b: T) => number {
   };
 }
 
+/**
+ * sidecar가 없는 Gate만 골라 축소된 행을 만든다. 이미 등록된 Gate는 건드리지 않으므로
+ * 등록된 설명·권장안·영향이 파생 값으로 덮이지 않는다.
+ */
+function derivePendingGateMetadata(
+  gates: readonly OrcaGate[],
+  stored: readonly GateMetadata[],
+  at: string,
+): readonly GateMetadata[] {
+  if (gates.length === 0) return [];
+  const known = new Set(stored.map((row) => row.gateKey));
+  const rows: GateMetadata[] = [];
+  for (const gate of gates) {
+    if (known.has(gateKey(gate.id))) continue;
+    const row = deriveGateMetadata(gate, at);
+    if (row !== null) rows.push(row);
+  }
+  return rows;
+}
+
 async function readRunSources(
   orca: OrcaRunner,
   run: OrcaRun,
   gateStore: GateStore | undefined,
+  at: string,
 ): Promise<RunSources> {
   // legacy Run은 읽기 전용 placeholder다. Task/Gate 조회를 시도하지 않는다(snapshot.ts와 같다).
   if (run.legacy) {
@@ -200,6 +222,24 @@ async function readRunSources(
   if (gateStore !== undefined) {
     try {
       gateMetadata = gateStore.listGateMetadata(runKey(run.id));
+      // sidecar를 등록하지 않은 Gate는 버튼 없는 카드로 떠서 Slack에서 해결할 수 없다.
+      // 관측이 Orca options만으로 축소된 행을 만들어 durable하게 남긴다. 버튼 클릭 검증
+      // (`claimGateResolution`)이 durable metadata를 요구하므로 렌더 시점 합성으로는 부족하다.
+      const derived = derivePendingGateMetadata(gates, gateMetadata, at);
+      if (derived.length > 0) {
+        for (const row of derived) {
+          try {
+            gateStore.insertGateMetadata(row);
+          } catch (e) {
+            if (e instanceof OperationalStoreError) throw e;
+            degraded.push({
+              kind: 'query_failed',
+              detail: `gate_metadata 파생 기록 실패: ${message(e)}`,
+            });
+          }
+        }
+        gateMetadata = gateStore.listGateMetadata(runKey(run.id));
+      }
     } catch (e) {
       if (e instanceof OperationalStoreError) throw e;
       degraded.push({
@@ -326,7 +366,7 @@ export function projectRun(
     if (effective && sources.repositoryIdentityReliable === false) {
       degraded.push({
         kind: 'repository_identity_unreadable',
-        detail: 'repository-bearing Orca evidence was present but its identity was unreadable',
+        detail: 'repository 근거는 있었지만 그 identity를 읽지 못했다',
         counts: { observedRepositories: 0, blockingReasons: 1 },
       });
     } else {
@@ -349,7 +389,7 @@ export function projectRun(
       kind: routeBlocks.has('repository_identity_unreadable')
         ? 'repository_identity_unreadable'
         : 'repository_route_blocked',
-      detail: 'effective repository routing did not produce one complete Project consensus',
+      detail: '관측된 repository id로 Project 하나를 확정하지 못해 route하지 않았다',
       entityRefs: repositoryIds.map((id) => redactedEntityRef('orca-repository', id)),
       counts: {
         observedRepositories: repositoryIds.length,
@@ -374,7 +414,7 @@ export function projectRun(
   if (effective && project !== null && remoteUnverified) {
     degraded.push({
       kind: 'remote_unverified_repository',
-      detail: 'explicit manual repository identity is active without a verified live remote',
+      detail: '수동 등록한 repository identity가 확인된 live remote 없이 쓰이고 있다',
       entityRefs: repositoryIds.map((id) => redactedEntityRef('orca-repository', id)),
       counts: { observedRepositories: repositoryIds.length },
     });
@@ -508,9 +548,9 @@ export async function collectRunFacts(
   const degraded: RunDegraded[] = [
     {
       kind: 'unverified_platform_assumption',
-      detail:
-        'live/stale 판정은 run-use가 consumer_generation을 올린다는 미검증 가정 위에 있다' +
-        '(docs/platform-capabilities.md §7.2). 플랫폼 동작이 바뀌면 이 판정이 깨진다',
+      // 문서 경로를 카드에 싣지 않는다. 근거는 platform-capabilities §7.2에 있고, 카드가 말해야
+      // 하는 것은 "이 판정이 미검증 가정 위에 있다"는 사실 한 줄이다.
+      detail: 'live/stale 판정은 미검증 플랫폼 가정 위에 있다',
     },
   ];
 
@@ -519,10 +559,10 @@ export async function collectRunFacts(
     degraded.push({
       kind: 'capacity_deferred',
       detail:
-        `deterministic Run capacity deferred ${deferredRuns.length} of ${orderedRuns.length}; ` +
-        `oldest deferred age ${Math.max(0, Math.floor(
+        `Run 수 상한에 걸려 ${orderedRuns.length}건 중 ${deferredRuns.length}건을 이번 관찰에서 ` +
+        `미뤘다. 가장 오래 미뤄진 Run은 ${Math.max(0, Math.floor(
           (observedAt.getTime() - oldestUpdated) / 1_000,
-        ))} seconds`,
+        ))}초 전 갱신됐다`,
       counts: {
         totalRuns: orderedRuns.length,
         deferredRuns: deferredRuns.length,
@@ -549,7 +589,7 @@ export async function collectRunFacts(
   } catch (e) {
     degraded.push(effective ? {
       kind: 'query_failed',
-      detail: 'the Orca inbox source query failed; ask and escalation facts are unavailable',
+      detail: 'Orca inbox 조회가 실패해 ask와 escalation 사실을 얻지 못했다',
       entityRefs: [redactedEntityRef('orca-inbox-failure', message(e))],
       counts: { failedSources: 1 },
     } : {
@@ -577,7 +617,7 @@ export async function collectRunFacts(
   for (const run of runs) {
     const projected = projectRun(
       run,
-      await readRunSources(orca, run, options.gateStore),
+      await readRunSources(orca, run, options.gateStore, observedAt.toISOString()),
       askInbox,
       config,
     );

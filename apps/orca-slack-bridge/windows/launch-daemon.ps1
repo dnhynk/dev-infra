@@ -5,12 +5,14 @@ param(
 
 $botTokenName = 'ORCA_SLACK_BRIDGE_BOT_TOKEN'
 $appTokenName = 'ORCA_SLACK_BRIDGE_APP_TOKEN'
+$openAiKeyName = 'ORCA_SLACK_BRIDGE_OPENAI_KEY'
 $buildIdentityName = 'ORCA_SLACK_BRIDGE_BUILD'
 
 # Task Scheduler may cache a logon environment. Remove both inherited values before doing any
 # manifest work; only fresh Windows User-scope values are copied into the daemon child below.
 [Environment]::SetEnvironmentVariable($botTokenName, $null, [EnvironmentVariableTarget]::Process)
 [Environment]::SetEnvironmentVariable($appTokenName, $null, [EnvironmentVariableTarget]::Process)
+[Environment]::SetEnvironmentVariable($openAiKeyName, $null, [EnvironmentVariableTarget]::Process)
 [Environment]::SetEnvironmentVariable($buildIdentityName, $null, [EnvironmentVariableTarget]::Process)
 
 Set-StrictMode -Version Latest
@@ -355,6 +357,7 @@ function Assert-ReleaseClosure($Runtime, [byte[]]$ManifestBytes) {
   $start.Arguments = (($arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
   [void]$start.EnvironmentVariables.Remove($botTokenName)
   [void]$start.EnvironmentVariables.Remove($appTokenName)
+  [void]$start.EnvironmentVariables.Remove($openAiKeyName)
   [void]$start.EnvironmentVariables.Remove($buildIdentityName)
   $process = [Diagnostics.Process]::new()
   $process.StartInfo = $start
@@ -498,6 +501,7 @@ function Assert-TaskBinding($Runtime, [string]$RuntimeSettingsPath) {
   $start.Arguments = (($arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
   [void]$start.EnvironmentVariables.Remove($botTokenName)
   [void]$start.EnvironmentVariables.Remove($appTokenName)
+  [void]$start.EnvironmentVariables.Remove($openAiKeyName)
   [void]$start.EnvironmentVariables.Remove($buildIdentityName)
   $process = [Diagnostics.Process]::new()
   $process.StartInfo = $start
@@ -630,12 +634,16 @@ try {
   $manifestStream.Dispose()
   $manifestStream = $null
 
-  # These are the only two Windows User-scope reads performed by the launcher.
+  # These are the only Windows User-scope reads performed by the launcher.
   $botToken = [Environment]::GetEnvironmentVariable($botTokenName, [EnvironmentVariableTarget]::User)
   $appToken = [Environment]::GetEnvironmentVariable($appTokenName, [EnvironmentVariableTarget]::User)
   if ([String]::IsNullOrWhiteSpace($botToken) -or [String]::IsNullOrWhiteSpace($appToken)) {
     Exit-StaticFailure 'windows.launcher.required_environment_absent'
   }
+  # 요약 키는 **선택**이다. 없으면 요약 없는 카드가 되고, 그것은 기동을 막을 이유가 아니다.
+  # 반대로 여기서 넘겨주지 않으면 daemon은 키가 있어도 볼 수 없다 — Task Scheduler가 띄운
+  # 프로세스에는 User-scope 값이 들어오지 않고, 이 launcher가 명시적으로 넣는 것만 전달된다.
+  $openAiKey = [Environment]::GetEnvironmentVariable($openAiKeyName, [EnvironmentVariableTarget]::User)
 
   $daemonArguments = @(
     [string]$runtime.distCli, 'daemon',
@@ -652,16 +660,70 @@ try {
   $start.Arguments = (($daemonArguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
   [void]$start.EnvironmentVariables.Remove($botTokenName)
   [void]$start.EnvironmentVariables.Remove($appTokenName)
+  [void]$start.EnvironmentVariables.Remove($openAiKeyName)
   [void]$start.EnvironmentVariables.Remove($buildIdentityName)
   $start.EnvironmentVariables[$botTokenName] = $botToken
   $start.EnvironmentVariables[$appTokenName] = $appToken
+  if (-not [String]::IsNullOrWhiteSpace($openAiKey)) {
+    $start.EnvironmentVariables[$openAiKeyName] = $openAiKey
+  }
   $start.EnvironmentVariables[$buildIdentityName] = [string]$runtime.releaseDigest
+
+  # daemon은 이 launcher가 살아 있는 동안만 산다.
+  #
+  # Task Scheduler가 task를 멈추면 launcher만 종료되고 daemon은 고아로 남는다. 실측에서 task가
+  # Ready인데 daemon이 Slack Socket과 상태 DB를 계속 쥐고 있었고, 그 위에 배포가 진행됐다.
+  #
+  # stdin을 파이프로 넘긴다. launcher가 어떤 방식으로 죽든 OS가 쓰기 끝을 닫고, daemon은 그
+  # EOF를 정상 종료 신호로 읽는다. 여기서 아무것도 쓰지 않는다 — 파이프의 존재 자체가 신호다.
+  $start.EnvironmentVariables['ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT'] = '1'
+  $start.RedirectStandardInput = $true
+
+  # daemon이 죽은 순간의 흔적을 남긴다.
+  #
+  # 지금까지 daemon이 사라져도 stderr가 어디에도 수집되지 않았다. Task로 뜬 프로세스에는 콘솔이
+  # 없어 그대로 버려진다. 그래서 두 번의 죽음 모두 운영 로그에 성공한 job이 마지막 줄이었고,
+  # 원인을 볼 수단이 없었다. 여기서 파일로 받는다.
+  #
+  # 비동기로 읽는다. 동기로 읽으면 파이프 버퍼가 차는 순간 daemon이 쓰기에서 막힌다 — 계측이
+  # 대상을 멈추게 하는 것이 가장 나쁜 종류다.
+  $start.RedirectStandardError = $true
+  $stderrPath = [IO.Path]::Combine([string]$runtime.logDirectory, 'daemon-stderr.log')
+  $stderrWriter = $null
+  $stderrSubscription = $null
+  try {
+    $stderrWriter = [IO.StreamWriter]::new($stderrPath, $true)
+    $stderrWriter.AutoFlush = $true
+  } catch { $stderrWriter = $null }
 
   $daemon = [Diagnostics.Process]::new()
   $daemon.StartInfo = $start
+  if ($null -ne $stderrWriter) {
+    $stderrSubscription = Register-ObjectEvent -InputObject $daemon -EventName ErrorDataReceived -MessageData $stderrWriter -Action {
+      $line = $EventArgs.Data
+      if ($null -eq $line) { return }
+      try {
+        # 무한히 커지지 않게 상한을 둔다. 넘으면 새로 시작한다 — 최근 것이 원인에 가깝다.
+        $writer = $Event.MessageData
+        if ($writer.BaseStream.Length -gt 4194304) { $writer.BaseStream.SetLength(0) }
+        $writer.WriteLine(('{0:o} {1}' -f (Get-Date).ToUniversalTime(), $line))
+      } catch { }
+    }
+  }
+  $daemon.EnableRaisingEvents = $true
   if (-not $daemon.Start()) { throw 'daemon start' }
+  if ($null -ne $stderrWriter) { $daemon.BeginErrorReadLine() }
   $daemon.WaitForExit()
   $exitCode = $daemon.ExitCode
+  if ($null -ne $stderrSubscription) {
+    try { Unregister-Event -SourceIdentifier $stderrSubscription.Name -ErrorAction SilentlyContinue } catch { }
+  }
+  if ($null -ne $stderrWriter) {
+    try {
+      $stderrWriter.WriteLine(('{0:o} daemon exited code={1}' -f (Get-Date).ToUniversalTime(), $exitCode))
+      $stderrWriter.Dispose()
+    } catch { }
+  }
   $daemon.Dispose()
   exit $exitCode
 } catch {
