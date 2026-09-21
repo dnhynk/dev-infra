@@ -10,9 +10,9 @@
 
 | 도구 | 버전 | 비고 |
 |---|---|---|
-| Orca | `1.4.187` | `C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready |
-| Claude Code | `2.1.246` | `C:\Users\dongh\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 production code는 `2.1.243` target surface에 고정돼 있다. research preview이므로 D3 재수용 전에 이 버전에서 다시 검증한다 |
-| codex-cli | `0.149.0` | `C:\Users\dongh\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
+| Orca | `1.4.187` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready |
+| Claude Code | `2.1.246` | `C:\Users\<user>\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 production code는 `2.1.243` target surface에 고정돼 있다. research preview이므로 D3 재수용 전에 이 버전에서 다시 검증한다 |
+| codex-cli | `0.149.0` | `C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
 | gh | `2.98.0` | |
 | git | `2.55.0.windows.4` | |
 | pnpm | `11.22.0` | |

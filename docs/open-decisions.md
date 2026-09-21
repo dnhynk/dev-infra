@@ -1430,7 +1430,7 @@ ID: OD-078
   - [관측] `orca worktree list --json`의 `repoId`가 같은 값이고 같은 행의 `path`와 나란히 있어
     사용자가 등록할 값을 한 번에 찾을 수 있다.
   - [관측] coordinator worktree는 `D:/dev-infra`이고 Orca가 만든 worktree는
-    `C:/Users/dongh/orca/workspaces/dev-infra/<name>`이다. 뿌리가 다르다.
+    `C:/Users/<user>/orca/workspaces/dev-infra/<name>`이다. 뿌리가 다르다.
 대안과 기각 이유:
   - 로컬 경로 등록: 뿌리가 둘이라 한쪽만 등록하면 Run 절반이 조용히 빠지고, 정규화(대소문자,
     구분자)와 segment 경계 처리(`D:/dev-infra`가 `D:/dev-infra-2`를 먹지 않게)를 요구하므로 기각.

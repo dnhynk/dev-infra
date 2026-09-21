@@ -48,7 +48,7 @@ dispatch 대상 터미널 **안에서** 실행해야 한다. THROWAWAY 실험은
 
 **[관측]** Windows에서 `orca.cmd`는 `orchestration send`와 `reply`를 거부하므로
 (`orca.cmd cannot safely forward orchestration message bodies`) 실험은
-`C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe`를 직접 호출했다.
+`C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`를 직접 호출했다.
 
 ---
 
@@ -95,7 +95,7 @@ pwsh -NoProfile -File od075-repro.ps1
 # 직접 실행한다. 직접 실행 위치의 근거는 §실험 하네스의 터미널 identity attest 관측이다.
 
 $ErrorActionPreference = 'Stop'
-$ORCA = 'C:\Users\dongh\AppData\Local\Programs\orca\resources\bin\orca.exe'  # orca.cmd는 orchestration send를 거부한다(§실험 하네스)
+$ORCA = 'C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe'  # orca.cmd는 orchestration send를 거부한다(§실험 하네스)
 $WR_FIELDS = @('provenance','outcome','messageId','reportedBy','subject','body',
                'completedBy','filesModified','reportPath','completedAt')     # (a)가 소실을 주장하는 10필드
 
@@ -496,7 +496,7 @@ run-list --limit 101 -> {"ok":false,"error":{"code":"invalid_argument","message"
 **[소스]** 실제 구현. `app.asar`에서 추출했다.
 
 ```bash
-cd "C:/Users/dongh/AppData/Local/Programs/orca/resources"
+cd "C:/Users/<user>/AppData/Local/Programs/orca/resources"
 grep -a -o -b "function getInbox(" app.asar          # -> offset 4540949
 dd if=app.asar bs=1 skip=4540700 count=1000 | tr -d '\0'
 grep -a -o -b "InboxParams = " app.asar              # -> offset 4913850

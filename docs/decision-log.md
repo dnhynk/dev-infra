@@ -57,14 +57,14 @@
 
 ### DL-009 · 문서 위치 — SUPERSEDED (DL-010)
 
-- 문서 루트는 `C:\Users\dongh\dev-infra\docs`다. → DL-010으로 대체됨.
+- 문서 루트는 `C:\Users\<user>\dev-infra\docs`다. → DL-010으로 대체됨.
 
 ## 2026-08-21 · 저장소 구조 확정
 
 ### DL-010 · 실제 문서 루트
 
 - 문서 루트는 `D:\dev-infra\docs`다.
-- DL-009의 `C:\Users\dongh\dev-infra\docs`를 대체한다.
+- DL-009의 `C:\Users\<user>\dev-infra\docs`를 대체한다.
 - 근거: 실제 작업 트리가 `D:\dev-infra`에 생성되어 있고 DL-009 경로에는 문서가 존재하지 않는다.
 
 ### DL-011 · 단일 monorepo 저장소
@@ -421,7 +421,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   repository의 id다. `orca worktree list --json`의 `repoId`가 같은 값이며 같은 행의 `path`와 나란히
   있어 사용자가 등록할 값을 한 번에 찾는다.
 - 경로 등록을 기각한 이유: coordinator worktree(`D:/dev-infra`)와 Orca가 만든
-  worktree(`C:/Users/dongh/orca/workspaces/dev-infra/<name>`)는 뿌리가 다르다. 한쪽만 등록하면 Run
+  worktree(`C:/Users/<user>/orca/workspaces/dev-infra/<name>`)는 뿌리가 다르다. 한쪽만 등록하면 Run
   절반이 조용히 빠진다. 정규화와 segment 경계 처리도 필요해진다. id 하나가 둘 다 덮는다.
 - Git remote는 읽지 않는다. 자동 발견·자동 등록·자동 routing은 O1 범위다(OD-068).
 - **남는 위험과 완화책.** `<uuid>::<path>` 형식 안정성은 미검증이고(platform-capabilities §7.1),
