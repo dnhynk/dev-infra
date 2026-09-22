@@ -327,6 +327,16 @@ export interface GateChannelDeliveryStore {
     baseline: GateResumeSnapshot,
     at: string,
   ): GateChannelDelivery | null;
+  /**
+   * 끝내 읽지 못한 baseline을 `unavailable`로 넘겨 delivery가 영원히 재시도하지 않게 한다.
+   * 전달 liveness는 유지하고 재개 증거만 포기한다 — v11 legacy delivery와 같은 의미다.
+   */
+  markGateResumeBaselineUnavailable(
+    gateKey: GateKey,
+    expectedDeliveryRevision: number,
+    owner: string,
+    at: string,
+  ): GateChannelDelivery | null;
   findGateResumeObservation(gateKey: GateKey): GateResumeObservation | null;
   listDueGateResumeObservations(at: string, limit?: number): readonly GateResumeObservation[];
   acquireGateResumeLease(

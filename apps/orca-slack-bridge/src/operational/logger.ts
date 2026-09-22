@@ -39,6 +39,10 @@ export const OPERATIONAL_LOG_EVENTS = [
   'registry.changed',
   'root_intent.changed',
   'status.owner_degraded',
+  // D3 Channel 구간. 이 둘이 없으면 daemon→Adapter→coordinator 왕복이 로그에 아무 흔적도 남기지
+  // 않아, 무인 운영에서 coordinator가 안 깨어난 이유를 추적할 수단이 사라진다(DL-031).
+  'channel.adapter',
+  'channel.delivery',
   'logger.failed',
   'telemetry.rejected',
   'log.corrupt_line',
