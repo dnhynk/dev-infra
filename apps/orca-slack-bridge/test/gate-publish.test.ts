@@ -15,6 +15,7 @@ import type {
   ThreadReplyInput,
   UpdateMessageInput,
 } from '../src/slack/post.js';
+import { SlackApiError } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
@@ -23,7 +24,11 @@ import { publishGateCard } from '../src/gate/publish.js';
 const RUN_ID = 'run_d2a';
 const GATE_ID = 'gate_static';
 const GATE_TASK = 'task_gate';
+const DECISIONS_CHANNEL = 'C0DECISIONS1';
 const RAW_ONLY_GATE = 'gate_without_sidecar';
+// options를 읽지 못하면 파생도 등록도 할 수 없다. 파생이 생긴 뒤에도 missing이 남는 유일한 경우다.
+const UNREADABLE_GATE = 'gate_unreadable_options';
+const UNREADABLE_TASK = 'task_unreadable';
 const RAW_ONLY_TASK = 'task_raw_gate';
 const REPO_ID = 'repo-d2a';
 const CHANNEL = 'C0AGENTRUNS';
@@ -35,7 +40,7 @@ const CONFIG: BridgeConfig = {
   slack: {
     teamId: 'T0TEAM',
     ownerUserIds: ['U0OWNER'],
-    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
   },
   projects: [
     { name: 'dev-infra', repositories: ['dnhynk/dev-infra'], orcaRepositoryIds: [REPO_ID] },
@@ -78,6 +83,7 @@ function gateRow(
   question: string,
   options: readonly string[],
   status = 'pending',
+  resolution: string | null = null,
 ): Record<string, unknown> {
   return {
     id,
@@ -86,7 +92,7 @@ function gateRow(
     question,
     options: JSON.stringify(options),
     status,
-    resolution: null,
+    resolution,
     created_at: '2026-08-24T05:00:00Z',
     resolved_at: null,
   };
@@ -95,6 +101,7 @@ function gateRow(
 class MutableFakeOrca implements OrcaRunner {
   gateQuestion = '정적 Gate card를 이 경로로 게시할까?';
   gateStatus = 'pending';
+  gateResolution: string | null = null;
   readonly calls: string[][] = [];
 
   run(args: readonly string[]): Promise<string> {
@@ -121,14 +128,22 @@ class MutableFakeOrca implements OrcaRunner {
         taskRow(GATE_TASK),
         taskRow('task_after', [GATE_TASK]),
         taskRow(RAW_ONLY_TASK),
+        taskRow(UNREADABLE_TASK),
         taskRow('task_independent'),
       ];
       result = { tasks, count: tasks.length };
     } else if (command === 'gate-list') {
       result = {
         gates: [
-          gateRow(GATE_ID, GATE_TASK, this.gateQuestion, ['기존 유지', '변경'], this.gateStatus),
+          gateRow(
+            GATE_ID, GATE_TASK, this.gateQuestion, ['기존 유지', '변경'],
+            this.gateStatus, this.gateResolution,
+          ),
           gateRow(RAW_ONLY_GATE, RAW_ONLY_TASK, 'sidecar가 없는 Gate', ['예', '아니오']),
+          {
+            ...gateRow(UNREADABLE_GATE, UNREADABLE_TASK, 'options를 읽지 못하는 Gate', []),
+            options: '{not json',
+          },
         ],
       };
     } else if (command === 'worker-list') {
@@ -152,7 +167,12 @@ class FakeSlack implements SlackPoster, ThreadPoster {
     return { channel: input.channel, ts: `1787554800.${String(this.posts.length).padStart(6, '0')}` };
   }
 
+  /** 이 ts를 갱신하려 하면 Slack이 지워진 메시지라고 답한다. */
+  deletedTs: string | null = null;
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
+    if (this.deletedTs !== null && input.ts === this.deletedTs) {
+      throw new SlackApiError('chat.update', 'message_not_found');
+    }
     this.updates.push(input);
     return { channel: input.channel, ts: input.ts };
   }
@@ -238,6 +258,7 @@ function insertSidecar(store: SqliteDigestStore): void {
     runKey: runKey(RUN_ID),
     taskKey: taskKey(GATE_TASK),
     dispatchKey: dispatchKey('ctx_gate'),
+    source: 'registered',
     askMessageId: 'msg_ask',
     questionThreadId: 'thread_question',
     options: [
@@ -314,30 +335,146 @@ describe('collect → project → render → existing Run thread publish', () =>
         now: () => new Date(AT),
       });
 
+      // sidecar를 등록하지 않은 Gate도 Orca options로 파생되어 matched가 된다. options 자체를
+      // 읽지 못한 Gate만 missing으로 남고, 그 카드에는 버튼이 없다.
+      // Gate는 id 순으로 정렬된다: 등록된 Gate, options를 읽지 못한 Gate, sidecar 없는 Gate.
       expect(report.facts.runs[0]?.gates.map((gate) => gate.metadataState)).toEqual([
         'matched',
         'missing',
+        'matched',
       ]);
-      expect(report.published.gates.map((gate) => gate.action)).toEqual(['create', 'create']);
+      expect(report.published.gates.map((gate) => gate.action)).toEqual([
+        'create',
+        'create',
+        'create',
+      ]);
       expect(slack.posts).toHaveLength(2); // collection root + Run root
-      expect(slack.replies).toHaveLength(2);
-      expect(slack.replies.map((reply) => reply.threadTs)).toEqual([RUN_ROOT_TS, RUN_ROOT_TS]);
-      expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
-      expect(noActionBlocks(slack.replies[1] ?? { blocks: [] })).toBe(true);
+      expect(slack.replies).toHaveLength(3);
+      expect(slack.replies.map((reply) => reply.threadTs)).toEqual([
+        RUN_ROOT_TS,
+        RUN_ROOT_TS,
+        RUN_ROOT_TS,
+      ]);
+      for (const reply of slack.replies) expect(noActionBlocks(reply)).toBe(true);
       const promoted = slack.updates.find((update) => update.ts === FIRST_GATE_TS);
       expect(noActionBlocks(promoted ?? { blocks: [] })).toBe(false);
       expect(JSON.stringify(promoted?.blocks)).toContain('"value":"keep"');
       expect(slack.replies[0]?.text).toContain('정적 Gate card');
       expect(JSON.stringify(promoted?.blocks)).toContain('현재 소비자와 호환된다');
-      expect(JSON.stringify(slack.replies[1]?.blocks)).toContain('추측하지 않음');
+      // 파생 카드도 누를 수 있어야 한다. 이것이 없으면 등록을 빠뜨린 Gate를 폰에서 해결할 수 없다.
+      const derived = slack.updates.find((update) => update.ts === '1787554800.000103');
+      expect(noActionBlocks(derived ?? { blocks: [] })).toBe(false);
+      expect(JSON.stringify(derived?.blocks)).toContain('"value":"orca_');
+      const unreadable = slack.updates.find((update) => update.ts === '1787554800.000102');
+      expect(unreadable === undefined || noActionBlocks(unreadable)).toBe(true);
 
       const matched = store.findGateMessage(gateKey(GATE_ID));
       const degraded = store.findGateMessage(gateKey(RAW_ONLY_GATE));
       expect(matched).toMatchObject({ threadTs: RUN_ROOT_TS, messageTs: FIRST_GATE_TS });
-      expect(degraded).toMatchObject({ threadTs: RUN_ROOT_TS, messageTs: '1787554800.000102' });
+      expect(degraded).toMatchObject({ threadTs: RUN_ROOT_TS, messageTs: '1787554800.000103' });
       expect(store.findGateLocalObservation(gateKey(GATE_ID))).toMatchObject({
         status: 'pending', metadataState: 'matched', mappingState: 'matched',
       });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('답할 카드 채널이 설정되면 Gate를 그 채널에 최상위로 놓는다', async () => {
+    /*
+     * Slack은 메시지를 게시 순서로 고정한다. 상태 카드는 제자리에서 갱신되므로 아래로 내려오지
+     * 않고, 답할 카드가 그 사이에 섞이면 둘 다 스크롤로 찾아야 한다. 폰에서 채널을 열었을 때
+     * 맨 아래가 지금 할 일이 아니면 이 기능의 목적이 성립하지 않는다.
+     *
+     * 최상위 메시지 자체가 알림이므로 broadcast가 필요 없다. 스레드 답글은 스레드를 따르지
+     * 않는 사람에게 알림이 가지 않고, 알림을 위해 broadcast를 켜면 그 복사본이 다시 상태 카드
+     * 사이에 섞인다.
+     */
+    const store = new SqliteDigestStore(dbPath);
+    const orca = new MutableFakeOrca();
+    const slack = new FakeSlack();
+    insertSidecar(store);
+    try {
+      const report = await runRunObserver(orca, {
+        config: CONFIG,
+        channel: CHANNEL,
+        decisionsChannel: DECISIONS_CHANNEL,
+        store,
+        slack,
+        thread: slack,
+        now: () => new Date(AT),
+      });
+
+      expect(report.published.gates.every((gate) => gate.action !== 'root_unavailable')).toBe(true);
+      // Gate 카드가 답할 카드 채널의 최상위 메시지로 간다. Run 카드 채널에는 답글이 없다.
+      const decisionPosts = slack.posts.filter((post) => post.channel === DECISIONS_CHANNEL);
+      expect(decisionPosts.length).toBeGreaterThan(0);
+      expect(slack.replies).toHaveLength(0);
+
+      // 매핑은 그 채널을 가리키고, 자기 자신이 루트다.
+      const mapped = store.findGateMessage(gateKey(GATE_ID));
+      expect(mapped?.channelId).toBe(DECISIONS_CHANNEL);
+      expect(mapped?.threadTs).toBe(mapped?.messageTs);
+
+      // 재관찰이 같은 카드를 다시 만들지 않는다.
+      const again = await runRunObserver(orca, {
+        config: CONFIG,
+        channel: CHANNEL,
+        decisionsChannel: DECISIONS_CHANNEL,
+        store,
+        slack,
+        thread: slack,
+        now: () => new Date(AT),
+      });
+      expect(again.published.gates.map((gate) => gate.action)).not.toContain('create');
+      expect(store.findGateMessage(gateKey(GATE_ID))?.messageTs).toBe(mapped?.messageTs);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('사람이 지운 Gate 카드는 매핑만 버리고 관측을 멈추지 않는다', async () => {
+    /*
+     * 사람이 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 던지게 두면 Gate 게시 루프가 그
+     * 자리에서 끝나고 관측 job이 실패로 끝나, 다음 주기에도 같은 카드에서 다시 멈춘다. 카드
+     * 한 장이 나머지 전부를 인질로 잡는다.
+     *
+     * 이미 끝난 Gate는 카드를 되살리지 않는다. 카드는 사람이 결정하라고 있는 것이고, 결정된
+     * Gate의 카드는 이력이다. 사람이 그 이력을 지웠으면 되살릴 이유가 없다.
+     */
+    const store = new SqliteDigestStore(dbPath);
+    const orca = new MutableFakeOrca();
+    const slack = new FakeSlack();
+    insertSidecar(store);
+    try {
+      await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack, thread: slack,
+        now: () => new Date(AT),
+      });
+      const mapped = store.findGateMessage(gateKey(GATE_ID));
+      expect(mapped).not.toBeNull();
+
+      // Gate가 끝나고, 그 사이 사람이 카드를 지웠다.
+      orca.gateStatus = 'resolved';
+      orca.gateResolution = 'A 유지';
+      slack.deletedTs = mapped!.messageTs;
+
+      const report = await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack, thread: slack,
+        now: () => new Date(AT),
+      });
+      const outcome = report.published.gates.find((g) => g.gate.gateId === GATE_ID);
+      expect(outcome?.action).toBe('relinked');
+      expect(store.findGateMessage(gateKey(GATE_ID))).toBeNull();
+
+      // 다음 관측이 끝난 Gate의 카드를 되살리지 않는다.
+      slack.deletedTs = null;
+      const again = await runRunObserver(orca, {
+        config: CONFIG, channel: CHANNEL, store, slack, thread: slack,
+        now: () => new Date(AT),
+      });
+      expect(again.published.gates.find((g) => g.gate.gateId === GATE_ID)?.action).toBe('skip');
+      expect(store.findGateMessage(gateKey(GATE_ID))).toBeNull();
     } finally {
       store.close();
     }
@@ -370,7 +507,7 @@ describe('collect → project → render → existing Run thread publish', () =>
         thread: secondSlack,
         now: () => new Date('2026-08-24T08:00:00Z'),
       });
-      expect(second.published.gates.map((gate) => gate.action)).toEqual(['skip', 'skip']);
+      expect(second.published.gates.map((gate) => gate.action)).toEqual(['skip', 'skip', 'skip']);
       expect(second.published.gates.map((gate) => gate.messageTs)).toEqual(firstTs);
       expect(secondSlack.replies).toEqual([]);
       expect(secondSlack.updates).toEqual([]);
@@ -597,7 +734,7 @@ describe('collect → project → render → existing Run thread publish', () =>
     }
   });
 
-  it('reopens a staged first mapping when its missing sidecar registers after the inert reply', async () => {
+  it('reopens a staged first mapping when registration replaces its derived sidecar after the inert reply', async () => {
     const orca = new MutableFakeOrca();
     const publisher = new SqliteDigestStore(dbPath);
     const registrar = new SqliteDigestStore(dbPath);
@@ -611,7 +748,9 @@ describe('collect → project → render → existing Run thread publish', () =>
     });
     const gate = preview.facts.runs[0]?.gates.find((candidate) => candidate.gateId === GATE_ID);
     if (gate === undefined) throw new Error('missing-sidecar Gate preview missing');
-    expect(gate.metadataState).toBe('missing');
+    // 등록 전이라 관측이 파생 행을 남긴다. matched지만 권장안이 없는 것으로 파생임을 판정한다.
+    expect(gate.metadataState).toBe('matched');
+    expect(gate.recommendation).toBeNull();
     const slack = new FakeSlack();
     await expect(publishGateCard(
       {
@@ -635,8 +774,10 @@ describe('collect → project → render → existing Run thread publish', () =>
     expect(noActionBlocks(slack.replies[0] ?? { blocks: [] })).toBe(true);
     expect(slack.updates).toEqual([]);
     expect(publisher.findGateMessage(gate.key)?.messageTs).toBe(FIRST_GATE_TS);
+    // 파생 행으로 이미 matched였으므로 등록이 그 판정을 되돌리지 않는다. 바뀌는 것은 option
+    // identity라서 카드가 다시 그려지고, 옛 파생 option ID로 누른 클릭은 claim에서 거부된다.
     expect(publisher.findGateLocalObservation(gate.key)).toMatchObject({
-      metadataState: 'mismatched',
+      metadataState: 'matched',
       mappingState: 'matched',
     });
     registrar.close();

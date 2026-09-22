@@ -4,6 +4,8 @@ import type { OrcaRunner } from '../orca/client.js';
 import {
   boundedSlackUpdate,
   DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  SlackApiError,
+  SlackUpdateTimeoutError,
   type SlackPoster,
   type ThreadPoster,
 } from '../slack/post.js';
@@ -11,6 +13,8 @@ import {
   postSlackRootAtMostOnce,
   type SlackRootIntentRuntime,
 } from '../slack/root-intent.js';
+import type { GateKey, RunKey } from '../identity/keys.js';
+import type { SlackRootEntity } from '../store/operational-types.js';
 import type { GateStore, RunStore } from '../store/schema.js';
 import { collectRunFacts, type RunRoutingConfig } from './collect.js';
 import {
@@ -67,7 +71,24 @@ export type RunPublishAction =
   | 'skip'
   | 'channel_mismatch'
   | 'deferred'
-  | 'uncertain';
+  | 'uncertain'
+  /**
+   * 이 카드 하나의 게시가 실패했다. 관찰 자체는 계속됐다.
+   *
+   * 이 값이 없으면 카드 하나의 Slack 실패가 관찰 전체를 던져 **나머지 카드까지 전부 멈춘다.**
+   * 실제로 그렇게 됐다 — 지워진 메시지 하나에 `chat.update`가 `message_not_found`로 실패하면서
+   * Run 카드 22장이 세 시간 동안 갱신되지 않았다. 컬렉션 카드를 먼저 게시하는 것과 같은
+   * 이유이고, 그 이유를 Run 카드 목록에도 적용한 것이다.
+   */
+  | 'failed'
+  /**
+   * 사람이 Slack에서 카드를 지웠다. 가리킬 곳이 없어진 매핑을 버렸고, 다음 관찰이 새로 만든다.
+   *
+   * 이것이 없으면 지워진 카드의 매핑이 영원히 남아 매 관찰마다 같은 오류를 낸다. 카드는
+   * 사실의 투영이지 사람이 쓴 글이 아니므로, Run이 살아 있는 한 다음 관찰에서 다시 나타나는
+   * 것이 맞다.
+   */
+  | 'relinked';
 
 /**
  * 카드 한 장에 대한 결정과 그 결정이 만든 값.
@@ -82,6 +103,14 @@ export type RunPublishOutcome = {
   readonly messageTs: string | null;
   readonly fingerprint: string;
   readonly card: RenderedCard;
+  /**
+   * `action`이 `failed`일 때의 Slack 오류 코드. 그 외에는 없다.
+   *
+   * 코드를 남기는 것이 요점이다. `message_not_found`(메시지가 지워졌다)와
+   * `not_in_channel`(채널에 없다)은 운영자가 해야 할 일이 다르고, 코드를 잃으면 그 구분이
+   * 사라진다.
+   */
+  readonly errorCode?: string;
 };
 
 export type RunPublishResult = RunPublishOutcome & {
@@ -104,6 +133,13 @@ export type RunCollectionPublishResult = {
 
 export type RunPublishOptions = {
   readonly store: RunStore & GateStore;
+  /**
+   * 답할 카드(Gate)를 놓을 채널. 없으면 Run 카드와 같은 채널의 스레드에 놓는다.
+   *
+   * Slack은 메시지를 게시 순서로 고정한다. 상태 카드는 제자리에서 갱신되므로 아래로 내려오지
+   * 않고, 답할 카드가 그 사이에 섞이면 둘 다 스크롤로 찾아야 한다.
+   */
+  readonly decisionsChannel?: string;
   /**
    * Slack write 경계. **null이면 dry-run이다** — Slack도 store도 건드리지 않고 결정만 돌려준다.
    *
@@ -141,6 +177,25 @@ export type RunPublishOptions = {
  * 아닌 곳의 메시지를 고치고, 새로 post하면 루트가 둘이 된다. 어느 쪽도 이 관찰이 결정할 일이
  * 아니므로 사실만 돌려준다.
  */
+/**
+ * 이 Run에서 답을 기다리는 터미널 수.
+ *
+ * store가 이 조회를 갖지 않는 구성에서는 0이다. 카드의 다른 절은 그대로이므로 이 값 하나가
+ * 없다고 관측이 실패하지 않는다.
+ */
+function countWaitingPrompts(store: unknown, key: RunKey): number {
+  const reader = store as {
+    listTerminalPrompts?: (runKey: RunKey) => readonly { readonly state: string }[];
+  };
+  if (typeof reader.listTerminalPrompts !== 'function') return 0;
+  try {
+    return reader.listTerminalPrompts(key)
+      .filter((prompt) => prompt.state === 'open' || prompt.state === 'claimed').length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function publishRunCard(
   options: RunPublishOptions,
   input: RunCardInput,
@@ -197,13 +252,21 @@ export async function publishRunCard(
     return { ...base, action: 'create', messageTs: created.message.ts };
   }
 
-  const updated = await boundedSlackUpdate(options.slack, {
-    channel: existing.channelId,
-    ts: existing.messageTs,
-    text: card.text,
-    blocks: card.blocks,
-    ...(signal === undefined ? {} : { signal }),
-  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  let updated;
+  try {
+    updated = await boundedSlackUpdate(options.slack, {
+      channel: existing.channelId,
+      ts: existing.messageTs,
+      text: card.text,
+      blocks: card.blocks,
+      ...(signal === undefined ? {} : { signal }),
+    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  } catch (error) {
+    if (!deletedInSlack(error)) throw error;
+    // 사람이 지웠다. 우리가 든 ts는 가리킬 곳이 없으므로 매핑을 버린다. 다음 관찰이 새로 만든다.
+    forgetRoot(options.store, { kind: 'run', key: runKey });
+    return { ...base, action: 'relinked', messageTs: null };
+  }
   options.store.updateRunObservation(runKey, fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
 }
@@ -272,15 +335,43 @@ export async function publishRunCollectionCard(
     return { ...base, action: 'create', messageTs: created.message.ts };
   }
 
-  const updated = await boundedSlackUpdate(options.slack, {
-    channel: existing.channelId,
-    ts: existing.messageTs,
-    text: card.text,
-    blocks: card.blocks,
-    ...(signal === undefined ? {} : { signal }),
-  }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  let updated;
+  try {
+    updated = await boundedSlackUpdate(options.slack, {
+      channel: existing.channelId,
+      ts: existing.messageTs,
+      text: card.text,
+      blocks: card.blocks,
+      ...(signal === undefined ? {} : { signal }),
+    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+  } catch (error) {
+    if (!deletedInSlack(error)) throw error;
+    forgetRoot(options.store, { kind: 'run_collection', key: 'run_collection' });
+    return { ...base, action: 'relinked', messageTs: null };
+  }
   options.store.updateRunCollectionObservation(fingerprint, at);
   return { ...base, action: 'update', messageTs: updated.ts };
+}
+
+/** Slack이 "그 메시지가 없다"고 답했는가. 다른 오류와 섞지 않는다. */
+function deletedInSlack(error: unknown): boolean {
+  return error instanceof SlackApiError && error.code === 'message_not_found';
+}
+
+/**
+ * 루트 매핑과 intent를 함께 버린다. store가 이 연산을 갖지 않으면 아무것도 하지 않는다.
+ *
+ * 버리지 못해도 던지지 않는다. 이 자리는 이미 한 카드의 실패를 처리하는 중이고, 정리에
+ * 실패했다고 나머지 카드까지 멈추면 원래 고치려던 문제로 돌아간다.
+ */
+function forgetRoot(store: unknown, entity: SlackRootEntity): void {
+  const forgetful = store as { forgetSlackRoot?: (target: SlackRootEntity) => boolean };
+  if (typeof forgetful.forgetSlackRoot !== 'function') return;
+  try {
+    forgetful.forgetSlackRoot(entity);
+  } catch {
+    // 다음 관찰이 같은 판정에 다시 도달한다.
+  }
 }
 
 /**
@@ -297,10 +388,22 @@ export async function publishRunCollectionCard(
  * 막는다. 컬렉션 카드가 싣는 것은 등록 실패를 드러내는 사실이고, 그 사실은 개별 카드의 성패와
  * 무관하게 도달해야 한다.
  */
+/**
+ * Slack이 준 오류 코드. Slack 오류가 아니면 오류 종류만 남긴다.
+ *
+ * 메시지 본문을 옮기지 않는다. 이 경로의 오류 문구에는 카드 내용이 들어갈 수 있다.
+ */
+function slackErrorCode(error: unknown): string {
+  if (error instanceof SlackApiError) return error.code;
+  if (error instanceof SlackUpdateTimeoutError) return 'update_timeout';
+  return 'unexpected_error';
+}
+
 export async function publishRunCollection(
   options: RunPublishOptions,
   collection: RunCollection,
 ): Promise<RunCollectionPublishResult> {
+  const signal = options.signal ?? options.rootIntent?.signal;
   const collectionResult = await publishRunCollectionCard(options, collection);
 
   // 관측 시각을 싣지 않는다. 카드에 그리지 않기 때문이고, 그 근거는 `run/render.ts`에 있다.
@@ -311,11 +414,35 @@ export async function publishRunCollection(
   const results: RunPublishResult[] = [];
   const gateResults: GatePublishResult[] = [];
   for (const run of collection.runs) {
-    const root = await publishRunCard(options, {
-      run,
-      pullRequests: options.store.listRunPullRequests(run.identity.key),
-      collection: context,
-    });
+    /*
+     * 카드 하나의 실패를 그 카드에 가둔다.
+     *
+     * 컬렉션 카드를 먼저 게시하는 것과 같은 이유다(위 주석). 던지게 두면 이 Run 뒤의 카드가
+     * 전부 게시되지 않고, 관찰 job이 실패로 끝나 다음 주기에도 같은 카드에서 다시 멈춘다.
+     * 즉 카드 하나가 지워지면 나머지 전부가 영구히 갱신을 멈춘다.
+     */
+    let root: RunPublishResult;
+    try {
+      root = await publishRunCard(options, {
+        run,
+        pullRequests: options.store.listRunPullRequests(run.identity.key),
+        collection: context,
+        // 답을 기다리는 터미널 수. store가 그 수를 세지 못하는 구성(dry-run 등)에서는 0이고,
+        // 그때 카드에서 이 줄이 빠질 뿐 다른 절은 그대로다.
+        waitingPrompts: countWaitingPrompts(options.store, run.identity.key),
+      });
+    } catch (error) {
+      // 취소는 관찰 전체의 결정이므로 이 카드에 가두지 않는다.
+      if (signal?.aborted === true) throw error;
+      root = {
+        run,
+        action: 'failed',
+        messageTs: options.store.findRunMessage(run.identity.key)?.messageTs ?? null,
+        fingerprint: '',
+        card: { text: '', blocks: [] },
+        errorCode: slackErrorCode(error),
+      };
+    }
     results.push(root);
     const rootMessageTs = root.action === 'channel_mismatch' ? null : root.messageTs;
     for (const gate of run.gates) {
@@ -325,7 +452,12 @@ export async function publishRunCollection(
             store: options.store,
             slack: options.slack,
             thread: options.thread,
-            channel: options.channel,
+            // 답할 카드는 답할 카드만 오는 채널에 최상위로 놓는다. 설정하지 않은 설치에서는
+            // 이 값이 `agentRuns`와 같아 지금까지와 같은 자리로 간다.
+            channel: options.decisionsChannel ?? options.channel,
+            ...(options.decisionsChannel === undefined
+              ? {}
+              : { placement: 'channel' as const }),
             now: options.now,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.slackTimeoutMs === undefined
@@ -353,6 +485,8 @@ export type RunObserveOptions = {
   readonly config: RunRoutingConfig;
   /** 게시 대상 채널 ID. 설정의 `slack.channels.agentRuns`에서만 온다. 여기서 만들지 않는다. */
   readonly channel: string;
+  /** 답할 카드(Gate)를 놓을 채널. 설정의 `slack.channels.decisions`에서만 온다. */
+  readonly decisionsChannel?: string;
   readonly store: RunStore & GateStore;
   /** Slack write 경계. **null이면 dry-run이다.** */
   readonly slack: SlackPoster | null;

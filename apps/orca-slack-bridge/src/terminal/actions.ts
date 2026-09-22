@@ -1,0 +1,73 @@
+import { createHash } from 'node:crypto';
+
+/**
+ * Block Kit identity. Gate와 완전히 분리된 prefix를 쓴다.
+ *
+ * 두 표면이 같은 prefix를 나눠 쓰면 한쪽 handler가 다른 쪽 클릭을 받는다. Gate 해결과 터미널
+ * 입력은 결과가 다르므로 그 혼선은 조용한 오작동이 된다.
+ */
+export const PROMPT_BLOCK_PREFIX = 'orca_prompt_options_v1';
+export const PROMPT_ACTION_PREFIX = 'orca_prompt_answer_v1';
+
+function digest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 24);
+}
+
+/**
+ * 한 프롬프트의 actions block id.
+ *
+ * 지문이 들어간다. 프롬프트가 바뀌면 block id가 바뀌므로, 옛 카드의 버튼을 눌러도 지금 프롬프트의
+ * block으로 인정되지 않는다.
+ */
+export function promptBlockId(handle: string, fingerprint: string): string {
+  return `${PROMPT_BLOCK_PREFIX}:${digest(`${handle}|${fingerprint}`)}`;
+}
+
+export function promptActionId(
+  handle: string,
+  fingerprint: string,
+  optionIndex: number,
+): string {
+  return `${PROMPT_ACTION_PREFIX}:${digest(`${handle}|${fingerprint}|${optionIndex}`)}`;
+}
+
+export function isPromptActionId(value: string): boolean {
+  return value.startsWith(`${PROMPT_ACTION_PREFIX}:`);
+}
+
+/**
+ * 버튼이 실어 나르는 값. handler는 이 값으로 대상을 찾는다.
+ *
+ * 사람이 읽는 문구는 넣지 않는다. 넣으면 handler가 그것을 파싱하게 되고, 화면 문구가 판정에
+ * 끼어든다.
+ *
+ * **구분자는 인쇄 가능한 문자여야 한다.** 제어문자를 쓰면 Slack이 왕복에서 지울 수 있고, 그러면
+ * 파싱이 깨져 모든 클릭이 조용히 거절된다. 실제로 NUL 구분자로 그렇게 됐다 — 카드는 멀쩡히
+ * 떴고 버튼도 눌렸는데 답만 들어가지 않았다. `|`는 handle(term_ + UUID)에도 32자 hex 지문에도
+ * 숫자에도 나타나지 않으므로 값과 겹치지 않는다.
+ */
+export function promptActionValue(
+  handle: string,
+  fingerprint: string,
+  optionIndex: number,
+): string {
+  return `${handle}|${fingerprint}|${optionIndex}`;
+}
+
+export type ParsedPromptAction = {
+  readonly handle: string;
+  readonly fingerprint: string;
+  readonly optionIndex: number;
+};
+
+/** 값을 되읽는다. 모양이 어긋나면 null이고, handler는 그 클릭을 거절한다. */
+export function parsePromptActionValue(value: string): ParsedPromptAction | null {
+  const parts = value.split('|');
+  if (parts.length !== 3) return null;
+  const [handle, fingerprint, rawIndex] = parts;
+  if (handle === undefined || !handle.startsWith('term_') || handle.length > 200) return null;
+  if (fingerprint === undefined || !/^[0-9a-f]{32}$/.test(fingerprint)) return null;
+  const optionIndex = Number.parseInt(rawIndex ?? '', 10);
+  if (!Number.isSafeInteger(optionIndex) || optionIndex < 1 || optionIndex > 25) return null;
+  return { handle, fingerprint, optionIndex };
+}

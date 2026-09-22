@@ -15,7 +15,22 @@ import {
 } from './protocol.js';
 
 export const CHANNEL_PIPE_PATH = String.raw`\\.\pipe\orca-slack-bridge-channel-v1`;
-export const DEFAULT_PROBE_DELAYS_MS = [5_000, 10_000, 20_000, 30_000] as const;
+/**
+ * 검증 probe 간격. 마지막 값이 정상 상태의 주기다(`#scheduleProbe`가 인덱스를 마지막으로 고정).
+ *
+ * **마지막 값이 10분인 이유.** probe는 세션 화면에 보이는 줄을 하나 남긴다. 검증되지 않은
+ * 연결에 30초마다 계속 쓰면 그 줄이 무한히 쌓여 세션 화면을 밀어낸다. 실제로 그렇게 됐다 —
+ * 코디네이터가 띄운 선택 프롬프트가 쌓인 probe 줄에 밀려 화면 밖으로 나갔고, 화면을 읽어
+ * 카드를 만드는 쪽도 그 프롬프트를 보지 못했다.
+ *
+ * 이 상태는 드물지 않다. **프롬프트 앞에 멈춘 세션은 도구를 호출할 수 없어 receipt를 보내지
+ * 못한다.** 즉 사람이 답을 기다리는 바로 그 순간이 연결이 검증되지 않는 순간이고, 그때 probe를
+ * 몰아치면 사람이 답해야 할 화면을 우리가 지운다.
+ *
+ * 앞의 네 값은 정상 연결을 빠르게 검증한다. 그 뒤로는 10분이다 — 세션이 나중에 풀렸을 때
+ * 복구는 되면서 화면에는 시간당 여섯 줄만 남는다. 완전히 멈추지 않는 것은 그 복구 때문이다.
+ */
+export const DEFAULT_PROBE_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 600_000] as const;
 const NS_PER_MS = 1_000_000n;
 
 function msAsNs(value: number): bigint {

@@ -45,6 +45,11 @@ function boundedString(value: unknown, at: string, cap: number): string {
 export function parseGateOptionMetadataArray(
   value: unknown,
   at = 'gate registration.options',
+  /**
+   * 등록 문서는 설명을 반드시 요구한다. durable store 읽기만 null을 허용하는데, 파생 행에는
+   * Orca가 주지 않는 설명이 없기 때문이다. 기본값이 strict인 것이 의도다.
+   */
+  nullableDescription = false,
 ): readonly GateOptionMetadata[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 25) {
     throw new TypeError(`${at}이(가) 1..25개 array가 아니다`);
@@ -57,10 +62,14 @@ export function parseGateOptionMetadataArray(
     if (!/^[A-Za-z0-9_-]+$/.test(id)) {
       throw new TypeError(`${optionAt}.id가 stable option ID 형식이 아니다`);
     }
+    const rawDescription = option['description'];
     return {
       id,
       label: boundedString(option['label'], `${optionAt}.label`, 75),
-      description: boundedString(option['description'], `${optionAt}.description`, 3000),
+      description:
+        nullableDescription && rawDescription === null
+          ? null
+          : boundedString(rawDescription, `${optionAt}.description`, 3000),
       resolution: boundedString(option['resolution'], `${optionAt}.resolution`, 3000),
     };
   });
@@ -176,8 +185,9 @@ function sameMetadata(a: GateMetadata, b: GateMetadata): boolean {
     a.askMessageId === b.askMessageId &&
     a.questionThreadId === b.questionThreadId &&
     sameOptions(a.options, b.options) &&
-    a.recommendation.optionId === b.recommendation.optionId &&
-    a.recommendation.reason === b.recommendation.reason &&
+    a.source === b.source &&
+    a.recommendation?.optionId === b.recommendation?.optionId &&
+    a.recommendation?.reason === b.recommendation?.reason &&
     a.impact === b.impact
   );
 }
@@ -234,6 +244,7 @@ export async function validateGateRegistrationIdentity(
     askMessageId: document.askMessageId,
     questionThreadId: document.questionThreadId,
     options: document.options,
+    source: 'registered',
     recommendation: document.recommendation,
     impact: document.impact,
     registeredAt: now().toISOString(),
@@ -246,7 +257,9 @@ export function persistGateMetadata(
   candidate: GateMetadata,
 ): GateRegistrationResult {
   const existing = store.findGateMetadata(candidate.gateKey);
-  if (existing !== null) {
+  // 관측이 만든 파생 행은 등록을 막지 않는다. 등록된 문서가 파생 행보다 항상 낫고, 파생 행은
+  // 등록을 빠뜨렸을 때의 대체물이지 등록과 겨루는 값이 아니다.
+  if (existing !== null && existing.source !== 'derived') {
     if (!sameMetadata(existing, candidate)) {
       throw new Error(
         `Gate ${candidate.gateKey.slice('gate:'.length)}가 이미 다른 sidecar metadata로 등록돼 있다`,

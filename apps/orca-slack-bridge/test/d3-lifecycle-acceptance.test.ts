@@ -52,7 +52,7 @@ const CONFIG: BridgeConfig = {
     teamId: 'T0TEAM',
     apiAppId: 'A0APP',
     ownerUserIds: ['U0OWNER'],
-    channels: { prDigest: 'C0PRDIGEST', agentRuns: 'C0AGENTRUNS' },
+    channels: { prDigest: 'C0PRDIGEST', agentRuns: 'C0AGENTRUNS' , decisions: 'C0AGENTRUNS' },
   },
   projects: [],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
@@ -352,6 +352,7 @@ function seedStatefulResolvedGate(path: string): void {
       runKey: STATEFUL_RUN_KEY,
       taskKey: STATEFUL_TASK_KEY,
       dispatchKey: dispatchKey(STATEFUL_SOURCE_DISPATCH_ID),
+      source: 'registered',
       askMessageId: 'msg_d3_stateful',
       questionThreadId: 'thread_d3_stateful',
       options: [

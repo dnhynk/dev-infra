@@ -93,6 +93,33 @@ describe('ObserverSupervisor', () => {
     await supervisor.stop(1_000);
   });
 
+  it('runs the terminal prompt job once at startup instead of waiting for a first record', async () => {
+    // 이전 실행 기록이 없는 job은 deferred schedule도 없다. `startAfterSocket`이 due로 표시하지
+    // 않으면 첫 타이머를 영영 받지 못하고, 그 job은 등록만 된 채 한 번도 돌지 않는다.
+    // `gate-reconcile`이 같은 이유로 멈춰 있었다. 재시작 직후가 바로 사람이 답을 기다리는
+    // 화면이 떠 있을 수 있는 구간이라 이 첫 실행을 한 주기 뒤로 미루면 안 된다.
+    const clock = new FakeClock();
+    const ran: ObserverJobName[] = [];
+    const withTerminal: ObserverJobDefinition[] = [
+      ...definitions(),
+      {
+        name: 'terminal-prompt',
+        intervalMs: 30_000,
+        timeoutMs: 120_000,
+        backoffCapMs: 300_000,
+        run: async () => { ran.push('terminal-prompt'); return {}; },
+      },
+    ];
+    const supervisor = new ObserverSupervisor({
+      installationSeed: 'installation-terminal', jitterRatio: 0, clock, jobs: withTerminal,
+    });
+    supervisor.startAfterSocket();
+    await flush();
+    expect(ran).toEqual(['terminal-prompt']);
+    expect(supervisor.snapshot().due).toEqual([]);
+    await supervisor.stop(1_000);
+  });
+
   it('still constructs without the optional Gate plane wired', () => {
     // `gate-reconcile` is schedulable but not required; selection order and the construction
     // invariant are different questions and must not be collapsed into one list.

@@ -1316,8 +1316,9 @@ function readWorkerDonePayload(
 export async function listWorkerDone(
   runner: OrcaRunner,
   limit = INBOX_LIMIT,
+  handle?: string,
 ): Promise<WorkerDoneInbox> {
-  return workerDoneFrom(await readInbox(runner, limit));
+  return workerDoneFrom(await readInbox(runner, limit, handle));
 }
 
 /**
@@ -1334,9 +1335,25 @@ export type OrcaInbox = {
   readonly limit: number;
 };
 
-export async function readInbox(runner: OrcaRunner, limit = INBOX_LIMIT): Promise<OrcaInbox> {
+export async function readInbox(
+  runner: OrcaRunner,
+  limit = INBOX_LIMIT,
+  handle?: string,
+): Promise<OrcaInbox> {
+  /*
+   * `handle`은 수신자다. `inbox`에 `--run`은 없지만 `--terminal`이 수신자로 거르고, 실측에서
+   * `worker_done` 563행 전부가 `run:<run_id>`로 배달돼 있었다(불일치 0). 그러므로 Run 키를
+   * 수신자로 넘기면 그 Run의 `worker_done`을 하나도 잃지 않고 좁힐 수 있다.
+   *
+   * 좁히는 이유는 포화다. 전역 inbox는 모든 Run과 heartbeat까지 한 배열로 오므로 상한에 닿고,
+   * 그 순간 부재를 증명할 수 없어 digest가 통째로 멈춘다. 실측(2026-09-04)에서 전역 6,220행
+   * 중 heartbeat가 4,736행이었고 가장 큰 Run도 3,785행이었다. 상한을 올리는 것은 `maxBuffer`
+   * 32MB라는 다음 벽으로 옮기는 것일 뿐이고, Run 단위로 나누면 포화 판정도 Run 안에 갇힌다.
+   */
   const r = await call<{ messages?: unknown[] }>(runner, [
-    'orchestration', 'inbox', '--limit', String(limit), '--json',
+    'orchestration', 'inbox',
+    ...(handle === undefined ? [] : ['--terminal', handle]),
+    '--limit', String(limit), '--json',
   ]);
   const rows = (r.messages ?? []).map((row) => row as Record<string, unknown>);
   // 포화 판정은 걸러낸 결과가 아니라 **반환된 전체 행 수**로 한다.

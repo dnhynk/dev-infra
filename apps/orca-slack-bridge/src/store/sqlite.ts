@@ -12,6 +12,13 @@ import {
 import { normalizeGithubNameWithOwner } from '../discovery/github-remote.js';
 import { parseGateOptionMetadataArray } from '../gate/register.js';
 import type { GateMetadata } from '../gate/types.js';
+import type { TerminalPromptOption } from '../terminal/prompt.js';
+import type {
+  ObservedTerminalPrompt,
+  TerminalPromptAttemptOutcome,
+  TerminalPromptClaim,
+  TerminalPromptRecord,
+} from '../terminal/types.js';
 import {
   gateActionId,
   gateBlockId,
@@ -59,7 +66,7 @@ import {
   type GateResolveResult,
   type GateSnapshot,
 } from '../gate/resolution-types.js';
-import { pullRequestKey, pullRequestNumber, runKey } from '../identity/keys.js';
+import { dispatchKey, pullRequestKey, pullRequestNumber, runKey } from '../identity/keys.js';
 import type { GateKey, PullRequestKey, RunKey, TaskKey } from '../identity/keys.js';
 import type { PrTerminal, ReviewerResult } from '../digest/types.js';
 import {
@@ -69,6 +76,7 @@ import {
   GATE_V10_SCHEMA_OBJECTS,
   GATE_V11_SCHEMA_OBJECTS,
   GATE_V12_SCHEMA_OBJECTS,
+  GATE_V14_SCHEMA_OBJECTS,
   MIGRATIONS,
   OPERATIONAL_V13_SCHEMA_OBJECTS,
   SCHEMA_DDL,
@@ -387,20 +395,23 @@ UPDATE run_collection_message SET render_fingerprint = ?, updated_at = ? WHERE i
 
 const SELECT_GATE_METADATA = `
 SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-       options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+       options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+       source
   FROM gate_metadata WHERE gate_key = ?`;
 
 const SELECT_RUN_GATE_METADATA = `
 SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-       options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+       options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+       source
   FROM gate_metadata WHERE run_key = ?
  ORDER BY gate_key`;
 
 const INSERT_GATE_METADATA = `
 INSERT INTO gate_metadata
   (gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-   options_json, recommendation_option_id, recommendation_reason, impact, registered_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+   options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+   source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 const SELECT_GATE_MESSAGE = `
 SELECT gate_key, run_key, channel_id, thread_ts, message_ts, render_fingerprint,
@@ -779,6 +790,65 @@ SELECT job_name, revision, state, attempt, consecutive_failures, started_at, com
        processed_count, deferred_count, checkpoint, updated_at
   FROM daemon_job_outcome ORDER BY job_name`;
 
+const TERMINAL_PROMPT_COLUMNS =
+  `terminal_handle, run_key, role, dispatch_key, fingerprint, prompt_json, channel_id, thread_ts,
+   message_ts, render_fingerprint, state, claimed_option, claimed_by, claimed_at, settled_at,
+   last_error_code, created_at, updated_at`;
+
+const SELECT_TERMINAL_PROMPT = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE terminal_handle = ? AND fingerprint = ?`;
+
+const SELECT_ACTIVE_TERMINAL_PROMPT = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE terminal_handle = ? AND state IN ('open','claimed')`;
+
+const SELECT_RUN_TERMINAL_PROMPTS = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE run_key = ? AND state <> 'gone'
+ ORDER BY terminal_handle, created_at`;
+
+const SELECT_TERMINAL_PROMPTS_BY_STATE = `
+SELECT ${TERMINAL_PROMPT_COLUMNS} FROM terminal_prompt
+ WHERE state = ? ORDER BY updated_at, terminal_handle`;
+
+const INSERT_TERMINAL_PROMPT = `
+INSERT INTO terminal_prompt
+  (terminal_handle, run_key, role, dispatch_key, fingerprint, prompt_json, channel_id, thread_ts,
+   message_ts, render_fingerprint, state, claimed_option, claimed_by, claimed_at, settled_at,
+   last_error_code, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 'open', NULL, NULL, NULL, NULL, NULL, ?, ?)`;
+
+const INSERT_TERMINAL_PROMPT_ATTEMPT = `
+INSERT INTO terminal_prompt_attempt (terminal_handle, fingerprint, option_index, outcome, reason, at)
+VALUES (?, ?, ?, ?, ?, ?)`;
+
+const CLOSE_ACTIVE_TERMINAL_PROMPTS = `
+UPDATE terminal_prompt SET state = 'gone', settled_at = ?, updated_at = ?
+ WHERE terminal_handle = ? AND state IN ('open','claimed')`;
+
+/** 위와 같되 닫은 행을 돌려준다. 호출자가 그 카드를 다시 그려야 하기 때문이다. */
+const CLOSE_ACTIVE_TERMINAL_PROMPTS_RETURNING = `${CLOSE_ACTIVE_TERMINAL_PROMPTS} RETURNING *`;
+
+const RECORD_TERMINAL_PROMPT_CARD = `
+UPDATE terminal_prompt
+   SET channel_id = ?, thread_ts = ?, message_ts = ?, render_fingerprint = ?, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND message_ts IS NULL`;
+
+const UPDATE_TERMINAL_PROMPT_CARD = `
+UPDATE terminal_prompt SET render_fingerprint = ?, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND message_ts IS NOT NULL`;
+
+const CLAIM_TERMINAL_PROMPT = `
+UPDATE terminal_prompt
+   SET state = 'claimed', claimed_option = ?, claimed_by = ?, claimed_at = ?,
+       last_error_code = NULL, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND state = 'open'`;
+
+const SETTLE_TERMINAL_PROMPT = `
+UPDATE terminal_prompt SET state = ?, settled_at = ?, last_error_code = ?, updated_at = ?
+ WHERE terminal_handle = ? AND fingerprint = ? AND state = 'claimed'`;
+
 const SELECT_SLACK_ROOT_INTENT = `
 SELECT entity_kind, entity_key, revision, channel_id, render_fingerprint, state, attempt_count,
        sending_instance_id, message_ts, prepared_at, last_attempt_at, posted_at, uncertain_at,
@@ -790,6 +860,27 @@ SELECT entity_kind, entity_key, revision, channel_id, render_fingerprint, state,
        sending_instance_id, message_ts, prepared_at, last_attempt_at, posted_at, uncertain_at,
        last_error_code, updated_at
   FROM slack_root_intent ORDER BY entity_kind, entity_key`;
+
+type TerminalPromptRow = {
+  readonly terminal_handle: string;
+  readonly run_key: string;
+  readonly role: string;
+  readonly dispatch_key: string | null;
+  readonly fingerprint: string;
+  readonly prompt_json: string;
+  readonly channel_id: string | null;
+  readonly thread_ts: string | null;
+  readonly message_ts: string | null;
+  readonly render_fingerprint: string | null;
+  readonly state: string;
+  readonly claimed_option: number | null;
+  readonly claimed_by: string | null;
+  readonly claimed_at: string | null;
+  readonly settled_at: string | null;
+  readonly last_error_code: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+};
 
 /** sqlite가 돌려주는 run_message 한 행. 컬럼명 그대로다. */
 type RunMessageRow = {
@@ -833,6 +924,7 @@ type GateMetadataRow = {
   readonly recommendation_reason: string;
   readonly impact: string;
   readonly registered_at: string;
+  readonly source: string;
 };
 
 type GateMessageRow = {
@@ -1761,6 +1853,7 @@ const OPERATIONAL_ISSUE_CATEGORIES = new Set<RepositoryDiscoveryIssueCategory>([
 
 const OPERATIONAL_JOB_NAMES = new Set<DaemonJobName>([
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
+  'terminal-prompt',
 ]);
 
 const OPERATIONAL_FAILURE_CODE_SET = new Set<OperationalFailureCode>(OPERATIONAL_FAILURE_CODES);
@@ -2133,8 +2226,13 @@ function toGateMetadata(row: GateMetadataRow): GateMetadata {
       { cause: e },
     );
   }
-  const options = parseGateOptionMetadataArray(parsed, `${row.gate_key}.options_json`);
-  if (!options.some((option) => option.id === row.recommendation_option_id)) {
+  const options = parseGateOptionMetadataArray(parsed, `${row.gate_key}.options_json`, true);
+  if (row.source !== 'registered' && row.source !== 'derived') {
+    throw new TypeError(`${row.gate_key}의 gate_metadata.source가 알 수 없는 값이다: ${row.source}`);
+  }
+  const derived = row.source === 'derived';
+  // 파생 행에는 권장안이 없다. 등록 행에서만 recommendation identity를 강제한다.
+  if (!derived && !options.some((option) => option.id === row.recommendation_option_id)) {
     throw new TypeError(
       `${row.gate_key}의 recommendation_option_id가 options_json에 없다: ${row.recommendation_option_id}`,
     );
@@ -2151,13 +2249,121 @@ function toGateMetadata(row: GateMetadataRow): GateMetadata {
     askMessageId: storedText(row.ask_message_id, `${row.gate_key}.ask_message_id`),
     questionThreadId: storedText(row.question_thread_id, `${row.gate_key}.question_thread_id`),
     options,
-    recommendation: {
-      optionId: row.recommendation_option_id,
-      reason: storedText(row.recommendation_reason, `${row.gate_key}.recommendation_reason`, 3000),
-    },
-    impact: storedText(row.impact, `${row.gate_key}.impact`, 3000),
+    source: derived ? 'derived' : 'registered',
+    recommendation: derived
+      ? null
+      : {
+          optionId: row.recommendation_option_id,
+          reason: storedText(
+            row.recommendation_reason,
+            `${row.gate_key}.recommendation_reason`,
+            3000,
+          ),
+        },
+    impact: derived ? null : storedText(row.impact, `${row.gate_key}.impact`, 3000),
     registeredAt: storedIso(row.registered_at, `${row.gate_key}.registered_at`),
   };
+}
+
+function toTerminalPrompt(row: TerminalPromptRow): TerminalPromptRecord {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.prompt_json);
+  } catch (e) {
+    throw new TypeError(
+      `${row.terminal_handle}의 terminal_prompt.prompt_json이 JSON이 아니다`,
+      { cause: e },
+    );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError(`${row.terminal_handle}의 terminal_prompt.prompt_json이 객체가 아니다`);
+  }
+  const snapshot = parsed as Record<string, unknown>;
+  const rawOptions = snapshot['options'];
+  if (!Array.isArray(rawOptions) || rawOptions.length < 2 || rawOptions.length > 25) {
+    throw new TypeError(`${row.terminal_handle}의 prompt options가 2..25개 array가 아니다`);
+  }
+  const options = rawOptions.map((raw, position): TerminalPromptOption => {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option[${position}]이 객체가 아니다`);
+    }
+    const option = raw as Record<string, unknown>;
+    const index = option['index'];
+    const label = option['label'];
+    const description = option['description'];
+    if (typeof index !== 'number' || !Number.isSafeInteger(index) || index !== position + 1) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option 번호가 1..N으로 이어지지 않는다`);
+    }
+    if (typeof label !== 'string' || label === '' || label.length > 75) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option label이 1..75자가 아니다`);
+    }
+    if (description !== null && (typeof description !== 'string' || description.length > 3000)) {
+      throw new TypeError(`${row.terminal_handle}의 prompt option description이 잘못됐다`);
+    }
+    return { index, label, description, selected: option['selected'] === true };
+  });
+  const cursorIndex = snapshot['cursorIndex'];
+  if (typeof cursorIndex !== 'number' || !options.some((option) => option.index === cursorIndex)) {
+    throw new TypeError(`${row.terminal_handle}의 prompt cursorIndex가 options에 없다`);
+  }
+  if (row.role !== 'coordinator' && row.role !== 'worker') {
+    throw new TypeError(`${row.terminal_handle}의 terminal_prompt.role이 알 수 없는 값이다`);
+  }
+  const state = row.state;
+  if (state !== 'open' && state !== 'claimed' && state !== 'answered' &&
+      state !== 'failed' && state !== 'gone') {
+    throw new TypeError(`${row.terminal_handle}의 terminal_prompt.state가 알 수 없는 값이다`);
+  }
+  return {
+    terminalHandle: storedText(row.terminal_handle, 'terminal_prompt.terminal_handle'),
+    runKey: storedKey(row.run_key, 'run:', `${row.terminal_handle}.run_key`) as RunKey,
+    role: row.role,
+    dispatchId: row.dispatch_key === null
+      ? null
+      : storedKey(
+          row.dispatch_key,
+          'dispatch:',
+          `${row.terminal_handle}.dispatch_key`,
+        ).slice('dispatch:'.length),
+    fingerprint: storedText(row.fingerprint, `${row.terminal_handle}.fingerprint`, 32),
+    title: typeof snapshot['title'] === 'string' ? snapshot['title'] : null,
+    question: typeof snapshot['question'] === 'string' ? snapshot['question'] : '',
+    options,
+    cursorIndex,
+    channelId: row.channel_id,
+    threadTs: row.thread_ts,
+    messageTs: row.message_ts,
+    renderFingerprint: row.render_fingerprint,
+    state,
+    claimedOption: row.claimed_option,
+    claimedBy: row.claimed_by,
+    claimedAt: row.claimed_at,
+    settledAt: row.settled_at,
+    lastErrorCode: row.last_error_code,
+    createdAt: storedIso(row.created_at, `${row.terminal_handle}.created_at`),
+    updatedAt: storedIso(row.updated_at, `${row.terminal_handle}.updated_at`),
+  };
+}
+
+/**
+ * 이미 durable한 카드가 이 관측이 기대하던 그 카드인가.
+ *
+ * 최상위 카드에는 대조할 루트 ts가 없다. 그 경우 신원은 채널과 Run이고, thread ts는 자기
+ * 자신이라 비교에 아무 것도 더하지 않는다.
+ */
+function mappedIdentity(
+  message: GateMessageRecord,
+  runKey: RunKey,
+  expected: {
+    readonly channelId: string;
+    readonly threadTs: string | null;
+    readonly placement?: 'thread' | 'channel';
+  },
+): 'matched' | 'mismatched' | 'missing' {
+  if (message.runKey !== runKey || message.channelId !== expected.channelId) return 'mismatched';
+  if (expected.placement === 'channel') return 'matched';
+  if (expected.threadTs === null) return 'missing';
+  return message.threadTs === expected.threadTs ? 'matched' : 'mismatched';
 }
 
 function toGateMessage(row: GateMessageRow): GateMessageRecord {
@@ -2639,6 +2845,205 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     }
   }
 
+  /** 이 Run에서 지나가지 않은 프롬프트 전부. 카드를 그리는 쪽이 쓴다. */
+  listTerminalPrompts(runKey: RunKey): readonly TerminalPromptRecord[] {
+    return (this.db.prepare(SELECT_RUN_TERMINAL_PROMPTS).all(runKey) as TerminalPromptRow[])
+      .map(toTerminalPrompt);
+  }
+
+  /** 한 상태의 프롬프트를 오래된 것부터. daemon이 처리 대상을 고를 때 쓴다. */
+  listTerminalPromptsByState(state: string): readonly TerminalPromptRecord[] {
+    return (this.db.prepare(SELECT_TERMINAL_PROMPTS_BY_STATE).all(state) as TerminalPromptRow[])
+      .map(toTerminalPrompt);
+  }
+
+  findTerminalPrompt(handle: string, fingerprint: string): TerminalPromptRecord | null {
+    const row = this.db.prepare(SELECT_TERMINAL_PROMPT).get(handle, fingerprint) as
+      | TerminalPromptRow
+      | undefined;
+    return row === undefined ? null : toTerminalPrompt(row);
+  }
+
+  /** 이 터미널에서 지금 답할 수 있는 프롬프트. 없으면 null이다. */
+  findActiveTerminalPrompt(handle: string): TerminalPromptRecord | null {
+    const row = this.db.prepare(SELECT_ACTIVE_TERMINAL_PROMPT).get(handle) as
+      | TerminalPromptRow
+      | undefined;
+    return row === undefined ? null : toTerminalPrompt(row);
+  }
+
+  /**
+   * 관측 한 번을 반영한다. 이미 있는 지문이면 아무것도 하지 않는다.
+   *
+   * 관측은 답변 상태도 카드 매핑도 건드리지 않는다. 같은 프롬프트를 다시 봤다는 사실만으로
+   * 진행 중인 답변을 되돌리면 안 되기 때문이다. 지문이 다르면 **다른 질문**이므로, 같은
+   * 터미널의 열린 행을 먼저 닫고 새 행을 만든다.
+   */
+  observeTerminalPrompt(input: ObservedTerminalPrompt, at: string): TerminalPromptRecord {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.terminalHandle, input.fingerprint) as TerminalPromptRow | undefined;
+      if (existing !== undefined) {
+        this.db.exec('COMMIT');
+        return toTerminalPrompt(existing);
+      }
+      // 같은 터미널의 옛 프롬프트를 닫는다. 화면에서 사라졌으므로 더는 답할 수 없다.
+      this.db.prepare(CLOSE_ACTIVE_TERMINAL_PROMPTS).run(at, at, input.terminalHandle);
+      const snapshot = JSON.stringify({
+        title: input.title,
+        question: input.question,
+        options: input.options,
+        cursorIndex: input.cursorIndex,
+      });
+      this.db.prepare(INSERT_TERMINAL_PROMPT).run(
+        input.terminalHandle,
+        input.runKey,
+        input.role,
+        input.dispatchId === null ? null : dispatchKey(input.dispatchId),
+        input.fingerprint,
+        snapshot,
+        at,
+        at,
+      );
+      const created = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.terminalHandle, input.fingerprint) as TerminalPromptRow;
+      this.db.exec('COMMIT');
+      return toTerminalPrompt(created);
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${input.terminalHandle}의 terminal prompt 관측을 기록할 수 없다: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+        { cause: e },
+      );
+    }
+  }
+
+  /** 화면에서 프롬프트가 사라졌다. 사람이 터미널에서 직접 답한 경우가 대부분이다. */
+  /**
+   * 이 터미널의 살아 있는 프롬프트를 전부 닫고, **닫은 것을 돌려준다.**
+   *
+   * 돌려주는 이유는 카드다. 상태만 바꾸고 끝내면 durable 상태는 `gone`인데 Slack 카드에는
+   * 버튼이 그대로 남는다. 실측에서 사라진 프롬프트의 카드를 두 시간 뒤에 눌렀고, 클릭은
+   * daemon까지 도착했지만 stale로 거절돼 아무 일도 일어나지 않았다.
+   */
+  markTerminalPromptGone(handle: string, at: string): readonly TerminalPromptRecord[] {
+    return (this.db.prepare(CLOSE_ACTIVE_TERMINAL_PROMPTS_RETURNING)
+      .all(at, at, handle) as TerminalPromptRow[])
+      .map(toTerminalPrompt);
+  }
+
+  /** 카드를 처음 게시한 뒤 매핑을 남긴다. 남길 행이 없으면 던진다. */
+  recordTerminalPromptCard(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly channelId: string;
+    readonly threadTs: string;
+    readonly messageTs: string;
+    readonly renderFingerprint: string;
+    readonly at: string;
+  }): void {
+    const result = this.db.prepare(RECORD_TERMINAL_PROMPT_CARD).run(
+      input.channelId, input.threadTs, input.messageTs, input.renderFingerprint, input.at,
+      input.handle, input.fingerprint,
+    );
+    if (Number(result.changes) === 0) {
+      throw new Error(`${input.handle}의 prompt 카드 매핑을 남길 행이 없다`);
+    }
+  }
+
+  /** 이미 게시한 카드의 렌더 지문만 갱신한다. message identity는 건드리지 않는다. */
+  updateTerminalPromptCard(
+    handle: string,
+    fingerprint: string,
+    renderFingerprint: string,
+    at: string,
+  ): void {
+    this.db.prepare(UPDATE_TERMINAL_PROMPT_CARD).run(renderFingerprint, at, handle, fingerprint);
+  }
+
+  /**
+   * Slack 버튼 한 번을 durable하게 확정한다.
+   *
+   * `open`이고 지문이 정확히 같을 때만 이긴다. 지문이 다르면 그 사이 화면이 바뀐 것이고, 그때
+   * 보내면 같은 답이 다른 질문에 들어간다. 여기서 거절하는 것이 이 기능의 안전성이다.
+   */
+  claimTerminalPromptAnswer(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly optionIndex: number;
+    readonly owner: string;
+    readonly at: string;
+  }): TerminalPromptClaim {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.handle, input.fingerprint) as TerminalPromptRow | undefined;
+      if (row === undefined) {
+        this.db.exec('COMMIT');
+        return { kind: 'stale', reason: 'prompt_not_found' };
+      }
+      const current = toTerminalPrompt(row);
+      if (current.state !== 'open') {
+        this.db.exec('COMMIT');
+        // 같은 사람이 같은 선택지를 다시 누른 것은 중복이지 경쟁이 아니다.
+        if (current.state === 'claimed' && current.claimedOption === input.optionIndex &&
+            current.claimedBy === input.owner) {
+          return { kind: 'duplicate', record: current };
+        }
+        return { kind: 'stale', reason: `prompt_${current.state}` };
+      }
+      if (!current.options.some((option) => option.index === input.optionIndex)) {
+        this.db.exec('COMMIT');
+        return { kind: 'stale', reason: 'unknown_option' };
+      }
+      this.db.prepare(CLAIM_TERMINAL_PROMPT).run(
+        input.optionIndex, input.owner, input.at, input.at, input.handle, input.fingerprint,
+      );
+      const claimed = this.db.prepare(SELECT_TERMINAL_PROMPT)
+        .get(input.handle, input.fingerprint) as TerminalPromptRow;
+      this.db.exec('COMMIT');
+      return { kind: 'claimed', record: toTerminalPrompt(claimed) };
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${input.handle}의 prompt 답변을 확정할 수 없다: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+        { cause: e },
+      );
+    }
+  }
+
+  /** 답변 시도 결과로 상태를 닫는다. `failed`는 자동으로 다시 시도하지 않는다. */
+  settleTerminalPromptAnswer(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly outcome: 'answered' | 'failed';
+    readonly errorCode: string | null;
+    readonly at: string;
+  }): void {
+    this.db.prepare(SETTLE_TERMINAL_PROMPT).run(
+      input.outcome, input.at, input.errorCode, input.at, input.handle, input.fingerprint,
+    );
+  }
+
+  /** 살아 있는 세션에 입력을 쓴 사실은 결과와 무관하게 남긴다. */
+  recordTerminalPromptAttempt(input: {
+    readonly handle: string;
+    readonly fingerprint: string;
+    readonly optionIndex: number;
+    readonly outcome: TerminalPromptAttemptOutcome;
+    readonly reason: string | null;
+    readonly at: string;
+  }): void {
+    this.db.prepare(INSERT_TERMINAL_PROMPT_ATTEMPT).run(
+      input.handle, input.fingerprint, input.optionIndex, input.outcome, input.reason, input.at,
+    );
+  }
+
   findGateMetadata(gateKey: GateKey): GateMetadata | null {
     const row = this.db.prepare(SELECT_GATE_METADATA).get(gateKey) as GateMetadataRow | undefined;
     return row === undefined ? null : toGateMetadata(row);
@@ -2652,6 +3057,12 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   insertGateMetadata(metadata: GateMetadata): void {
     const optionsJson = JSON.stringify(metadata.options);
+    // 파생 행에는 권장안과 영향이 없다. 컬럼은 NOT NULL이므로 빈 문자열로 남기고, 읽는 쪽이
+    // `source`를 보고 null로 노출한다. 빈 문자열은 option ID 형식과 겹치지 않아 실제 값과
+    // 혼동되지 않는다.
+    const recommendationOptionId = metadata.recommendation?.optionId ?? '';
+    const recommendationReason = metadata.recommendation?.reason ?? '';
+    const impact = metadata.impact ?? '';
     toGateMetadata({
       gate_key: metadata.gateKey,
       run_key: metadata.runKey,
@@ -2660,13 +3071,21 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
       ask_message_id: metadata.askMessageId,
       question_thread_id: metadata.questionThreadId,
       options_json: optionsJson,
-      recommendation_option_id: metadata.recommendation.optionId,
-      recommendation_reason: metadata.recommendation.reason,
-      impact: metadata.impact,
+      recommendation_option_id: recommendationOptionId,
+      recommendation_reason: recommendationReason,
+      impact,
       registered_at: metadata.registeredAt,
+      source: metadata.source,
     });
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      // 관측이 만든 파생 행은 등록을 막지 않는다. coordinator가 뒤늦게 `gate-register`를 해도
+      // 그때 더 나은 카드로 바뀌어야 한다. 등록된 행은 여기서 지우지 않으므로 덮어쓰기가 아니다.
+      if (metadata.source === 'registered') {
+        this.db.prepare(
+          "DELETE FROM gate_metadata WHERE gate_key = ? AND source = 'derived'",
+        ).run(metadata.gateKey);
+      }
       this.db
         .prepare(INSERT_GATE_METADATA)
         .run(
@@ -2677,10 +3096,11 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           metadata.askMessageId,
           metadata.questionThreadId,
           optionsJson,
-          metadata.recommendation.optionId,
-          metadata.recommendation.reason,
-          metadata.impact,
+          recommendationOptionId,
+          recommendationReason,
+          impact,
           metadata.registeredAt,
+          metadata.source,
         );
       const observation = this.db.prepare(SELECT_GATE_LOCAL_OBSERVATION).get(metadata.gateKey) as
         | GateLocalObservationRow
@@ -2709,6 +3129,41 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
   findGateMessage(gateKey: GateKey): GateMessageRecord | null {
     const row = this.db.prepare(SELECT_GATE_MESSAGE).get(gateKey) as GateMessageRow | undefined;
     return row === undefined ? null : toGateMessage(row);
+  }
+
+  /**
+   * Slack에서 사라진 Gate 카드의 매핑을 버린다.
+   *
+   * 사람이 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 그 매핑을 그대로 두면 매 관측마다
+   * `chat.update`가 `message_not_found`로 던지고, Gate 게시 루프는 감싸져 있지 않으므로 관측
+   * pass 전체가 죽는다. 카드 한 장이 나머지 전부를 인질로 잡는다.
+   *
+   * 관측 행은 남긴다. 그 행은 Gate의 사실이지 카드의 사실이 아니다. 매핑만 없어지므로 다음
+   * 관측은 카드가 없는 상태에서 시작한다.
+   */
+  forgetGateMessage(gateKey: GateKey): boolean {
+    const key = storedKey(gateKey, 'gate:', 'forgetGateMessage.gateKey') as GateKey;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const removed = Number(
+        this.db.prepare('DELETE FROM gate_message WHERE gate_key = ?').run(key).changes,
+      );
+      if (removed > 0) {
+        this.db.prepare(
+          `UPDATE gate_local_observation SET mapping_state = 'missing', write_owner = NULL,
+                  write_expires_at = NULL
+            WHERE gate_key = ?`,
+        ).run(key);
+      }
+      this.db.exec('COMMIT');
+      return removed > 0;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${key}의 Gate 카드 매핑을 버릴 수 없다: ${e instanceof Error ? e.message : String(e)}`,
+        { cause: e },
+      );
+    }
   }
 
   insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void {
@@ -3042,7 +3497,18 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
 
   saveGateLocalObservation(
     observation: GateLocalObservation,
-    expectedFirstMessage?: { readonly channelId: string; readonly threadTs: string | null },
+    expectedFirstMessage?: {
+      readonly channelId: string;
+      readonly threadTs: string | null;
+      /**
+       * 카드가 어디에 놓이는가.
+       *
+       * `thread`는 Run 루트 아래 답글이고 그 루트의 ts가 신원의 일부다. `channel`은 자기 자신이
+       * 루트인 최상위 메시지라 대조할 상대 ts가 없다 — 그때 신원은 채널과 Run이다. 이 구분이
+       * 없으면 최상위 카드가 늘 `missing`으로 접힌다.
+       */
+      readonly placement?: 'thread' | 'channel';
+    },
     expectedRevision?: number,
   ): GateObservationSaveResult {
     if (expectedRevision !== undefined) {
@@ -3062,14 +3528,7 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
           const message = toGateMessage(currentMessage);
           reconciledObservation = {
             ...observation,
-            mappingState:
-              expectedFirstMessage.threadTs === null
-                ? 'missing'
-                : message.runKey === observation.runKey &&
-                    message.channelId === expectedFirstMessage.channelId &&
-                    message.threadTs === expectedFirstMessage.threadTs
-                  ? 'matched'
-                  : 'mismatched',
+            mappingState: mappedIdentity(message, observation.runKey, expectedFirstMessage),
           };
         }
       }
@@ -4683,6 +5142,67 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     }
   }
 
+  /**
+   * baseline을 끝내 읽지 못한 delivery를 `unavailable`로 넘긴다.
+   *
+   * baseline은 알림 **이전** 상태의 스냅샷이다. 제때 못 찍으면 나중에 찍은 것은 "이전"이 아니라
+   * 증거로서 무의미하다. 그런데 실패 경로에 포기가 없어서, 읽히지 않는 baseline 하나가 5초마다
+   * 영원히 재시도했다 — 실측에서 사흘 된 delivery 하나가 그렇게 돌고 있었다.
+   *
+   * `unavailable`은 이미 v11 legacy delivery가 쓰던 상태이고 뜻이 정확히 같다: **전달 liveness는
+   * 유지하되 재개 증거는 얻지 못한다.** 그 의미를 "읽을 수 없는 baseline" 일반으로 넓힌다.
+   *
+   * CAS 규율은 `recordGateResumeBaseline`과 같다.
+   */
+  markGateResumeBaselineUnavailable(
+    gateKey: GateKey,
+    expectedDeliveryRevision: number,
+    owner: string,
+    at: string,
+  ): GateChannelDelivery | null {
+    storedRevision(expectedDeliveryRevision, `${gateKey}.resume baseline delivery revision`);
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.resume baseline owner`);
+    const markedAt = storedIso(at, `${gateKey}.resume baseline at`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const delivery = this.findGateChannelDelivery(gateKey);
+      if (
+        delivery === null || delivery.revision !== expectedDeliveryRevision ||
+        delivery.leaseOwner !== safeOwner || delivery.leaseExpiresAt === null ||
+        delivery.resumeBaselineState !== 'required' || delivery.state !== 'pending' ||
+        delivery.attemptCount !== 0
+      ) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const effectiveAt = this.channelDeliveryLogicalAt(markedAt, delivery);
+      if (delivery.leaseExpiresAt <= effectiveAt) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const updated = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, resume_baseline_state = 'unavailable', updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND lease_owner = ?
+            AND lease_expires_at > ? AND resume_baseline_state = 'required'
+            AND state = 'pending' AND attempt_count = 0`,
+      ).run(effectiveAt, gateKey, expectedDeliveryRevision, safeOwner, effectiveAt);
+      if (Number(updated.changes) !== 1) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
+      const current = this.findGateChannelDelivery(gateKey);
+      if (current === null) {
+        throw new Error(`${gateKey}의 unavailable baseline delivery를 다시 읽지 못했다`);
+      }
+      this.db.exec('COMMIT');
+      return current;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   findGateResumeObservation(gateKey: GateKey): GateResumeObservation | null {
     const row = this.db.prepare(SELECT_GATE_RESUME_OBSERVATION).get(gateKey) as
       | GateResumeObservationRow
@@ -4918,6 +5438,8 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     expectedMessageIdentity?: {
       readonly channelId: string;
       readonly threadTs: string | null;
+      /** `channel`이면 자기 자신이 루트라 대조할 상대 ts가 없다. 신원은 채널과 Run이다. */
+      readonly placement?: 'thread' | 'channel';
     },
   ): boolean {
     storedIso(at, `${gateKey}.ordinary Gate write fence at`);
@@ -4966,11 +5488,13 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         | undefined;
       const messageIdentityMatched =
         expectedMessageIdentity !== undefined &&
-        expectedMessageIdentity.threadTs !== null &&
         messageRow !== undefined &&
         messageRow.run_key === expectedObservation.runKey &&
         messageRow.channel_id === expectedMessageIdentity.channelId &&
-        messageRow.thread_ts === expectedMessageIdentity.threadTs;
+        (expectedMessageIdentity.placement === 'channel'
+          ? true
+          : expectedMessageIdentity.threadTs !== null &&
+            messageRow.thread_ts === expectedMessageIdentity.threadTs);
       if (
         expectedMessageIdentity !== undefined &&
         !messageIdentityMatched
@@ -6001,7 +6525,20 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         | DaemonJobOutcomeRow | undefined;
       if (existingRow !== undefined) {
         const existing = toDaemonJobOutcome(existingRow);
-        if (existing.state === 'running' || existing.updatedAt > safeAt ||
+        /*
+         * 죽은 instance가 남긴 `running` 행은 startup takeover가 회수한다.
+         *
+         * 이 조건이 무조건 거부였을 때, daemon이 job 도중 비정상 종료하면 그 행이 영원히
+         * `running`으로 남았다. 이후 뜨는 daemon은 그 job을 claim하지 못하고, claim 거부는
+         * fatal이라 스스로 종료했다 — 회수 경로가 없는 무한 크래시 루프다. 실측에서 daemon이
+         * 기동 40초 뒤 반복해서 사라졌고 원인은 `gate-reconcile`의 잔류 `running` 행이었다.
+         *
+         * 회수해도 안전한 근거는 상호배제다. daemon은 고정 pipe와 status snapshot lease를
+         * 배타적으로 쥐고서야 job을 돌린다. 그러므로 새로 뜬 daemon이 보는 `running` 행의
+         * 주인은 이미 존재하지 않는다. takeover는 job당 기동 1회로 제한된다(`startupClaims`).
+         */
+        const staleRunning = options.startupTakeover === true && existing.state === 'running';
+        if ((existing.state === 'running' && !staleRunning) || existing.updatedAt > safeAt ||
             (options.startupTakeover !== true &&
              existing.nextRunAt !== null && existing.nextRunAt > safeAt)) {
           this.db.exec('COMMIT');
@@ -6012,8 +6549,9 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
              SET revision = revision + 1, state = 'running', attempt = attempt + 1,
                  started_at = ?, completed_at = NULL, duration_ms = NULL, next_run_at = NULL,
                  error_code = NULL, processed_count = 0, deferred_count = 0, updated_at = ?
-           WHERE job_name = ? AND revision = ? AND state <> 'running' AND updated_at <= ?`)
-          .run(safeAt, safeAt, safeJob, existing.revision, safeAt);
+           WHERE job_name = ? AND revision = ? AND updated_at <= ?
+             AND (state <> 'running' OR ? = 1)`)
+          .run(safeAt, safeAt, safeJob, existing.revision, safeAt, staleRunning ? 1 : 0);
         if (Number(result.changes) !== 1) {
           this.db.exec('ROLLBACK');
           return null;
@@ -6194,6 +6732,56 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
         dead: { unavailableResumeBaselines: dead, total: dead },
       };
     });
+  }
+
+  /**
+   * Slack에서 사라진 루트의 매핑과 intent를 함께 버린다.
+   *
+   * ## 왜 둘 다인가
+   *
+   * 매핑만 지우면 `prepareSlackRootIntent`가 `posted` intent를 만나 지문이 달라졌다고 판정하고
+   * `OPERATIONAL_CONFLICT`로 던진다. intent만 지우면 매핑이 남아 `mappingExists`에서 같은 결과가
+   * 된다. 하나만 지우는 것은 두 상태를 갈라놓는 것이고, 그러면 그 카드는 영원히 다시 만들어지지
+   * 않는다. 그래서 한 트랜잭션에서 둘 다 버린다.
+   *
+   * ## 언제 부르는가
+   *
+   * 사람이 Slack UI에서 카드를 지웠을 때다. `chat.update`가 `message_not_found`로 답하는 것이
+   * 그 관측이고, 그때 우리가 든 ts는 가리킬 곳이 없는 값이다. 다른 오류에는 부르지 않는다 —
+   * 일시적 실패로 durable 증거를 지우면 다음 관찰이 루트를 하나 더 만든다.
+   *
+   * 지운 것이 있으면 true다. 없어도 실패가 아니다.
+   */
+  forgetSlackRoot(entity: SlackRootEntity): boolean {
+    const validated = operationalEntity(entity);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const intent = this.db.prepare(
+        'DELETE FROM slack_root_intent WHERE entity_kind = ? AND entity_key = ?',
+      ).run(validated.kind, validated.key);
+      let mapping = 0;
+      if (validated.kind === 'run') {
+        mapping = Number(
+          this.db.prepare('DELETE FROM run_message WHERE run_key = ?').run(validated.key).changes,
+        );
+      } else if (validated.kind === 'run_collection') {
+        mapping = Number(
+          this.db.prepare('DELETE FROM run_collection_message WHERE id = 1').run().changes,
+        );
+      } else {
+        mapping = Number(
+          this.db.prepare('DELETE FROM pr_message WHERE pr_key = ?').run(validated.key).changes,
+        );
+      }
+      this.db.exec('COMMIT');
+      return Number(intent.changes) > 0 || mapping > 0;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw new Error(
+        `${validated.kind} 루트 매핑을 버릴 수 없다: ${e instanceof Error ? e.message : String(e)}`,
+        { cause: e },
+      );
+    }
   }
 
   prepareSlackRootIntent(input: PrepareSlackRootIntentInput): SlackRootIntentRecord {
@@ -6614,6 +7202,10 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
     throw new Error(`dry-run은 store에 쓰지 않는다. 컬렉션 루트 매핑을 기록하려 했다: ${this.path}`);
   }
 
+  forgetGateMessage(): boolean {
+    throw new Error(`dry-run은 store에 쓰지 않는다. Gate 카드 매핑을 버리려 했다: ${this.path}`);
+  }
+
   updateRunCollectionObservation(): void {
     throw new Error(`dry-run은 store에 쓰지 않는다. 컬렉션 관찰 결과를 갱신하려 했다: ${this.path}`);
   }
@@ -6804,6 +7396,10 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
     throw new Error(`dry-run은 store에 쓰지 않는다. resume baseline을 기록하려 했다: ${this.path}`);
   }
 
+  markGateResumeBaselineUnavailable(): GateChannelDelivery | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. resume baseline을 포기하려 했다: ${this.path}`);
+  }
+
   findGateResumeObservation(gateKey: GateKey): GateResumeObservation | null {
     const { db, schemaReady } = this.opened;
     if (db === null || !schemaReady) return null;
@@ -6974,7 +7570,7 @@ const CURRENT_GATE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   gate_metadata: [
     'gate_key', 'run_key', 'task_key', 'dispatch_key', 'ask_message_id',
     'question_thread_id', 'options_json', 'recommendation_option_id',
-    'recommendation_reason', 'impact', 'registered_at',
+    'recommendation_reason', 'impact', 'registered_at', 'source',
   ],
   gate_message: [
     'gate_key', 'run_key', 'channel_id', 'thread_ts', 'message_ts',
@@ -7171,6 +7767,7 @@ function validateCurrentGateStore(
     ...GATE_V10_SCHEMA_OBJECTS,
     ...GATE_V11_SCHEMA_OBJECTS,
     ...GATE_V12_SCHEMA_OBJECTS,
+    ...GATE_V14_SCHEMA_OBJECTS,
   };
   for (const [name, expected] of Object.entries(gateSchemaObjects)) {
     const row = db.prepare(
@@ -7207,7 +7804,8 @@ function validateCurrentGateStore(
   }
   const metadatas = (db.prepare(
     `SELECT gate_key, run_key, task_key, dispatch_key, ask_message_id, question_thread_id,
-            options_json, recommendation_option_id, recommendation_reason, impact, registered_at
+            options_json, recommendation_option_id, recommendation_reason, impact, registered_at,
+            source
        FROM gate_metadata ORDER BY gate_key`,
   ).all() as GateMetadataRow[]).map(toGateMetadata);
   const messages = (db.prepare(

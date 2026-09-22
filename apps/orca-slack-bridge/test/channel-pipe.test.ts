@@ -11,7 +11,10 @@ import {
   type ChannelAdapterIdentity,
   type ChannelNotificationWriter,
 } from '../src/channel/adapter.js';
-import { ChannelPipeServer } from '../src/channel/pipe-server.js';
+import {
+  ChannelPipeServer,
+  DEFAULT_PROBE_DELAYS_MS,
+} from '../src/channel/pipe-server.js';
 import {
   CHANNEL_PROTOCOL_VERSION,
   ChannelNdjsonDecoder,
@@ -388,6 +391,24 @@ afterEach(async () => {
 });
 
 describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
+  it('검증되지 않은 연결의 정상 상태 probe 주기가 짧지 않다', () => {
+    /*
+     * probe는 세션 화면에 보이는 줄을 하나 남긴다. adapter의 중복 제거가 전송 중 집합만 보므로
+     * 같은 probe gate id라도 매번 다시 알림으로 나간다. 그래서 이 주기가 곧 "검증되지 않은
+     * 연결이 사람 화면에 줄을 쌓는 속도"다.
+     *
+     * 30초였을 때 실제로 코디네이터가 띄운 선택 프롬프트가 쌓인 probe 줄에 밀려 화면 밖으로
+     * 나갔다. 그 상태는 드물지 않다 — 프롬프트 앞에 멈춘 세션은 도구를 호출할 수 없어 receipt를
+     * 보내지 못하고, 즉 사람이 답을 기다리는 순간이 바로 연결이 검증되지 않는 순간이다.
+     *
+     * 앞쪽 값들은 정상 연결을 빠르게 검증하므로 짧아도 된다. 고정되는 마지막 값만 길어야 한다.
+     */
+    const steadyState = DEFAULT_PROBE_DELAYS_MS[DEFAULT_PROBE_DELAYS_MS.length - 1]!;
+    expect(steadyState).toBeGreaterThanOrEqual(300_000);
+    // 완전히 멈추지는 않는다. 세션이 나중에 풀렸을 때 복구되어야 한다.
+    expect(Number.isFinite(steadyState)).toBe(true);
+  });
+
   it('works daemon-first and verifies only the exact receipt callback', async () => {
     const path = pipePath('daemon-first');
     const daemon = server(path);

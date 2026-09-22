@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { publishRunCard, publishRunCollection } from '../src/run/publish.js';
 import type { RunPublishOptions } from '../src/run/publish.js';
 import type { RunCardInput } from '../src/run/render.js';
+import { SlackApiError } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 import type {
@@ -55,7 +56,13 @@ class FakeSlack implements SlackPoster {
     this.seq += 1;
     return { channel: input.channel, ts: `1787403740.00000${this.seq}` };
   }
+  /** 이 ts를 갱신하려 하면 Slack이 아래 코드로 실패한다. */
+  failUpdateFor: string | null = null;
+  failUpdateCode = 'message_not_found';
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
+    if (this.failUpdateFor !== null && input.ts === this.failUpdateFor) {
+      throw new SlackApiError('chat.update', this.failUpdateCode);
+    }
     this.updates.push(input);
     return { channel: input.channel, ts: input.ts };
   }
@@ -296,6 +303,69 @@ describe('컬렉션 게시', () => {
     ...over,
   });
 
+  it('사람이 지운 카드는 매핑을 버리고 다음 관찰이 다시 만든다', async () => {
+    /*
+     * 사람이 Slack UI에서 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 그 매핑을 그대로 두면
+     * 매 관찰마다 같은 오류가 나고, 실제로 Run 카드 22장이 세 시간 동안 갱신되지 않았다.
+     *
+     * 매핑과 root intent를 함께 버려야 한다. 하나만 버리면 다음 관찰이 `OPERATIONAL_CONFLICT`로
+     * 막혀 그 카드는 영원히 다시 만들어지지 않는다.
+     */
+    const store = new SqliteDigestStore(dbPath);
+    const slack = new FakeSlack();
+
+    await publishRunCollection(options(store, slack), collection());
+    const firstTs = store.findRunMessage(runKey(RUN_ID))?.messageTs ?? '';
+    expect(firstTs).not.toBe('');
+    slack.failUpdateFor = firstTs;
+
+    const moved = [
+      facts({ tasks: { total: 99, byStatus: [] } }),
+      facts({ tasks: { total: 98, byStatus: [] } }, OTHER_RUN_ID),
+    ];
+    const relinking = await publishRunCollection(
+      options(store, slack), collection({ runs: moved }),
+    );
+    const actions = relinking.runs.map((entry) => entry.action);
+    expect(actions).toContain('relinked');
+    // 두 번째 카드는 그대로 갱신된다. 이것이 없으면 카드 하나가 나머지를 인질로 잡는다.
+    expect(actions).toContain('update');
+    expect(store.findRunMessage(runKey(RUN_ID))).toBeNull();
+
+    // 다음 관찰이 새 루트를 만든다.
+    slack.failUpdateFor = null;
+    const recreated = await publishRunCollection(
+      options(store, slack), collection({ runs: moved }),
+    );
+    expect(recreated.runs.find((entry) => entry.run.identity.runId === RUN_ID)?.action)
+      .toBe('create');
+    expect(store.findRunMessage(runKey(RUN_ID))?.messageTs).not.toBe(firstTs);
+    store.close();
+  });
+
+  it('지워짐이 아닌 Slack 실패는 그 카드에 가두고 코드를 남긴다', async () => {
+    // 일시적 실패로 durable 매핑을 지우면 다음 관찰이 루트를 하나 더 만든다. 그래서 지워짐만
+    // 매핑을 버리고, 나머지는 그 카드의 실패로만 남는다.
+    const store = new SqliteDigestStore(dbPath);
+    const slack = new FakeSlack();
+
+    await publishRunCollection(options(store, slack), collection());
+    const firstTs = store.findRunMessage(runKey(RUN_ID))?.messageTs ?? '';
+    slack.failUpdateFor = firstTs;
+    slack.failUpdateCode = 'ratelimited';
+
+    const moved = [
+      facts({ tasks: { total: 99, byStatus: [] } }),
+      facts({ tasks: { total: 98, byStatus: [] } }, OTHER_RUN_ID),
+    ];
+    const result = await publishRunCollection(options(store, slack), collection({ runs: moved }));
+    store.close();
+
+    const failure = result.runs.find((entry) => entry.action === 'failed');
+    expect(failure?.errorCode).toBe('ratelimited');
+    expect(result.runs.map((entry) => entry.action)).toContain('update');
+  });
+
   it('등록된 Run마다 카드 하나를 만든다', async () => {
     const store = new SqliteDigestStore(dbPath);
     const slack = new FakeSlack();
@@ -353,8 +423,18 @@ describe('컬렉션 게시', () => {
     store.close();
 
     for (const post of slack.posts) {
+      // degraded는 카드 아래쪽 작은 글씨(context)로 내려갔다. 사실이 실린다는 요구는 그대로이므로
+      // 두 블록 종류를 모두 훑는다.
       const text = post.blocks
-        .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
+        .map((b) => {
+          const direct = (b['text'] as { text?: string } | undefined)?.text;
+          if (direct !== undefined) return direct;
+          const elements = b['elements'];
+          return Array.isArray(elements)
+            ? (elements as readonly Record<string, unknown>[])
+              .map((e) => String(e['text'] ?? '')).join('\n')
+            : '';
+        })
         .join('\n');
       expect(text).toContain('[unverified_platform_assumption]');
     }
@@ -408,7 +488,15 @@ describe('컬렉션 게시', () => {
     store.close();
 
     const text = (slack.posts[1]?.blocks ?? [])
-      .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
+      .map((b) => {
+        const direct = (b['text'] as { text?: string } | undefined)?.text;
+        if (direct !== undefined) return direct;
+        const elements = b['elements'];
+        return Array.isArray(elements)
+          ? (elements as readonly Record<string, unknown>[])
+            .map((e) => String(e['text'] ?? '')).join(String.fromCharCode(10))
+          : '';
+      })
       .join('\n');
     expect(text).toContain('store에 기록된 PR 없음');
     expect(text).not.toContain('#26');

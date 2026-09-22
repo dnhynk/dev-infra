@@ -50,6 +50,12 @@ import type { DigestStore, GateStore, RunStore } from './store/schema.js';
 import type { SummaryProvider } from './summarize/openai.js';
 import { GateActionHandler } from './gate/action-handler.js';
 import {
+  TerminalPromptActionHandler,
+  isTerminalPromptEvent,
+} from './terminal/action-handler.js';
+import { collectTerminalCandidates } from './terminal/candidates.js';
+import { runTerminalPromptPass } from './terminal/observer.js';
+import {
   GateDirectInputHandler,
   isGateDirectInputEvent,
 } from './gate/direct-input-handler.js';
@@ -99,6 +105,7 @@ import {
 import {
   OPERATIONAL_JOB_NAMES,
   OperationalNdjsonLogger,
+  entityIdentity,
   resolveOperationalLogDir,
   type OperationalTelemetrySink,
 } from './operational/logger.js';
@@ -1078,6 +1085,14 @@ type ProcessStopLatch = {
   dispose(): void;
 };
 
+/**
+ * 부모가 사라지면 daemon도 멈춘다는 신호를 켤지 여부.
+ *
+ * launcher가 stdin을 파이프로 넘길 때만 '1'이다. 파이프 없이 이 감시를 켜면 stdin이 이미 닫힌
+ * 실행(콘솔 없는 서비스, 수동 포그라운드 실행)에서 즉시 종료로 오인한다.
+ */
+const STOP_ON_PARENT_EXIT = 'ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT';
+
 function processStop(): ProcessStopLatch {
   let dispose = (): void => undefined;
   const promise = new Promise<void>((resolve) => {
@@ -1088,12 +1103,33 @@ function processStop(): ProcessStopLatch {
       dispose();
       resolve();
     };
+    /*
+     * 부모(launcher)가 죽으면 stdin 파이프의 쓰기 끝이 닫히고 여기서 EOF로 관측된다.
+     *
+     * Windows Task Scheduler가 task를 멈추면 launcher만 종료되고 daemon은 고아로 살아남는다.
+     * 실측에서 task 상태가 Ready인데 daemon이 Socket과 상태 DB를 계속 쥐고 있었다. 배포가
+     * 옛 daemon을 남긴 채 진행되는 구조다.
+     *
+     * Job Object 강제 종료 대신 이 경로를 쓰는 이유는 정상 종료이기 때문이다. 강제 종료는 job
+     * 행을 `running`인 채로 남기고, 그 행은 다음 daemon의 claim을 거부해 크래시 루프를 만든다.
+     */
+    const watchParent = process.env[STOP_ON_PARENT_EXIT] === '1';
     dispose = (): void => {
       process.off('SIGINT', stop);
       process.off('SIGTERM', stop);
+      if (watchParent) {
+        process.stdin.off('end', stop);
+        process.stdin.off('close', stop);
+        process.stdin.pause();
+      }
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
+    if (watchParent) {
+      process.stdin.once('end', stop);
+      process.stdin.once('close', stop);
+      process.stdin.resume();
+    }
   });
   return { promise, dispose: () => dispose() };
 }
@@ -1222,12 +1258,64 @@ export async function runDaemonCommand(
   let daemonHealthStarted = false;
   let observerDrainTimedOut = false;
   let fatalOperationalFailure = false;
+  /*
+   * observer supervisor가 넘겨주는 fatal 원인. 지금까지 이 값을 버렸고, 그래서 daemon이 죽어도
+   * 종료 경로가 남기는 것은 "실패했다" 한 줄뿐이었다. 실측에서 daemon이 기동 40초 뒤 반복해서
+   * 사라졌는데 stderr·운영 로그 어디에도 원인이 없었다.
+   */
+  let observerFatalCause: unknown;
   let commandFailed = false;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
   let deliveryReconciliation: Promise<void> | null = null;
   const pending = new Set<Promise<void>>();
   const inbound = new Set<Promise<void>>();
+
+  /*
+   * try/catch를 우회하는 죽음을 로그에 남긴다.
+   *
+   * daemon이 두 번 사라졌는데 운영 로그에는 성공한 job이 마지막 줄이었다. `runDaemonCommand`의
+   * catch도, 그 catch가 남기는 `daemon.failed`도 발화하지 않았다. 그 말은 예외가 그 promise
+   * 사슬 밖에서 났다는 뜻이다 — uncaught exception이나 주인 없는 rejection은 Node가 프로세스를
+   * 그대로 끝낸다. Task로 띄운 daemon은 stderr가 어디에도 수집되지 않으므로 그 순간이 통째로
+   * 증거 없이 지나갔다.
+   *
+   * 여기서 잡는 것은 복구가 아니라 **관측**이다. 한 줄을 남기고 원래대로 죽는다. 살려 두면
+   * 어떤 상태가 깨진 채로 계속 도는지 알 수 없다.
+   *
+   * 예외 본문은 싣지 않는다. 이 경로에는 카드 내용과 사용자 결정이 들어갈 수 있다.
+   */
+  const crashCodes: Readonly<Record<'uncaughtException' | 'unhandledRejection', string>> = {
+    uncaughtException: 'daemon.uncaught_exception',
+    unhandledRejection: 'daemon.unhandled_rejection',
+  };
+  let crashReported = false;
+  const reportCrash = (kind: 'uncaughtException' | 'unhandledRejection'): void => {
+    if (crashReported) return;
+    crashReported = true;
+    process.stderr.write(`${crashCodes[kind]}\n`);
+    /*
+     * 보고가 실패해도, 보고할 곳이 없어도 반드시 죽는다.
+     *
+     * `health`가 아직 null인 구간이 있다. 옵셔널 호출의 결과에 그대로 `.catch`를 붙이면 그
+     * 자리에서 TypeError가 나고, 그것이 uncaughtException 핸들러 안이라 프로세스가 아무 줄도
+     * 남기지 않고 끝난다. 관측하려고 놓은 덫이 관측을 지우는 셈이다.
+     */
+    const reported = (async (): Promise<void> => {
+      await health?.event({
+        level: 'error',
+        event: 'daemon.failed',
+        outcome: 'failed',
+        errorCode: crashCodes[kind] as OperationalFailureCode,
+        retryable: true,
+      });
+    })().catch(() => undefined);
+    void reported.finally(() => { process.exit(1); });
+  };
+  const onUncaught = (): void => { reportCrash('uncaughtException'); };
+  const onUnhandled = (): void => { reportCrash('unhandledRejection'); };
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onUnhandled);
   const inboundAbort = new AbortController();
   const reconciliationAbort = new AbortController();
   const acceptedWorkAbort = new AbortController();
@@ -1240,10 +1328,31 @@ export async function runDaemonCommand(
     reconciliationAbort.abort();
     resolveStop();
   };
-  const reportFailure = (): void => {
+  /**
+   * 죽은 자리를 stderr에 남긴다.
+   *
+   * **프레임만 적고 메시지는 적지 않는다.** 이 경로의 오류 문구에는 카드 내용과 사용자 결정이
+   * 들어갈 수 있고, stderr는 파일로 수집된다. 필요한 것은 "어디서 던졌나"이고 그것은 프레임에
+   * 있다. 이것이 없어 같은 죽음을 세 번 놓쳤다 — 문구 없이 코드만으로는 자리를 좁힐 수 없었다.
+   */
+  const reportFailure = (error?: unknown): void => {
     if (failureReported) return;
     failureReported = true;
     process.stderr.write('daemon이 strict startup 또는 Gate reconciliation에 실패했다\n');
+    // 던진 값이 없는 호출자도 있다. 그때는 지금까지와 같은 한 줄만 남긴다.
+    if (error === undefined) return;
+    if (!(error instanceof Error)) {
+      process.stderr.write(`daemon.failure kind=${typeof error}\n`);
+      return;
+    }
+    process.stderr.write(`daemon.failure name=${error.name}\n`);
+    const frames = (error.stack ?? '')
+      .split('\n')
+      .filter((line) => line.trimStart().startsWith('at '))
+      .slice(0, 12);
+    for (const frame of frames) process.stderr.write(`  ${frame.trim()}\n`);
+    const cause: unknown = (error as { cause?: unknown }).cause;
+    if (cause instanceof Error) process.stderr.write(`daemon.failure cause=${cause.name}\n`);
   };
   if (processStopLatch !== null) {
     void processStopLatch.promise.then(() => requestStop('requested'));
@@ -1379,12 +1488,79 @@ export async function runDaemonCommand(
       schedule,
       abortSignal: inboundAbort.signal,
     });
+    /**
+     * 터미널 프롬프트 버튼.
+     *
+     * Gate와 다른 handler인 것이 의도다. Gate 버튼은 Orca Gate를 해결하고 이 버튼은 살아 있는
+     * 세션에 입력을 넣는다. 결과가 다르므로 한 handler가 둘을 구분하게 두지 않는다.
+     */
+    const promptHandler = new TerminalPromptActionHandler({
+      config: config.slack,
+      store,
+      now: () => observerClock.wallNow(),
+      // 확정 직후 다음 pass를 앞당긴다. 없으면 사용자가 누른 뒤 최대 한 주기를 기다린다.
+      wake: () => observerSupervisor?.markDue('terminal-prompt'),
+      onOutcome: (outcome) => {
+        if (outcome === 'claimed' || outcome === 'duplicate') return;
+        // 카드가 뒤처진 것과 신원·형식이 어긋난 것을 나눈다. 앞은 정상 동작이고 뒤는 고장이다.
+        const stale = outcome.startsWith('stale_');
+        void health?.event({
+          level: 'warn',
+          event: 'terminal.prompt_action',
+          outcome: 'failed',
+          errorCode: stale ? 'terminal.action_stale' : 'terminal.action_rejected',
+          retryable: false,
+        }).catch(() => { /* reporting never fences the ACK */ });
+      },
+    });
 
     // Acquire the single fixed pipe before recovery or Slack ingress. A second daemon fails closed
     // here and cannot become either the Channel owner or an interactive consumer.
     channelServer = dependencies.channelServer ?? new ChannelPipeServer({ orca });
+    /** 코드별 연속 실패 수. 5초 재시도를 무제한으로 적으면 로그가 운영 이력을 밀어낸다. */
+    const channelFailureStreak = new Map<OperationalFailureCode, number>();
     channelDelivery = dependencies.createChannelDelivery?.(store, orca, channelServer) ??
-      new GateChannelDeliveryEngine({ store, orca, transport: channelServer });
+      new GateChannelDeliveryEngine({
+        store,
+        orca,
+        transport: channelServer,
+        // The Channel round trip was the one production path with no operational trace at all.
+        // Without these the daemon reports every job `succeeded` while a coordinator silently
+        // never wakes, which is exactly the failure shape DL-031 forbids.
+        // `route_*` means no coordinator session could be reached; everything else is the delivery
+        // machinery itself failing. An operator needs those two apart — the first is "boot a
+        // coordinator", the second is "something is broken". The raw code carries an unbounded
+        // suffix, so only these two fixed codes are persisted.
+        onError: (code) => {
+          const persisted: OperationalFailureCode = code.startsWith('route_')
+            ? 'channel.route_unavailable'
+            : 'channel.delivery_failed';
+          // 재시도는 5초 주기라 무제한으로 적으면 로그가 실제 운영 이력을 밀어낸다. 실측에서
+          // 막힌 delivery 하나가 23분에 134줄을 냈고 파일이 5 MiB 회전 한계에 닿았다.
+          // 상태 owner와 같은 cadence로 접는다 — 처음, 10회, 60회, 이후 300회마다.
+          const streak = (channelFailureStreak.get(persisted) ?? 0) + 1;
+          channelFailureStreak.set(persisted, streak);
+          if (streak !== 1 && streak !== 10 && streak !== 60 && streak % 300 !== 0) return;
+          void health?.event({
+            level: 'warn',
+            event: 'channel.delivery',
+            outcome: 'failed',
+            errorCode: persisted,
+            retryable: true,
+            attempt: streak,
+          }).catch(() => { /* reporting never fences delivery */ });
+        },
+        onTransition: (state, gateKey) => {
+          // 전이가 났다는 것은 그 delivery가 다시 움직였다는 뜻이다. 실패 streak을 접는다.
+          channelFailureStreak.clear();
+          void health?.event({
+            level: 'info',
+            event: 'channel.delivery',
+            outcome: state === 'attempted' ? 'started' : state === 'receipted' ? 'running' : 'succeeded',
+            entityIdentity: entityIdentity(gateKey),
+          }).catch(() => { /* reporting never fences delivery */ });
+        },
+      });
     channelServer.setProductionDeliveryHandlers?.({
       attempted: (event: ChannelProductionDeliveryEvent, commitFence) => {
         channelDelivery?.recordAttempted(event, commitFence);
@@ -1630,6 +1806,63 @@ export async function runDaemonCommand(
           },
         },
         {
+          /**
+           * 막힌 agent 터미널을 카드로 올리고, 확정된 답을 보낸다.
+           *
+           * 관측과 답변이 한 job인 것이 의도다. 둘 다 같은 터미널의 화면을 만지므로 나누면
+           * 서로의 중간 상태를 본다.
+           */
+          name: 'terminal-prompt' as const,
+          intervalMs: automation.terminalPrompt.intervalSeconds * 1_000,
+          timeoutMs: automation.terminalPrompt.timeoutSeconds * 1_000,
+          backoffCapMs: 5 * 60_000,
+          run: async (signal: AbortSignal) => {
+            const scoped = scopedOrcaRunner(orca, signal);
+            try {
+              const candidates = await collectTerminalCandidates({
+                orca: scoped,
+                store: daemonStore,
+                decisionsChannel: config.slack!.channels.decisions,
+              });
+              const report = await runTerminalPromptPass({
+                orca: scoped,
+                store: daemonStore,
+                slack,
+                candidates,
+                now: observerClock.wallNow,
+                // TUI가 다시 그려질 틈을 준다. 이 대기가 없으면 이동 직후 옛 화면을 읽는다.
+                settle: () => new Promise((resolve) => { setTimeout(resolve, 400); }),
+                onError: (code) => {
+                  // 읽지 못한 프롬프트는 다른 사실이다. 같은 코드로 접으면 "코디네이터가 막혀
+                  // 있는데 카드를 못 만들고 있다"가 운영에서 보이지 않는다.
+                  const persisted: OperationalFailureCode = code === 'terminal.prompt_unreadable'
+                    ? 'terminal.prompt_unreadable'
+                    : 'terminal.pass_degraded';
+                  void health?.event({
+                    level: 'warn',
+                    event: 'terminal.prompt',
+                    outcome: 'failed',
+                    errorCode: persisted,
+                    retryable: true,
+                  }).catch(() => { /* reporting never fences the pass */ });
+                },
+              }, signal);
+              return {
+                processedCount: report.observed,
+                deferredCount: report.refused + report.failed,
+              };
+            } catch (error) {
+              if (error instanceof ObserverJobFailure) throw error;
+              if (observerInvariantError(error)) {
+                throw new ObserverJobFailure('terminal.schema_drift', {}, true);
+              }
+              throw new ObserverJobFailure(
+                signal.aborted ? 'terminal.timeout' : 'terminal.query_failed',
+              );
+            }
+          },
+        },
+        {
           name: 'run-observer' as const,
           intervalMs: automation.runObserver.intervalSeconds * 1_000,
           timeoutMs: automation.runObserver.timeoutSeconds * 1_000,
@@ -1639,6 +1872,9 @@ export async function runDaemonCommand(
               const report = await runRunObserver(scopedOrcaRunner(orca, signal), {
                 config: effectiveConfig,
                 channel: config.slack!.channels.agentRuns,
+                // Gate 카드는 답할 카드만 오는 채널로 간다. 설정하지 않으면 이 값이
+                // `agentRuns`와 같아 지금까지와 같은 자리에 남는다.
+                decisionsChannel: config.slack!.channels.decisions,
                 store: daemonStore,
                 slack,
                 thread: threadPoster,
@@ -1720,7 +1956,14 @@ export async function runDaemonCommand(
                   store: daemonStore,
                   slack,
                   thread: threadPoster,
-                  summaryMode: 'facts_only',
+                  // daemon도 model 경로를 쓴다. 이 제품의 목적이 "PR 상태 변화를 사람이 10초
+                  // 안에 이해하는 카드"이고, 요약이 없으면 카드는 사실 나열로 남는다.
+                  //
+                  // 호출 비용은 주기가 아니라 게이트 A가 정한다. `factsFingerprint`가 같으면
+                  // 저장된 요약을 재사용하고 provider를 부르지 않으므로(OD-035), 15분 주기라도
+                  // 실제 호출은 요약 입력이 바뀐 PR에만 발생한다.
+                  summaryMode: 'model',
+                  provider: await summaryProvider(process.env),
                   prLimit: cycle.prLimit,
                   onlyPr: null,
                   now: observerClock.wallNow,
@@ -1763,8 +2006,15 @@ export async function runDaemonCommand(
           },
         },
       ] as const;
+      /*
+       * 기동 시 한 번 회수를 허용할 job. 여기 없는 job은 이전 instance가 남긴 `running` 행을
+       * 회수하지 못하고, 그 job의 claim 거부가 daemon 전체를 죽인다.
+       *
+       * 위 initialState와 같은 다섯 개를 모두 적는다. 실측에서 `gate-reconcile`이 빠져 있어
+       * 강제 종료 한 번이 daemon을 무한 크래시 루프에 빠뜨렸다.
+       */
       const startupClaims = new Set<ObserverJobName>([
-        'repository-discovery', 'run-observer', 'pr-digest',
+        'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest', 'terminal-prompt',
       ]);
       observerSupervisor = new ObserverSupervisor({
         installationSeed: dependencies.installationSeed ?? resolvedStatePath,
@@ -1772,7 +2022,7 @@ export async function runDaemonCommand(
         jobs: observerJobs,
         clock: observerClock,
         initialState: Object.fromEntries([
-          'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest',
+          'repository-discovery', 'run-observer', 'gate-reconcile', 'pr-digest', 'terminal-prompt',
         ].map((name) => {
           const prior = daemonStore.findDaemonJobOutcome(name as ObserverJobName);
           return [name, {
@@ -1827,8 +2077,9 @@ export async function runDaemonCommand(
             throw new Error('daemon_job_backoff_rejected');
           }
         },
-        onFatal: () => {
+        onFatal: (error) => {
           fatalOperationalFailure = true;
+          observerFatalCause ??= error;
           requestStop('requested');
         },
       });
@@ -1844,8 +2095,31 @@ export async function runDaemonCommand(
         // A connection may invoke a retained callback while its bounded close is still draining.
         // Leave that envelope unACKed for Slack redelivery instead of starting work after stop.
         if (!acceptingInbound) return Promise.resolve();
-        const consumer = isGateDirectInputEvent(event) ? directHandler : handler;
-        const task = consumer.handle(event).then(() => undefined).finally(() => inbound.delete(task));
+        /*
+         * 도착 사실을 먼저 남긴다. 처리 결과가 아니라 도착 여부다.
+         *
+         * 이 줄이 없으면 "폰에서 눌렀는데 아무 일도 없다"를 받았을 때 클릭이 daemon까지 왔는지
+         * 조차 알 수 없다. 기록을 기다리지 않는다 — Slack ACK 예산을 로깅에 쓰지 않는다.
+         */
+        void health?.event({
+          level: 'info', event: 'slack.ingress', outcome: 'started', counts: { processed: 1 },
+        }).catch(() => undefined);
+        const consumer = isTerminalPromptEvent(event)
+          ? promptHandler
+          : isGateDirectInputEvent(event)
+            ? directHandler
+            : handler;
+        /*
+         * ingress handler의 실패가 daemon을 죽이지 못하게 한다.
+         *
+         * 이 promise는 Socket transport로 올라간다. 여기서 reject를 흘리면 그것을 받는 곳이
+         * 없어 프로세스가 죽고, 관측 전체가 멈춘다. handler 각자가 던지지 않는 것이 계약이지만
+         * 계약을 어긴 handler 하나가 daemon을 내리는 구조를 남겨 두지 않는다.
+         */
+        const task = consumer.handle(event)
+          .then(() => undefined)
+          .catch(() => undefined)
+          .finally(() => inbound.delete(task));
         inbound.add(task);
         return task;
       },
@@ -1905,11 +2179,30 @@ export async function runDaemonCommand(
     await channelServer.stop();
     channelServer = null;
     return stopReason === 'pipe_failure' || observerDrainTimedOut || fatalOperationalFailure ? 1 : 0;
-  } catch {
+  } catch (failure) {
     commandFailed = true;
-    reportFailure();
+    /*
+     * 크래시를 운영 로그에 남긴다.
+     *
+     * 이것이 없으면 daemon이 죽어도 로그에 아무 줄도 없다. 실측에서 daemon이 exit 1로 사라졌고,
+     * 마지막 줄은 성공한 job이었으며, stderr는 어디에도 수집되지 않아 원인을 남기지 않았다.
+     * 그 사이 사용자가 폰에서 누른 답은 처리되지 않은 채로 남아 있었다.
+     *
+     * 예외 본문은 싣지 않는다. 이 경로의 오류 문구에는 카드 내용과 사용자 결정이 들어갈 수
+     * 있다. 남기는 것은 "죽었다"는 사실이고, 그것만으로 운영자가 다음 행동을 정할 수 있다.
+     */
+    await health?.event({
+      level: 'error',
+      event: 'daemon.failed',
+      outcome: 'failed',
+      errorCode: 'daemon.startup_failed',
+      retryable: true,
+    }).catch(() => { /* 죽는 중이다. 보고 실패가 종료를 막지 않는다. */ });
+    reportFailure(failure);
     return 1;
   } finally {
+    process.off('uncaughtException', onUncaught);
+    process.off('unhandledRejection', onUnhandled);
     acceptingInbound = false;
     if (reconciliationTimer !== null) clearInterval(reconciliationTimer);
     reconciliationAbort.abort();
@@ -1984,7 +2277,17 @@ export async function runDaemonCommand(
     if (writableStoreClosureUncertain || observerDrainTimedOut || fatalOperationalFailure) {
       // Do not release or discard the descriptor/mutex when the writable handle may still be live.
       // The CLI entrypoint exits nonzero immediately after this bounded static diagnostic.
-      reportFailure();
+      //
+      // 어느 조건으로 죽었는지까지 남긴다. 셋 다 exit 1로 합류하므로 이 줄이 없으면 store 닫기
+      // 실패인지, observer drain timeout인지, 운영 fatal인지 구분할 수단이 없다.
+      process.stderr.write(
+        `daemon.stop_flags store_uncertain=${writableStoreClosureUncertain}`
+        + ` observer_drain_timeout=${observerDrainTimedOut}`
+        + ` fatal_operational=${fatalOperationalFailure}`
+        + ` stop_reason=${stopReason ?? 'none'}
+`,
+      );
+      reportFailure(observerFatalCause);
       return 1;
     }
   }

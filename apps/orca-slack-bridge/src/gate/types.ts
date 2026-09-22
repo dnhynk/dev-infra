@@ -9,7 +9,8 @@ export type GateOptionMetadata = {
   readonly id: string;
   /** Exact human-readable Orca Gate option. Registration compares this list without parsing it. */
   readonly label: string;
-  readonly description: string;
+  /** Null only on derived rows: Orca Gate는 선택지 설명 필드를 갖지 않는다. */
+  readonly description: string | null;
   /** Exact text the D2-C resolver writes to Orca after the stable option ID wins locally. */
   readonly resolution: string;
 };
@@ -42,8 +43,16 @@ export type GateMetadata = {
   readonly askMessageId: string;
   readonly questionThreadId: string;
   readonly options: readonly GateOptionMetadata[];
-  readonly recommendation: GateRecommendation;
-  readonly impact: string;
+  /**
+   * `registered`는 `gate-register`가 쓴 code-owned 문서다. `derived`는 sidecar 없이 관측된
+   * Gate를 Orca `options`만으로 채운 행이고, 그때 `recommendation`과 `impact`는 없다.
+   * 파생 행이 없으면 등록을 빠뜨린 Gate가 Slack에서 누를 수 없는 카드로 남는다.
+   */
+  readonly source: 'registered' | 'derived';
+  /** Null on derived rows: Orca Gate에는 권장안 필드가 없다. */
+  readonly recommendation: GateRecommendation | null;
+  /** Null on derived rows: Orca Gate에는 영향 필드가 없다. */
+  readonly impact: string | null;
   /** ISO8601 written by the Bridge. */
   readonly registeredAt: string;
 };

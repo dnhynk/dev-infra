@@ -651,7 +651,7 @@ async function inspectThroughFakeOwner(
         transportBinding: parsed['transportBinding'],
         nonce: parsed['nonce'],
         capturedAt: TRANSPORT_AT,
-        schemaVersion: 13,
+        schemaVersion: 16,
         snapshot: mode === 'malformed-snapshot'
           ? { body: 'SENTINEL_PRIVATE' }
           : projectedSnapshot({
@@ -784,7 +784,7 @@ describe('read-only operational status classification', () => {
     expect(backupRate).toBe(2_147_483_647);
     expect(report).toMatchObject({
       overall: 'healthy', exitCode: 0, codes: ['status.healthy'],
-      schema: { state: 'matched', expectedVersion: 13, foundVersion: 13 },
+      schema: { state: 'matched', expectedVersion: 16, foundVersion: 16 },
       config: { state: 'matched' }, build: { state: 'matched' },
       daemon: { state: 'running', desiredState: 'running', heartbeatAgeSeconds: 30 },
       registry: { active: 0, pending: 0, rejected: 0, deferred: 0 },
@@ -813,7 +813,7 @@ describe('read-only operational status classification', () => {
       const before = sourceFiles.map((path) => ({ path, hash: sha256(path) }));
       const beforeFiles = readdirSync(dir).sort();
       const wire = await rawOwnerFrame();
-      expect(unframe(wire)).toMatchObject({ version: 2, schemaVersion: 13 });
+      expect(unframe(wire)).toMatchObject({ version: 2, schemaVersion: 16 });
       for (const privateValue of [
         INSTANCE, BUILD, fingerprintOperationalConfig(config),
         fingerprintOperationalBuild(BUILD), statePath, dir,
@@ -1140,7 +1140,7 @@ describe('read-only operational status classification', () => {
       await owner.start();
       expect(unframe((await rawOwnerExchange('valid-split'))!)).toMatchObject({
         version: 2,
-        schemaVersion: 13,
+        schemaVersion: 16,
       });
       for (const mode of [
         'unauthenticated', 'wrong-transport-binding', 'coalesced', 'delayed-trailing',
@@ -3147,7 +3147,7 @@ describe('read-only operational status classification', () => {
     });
     expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
     expect(report.jobs.filter((job) => job.state === 'absent').map((job) => job.job)).toEqual([
-      'repository-discovery', 'run-observer', 'pr-digest',
+      'repository-discovery', 'run-observer', 'pr-digest', 'terminal-prompt',
     ]);
 
     rmSync(statePath, { force: true });
@@ -3207,7 +3207,7 @@ describe('read-only operational status classification', () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
-  it.each([12, 14] as const)('does not migrate or alter a schema-v%s source database', async (version) => {
+  it.each([12, 17] as const)('does not migrate or alter a schema-v%s source database', async (version) => {
     healthyStore().close();
     const raw = new DatabaseSync(statePath);
     raw.prepare('UPDATE schema_version SET version = ? WHERE id = 1').run(version);
@@ -3240,7 +3240,7 @@ describe('read-only operational status classification', () => {
 
     await expect(inspect()).resolves.toMatchObject({
       exitCode: 1,
-      schema: { state: 'matched', foundVersion: 13 },
+      schema: { state: 'matched', foundVersion: 16 },
       registry: { active: 0, pending: 0, rejected: 0, deferred: 512 },
     });
   }, 15_000);

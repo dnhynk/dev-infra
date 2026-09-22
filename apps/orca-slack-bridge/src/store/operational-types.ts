@@ -107,6 +107,9 @@ export const OPERATIONAL_FAILURE_CODES = [
   'schema.drift',
   'daemon.startup_failed',
   'daemon.heartbeat_failed',
+  // try/catch 밖에서 난 죽음. 이 둘이 없으면 daemon이 사라진 순간이 로그에 남지 않는다.
+  'daemon.uncaught_exception',
+  'daemon.unhandled_rejection',
   'logger.write_failed',
   'discovery.no_remote',
   'discovery.unsupported_remote',
@@ -130,7 +133,28 @@ export const OPERATIONAL_FAILURE_CODES = [
   'digest.timeout',
   'digest.capacity_deferred',
   'gate.reconcile_failed',
+  // 한 pass 안에서 터미널 하나를 읽거나 카드를 올리지 못했다. pass 자체는 계속한다.
+  'terminal.pass_degraded',
+  // 프롬프트가 떠 있는데 화면에서 선택지를 만들지 못했다. 사라진 것과 다르고, 이 코드가 없으면
+  // 그 구분이 운영에서 보이지 않는다.
+  'terminal.prompt_unreadable',
+  // 확정된 답을 보내지 못했다. 화면이 바뀌어 거절한 경우가 여기 대부분이고, 그것이 정상 동작이다.
+  'terminal.answer_refused',
+  'terminal.query_failed',
+  'terminal.timeout',
+  'terminal.schema_drift',
+  // Slack 버튼 클릭을 받아들이지 않았다.
+  'terminal.action_rejected',
+  /*
+   * 카드는 살아 있는데 그 프롬프트가 이미 지나간 경우. 고장이 아니다.
+   *
+   * `action_rejected`와 나누는 이유는 다음 행동이 다르기 때문이다. 이 코드는 카드가
+   * 뒤처졌다는 뜻이고, 앞의 코드는 신원이나 형식이 어긋났다는 뜻이다. 한 코드로 묶여
+   * 있었을 때 실측에서 둘을 가르는 데 로그가 아무 도움도 되지 못했다.
+   */
+  'terminal.action_stale',
   'channel.delivery_failed',
+  'channel.route_unavailable',
   'scheduler.timeout',
   'scheduler.aborted',
   'status.owner_refresh_failed',
@@ -167,7 +191,8 @@ export type DaemonJobName =
   | 'run-observer'
   | 'pr-digest'
   | 'gate-reconcile'
-  | 'channel-delivery';
+  | 'channel-delivery'
+  | 'terminal-prompt';
 
 export type DaemonJobState = 'running' | 'succeeded' | 'failed' | 'backoff';
 

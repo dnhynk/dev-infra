@@ -214,6 +214,21 @@ class SaturatingInbox implements OrcaRunner {
   }
 }
 
+/** 넘어온 인자를 그대로 남기는 inbox. 수신자 범위를 검사한다. */
+class RecordingInbox implements OrcaRunner {
+  readonly calls: string[][] = [];
+  constructor(private readonly rows: readonly unknown[]) {}
+  async run(args: readonly string[]): Promise<string> {
+    this.calls.push([...args]);
+    const handleAt = args.indexOf('--terminal');
+    const handle = handleAt === -1 ? null : String(args[handleAt + 1]);
+    const visible = handle === null
+      ? this.rows
+      : this.rows.filter((r) => (r as { to_handle?: unknown }).to_handle === handle);
+    return JSON.stringify({ id: 'x', ok: true, result: { messages: visible } });
+  }
+}
+
 /** `inbox` 응답의 worker_done row 하나. */
 function row(id: string, taskId: string): unknown {
   return {
@@ -813,11 +828,56 @@ describe('worker_done 선택', () => {
 });
 
 /**
+ * 수신자 범위.
+ *
+ * `inbox`에 `--run`은 없지만 `--terminal`이 수신자로 거른다. worker_done은 언제나
+ * `run:<run_id>`로 배달되므로 Run 키를 수신자로 넘기면 그 Run만 좁혀 읽는다. 이것이 없으면
+ * 모든 Run과 heartbeat가 한 배열로 와서 상한에 닿고, 그 순간 digest 전체가 멈춘다.
+ */
+describe('inbox 수신자 범위', () => {
+  const rowFor = (id: string, taskId: string, runId: string): unknown => ({
+    id, run_id: runId, to_handle: `run:${runId}`, type: 'worker_done',
+    subject: '완료', body: `${runId} 보고`,
+    payload: JSON.stringify({ taskId, dispatchId: 'ctx_1', outcome: 'succeeded' }),
+    created_at: '2026-08-22T10:30:36Z',
+  });
+
+  it('수신자를 주면 그 Run만 읽고, 안 주면 전부 읽는다', async () => {
+    const rows = [
+      rowFor('m1', 'task_a', 'run_7804be5a654f'),
+      rowFor('m2', 'task_b', 'run_98ccc873ba4b'),
+      rowFor('m3', 'task_c', 'run_98ccc873ba4b'),
+    ];
+
+    const scoped = new RecordingInbox(rows);
+    const one = await listWorkerDone(scoped, 5000, 'run:run_98ccc873ba4b');
+    expect(scoped.calls[0]).toContain('--terminal');
+    expect(scoped.calls[0]).toContain('run:run_98ccc873ba4b');
+    expect(one.messages.map((m) => m.taskId)).toEqual(['task_b', 'task_c']);
+    // 좁혀 읽었으므로 상한 판정도 이 Run 안에 갇힌다.
+    expect(one.saturated).toBe(false);
+
+    const global = new RecordingInbox(rows);
+    const all = await listWorkerDone(global, 5000);
+    expect(global.calls[0]).not.toContain('--terminal');
+    expect(all.messages).toHaveLength(3);
+  });
+
+  it('좁혀 읽어도 그 Run이 상한에 닿으면 판정 불가로 남는다', async () => {
+    // 한 Run만으로 상한을 채운다. 좁히는 것은 포화를 없애는 것이 아니라 Run 안에 가두는 것이다.
+    const rows = Array.from({ length: 4 }, (_, i) =>
+      rowFor(`m${i}`, `task_${i}`, 'run_98ccc873ba4b'));
+    const inbox = await listWorkerDone(new RecordingInbox(rows), 4, 'run:run_98ccc873ba4b');
+    expect(inbox.saturated).toBe(true);
+  });
+});
+
+/**
  * inbox 포화와 "부재를 증명할 수 없음".
  *
- * `inbox`에는 `--run` 필터도 pagination도 없고 `--limit`이 유일한 손잡이다. 상한을 넘긴
- * 상태에서 worker_done을 못 찾은 것은 "없다"가 아니라 "판정 불가"다. OD-070의 "없음"
- * 규칙을 판정 불가에 적용하면 카드가 거짓을 말한다.
+ * 호출자가 Run 하나를 수신자로 좁혀 읽지만 `inbox`에는 pagination이 없고 `--limit`이 유일한
+ * 손잡이다. 그 Run이 상한을 넘긴 상태에서 worker_done을 못 찾은 것은 "없다"가 아니라
+ * "판정 불가"다. OD-070의 "없음" 규칙을 판정 불가에 적용하면 카드가 거짓을 말한다.
  */
 describe('inbox 포화', () => {
   const origin = (() => {

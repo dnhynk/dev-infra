@@ -76,17 +76,62 @@ node apps/orca-slack-bridge/dist/cli.js daemon `
 고정 pipe owner를 이미 가진 daemon이 있으면 두 번째 daemon은 Slack Socket ingress 전에 exit 1로
 실패해야 한다. 첫 daemon을 임의로 죽여 ownership을 빼앗지 말고 기존 owner를 확인한다.
 
-## 4. interactive Claude Code 2.1.243 smoke
+## 3.5 plugin 경로 등재 (권장, 세션 확인 없음)
+
+development flag는 세션마다 사람이 경고를 승인해야 해서 무인 운영과 충돌한다. `allowedChannelPlugins`가
+Anthropic allowlist를 통째로 대체하므로(OD-081) Adapter를 자작 marketplace의 plugin으로 켜면 그 확인이
+사라진다. 등재는 **일회성**이고 세션마다 반복되지 않는다.
+
+repository의 `plugins/`가 marketplace이자 plugin이다. Adapter 실행 경로는 `launch-adapter.mjs`가 매
+기동 `runtime.json`에서 현재 release를 읽어 정하므로, release를 새로 배포해도 plugin을 고칠 필요가 없다.
+
+```powershell
+claude plugin marketplace add <repo>\plugins
+claude plugin install orca-slack-channel@dev-infra
+```
+
+그다음 **관리자 권한으로 한 번** 정책 파일을 만든다. 이 파일이 없으면 기본 Anthropic 목록이 쓰이고
+자작 plugin은 거부된다.
+
+```powershell
+# 관리자 PowerShell
+New-Item -ItemType Directory -Force -Path 'C:\Program Files\ClaudeCode' | Out-Null
+Set-Content -Path 'C:\Program Files\ClaudeCode\managed-settings.json' -Encoding UTF8 -Value @'
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "dev-infra", "plugin": "orca-slack-channel" }
+  ]
+}
+'@
+```
+
+- `channelsEnabled: true`가 함께 있어야 한다. 스키마가 `allowedChannelPlugins`의 전제로 명시한다.
+- 이 파일은 기본 allowlist를 **대체**한다. 이후 Anthropic 등재 plugin을 쓰려면 그것도 이 배열에 넣는다.
+- `--managed-settings` flag로는 대신할 수 없다. policy layer에 반영되지 않는다(OD-081).
+- 되돌리려면 이 파일을 지운다. 그러면 기본 목록으로 돌아간다.
+
+세션은 development flag 없이 연다.
+
+```text
+claude --channels plugin:orca-slack-channel@dev-infra
+```
+
+## 4. interactive smoke
 
 이 단계는 coordinator가 실제 live write 대상을 검토한 뒤 수동으로 수행한다. 자동 하니스나 Agent가
 아래 명령을 대신 실행하거나 화면을 보고 Enter를 누르면 안 된다.
+
+§3.5의 plugin 경로를 쓰지 않고 development flag로 확인할 때만 아래를 쓴다.
 
 ```text
 claude --dangerously-load-development-channels server:orca-slack
 ```
 
-- 정확히 Claude Code `2.1.243`과 interactive session을 사용한다. `-p` headless session은 acceptance
-  대상이 아니다.
+- interactive session을 사용한다. `-p` headless session은 어떤 구성에서도 channel 이벤트가 도달하지
+  않으므로 acceptance 대상이 아니다.
+- 대상 Claude Code 버전을 기록한다. Channels는 research preview이므로 버전이 오르면 계약을 다시
+  확인한다. 현재 호스트는 `2.1.246`이고 D3 production code는 `2.1.243` target surface에 고정돼 있다.
 - 매 기동 표시되는 development-channel 경고의 server 이름과 위험 문구를 사람이 읽고 직접
   승인한다. 승인 여부를 기억시키거나 keypress/click으로 자동 통과시키지 않는다.
 - flag가 없거나 조직 policy가 Channel을 막으면 MCP transport가 연결돼도 probe receipt가 오지 않을

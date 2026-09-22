@@ -4,6 +4,7 @@ import {
   boundedSlackReply,
   boundedSlackUpdate,
   DEFAULT_SLACK_UPDATE_TIMEOUT_MS,
+  SlackApiError,
   type SlackPoster,
   type ThreadPoster,
 } from '../slack/post.js';
@@ -20,7 +21,14 @@ export type GatePublishAction =
   | 'skip'
   | 'channel_mismatch'
   | 'thread_mismatch'
-  | 'root_unavailable';
+  | 'root_unavailable'
+  /**
+   * 사람이 카드를 지웠다. 가리킬 곳이 없어진 매핑을 버렸다.
+   *
+   * 아직 열린 Gate면 다음 관측이 새로 만들고, 이미 끝난 Gate면 만들지 않는다. 이 값이 없으면
+   * 지워진 카드 한 장이 관측 pass 전체를 영원히 멈춘다.
+   */
+  | 'relinked';
 
 export type GatePublishResult = {
   readonly gate: GateDecisionFacts;
@@ -37,6 +45,14 @@ export type GatePublishOptions = {
   /** Thread-reply boundary. Null together with `slack` means dry-run. */
   readonly thread: ThreadPoster | null;
   readonly channel: string;
+  /**
+   * 카드를 어디에 놓는가. 기본은 Run 루트 아래 답글이다.
+   *
+   * `channel`은 답할 카드만 오는 채널에 최상위 메시지로 놓는다. 답글은 스레드를 따르지 않는
+   * 사람에게 알림이 가지 않고, 알림을 위해 broadcast를 켜면 그 복사본이 상태 카드 사이에
+   * 섞인다. 답할 카드는 그 채널의 맨 아래에 혼자 있어야 폰에서 열자마자 보인다.
+   */
+  readonly placement?: 'thread' | 'channel';
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
   /** Observer deadline/shutdown fence carried through first replies and later updates. */
@@ -78,14 +94,21 @@ export async function publishGateCard(
   const base = { gate, fingerprint, card } as const;
   const existing = options.store.findGateMessage(gate.key);
   const isDryRun = dryRun(options);
+  const topLevel = options.placement === 'channel';
   const mappingState =
-    rootMessageTs === null || existing === null
+    existing === null || (!topLevel && rootMessageTs === null)
       ? 'missing'
       : existing.channelId === options.channel &&
           existing.runKey === runKey &&
-          existing.threadTs === rootMessageTs
+          (topLevel || existing.threadTs === rootMessageTs)
         ? 'matched'
         : 'mismatched';
+  /** 기대 매핑 신원. 최상위 카드에는 대조할 루트 ts가 없다. */
+  const expectedIdentity = {
+    channelId: options.channel,
+    threadTs: rootMessageTs,
+    ...(topLevel ? { placement: 'channel' as const } : {}),
+  };
   const locallyConsistentPending =
     gate.status === 'pending' && gate.resolution === null && gate.resolvedAt === null;
   const locallyConsistentResolved =
@@ -116,7 +139,7 @@ export async function publishGateCard(
     // because it reached SQLite later.
     const reservedObservation = options.store.saveGateLocalObservation(
       localObservation,
-      existing === null ? { channelId: options.channel, threadTs: rootMessageTs } : undefined,
+      existing === null ? expectedIdentity : undefined,
     );
     await options.fault?.('after_gate_observation_reservation_before_confirmation', gate.key);
     // When this publisher observed no message, recheck that fact inside the SQLite write. A
@@ -124,7 +147,7 @@ export async function publishGateCard(
     // was paused; persist the current facts without downgrading that established mapping.
     savedObservation = options.store.saveGateLocalObservation(
       localObservation,
-      existing === null ? { channelId: options.channel, threadTs: rootMessageTs } : undefined,
+      existing === null ? expectedIdentity : undefined,
       reservedObservation.revision,
     );
   }
@@ -136,7 +159,8 @@ export async function publishGateCard(
   const recoveringOrdinaryWrite =
     !isDryRun && options.store.findGateLocalObservation(gate.key)?.mappingState !== 'matched';
 
-  if (rootMessageTs === null && !isDryRun) {
+  // 최상위 배치에는 매달 루트가 없다. 루트 부재가 게시를 막는 것은 답글 배치에서만이다.
+  if (rootMessageTs === null && !topLevel && !isDryRun) {
     return { ...base, action: 'root_unavailable', messageTs: existing?.messageTs ?? null };
   }
   if (existing !== null && existing.channelId !== options.channel) {
@@ -145,7 +169,7 @@ export async function publishGateCard(
   if (
     existing !== null &&
     (existing.runKey !== runKey ||
-      (rootMessageTs !== null && existing.threadTs !== rootMessageTs))
+      (!topLevel && rootMessageTs !== null && existing.threadTs !== rootMessageTs))
   ) {
     return { ...base, action: 'thread_mismatch', messageTs: existing.messageTs };
   }
@@ -205,27 +229,50 @@ export async function publishGateCard(
       messageTs: existing?.messageTs ?? null,
     };
   }
-  if (rootMessageTs === null || options.slack === null || options.thread === null) {
+  if ((rootMessageTs === null && !topLevel) || options.slack === null || options.thread === null) {
     return { ...base, action: 'root_unavailable', messageTs: existing?.messageTs ?? null };
   }
 
   const at = options.now().toISOString();
+  if (existing === null && gate.status !== 'pending') {
+    /*
+     * 끝난 Gate에 카드를 새로 만들지 않는다.
+     *
+     * 카드는 사람이 결정하라고 있는 것이고, 이미 결정된 Gate의 카드는 이력이다. 사람이 그
+     * 이력을 지웠으면 다음 관측이 되살릴 이유가 없다. 이것이 없으면 지운 카드가 채널마다
+     * 계속 다시 나타난다.
+     */
+    return { ...base, action: 'skip', messageTs: null };
+  }
   if (existing === null) {
     const stagedCard = stagedGateCard(card);
     const stagedFingerprint = renderFingerprint(stagedCard);
-    const posted = await boundedSlackReply(options.thread, {
-      channel: options.channel,
-      threadTs: rootMessageTs,
-      text: stagedCard.text,
-      blocks: stagedCard.blocks,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
+    const posted = topLevel
+      // 답할 카드만 오는 채널이다. 최상위 메시지 자체가 알림이므로 broadcast가 필요 없다.
+      ? await options.slack.post({
+          channel: options.channel,
+          text: stagedCard.text,
+          blocks: stagedCard.blocks,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        })
+      : await boundedSlackReply(options.thread, {
+          channel: options.channel,
+          threadTs: rootMessageTs!,
+          text: stagedCard.text,
+          blocks: stagedCard.blocks,
+          // Gate는 owner가 결정하기 전에는 아무것도 진행되지 않는 유일한 사실이다. thread
+          // reply만으로는 그 thread를 따르지 않는 owner에게 도달하지 않으므로 채널에도 함께
+          // 띄운다(OD-072).
+          broadcast: true,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
     await options.fault?.('after_staged_first_reply_before_mapping', gate.key);
     options.store.insertGateMessage({
       gateKey: gate.key,
       runKey,
       channelId: posted.channel,
-      threadTs: rootMessageTs,
+      // 최상위 카드는 자기 자신이 루트다. 매핑의 세 값이 함께 있어야 한다는 규칙을 지킨다.
+      threadTs: topLevel ? posted.ts : rootMessageTs!,
       messageTs: posted.ts,
       renderFingerprint: stagedFingerprint,
       at,
@@ -253,7 +300,7 @@ export async function publishGateCard(
     at,
     savedObservation.observation,
     savedObservation.revision,
-    { channelId: options.channel, threadTs: rootMessageTs },
+    expectedIdentity,
   )) {
     // The fence and Gate claim use the same BEGIN IMMEDIATE boundary. If a winner committed after
     // the earlier read, never start the ordinary Slack update; render/project that durable state.
@@ -297,6 +344,12 @@ export async function publishGateCard(
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);
+    if (e instanceof SlackApiError && e.code === 'message_not_found') {
+      // 사람이 카드를 지웠다. 가리킬 곳이 없어진 매핑을 버린다. 던지면 이 Gate 하나가 관측
+      // pass 전체를 멈춘다.
+      options.store.forgetGateMessage(gate.key);
+      return { ...base, action: 'relinked', messageTs: null };
+    }
     throw e;
   }
   await options.fault?.('after_static_slack_before_observation', gate.key);

@@ -247,7 +247,15 @@ function parseButton(body: unknown): ParsedButton | null {
     ? null
     : boundedText(container['thread_ts'], 32);
   const messageTs = boundedText(message['ts'], 32);
-  const threadTs = boundedText(message['thread_ts'], 32);
+  /*
+   * 최상위 메시지에는 `thread_ts`가 없다. 그 메시지가 곧 스레드 루트이므로 자기 ts로 채운다.
+   * 카드 매핑을 저장할 때 쓴 규약과 같아야 신원 비교가 맞는다(`action-handler.ts` 주석 참고).
+   *
+   * 필드가 있는데 형식이 어긋나는 것은 여전히 거절이다.
+   */
+  const threadProvided = message['thread_ts'] !== undefined;
+  const parsedThreadTs = threadProvided ? boundedText(message['thread_ts'], 32) : null;
+  const threadTs = parsedThreadTs ?? messageTs;
   const blockId = boundedText(action['block_id'], 255);
   const actionId = boundedText(action['action_id'], 255);
   const actionValue = boundedText(action['value'], 255);
@@ -256,7 +264,8 @@ function parseButton(body: unknown): ParsedButton | null {
   if (
     teamId === null || ownerUserId === null || userTeamId !== teamId || apiAppId === null ||
     channelId === null || containerChannelId !== channelId || containerMessageTs === null ||
-    messageTs !== containerMessageTs || threadTs === null || blockId === null || actionId === null ||
+    messageTs !== containerMessageTs || (threadProvided && parsedThreadTs === null) ||
+    threadTs === null || blockId === null || actionId === null ||
     actionValue === null || actionTs === null || triggerId === null ||
     container['type'] !== 'message' || container['is_ephemeral'] !== false ||
     (containerThreadTs !== null && containerThreadTs !== threadTs)
@@ -393,6 +402,20 @@ export function isGateDirectInputEvent(event: SocketSlackEvent): boolean {
   return false;
 }
 
+/**
+ * Gate 카드가 놓일 수 있는 채널인가.
+ *
+ * 답할 카드는 `decisions` 채널로 옮겼지만 그 전에 만들어진 카드는 `agentRuns`에 남아 있다.
+ * 한 쪽만 인정하면 다른 쪽 카드의 버튼이 전부 거절된다 — 옮긴 직후 `channel_mismatch`로 실제로
+ * 그렇게 됐다.
+ *
+ * **아무 채널이나 받는 것이 아니다.** 설정에 있는 두 채널만 인정한다. 그 밖의 채널에서 온
+ * 클릭은 우리가 카드를 놓은 적이 없는 자리이므로 여전히 거절이다.
+ */
+function isGateCardChannel(config: SlackConfig, channelId: string): boolean {
+  return channelId === config.channels.agentRuns || channelId === config.channels.decisions;
+}
+
 export class GateDirectInputHandler {
   private readonly now: () => Date;
   private readonly monotonic: () => number;
@@ -453,7 +476,7 @@ export class GateDirectInputHandler {
       button === null || button.teamId !== this.options.config.teamId ||
       (configAppId !== undefined && button.apiAppId !== configAppId) ||
       !this.options.config.ownerUserIds.includes(button.ownerUserId) ||
-      button.channelId !== this.options.config.channels.agentRuns
+      !isGateCardChannel(this.options.config, button.channelId)
     ) return (await ack()) ? 'rejected' : 'ack_failed';
     if (this.options.abortSignal?.aborted || (budget.elapsed() ?? Infinity) >= this.localStoreDeadlineMs) {
       return (await ack()) ? 'store_failed' : 'ack_failed';
@@ -564,7 +587,7 @@ export class GateDirectInputHandler {
     }
     if (
       session === null || session.state !== 'opened' ||
-      session.channelId !== this.options.config.channels.agentRuns ||
+      !isGateCardChannel(this.options.config, session.channelId) ||
       session.teamId !== parsed.teamId ||
       session.ownerUserId !== parsed.ownerUserId || session.apiAppId !== parsed.apiAppId ||
       session.viewId !== parsed.viewId || session.callbackId !== parsed.callbackId
@@ -572,7 +595,7 @@ export class GateDirectInputHandler {
       // An accepted exact redelivery is allowed through to the atomic winner comparison below.
       if (
         session === null || session.state !== 'accepted' ||
-        session.channelId !== this.options.config.channels.agentRuns ||
+        !isGateCardChannel(this.options.config, session.channelId) ||
         session.teamId !== parsed.teamId ||
         session.ownerUserId !== parsed.ownerUserId || session.apiAppId !== parsed.apiAppId ||
         session.viewId !== parsed.viewId || session.callbackId !== parsed.callbackId
