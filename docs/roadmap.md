@@ -156,9 +156,9 @@ D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발�
 그 수는 Run 카드와 별개로 **등록된 Run 수와 무관하게 항상 게시되는 컬렉션 루트**에도 실린다.
 등록이 통째로 어긋나 Run 카드가 하나도 없는 구간이 곧 OD-078이 감수한 실패 모드이고, 그때도
 사실이 `#agent-runs`에 도달해야 하기 때문이다(OD-080).
-Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·
-`consumer_generation`을 권위로 읽고 live/stale은 generation으로 구분한다. coordinator 환경변수는 보조
-단서로만 쓴다(OD-020).
+Run/coordinator identity는 `run-list` row의 `coordinator_handle`·`consumer_generation`을 권위로 읽고
+live/stale은 generation으로 구분한다. pane은 그 handle의 `terminal show`로 확인한다. coordinator
+환경변수는 보조 단서로만 쓴다(OD-020, DL-066).
 
 출구 조건:
 

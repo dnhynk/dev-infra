@@ -77,7 +77,9 @@ release digest로 고정한다. token 누락이나 runtime/release drift는 값 
 
 설치 preflight의 Orca readiness probe는 trusted known-folder API로 얻어 canonicalize한 `APPDATA`와
 `LOCALAPPDATA`만 기존의 최소 Windows system 환경에 추가해 `orca status --json`을 실행한다. exit,
-bounded timeout 및 closed ready shape 중 하나라도 맞지 않으면 설치를 시작하지 않는다.
+bounded timeout, ready 사실(`ok`, local target, 실행 중인 app과 사용 가능한 desktop window, ready·reachable
+runtime과 일치하는 `runtimeId`, ready graph) 중 하나라도 맞지 않으면 설치를 시작하지 않는다. 그 밖의 status
+필드는 무시한다(DL-066).
 
 ## 재설치와 제거
 

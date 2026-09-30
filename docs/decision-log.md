@@ -732,3 +732,37 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   `ultra` 금지, service tier 임의 지정 금지.
 - 기각: model ID와 effort를 표에 고정하는 방식(DL-064). 2026-09-07 표에 없던 `gpt-6.1-sol`,
   `gpt-6-sol`, `gpt-6-luna`가 2026-09-30 `codex debug models` 카탈로그에 올라와 표의 lane이 낡았다.
+
+## 2026-09-30 · Orca 1.4.216 호환과 치명 종료 알림
+
+### DL-066 · Orca 출력은 읽는 필드만 검사하고 coordinator pane은 terminal show로 증명한다
+
+- 사용자 결정: Bridge가 읽는 Orca 출력 필드는 존재·type·의미를 검사하고 그 밖의 필드는 무시한다. 읽는
+  필드가 없거나 type이 다르면 계속 fail closed한다. version-matched Orca guide도 "Treat unknown optional
+  fields as absent"를 요구한다.
+- 대상은 Orca CLI 출력 파서다: `repo list`, 설치 preflight의 `status` readiness, `run-show`, strict
+  `task-list`·`gate-list`·`gate-resolve`·`worker-list`·`dispatch-show`. Bridge가 정의한 계약(channel pipe
+  protocol, gate-register JSON, 저장된 resume snapshot, Codex marker)은 exact 검사를 유지한다.
+- Orca 1.4.216 Run row에는 `coordinator_pane_key`가 없다. Claude Channel binding은 coordinator handle과
+  generation으로 만들고, 전달 직전 그 handle의 `terminal show` pane이 Adapter hello의 pane과 같아야 한다
+  (사용자 결정). Codex wake는 Run row의 handle·generation을 marker와 대조하고 pane은 기존 terminal route
+  검사로 증명한다.
+- `worker-list`는 모든 페이지를 읽는다. 페이지마다 Run 전체 기준 `counts`·`page.total`이 같고 합친 row 수가
+  total과 같아야 한다. 어긋나면 strict 재개 판정은 실패로 두고 다음 주기에 재시도하며, Run 관찰은 증거
+  불완전으로 둔다.
+- 결과로 `run-show`의 모르는 필드도 더는 거부하지 않는다. 이전에는 "unexpected authority field"로
+  `gate-resolve` 전에 막았다. authority는 계속 exact Run id와 `coordinator_handle`에서 온다.
+- 기각: 관측한 필드만 exact 목록에 추가하는 방식(2026-09-08 `projectHostSetupMethod` 수정). 2026-09-10
+  사용자가 한 repository의 external-worktree 안내를 닫자 row에 optional 필드 2개가 생겼고, exact 검사가
+  discovery pass 전체를 실패시켜 daemon이 17일 동안 1분마다 재시작·종료를 반복했다.
+- 기각: Claude 경로의 pane 대조 제거. 사용자가 `terminal show` 대조 유지를 택했다.
+
+### DL-067 · daemon 치명 종료는 원인별로 하루 한 번 Slack에 알린다
+
+- 사용자 결정: daemon이 0이 아닌 코드로 끝나면 decisions 채널에 소유자 멘션과 원인 코드 한 줄을
+  게시한다. 원인 코드는 observer fatal 원인(예: `discovery.schema_drift`)이 있으면 그것을 쓴다.
+- 같은 원인은 24시간 안에 다시 알리지 않는다. 기록은 운영 로그 디렉터리의 `fatal-alert.json`에 두고 state
+  DB schema는 바꾸지 않는다. Slack API 거부는 게시되지 않았다는 증거이므로 기록하지 않고 다음 기동이
+  재시도한다. timeout과 알 수 없는 실패는 게시됐을 수 있어 기록한다.
+- 알림은 최대 10초 best-effort이며 종료 코드와 종료를 바꾸지 않는다. payload와 오류 본문은 싣지 않는다.
+- 한계: Slack poster를 만들기 전의 실패와 launcher 단계 실패(token 누락, release drift)는 알리지 못한다.

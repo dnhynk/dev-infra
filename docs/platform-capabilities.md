@@ -10,7 +10,7 @@
 
 | 도구 | 버전 | 비고 |
 |---|---|---|
-| Orca | `1.4.187` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready |
+| Orca | `1.4.216` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready. 2026-09-30 확인. 앱이 스스로 업데이트되며 출력 형식 변화는 §2.2 |
 | Claude Code | `2.1.246` | `C:\Users\<user>\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 production code는 `2.1.243` target surface에 고정돼 있다. research preview이므로 D3 재수용 전에 이 버전에서 다시 검증한다 |
 | codex-cli | `0.149.0` | `C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
 | gh | `2.98.0` | |
@@ -50,6 +50,16 @@ worker-read, worker-release, worker-retain, worker-show, worker-start, worker-st
 
 `effectsApplied`로 실패 시 mutation 발생 여부를 판정한다.
 
+출력 필드는 버전마다 더해지고 빠진다. version-matched guide는 "Clients and remote servers update
+independently. Treat unknown optional fields as absent."라고 요구한다. Bridge의 Orca 출력 파서는 읽는
+필드만 존재·타입·의미를 검사하고 나머지는 무시한다(DL-066). Orca 1.4.216(2026-09-30)에서 관측한 변화:
+
+- `repo list` row: external-worktree 안내를 닫은 repository에 `externalWorktreeInboxBaselinePaths`(string
+  배열)와 `externalWorktreeVisibilityPromptDismissedAt`(epoch ms)가 생긴다.
+- `status`: `result.runtime.connectionState`가 추가됐다.
+- `run-list`/`run-show` row: `coordinator_pane_key`와 `home_database`가 빠졌다(§2.3).
+- `worker-list`: 한 번에 최대 100행을 돌려주는 페이지가 생겼다(§2.6).
+
 mutation 응답은 다음을 포함한다.
 
 ```json
@@ -66,9 +76,7 @@ mutation 응답은 다음을 포함한다.
 {
   "id": "run_a48566be983b",
   "objective": "...",
-  "home_database": "this_database",
   "coordinator_handle": "term_720b6c26-eb04-4a16-ab79-b226ac50c04f",
-  "coordinator_pane_key": "f39db44b-...:8c71884b-...",
   "consumer_generation": 1,
   "legacy": 0,
   "created_at": "2026-08-21T14:32:45Z",
@@ -76,7 +84,9 @@ mutation 응답은 다음을 포함한다.
 }
 ```
 
-`coordinator_handle`과 `coordinator_pane_key`는 `run-create` 시 자동으로 채워진다. row에 repository/worktree identity는 없다.
+`coordinator_handle`은 `run-create` 시 자동으로 채워진다. Orca 1.4.216부터 row에 `coordinator_pane_key`가
+없으므로 coordinator의 pane은 `terminal show --terminal <coordinator_handle>`의 `tabId:leafId`로 확인한다.
+row에 repository/worktree identity는 없다.
 
 Orca Run은 durable namespace이자 coordinator inbox이며, 플랫폼이 repository-bound entity라고 보장하지 않는다. Run↔Repository는 Bridge 정책으로 정의한다.
 
@@ -182,6 +192,11 @@ orca orchestration send --type worker_done --subject "<status>" --body "<3문장
 
 `worker-list --terminal-state` 값: `active`, `reclaimable`, `retained`, `release_pending`, `release_unknown`, `released`. terminal 상태는 process accounting이며 Task status와 별개다. 완료된 Task도 live terminal을 소유할 수 있으므로 liveness 판정에 Task status를 대신 쓰면 안 된다.
 
+Orca 1.4.216의 `worker-list`는 한 호출에 최대 100행(최신 순)을 돌려주고 `page.hasMore`·`page.nextCursor`로
+다음 페이지를 알린다. 다음 페이지는 `--cursor <page.nextCursor>`로 읽는다. `counts`와 `page.total`은 페이지가
+아니라 Run 전체 기준이다(2026-09-30 실측: 313 worker Run에서 모든 페이지가 같은 `counts`·`total`). 그래서
+전체 목록과 `counts`를 대조하려면 모든 페이지를 읽어야 한다.
+
 global `worker-list`는 unbound context에서도 성공하며 일부 row의 `runId + resource.worktreeId`로 Run↔worktree 후보를 얻을 수 있다. historical/released worker도 포함되므로 liveness 증거가 아니고, worker가 없는 Run에는 적용되지 않는다.
 
 `worker-read --source auto|transcript|terminal`. `auto`는 증명 가능한 경우 hook-reported transcript를, 아니면 labeled terminal 출력을 반환한다. released worker도 읽을 수 있다. cursor는 특정 source에 고정되며 Orca가 `source_changed`를 보고하면 새로 읽어야 한다.
@@ -206,15 +221,15 @@ ORCA_AGENT_HOOK_PORT = 51594
 | 환경변수 | 대응 필드 |
 |---|---|
 | `ORCA_TERMINAL_HANDLE` | Run의 `coordinator_handle` |
-| `ORCA_PANE_KEY` | Run의 `coordinator_pane_key`, Task의 `created_by_pane_key` |
+| `ORCA_PANE_KEY` | coordinator 터미널의 `terminal show` `tabId:leafId`, Task의 `created_by_pane_key` |
 | `ORCA_WORKTREE_ID` | Task `created_by_process_incarnation`의 접두부 |
 
 연결 사슬:
 
 ```text
-Orca Run.coordinator_handle / coordinator_pane_key
-   ↕ 동일 값
-coordinator 세션의 ORCA_TERMINAL_HANDLE / ORCA_PANE_KEY
+Orca Run.coordinator_handle ─ terminal show ─ tabId:leafId
+   ↕ 동일 값                                   ↕ 동일 값
+coordinator 세션의 ORCA_TERMINAL_HANDLE        ORCA_PANE_KEY
    ↓
 ORCA_WORKTREE_ID = <workspaceUuid>::<로컬 경로>
    ↓ Git remote
@@ -324,8 +339,9 @@ throwaway Run `run_ebd0bb4592d2`으로 승계를 완주하며 확인한 사실�
 - **인수 명령은 `run-use --id <run_id>`이며 `--takeover-legacy`가 아니다.** 후자는 플랫폼이 자동
   채택한 legacy Run 전용이고 일반 Run(`legacy: 0`)에는 `invalid_argument`로 거부된다.
   `"Legacy takeover is only available for the automatically adopted Run."`
-- 인수에 성공하면 Run row의 `coordinator_handle`·`coordinator_pane_key`가 새 터미널 값으로 바뀌고
-  **`consumer_generation`이 1 증가한다.** 이전 coordinator가 자신이 밀려났음을 판정할 수 있는 값이다.
+- 인수에 성공하면 Run row의 `coordinator_handle`이 새 터미널 값으로 바뀌고 **`consumer_generation`이 1
+  증가한다.** 이전 coordinator가 자신이 밀려났음을 판정할 수 있는 값이다. 새 터미널의 pane은
+  `terminal show`로 확인한다(§2.3).
 
 > ⚠️ **`--text`가 `/`로 시작하면 셸이 경로로 치환할 수 있다.** Git Bash에서 호출했을 때
 > `/init-orchestrate --resume <run>`이 터미널에 `C:/Program Files/Git/init-orchestrate --resume <run>`으로

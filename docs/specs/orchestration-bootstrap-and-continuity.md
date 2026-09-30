@@ -288,7 +288,7 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 |---|---|
 | 제품 요구사항과 작업 규약 | 확정 spec, `AGENTS.md` |
 | orchestration 상태 | Orca live Run/Task/Worker/Gate |
-| Run/coordinator identity | `run-list` Run row의 `coordinator_handle`·`coordinator_pane_key`·`consumer_generation`; 환경변수는 보조 단서 |
+| Run/coordinator identity | `run-list` Run row의 `coordinator_handle`·`consumer_generation`과 그 handle의 `terminal show` pane; 환경변수는 보조 단서 |
 | 코드·worktree 상태 | Git working tree/worktree |
 | PR·CI·merge 상태 | GitHub 원본 |
 | reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` |

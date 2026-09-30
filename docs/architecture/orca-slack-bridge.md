@@ -44,13 +44,15 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
 ### Discovery
 
 - D1에서는 설정 파일에 수동 등록한 repository와 그 Run 후보만 찾는다.
-- Run identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·`consumer_generation`을
-  권위로 읽고, live/stale은 `consumer_generation`으로 구분한다(OD-020).
+- Run identity는 `run-list` row의 `coordinator_handle`·`consumer_generation`을 권위로 읽고, live/stale은
+  `consumer_generation`으로 구분한다(OD-020). coordinator의 pane은 row에 없으므로 그 handle의
+  `terminal show` pane으로 확인한다(DL-066).
 - coordinator 세션의 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID`는 보조 단서로만 쓴다.
 - global worker list의 Run↔worktree 정보는 repository 후보 복구에 사용할 수 있지만 historical/released worker를 liveness로 사용하지 않는다.
-- O1-1은 `orca repo list --json` success envelope/result와 관측된 14-key repository row를 strict parse하는
-  read-only adapter를 추가한다. whole-envelope 또는 row schema drift는 pass 전체 실패이며 raw path/URL/
-  payload를 오류에 복사하지 않는다. durable last-good registry 적용은 O1-2/O1-3 범위다.
+- O1-1은 `orca repo list --json`에서 discovery가 읽는 필드(`ok`, `result.repos`, row `id`·
+  `gitRemoteIdentity`)만 검사하는 read-only adapter를 추가한다. 그 밖의 필드는 무시한다(DL-066). 읽는
+  필드의 schema drift는 pass 전체 실패이며 raw path/URL/payload를 오류에 복사하지 않는다. durable
+  last-good registry 적용은 O1-2/O1-3 범위다.
 - O1-1 GitHub normalizer는 HTTPS, SCP-like `git@github.com`, `ssh://git@github.com` 세 syntax만 받고
   host/owner/repository case와 한 `.git` suffix를 canonicalize한다. Orca `canonicalKey`는 독립 계산값과
   exact 일치할 때만 evidence이며 mismatch는 row-local `canonical_conflict`다.
@@ -62,7 +64,7 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
   canonical GitHub identity, canonical remote당 exact Orca ID N개, blocked conflict를 나타내는 immutable
   effective-config 타입까지만 제공하고 route나 durable registry를 만들지 않는다.
 
-`run-use` 인수 뒤 coordinator handle·pane key는 새 터미널 값으로 바뀌고 generation이 올라가므로, 최초 handle을
+`run-use` 인수 뒤 coordinator handle은 새 터미널 값으로 바뀌고 generation이 올라가므로, 최초 handle을
 Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설정(OD-068)을 따르며, 관측된
 `<uuid>::<path>` worktree id 형식은 안정성이 보장된 계약으로 파싱하지 않는다.
 
