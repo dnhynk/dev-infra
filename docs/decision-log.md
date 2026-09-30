@@ -767,3 +767,17 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   재시도한다. timeout과 알 수 없는 실패는 게시됐을 수 있어 기록한다.
 - 알림은 최대 10초 best-effort이며 종료 코드와 종료를 바꾸지 않는다. payload와 오류 본문은 싣지 않는다.
 - 한계: Slack poster를 만들기 전의 실패와 launcher 단계 실패(token 누락, release drift)는 알리지 못한다.
+
+## 2026-09-30 · Channel 이벤트 receipt 규칙
+
+### DL-068 · coordinator는 channel 이벤트를 묻지 않고 즉시 receipt한다
+
+- 사용자 결정: Channel MCP instructions와 Claude `/init-orchestrate` skill이 둘 다 이 규칙을 명시한다.
+  빈 본문은 설계이고, receipt는 판단이 필요 없는 가시성 확인이므로 사용자에게 묻지 않고 즉시 1회
+  호출한다. 그 뒤 coordinate 중인 Run의 Gate면 Orca에서 다시 읽고, 아니면(probe 등) 아무것도 하지 않는다.
+- 근거: Claude Code 2.1.285 + Opus 5.5 세션은 기존 instructions("call once")만으로는 빈 probe 3개에
+  receipt를 부르지 않았다. 대신 본문이 전달 중 빠졌다고 추정하고 사용자에게 세 번 물었다. T5
+  prototype에서는 instructions만으로 매 event에 receipt tool을 불렀지만 당시 model과 문안은 달랐다.
+- `gate_id`를 untrusted로 다루고 거기서 질문·결정·소유자·행동을 추론하지 않는 규칙은 그대로다.
+- skill은 `--channels` 기동 여부를 부팅 조건으로 검사하지 않는다. 세션은 자기 channel opt-in을 알 수
+  없고(T5), instructions는 flag가 없어도 보인다. 기동 방법은 skill 호출 형태에 운영 안내로 둔다.

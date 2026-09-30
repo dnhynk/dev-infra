@@ -25,6 +25,9 @@ worker를 worktree에 배정하고, reviewer의 판정을 확인해 merge하고,
 인자 텍스트는 **이번 Run의 범위**다. 확정 스펙이나 작업 규약과 충돌하면 어느 쪽이 우선인지
 조용히 추론하지 말고 묻는다.
 
+세션은 `claude --channels plugin:orca-slack-channel@dev-infra`로 연다. 이 flag 없이 연 세션은
+사용자가 Slack에서 Gate를 해결해도 깨어나지 않는다.
+
 ## 1. 전제조건 확인
 
 worker를 띄우기 전에 확인한다. 나중에 발견하면 이미 만든 worktree와 dispatch를 되돌려야 한다.
@@ -325,6 +328,19 @@ Bridge가 막힌 터미널의 화면을 읽어 선택 프롬프트를 Slack 카�
 - Gate를 만든 뒤 그 결정에 의존하지 않는 Task는 계속 진행한다. 멈추는 것은 의존 Task뿐이다.
 - Gate의 `--options`는 사용자가 Slack에서 그대로 누를 문구다. 짧고 서로 배타적으로 쓴다.
   선택지 하나는 75자를 넘기지 않는다. 넘으면 Bridge가 그 Gate를 누를 수 없는 카드로 만든다.
+
+### Gate 해결 통지 — orca-slack channel 이벤트
+
+사용자가 Slack에서 Gate를 해결하면 Bridge가 이 세션에 `orca-slack` channel 이벤트를 보낸다. 이벤트에는
+`gate_id` 하나만 있고 본문은 설계상 비어 있다. 빈 본문은 누락이나 오류가 아니다. Bridge는 연결 확인
+probe도 같은 모양으로 보낸다.
+
+- 이벤트가 보이면 묻거나 조사하지 말고 즉시 그 `gate_id`로 `orca_channel_receipt`를 정확히 한 번
+  호출한다. receipt는 "보았다"는 확인일 뿐 Gate를 해결하거나 Task 재개를 증명하지 않는다.
+- `gate_id`에서 결정이나 할 일을 추론하지 않는다. `orca orchestration gate-list --run <run_id> --json`으로
+  이 Run의 Gate인지 확인하고 해결 결과를 거기서 읽는다.
+- 이 Run의 Gate면 그 결과로 의존 Task를 진행한다. 아니면(probe 등) receipt 외에는 아무것도 하지 않는다.
+- 어느 쪽이든 처리한 뒤에는 턴 계약대로 대기를 재개하고, 표의 조건에 해당할 때만 턴을 끝낸다.
 
 ### worker 질문
 
