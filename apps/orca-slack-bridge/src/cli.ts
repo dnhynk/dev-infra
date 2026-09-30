@@ -1069,6 +1069,8 @@ export type DaemonDependencies = {
   readonly statusOwnerServer?: OperationalStatusOwnerServerLike;
   /** Test seam for the cross-process daemon/closed-snapshot exclusion primitive. */
   readonly statusSnapshotLeaseStore?: OperationalStatusSnapshotLeaseStore;
+  /** Bounded wait for the startup snapshot lease; defaults to STARTUP_SNAPSHOT_LEASE_WAIT_MS. */
+  readonly snapshotLeaseWaitMs?: number;
   /** Test seam for proving the production lease precedes every writable store open. */
   readonly openStore?: (statePath: string) => SqliteDigestStore;
   readonly createChannelDelivery?: (
@@ -1097,6 +1099,9 @@ type ProcessStopLatch = {
  * 실행(콘솔 없는 서비스, 수동 포그라운드 실행)에서 즉시 종료로 오인한다.
  */
 const STOP_ON_PARENT_EXIT = 'ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT';
+/** How long startup waits for a status snapshot lease that a read-only `status` holds briefly. */
+const STARTUP_SNAPSHOT_LEASE_WAIT_MS = 10_000;
+const STARTUP_SNAPSHOT_LEASE_RETRY_MS = 250;
 
 function processStop(): ProcessStopLatch {
   let dispose = (): void => undefined;
@@ -1412,10 +1417,18 @@ export async function runDaemonCommand(
       ? new CurrentUserOperationalStatusCapabilityStore()
       : null;
     const statusSnapshotLeaseStore = dependencies.statusSnapshotLeaseStore ?? nativeStatusStore!;
-    statusSnapshotLease = await statusSnapshotLeaseStore.tryAcquireSnapshotLease(
-      statusCapabilityPath,
-      operationalStatusStateIdentity(resolvedStatePath),
-    );
+    // A read-only `status` holds this lease briefly while no daemon serves it, e.g. every poll of
+    // install --run-now during this very startup. Retry for a bounded window instead of dying on
+    // the first contended attempt; a lease held for the whole window still fails closed.
+    const leaseDeadline = Date.now() + (dependencies.snapshotLeaseWaitMs ?? STARTUP_SNAPSHOT_LEASE_WAIT_MS);
+    for (;;) {
+      statusSnapshotLease = await statusSnapshotLeaseStore.tryAcquireSnapshotLease(
+        statusCapabilityPath,
+        operationalStatusStateIdentity(resolvedStatePath),
+      );
+      if (statusSnapshotLease !== null || Date.now() >= leaseDeadline) break;
+      await new Promise((resolve) => setTimeout(resolve, STARTUP_SNAPSHOT_LEASE_RETRY_MS));
+    }
     if (statusSnapshotLease === null) throw new Error('status.snapshot_lease_failed');
     statusSnapshotLease.assertHeld();
     writableStoreOpenAttempted = true;

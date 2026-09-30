@@ -475,7 +475,9 @@ fingerprint skip/update와 thread dedupe는 그대로이며 Gate thread reply는
 
 observer의 GitHub/Orca/discovery outage는 job-local failure/backoff라 Socket과 Gate plane을 죽이지 않는다.
 반대로 store/schema/config invariant, fixed-pipe ownership, operational status mutation, fatal logger failure는
-daemon-fatal이다. shutdown은 새 ingress와 timers를 먼저 막고 observer/child AbortController를 취소한 뒤
+daemon-fatal이다. startup은 store를 열기 전에 status snapshot lease를 잡는다. daemon이 아직 응답하지 않는 동안
+read-only `status`(예: install `--run-now`의 1초 간격 확인)가 이 lease를 잠깐 쥐므로 최대 10초 재시도하고,
+그동안 계속 쥐여 있을 때만 실패한다. shutdown은 새 ingress와 timers를 먼저 막고 observer/child AbortController를 취소한 뒤
 accepted work를 bounded drain하며, timeout이면 nonzero다. clean shutdown만 daemon clean-stop을 기록하고
 Socket, pipe, status owner, log, store, snapshot lease 순으로 소유권을 놓는다. `desired_state=stopped`도 같은
 graceful 경로를 사용한다.

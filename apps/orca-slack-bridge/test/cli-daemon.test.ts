@@ -1117,12 +1117,48 @@ describe('daemon production wiring', () => {
     }
   });
 
+  it('retries a snapshot lease that a read-only status holds briefly at startup', async () => {
+    // install --run-now polls status every second while the daemon starts; each poll holds the
+    // snapshot lease for a moment, and the daemon must not die on the first contended attempt.
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const leases = new MemorySnapshotLeaseStore();
+    let attempts = 0;
+    let opened = false;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      statusSnapshotLeaseStore: {
+        tryAcquireSnapshotLease: async () => {
+          attempts += 1;
+          return attempts <= 2 ? null : await leases.tryAcquireSnapshotLease();
+        },
+      },
+      snapshotLeaseWaitMs: 5_000,
+      openStore: (path) => {
+        opened = true;
+        return new SqliteDigestStore(path);
+      },
+      channelServer: new FakeChannelServer([]),
+      orca: new ObserverOrca([]),
+      slack: new ObserverSlack([]),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-lease-retry-test',
+    });
+    expect(attempts).toBe(3);
+    expect(opened).toBe(true);
+    expect(code).toBe(0);
+  });
+
   it('fails bounded lease contention before opening a writable store', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
     let opened = false;
     const code = await runDaemonCommand(parsed, CONFIG, {
       statusSnapshotLeaseStore: { tryAcquireSnapshotLease: async () => null },
+      snapshotLeaseWaitMs: 300,
       openStore: (path) => {
         opened = true;
         return new SqliteDigestStore(path);

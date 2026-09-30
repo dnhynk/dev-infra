@@ -597,6 +597,8 @@ function startDaemon(options: {
   readonly stop?: Deferred;
   readonly socketFactoryCalled?: () => void;
   readonly slack?: SlackPoster;
+  /** A contender only needs to prove it fails closed, not wait out the full startup lease window. */
+  readonly snapshotLeaseWaitMs?: number;
 }): Promise<number> {
   const events = options.events;
   const running = runDaemonCommand(parsedDaemon(), CONFIG, {
@@ -608,6 +610,7 @@ function startDaemon(options: {
     },
     orca: options.orca,
     orcaTimeoutMs: 200,
+    ...(options.snapshotLeaseWaitMs === undefined ? {} : { snapshotLeaseWaitMs: options.snapshotLeaseWaitMs }),
     slack: options.slack ?? new RejectingSlack(),
     reconcileIntervalMs: 20,
     connectionFactory: () => {
@@ -679,6 +682,7 @@ describe('D3-4 offline lifecycle acceptance', () => {
       orca,
       stop: { promise: Promise.resolve(), resolve: () => undefined },
       socketFactoryCalled: () => { contenderSocketFactories += 1; },
+      snapshotLeaseWaitMs: 200,
     });
     expect(contenderCode).toBe(1);
     expect(contenderSocketFactories).toBe(0);
