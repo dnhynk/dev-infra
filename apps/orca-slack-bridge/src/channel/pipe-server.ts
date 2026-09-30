@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type Server, type Socket } from 'node:net';
 
 import { listRuns, type OrcaRun, type OrcaRunner } from '../orca/client.js';
+import { readTerminalRoute } from '../terminal/client.js';
 import {
   CHANNEL_PROTOCOL_VERSION,
   ChannelNdjsonDecoder,
@@ -236,19 +237,15 @@ function listenErrorCode(error: unknown): ChannelPipeErrorCode {
     : 'pipe_listen_failed';
 }
 
-function bindingKey(terminalHandle: string, paneKey: string): string {
-  return `${terminalHandle}\u0000${paneKey}`;
-}
-
+/**
+ * Orca 1.4.216 Run rows name the coordinator terminal but no longer its pane, so bindings are keyed
+ * by terminal handle and the pane is proven from the live terminal route at delivery (DL-066).
+ */
 function indexBindingGenerations(runs: readonly OrcaRun[]): BindingGenerationIndex {
   const mutable = new Map<string, Map<string, number>>();
   for (const run of runs) {
-    if (
-      run.coordinatorHandle === null ||
-      run.coordinatorPaneKey === null ||
-      run.consumerGeneration.kind !== 'value'
-    ) continue;
-    const key = bindingKey(run.coordinatorHandle, run.coordinatorPaneKey);
+    if (run.coordinatorHandle === null || run.consumerGeneration.kind !== 'value') continue;
+    const key = run.coordinatorHandle;
     let generations = mutable.get(key);
     if (generations === undefined) {
       generations = new Map();
@@ -676,28 +673,42 @@ export class ChannelPipeServer {
       return { decision: { kind: 'ambiguous', code: 'duplicate_run' }, connection: null };
     }
     const run = runs[0]!;
-    if (
-      run.coordinatorHandle === null ||
-      run.coordinatorPaneKey === null ||
-      run.consumerGeneration.kind !== 'value'
-    ) {
+    if (run.coordinatorHandle === null || run.consumerGeneration.kind !== 'value') {
       return { decision: { kind: 'pending', code: 'run_unreadable' }, connection: null };
     }
+    const coordinatorHandle = run.coordinatorHandle;
 
-    const candidates = connectionSnapshot.filter((connection) =>
+    const handleCandidates = connectionSnapshot.filter((connection) =>
       this.#connections.has(connection) &&
       bindings.has(connection) &&
       connection.hello !== null &&
       connection.epoch !== null &&
-      connection.hello.terminal_handle === run.coordinatorHandle &&
-      connection.hello.pane_key === run.coordinatorPaneKey,
+      connection.hello.terminal_handle === coordinatorHandle,
     );
+    if (handleCandidates.length === 0) {
+      return { decision: { kind: 'pending', code: 'no_candidate' }, connection: null };
+    }
+    // The Run row no longer carries the pane; the Adapter's reported pane must be the live pane of
+    // the Run's coordinator terminal. A route that cannot be read is a failed Run route read.
+    let route;
+    try {
+      route = await abortablePromise(readTerminalRoute(
+        this.#orca,
+        coordinatorHandle,
+        signal === undefined ? undefined : { signal },
+      ), signal);
+    } catch {
+      this.#onError('run_read_failed');
+      return { decision: { kind: 'pending', code: 'run_read_failed' }, connection: null };
+    }
+    const candidates = handleCandidates.filter((connection) =>
+      route !== null && connection.hello!.pane_key === route.paneKey);
     if (candidates.length === 0) {
       return { decision: { kind: 'pending', code: 'no_candidate' }, connection: null };
     }
 
     const currentGeneration = run.consumerGeneration.value;
-    const key = bindingKey(run.coordinatorHandle, run.coordinatorPaneKey);
+    const key = coordinatorHandle;
     const currentCandidates: ConnectionState[] = [];
     let retiredFailedRead = false;
     let retiredStaleGeneration = false;

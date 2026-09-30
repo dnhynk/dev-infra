@@ -32,6 +32,18 @@ const RUN_ID = 'run_channel';
 const TERMINAL = 'term_22222222-2222-4222-8222-222222222222';
 const PANE = '33333333-3333-4333-8333-333333333333:44444444-4444-4444-8444-444444444444';
 
+/** Orca 1.4.216 names the coordinator pane only through `terminal show` (DL-066). */
+function terminalShow(args: readonly string[], panes: ReadonlyMap<string, string>): string | null {
+  if (args[0] !== 'terminal' || args[1] !== 'show') return null;
+  const handle = args[args.indexOf('--terminal') + 1] ?? '';
+  const pane = panes.get(handle);
+  if (pane === undefined) return JSON.stringify({ id: 'fake', ok: false, error: { code: 'not_found' } });
+  const [tabId, leafId] = pane.split(':');
+  return JSON.stringify({ id: 'fake', ok: true, result: { terminal: {
+    handle, tabId, leafId, worktreePath: 'C:/REDACTED/worktree', connected: true, writable: true,
+  } } });
+}
+
 class FakeOrca implements OrcaRunner {
   generation = 1;
   duplicateRun = false;
@@ -42,6 +54,8 @@ class FakeOrca implements OrcaRunner {
   completions = 0;
 
   run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
+    const shown = terminalShow(args, new Map([[TERMINAL, PANE]]));
+    if (shown !== null) return Promise.resolve(shown);
     this.calls += 1;
     if (this.fail) return Promise.reject(new Error('raw private Orca failure'));
     if (args.join(' ') !== 'orchestration run-list --json') {
@@ -51,7 +65,6 @@ class FakeOrca implements OrcaRunner {
       id: RUN_ID,
       objective: 'channel test',
       coordinator_handle: TERMINAL,
-      coordinator_pane_key: PANE,
       consumer_generation: this.generation,
       legacy: false,
       created_at: '2026-08-25T00:00:00.000Z',
@@ -98,6 +111,8 @@ class HeldRouteOrca implements OrcaRunner {
   readonly held: HeldRouteRead[] = [];
 
   run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
+    const shown = terminalShow(args, new Map([[TERMINAL, PANE]]));
+    if (shown !== null) return Promise.resolve(shown);
     this.calls += 1;
     if (args.join(' ') !== 'orchestration run-list --json') {
       return Promise.reject(new Error('unexpected fake command'));
@@ -111,7 +126,6 @@ class HeldRouteOrca implements OrcaRunner {
           id: RUN_ID,
           objective: 'channel test',
           coordinator_handle: TERMINAL,
-          coordinator_pane_key: PANE,
           consumer_generation: generation,
           legacy: false,
           created_at: '2026-08-25T00:00:00.000Z',
@@ -171,6 +185,9 @@ class GlobalAdmissionOrca implements OrcaRunner {
   constructor(readonly bindings: readonly GlobalRouteBinding[]) {}
 
   run(args: readonly string[], _options: OrcaRunOptions = {}): Promise<string> {
+    const shown = terminalShow(args, new Map(this.bindings.map((binding) =>
+      [binding.identity.terminalHandle, binding.identity.paneKey] as const)));
+    if (shown !== null) return Promise.resolve(shown);
     this.calls += 1;
     if (args.join(' ') !== 'orchestration run-list --json') {
       return Promise.reject(new Error('unexpected global-admission command'));
@@ -183,7 +200,6 @@ class GlobalAdmissionOrca implements OrcaRunner {
           id: binding.runId,
           objective: 'global admission test',
           coordinator_handle: binding.identity.terminalHandle,
-          coordinator_pane_key: binding.identity.paneKey,
           consumer_generation: 1,
           legacy: false,
           created_at: '2026-08-25T00:00:00.000Z',
@@ -2256,6 +2272,30 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       {
         ...identity(),
         terminalHandle: 'term_99999999-9999-4999-8999-999999999999',
+      },
+    );
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    expect(await daemon.evaluateProductionRoute(RUN_ID)).toEqual({
+      kind: 'pending',
+      code: 'no_candidate',
+    });
+    expect(daemon.getResourceSnapshot().productionGateWrites).toBe(0);
+  });
+
+  it('keeps the route pending when the Adapter pane is not the live pane of the Run terminal', async () => {
+    // Orca 1.4.216 Run rows carry no pane; terminal show must still prove the Adapter's pane.
+    const path = pipePath('wrong-pane');
+    const daemon = server(path);
+    await daemon.start();
+    let client!: ChannelAdapterClient;
+    client = adapter(
+      path,
+      { notifyGate: async (gateId) => { await client.reportReceipt(gateId); } },
+      {
+        ...identity(),
+        paneKey: '99999999-9999-4999-8999-999999999999:88888888-8888-4888-8888-888888888888',
       },
     );
     client.start();

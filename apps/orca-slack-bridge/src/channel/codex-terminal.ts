@@ -71,9 +71,9 @@ function parseMarker(value: unknown, runId: string): CodexRunMarker | null {
   return { runId, worktreePath, sessionId, terminalHandle, paneKey, generation };
 }
 
+/** Orca 1.4.216 Run rows carry no pane; `sameTerminal` proves the marker pane from terminal show. */
 function sameOwner(run: OrcaRun, marker: CodexRunMarker): boolean {
   return run.coordinatorHandle === marker.terminalHandle &&
-    run.coordinatorPaneKey === marker.paneKey &&
     currentGeneration(run) === marker.generation;
 }
 

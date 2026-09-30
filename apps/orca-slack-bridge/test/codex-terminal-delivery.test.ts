@@ -48,6 +48,9 @@ class FakeOrca implements OrcaRunner {
   readonly calls: string[][] = [];
   generation = 4;
   worktreePath = WORKTREE;
+  /** Orca 1.4.216 run-list/run-show dropped coordinator_pane_key; null omits it from the row. */
+  runPaneKey: string | null = PANE;
+  terminalPane = PANE;
   worktreeAfterSend: string | null = null;
 
   run(args: readonly string[]): Promise<string> {
@@ -57,7 +60,7 @@ class FakeOrca implements OrcaRunner {
         id: RUN_ID,
         objective: 'test Codex route',
         coordinator_handle: HANDLE,
-        coordinator_pane_key: PANE,
+        ...(this.runPaneKey === null ? {} : { coordinator_pane_key: this.runPaneKey }),
         consumer_generation: this.generation,
         legacy: false,
         created_at: '2026-09-07T00:00:00.000Z',
@@ -65,7 +68,7 @@ class FakeOrca implements OrcaRunner {
       }] }));
     }
     if (args[0] === 'terminal' && args[1] === 'show') {
-      const [tabId, leafId] = PANE.split(':');
+      const [tabId, leafId] = this.terminalPane.split(':');
       return Promise.resolve(envelope({ terminal: {
         handle: HANDLE,
         tabId,
@@ -104,6 +107,30 @@ describe('Codex terminal Gate delivery', () => {
       `[orca-gate-wakeup v1 run_id=${RUN_ID} gate_id=${GATE_ID}]`,
     );
     expect(send[send.indexOf('--text') + 1]).toContain('do not infer a decision');
+  });
+
+  it('proves the pane through terminal show when the Orca 1.4.216 Run row has no pane key', async () => {
+    marker();
+    const orca = new FakeOrca();
+    orca.runPaneKey = null;
+    const transport = new CodexTerminalDeliveryTransport({ orca, markerRoot: directory });
+
+    await expect(transport.deliverGate(RUN_ID, GATE_ID)).resolves.toMatchObject({
+      kind: 'sent',
+      receipt: 'application_queued',
+    });
+  });
+
+  it('fails closed without a Run pane key when the terminal pane is not the marker pane', async () => {
+    marker();
+    const orca = new FakeOrca();
+    orca.runPaneKey = null;
+    orca.terminalPane = '44444444-4444-4444-8444-444444444444:55555555-5555-4555-8555-555555555555';
+    const transport = new CodexTerminalDeliveryTransport({ orca, markerRoot: directory });
+
+    const result = await transport.deliverGate(RUN_ID, GATE_ID);
+    expect(result.kind).not.toBe('sent');
+    expect(orca.calls.some((args) => args[0] === 'terminal' && args[1] === 'send')).toBe(false);
   });
 
   it('fails closed before terminal I/O when the marker generation is stale', async () => {

@@ -4,7 +4,8 @@
 
 Exactly one coordinator generation may mutate a Run. Fresh boot establishes it; Resume first
 reconciles read-only state and then uses Orca `run-use`. A predecessor must fence itself before the
-successor is created. A successor does not mutate until the Run row names its terminal and pane.
+successor is created. A successor does not mutate until the Run row names its terminal and
+`terminal show` for that terminal reports its pane.
 
 Keep the repository's handoff file current at safe checkpoints. If the repository has no format,
 use `HANDOFF.md` with:
@@ -80,8 +81,8 @@ When the Stop hook directs rollover, or context quality is visibly degraded:
 5. Send `$init-orchestrate --resume <run_id>` with text and Enter in one Orca terminal call.
 6. Wait for TUI idle and inspect the screen. If the text remains unsubmitted, send Enter once; do
    not duplicate the text.
-7. Confirm the successor has reconciled and the Run consumer generation now names its terminal and
-   pane. Update evidence in the handoff.
+7. Confirm the successor has reconciled, the Run names its terminal at the advanced consumer
+   generation, and `terminal show` reports its pane. Update evidence in the handoff.
 8. Stop mutating from the predecessor and allow it to exit.
 
 Use `--screen`, not accumulated terminal output, for TUI state. After three failed readiness or

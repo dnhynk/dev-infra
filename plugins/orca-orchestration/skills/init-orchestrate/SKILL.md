@@ -69,8 +69,9 @@ Git worktree, GitHub PR/review/CI, and cleanup state. Live state wins. Do not du
 merge, or already-completed external effect.
 
 Only after the predecessor has fenced itself, take ownership with the installed guide's `run-use`
-flow. Confirm that the Run now names this terminal/pane and has advanced its consumer generation;
-then replace the marker with this session's identity. Reuse valid workers, worktrees, and PRs.
+flow. Confirm that the Run now names this terminal and has advanced its consumer generation, and
+that `terminal show` for this terminal reports this session's `ORCA_PANE_KEY` (Run rows carry no
+pane); then replace the marker with this session's identity. Reuse valid workers, worktrees, and PRs.
 
 ## Codex Run marker
 

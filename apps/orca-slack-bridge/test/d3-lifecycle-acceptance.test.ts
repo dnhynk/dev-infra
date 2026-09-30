@@ -38,6 +38,16 @@ import { SqliteDigestStore } from '../src/store/sqlite.js';
 const RUN_ID = 'run_d3_acceptance';
 const TERMINAL = 'term_d3-acceptance';
 const PANE = 'd3-acceptance:pane-1';
+
+/** Orca 1.4.216 names the coordinator pane only through `terminal show` (DL-066). */
+function terminalShow(args: readonly string[]): string | null {
+  if (args[0] !== 'terminal' || args[1] !== 'show') return null;
+  const [tabId, leafId] = PANE.split(':');
+  return JSON.stringify({ id: 'fake', ok: true, result: { terminal: {
+    handle: TERMINAL, tabId, leafId, worktreePath: 'C:/REDACTED/worktree', connected: true,
+    writable: true,
+  } } });
+}
 const STATEFUL_GATE_ID = 'gate_d3acceptance';
 const STATEFUL_SOURCE_TASK_ID = 'task_d3source';
 const STATEFUL_SOURCE_DISPATCH_ID = 'ctx_d3source';
@@ -63,6 +73,8 @@ class RunListOrca implements OrcaRunner {
   missing = false;
 
   run(args: readonly string[]): Promise<string> {
+    const shown = terminalShow(args);
+    if (shown !== null) return Promise.resolve(shown);
     if (args.join(' ') !== 'orchestration run-list --json') {
       return Promise.reject(new Error('unexpected acceptance Orca command'));
     }
@@ -70,7 +82,6 @@ class RunListOrca implements OrcaRunner {
       id: RUN_ID,
       objective: 'D3-4 hermetic acceptance fixture',
       coordinator_handle: TERMINAL,
-      coordinator_pane_key: PANE,
       consumer_generation: this.generation,
       legacy: false,
       created_at: '2026-08-26T00:00:00.000Z',
@@ -111,6 +122,8 @@ class StatefulAcceptanceOrca implements OrcaRunner {
   }
 
   run(args: readonly string[]): Promise<string> {
+    const shown = terminalShow(args);
+    if (shown !== null) return Promise.resolve(shown);
     const command = args[1] ?? '';
     this.calls.push(command);
     const ok = (result: unknown): string => JSON.stringify({
@@ -122,7 +135,6 @@ class StatefulAcceptanceOrca implements OrcaRunner {
           id: RUN_ID,
           objective: 'D3-4 stateful lifecycle acceptance',
           coordinator_handle: TERMINAL,
-          coordinator_pane_key: PANE,
           consumer_generation: this.generation,
           legacy: false,
           created_at: STATEFUL_AT,

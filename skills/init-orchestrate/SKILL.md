@@ -91,7 +91,8 @@ handoff 문서만 읽고 바로 mutation하지 않는다.
 5. 차이는 live system을 기준으로 reconcile하고 그 사실을 기록한다.
 6. predecessor의 ownership 반납이 확인된 뒤에만 mutation 권한을 얻는다
    (`orca orchestration run-use --id <run_id>`, 이 터미널에서 실행). 인수되면 Run의
-   coordinator handle과 pane key가 이 터미널 값으로 바뀌고 consumer generation이 올라간다.
+   coordinator handle이 이 터미널로 바뀌고 consumer generation이 올라간다. Run 행에는 pane이 없으므로
+   `orca terminal show --terminal <이 handle> --json`의 pane이 이 세션의 `ORCA_PANE_KEY`와 같은지 확인한다.
    `--takeover-legacy`는 플랫폼이 자동 채택한 legacy Run 전용이며 일반 Run에는 거부된다.
 7. §7의 Run 마커를 이 세션 값으로 갱신한다. 갱신하지 않으면 monitor가 이 세션을 coordinator로 인식하지 못한다.
 8. 아직 진행 중인 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은
