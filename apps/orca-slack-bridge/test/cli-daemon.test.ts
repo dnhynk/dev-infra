@@ -552,6 +552,32 @@ describe('daemon production wiring', () => {
     reopened.close();
   });
 
+  it('announces a fatal observer drift once per cause across the restart loop', async () => {
+    const logDir = join(dir, 'logs');
+    const parsed = parseArgs(['daemon', '--state', statePath, '--log-dir', logDir]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const slack = new ObserverSlack([]);
+    const start = (): Promise<number> => runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer([]),
+      orca: new ObserverOrca([], { discoverySchema: true }),
+      slack,
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-fatal-alert-test',
+    });
+
+    // The Scheduled Task restarts the daemon every minute; the owner hears about the cause once.
+    expect(await start()).toBe(1);
+    expect(await start()).toBe(1);
+    const notices = slack.posts.filter((post) => post.text.includes('discovery.schema_drift'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ channel: CHANNEL });
+    expect(notices[0]!.text).toContain('<@U0OWNER>');
+  });
+
   it('treats a discovery store mutation failure as fatal before Socket ingress', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');

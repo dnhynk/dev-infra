@@ -114,6 +114,7 @@ import {
   type OperationalTelemetrySink,
 } from './operational/logger.js';
 import { OperationalHealthTelemetry } from './operational/health.js';
+import { announceFatalExit } from './operational/fatal-alert.js';
 import {
   fingerprintOperationalBuild,
   fingerprintOperationalConfig,
@@ -1271,6 +1272,8 @@ export async function runDaemonCommand(
    */
   let observerFatalCause: unknown;
   let commandFailed = false;
+  /** Set once the daemon's Slack poster exists; a fatal exit before that cannot post a notice. */
+  let fatalAlertSlack: SlackPoster | null = null;
   let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
   let gateReconciliation: Promise<void> | null = null;
   let deliveryReconciliation: Promise<void> | null = null;
@@ -1455,6 +1458,7 @@ export async function runDaemonCommand(
       ? (dependencies.slack === undefined ? botToken(process.env) : null)
       : null;
     const slack = dependencies.slack ?? new SlackWebApiPoster({ token: productionBotToken! });
+    fatalAlertSlack = slack;
     const threadPoster = typeof (slack as Partial<ThreadPoster>).reply === 'function'
       ? slack as SlackPoster & ThreadPoster
       : null;
@@ -2284,6 +2288,24 @@ export async function runDaemonCommand(
       statusSnapshotLease = null;
     }
     processStopLatch?.dispose();
+    if (
+      fatalAlertSlack !== null && config.slack !== undefined &&
+      (commandFailed || writableStoreClosureUncertain || observerDrainTimedOut ||
+        fatalOperationalFailure || stopReason === 'pipe_failure')
+    ) {
+      // Every nonzero exit ends here. Tell the owner once per cause instead of dying silently in
+      // the Scheduled Task's one-minute restart loop.
+      await announceFatalExit({
+        code: observerFatalCause instanceof ObserverJobFailure
+          ? observerFatalCause.errorCode
+          : commandFailed ? 'daemon.startup_failed' : 'daemon.fatal_stop',
+        slack: fatalAlertSlack,
+        channel: config.slack.channels.decisions,
+        ownerUserId: config.slack.ownerUserIds[0] ?? null,
+        logDir: resolveOperationalLogDir(parsed.logDir),
+        now: new Date(),
+      });
+    }
     if (writableStoreClosureUncertain || observerDrainTimedOut || fatalOperationalFailure) {
       // Do not release or discard the descriptor/mutex when the writable handle may still be live.
       // The CLI entrypoint exits nonzero immediately after this bounded static diagnostic.
