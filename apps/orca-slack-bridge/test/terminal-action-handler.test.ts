@@ -23,7 +23,7 @@ const HANDLE = 'term_0bb89f84-bd61-4ffe-9dce-1c05d9e197f0';
 const AT = '2026-08-29T11:18:27.177Z';
 
 /** 운영 config와 같은 모양. teamId는 실제 워크스페이스 형식을 따른다. */
-const CONFIG = { teamId: 'T0BRD3XH6LE' } as unknown as SlackConfig;
+const CONFIG = { teamId: 'T0FAKETEAM1' } as unknown as SlackConfig;
 
 /**
  * Slack이 버튼 클릭에 보내는 봉투.
@@ -36,17 +36,17 @@ function clickPayload(actionId: string, value: string): unknown {
     type: 'block_actions',
     api_app_id: 'A0BRXXXXXXX',
     token: 'legacy',
-    team: { id: 'T0BRD3XH6LE', domain: 'workspace' },
-    user: { id: 'U0BRUSER01', username: 'dongh', team_id: 'T0BRD3XH6LE' },
+    team: { id: 'T0FAKETEAM1', domain: 'workspace' },
+    user: { id: 'U0BRUSER01', username: 'test-user', team_id: 'T0FAKETEAM1' },
     container: {
       type: 'message',
       message_ts: '1788002307.783239',
-      channel_id: 'C0BRG9YMF7U',
+      channel_id: 'C0FAKECHAN1',
       is_ephemeral: false,
       thread_ts: '1787932047.002029',
     },
     trigger_id: '123.456.abc',
-    channel: { id: 'C0BRG9YMF7U', name: 'agent-runs' },
+    channel: { id: 'C0FAKECHAN1', name: 'agent-runs' },
     message: { type: 'message', ts: '1788002307.783239', thread_ts: '1787932047.002029' },
     response_url: 'https://hooks.slack.com/actions/T0/1/abc',
     is_enterprise_install: false,
