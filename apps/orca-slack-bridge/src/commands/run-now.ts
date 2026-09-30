@@ -57,7 +57,7 @@ export type RunNowDependencies = {
   readonly manifestStore?: WindowsRuntimeManifestStore;
 };
 
-export type RunNowResult = { readonly action: 'already-healthy' | 'started' };
+export type RunNowResult = { readonly action: 'already-healthy' | 'started' | 'awaited-running' };
 
 export function validateWindowsWaitSeconds(value: number): number {
   if (!Number.isSafeInteger(value) || value < MIN_WINDOWS_WAIT_SECONDS || value > MAX_WINDOWS_WAIT_SECONDS) {
@@ -225,11 +225,11 @@ export async function runManagedTaskNow(
   const inspectHealth = dependencies.inspectHealth ?? defaultHealthInspector(scheduler);
   const first = await inspectHealth(launch);
   if (healthyExactRelease(first, launch.releaseDigest)) return { action: 'already-healthy' };
-  if (initial.runtime.executionState === 'running') {
-    // Running-but-stale is deliberately not multiplied or terminated.
-    throw new Error('windows.run_now.running_stale');
-  }
-  await scheduler.start(initial.xml);
+  // A running task is never started a second time or terminated. install's registration trigger
+  // starts the task itself, so a running task is usually still before its first heartbeat: wait
+  // for it, and call it stale only if it stays unhealthy for the whole wait.
+  const alreadyRunning = initial.runtime.executionState === 'running';
+  if (!alreadyRunning) await scheduler.start(initial.xml);
   const sleep = dependencies.sleep ?? defaultSleep;
   const now = dependencies.nowMilliseconds ?? (() => performance.now());
   const pollMilliseconds = dependencies.pollMilliseconds ?? 1_000;
@@ -247,7 +247,9 @@ export async function runManagedTaskNow(
   const deadline = previousNow + waitSeconds * 1_000;
   while (monotonicNow() <= deadline) {
     const observed = await inspectHealth(launch);
-    if (healthyExactRelease(observed, launch.releaseDigest)) return { action: 'started' };
+    if (healthyExactRelease(observed, launch.releaseDigest)) {
+      return { action: alreadyRunning ? 'awaited-running' : 'started' };
+    }
     if (observed.scheduler.kind === 'absent' ||
         (observed.scheduler.kind === 'present' &&
          (observed.scheduler.ownership !== 'owned' || observed.scheduler.integrity !== 'matched'))) {
@@ -257,5 +259,5 @@ export async function runManagedTaskNow(
     if (remaining <= 0) break;
     await sleep(Math.min(pollMilliseconds, remaining));
   }
-  throw new Error('windows.run_now.heartbeat_timeout');
+  throw new Error(alreadyRunning ? 'windows.run_now.running_stale' : 'windows.run_now.heartbeat_timeout');
 }
