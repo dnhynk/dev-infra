@@ -92,6 +92,18 @@ describe('parseOrcaRepositoryList', () => {
     }]);
   });
 
+  it.each([true, false])('accepts the installed unset setup-method row (repoIcon=%s)', (withIcon) => {
+    // Orca 1.4.188 omits the unset setup preference on a newly added git repository.
+    const value = withIcon ? row() : rowWithoutRepoIcon();
+    delete value['projectHostSetupMethod'];
+    const got = parseOrcaRepositoryList(envelope([row(), value]));
+    expect(got.rows).toHaveLength(2);
+    expect(got.rows.every((item) => item.status === 'valid')).toBe(true);
+    expect(got.diagnostics).toEqual([]);
+    expect(contractCode(() => parseOrcaRepositoryList(envelope([{ ...value, extra: true }]))))
+      .toBe('ORCA_REPOSITORY_ROW_INVALID');
+  });
+
   it('represents null remote as a row-local no_remote diagnostic', () => {
     const got = parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: null, repoIcon: null })]));
     expect(got.rows[0]).toMatchObject({ status: 'no_remote', rowIndex: 0 });
@@ -220,7 +232,7 @@ describe('parseOrcaRepositoryList', () => {
       .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
   });
 
-  const rowKeys = Object.keys(row()).filter((key) => key !== 'repoIcon');
+  const rowKeys = Object.keys(row()).filter((key) => key !== 'repoIcon' && key !== 'projectHostSetupMethod');
   it.each(rowKeys)('rejects a missing top-level row key: %s', (key) => {
     const value = row();
     delete value[key];
@@ -234,7 +246,7 @@ describe('parseOrcaRepositoryList', () => {
   });
 
   it('rejects every other missing or extra key in the repoIcon-omitted row variant', () => {
-    for (const key of Object.keys(rowWithoutRepoIcon())) {
+    for (const key of Object.keys(rowWithoutRepoIcon()).filter((key) => key !== 'projectHostSetupMethod')) {
       const value = rowWithoutRepoIcon();
       delete value[key];
       expect(contractCode(() => parseOrcaRepositoryList(envelope([value]))))
@@ -250,7 +262,8 @@ describe('parseOrcaRepositoryList', () => {
     ['id', 1], ['path', null], ['displayName', false], ['badgeColor', 1], ['addedAt', 1.5],
     ['kind', null], ['externalWorktreeVisibilityLegacy', 0], ['gitUsername', []],
     ['repoIcon', 'icon'], ['upstream', {}], ['gitRemoteIdentity', []],
-    ['projectHostSetupMethod', false], ['hookSettings', null], ['externalWorktreeVisibility', 1],
+    ['projectHostSetupMethod', false], ['projectHostSetupMethod', null],
+    ['hookSettings', null], ['externalWorktreeVisibility', 1],
   ];
   it.each(wrongTypes)('rejects wrong top-level row type: %s', (key, value) => {
     expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ [key]: value })]))))

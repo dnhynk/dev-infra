@@ -82,11 +82,14 @@ function requireString(row: Record<string, unknown>, key: string): void {
 }
 
 function validateRowShape(value: unknown): Record<string, unknown> {
-  if (
-    !isRecord(value) ||
-    (!hasExactKeys(value, ROW_KEYS_WITH_REPO_ICON) &&
-      !hasExactKeys(value, ROW_KEYS_WITHOUT_REPO_ICON))
-  ) {
+  if (!isRecord(value)) fail('ORCA_REPOSITORY_ROW_INVALID');
+  const keysWithSetupMethod = 'repoIcon' in value ? ROW_KEYS_WITH_REPO_ICON : ROW_KEYS_WITHOUT_REPO_ICON;
+  // Orca 1.4.188 also emits git rows without this optional setup preference.
+  // Keep every identity field required and reject unknown fields in each observed variant.
+  const expectedKeys = 'projectHostSetupMethod' in value
+    ? keysWithSetupMethod
+    : keysWithSetupMethod.filter((key) => key !== 'projectHostSetupMethod');
+  if (!hasExactKeys(value, expectedKeys)) {
     fail('ORCA_REPOSITORY_ROW_INVALID');
   }
   for (const key of [
@@ -96,11 +99,11 @@ function validateRowShape(value: unknown): Record<string, unknown> {
     'badgeColor',
     'kind',
     'gitUsername',
-    'projectHostSetupMethod',
     'externalWorktreeVisibility',
   ]) {
     requireString(value, key);
   }
+  if ('projectHostSetupMethod' in value) requireString(value, 'projectHostSetupMethod');
   if (!Number.isSafeInteger(value['addedAt'])) fail('ORCA_REPOSITORY_ROW_INVALID');
   if (typeof value['externalWorktreeVisibilityLegacy'] !== 'boolean') {
     fail('ORCA_REPOSITORY_ROW_INVALID');
