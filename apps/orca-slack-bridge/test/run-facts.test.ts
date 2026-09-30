@@ -371,7 +371,13 @@ describe('live/stale (OD-020)', () => {
   it('generation이 같아도 handle이 다르면 판정하지 않는다', () => {
     const r = run({ coordinatorHandle: 'term_a', coordinatorPaneKey: 'pane:a', consumerGeneration: ok(3) });
     expect(classifyBinding(r, { handle: 'term_b', paneKey: 'pane:a', generation: 3 })).toBe('unknown');
-    expect(classifyBinding(r, { handle: 'term_a', paneKey: 'pane:z', generation: 3 })).toBe('unknown');
+  });
+
+  it('Orca 1.4.216 Run row에는 pane이 없으므로 같은 handle과 generation이면 live다', () => {
+    // run-list/run-show dropped coordinator_pane_key; Task rows still record created_by_pane_key.
+    const r = run({ coordinatorHandle: 'term_a', coordinatorPaneKey: null, consumerGeneration: ok(3) });
+    expect(classifyBinding(r, { handle: 'term_a', paneKey: 'pane:a', generation: 3 })).toBe('live');
+    expect(classifyBinding(r, { handle: 'term_b', paneKey: 'pane:a', generation: 3 })).toBe('unknown');
   });
 
   it('Run row보다 앞선 generation을 live로 부르지 않는다', () => {

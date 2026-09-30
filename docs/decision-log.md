@@ -746,7 +746,8 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - Orca 1.4.216 Run row에는 `coordinator_pane_key`가 없다. Claude Channel binding은 coordinator handle과
   generation으로 만들고, 전달 직전 그 handle의 `terminal show` pane이 Adapter hello의 pane과 같아야 한다
   (사용자 결정). Codex wake는 Run row의 handle·generation을 marker와 대조하고 pane은 기존 terminal route
-  검사로 증명한다.
+  검사로 증명한다. Run 카드의 binding liveness는 표시용 판정이므로 Run row의 handle·generation으로만
+  판정하고 Task에 기록된 pane은 관측값으로만 보여 준다.
 - `worker-list`는 모든 페이지를 읽는다. 페이지마다 Run 전체 기준 `counts`·`page.total`이 같고 합친 row 수가
   total과 같아야 한다. 어긋나면 strict 재개 판정은 실패로 두고 다음 주기에 재시도하며, Run 관찰은 증거
   불완전으로 둔다.
