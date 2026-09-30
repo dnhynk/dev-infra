@@ -6397,6 +6397,29 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     }
   }
 
+  /**
+   * Drop the routing generation when the daemon starts under a different config fingerprint.
+   * Routing rows are last-known-good only for the config the health row records, so the daemon
+   * calls this before that record changes. Issue history stays, as in the replace path.
+   */
+  clearDiscoveryRouting(): void {
+    let transactionOpen = false;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      transactionOpen = true;
+      this.db.prepare('DELETE FROM orca_repository_binding').run();
+      this.db.prepare('DELETE FROM repository_registry').run();
+      this.db.exec('COMMIT');
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) {
+        try { this.db.exec('ROLLBACK'); } catch { /* preserve the static public error */ }
+      }
+      if (error instanceof OperationalStoreError) throw error;
+      operationalFail('OPERATIONAL_CONFLICT');
+    }
+  }
+
   hasDiscoveryRoutingRows(): boolean {
     try {
       const row = this.db.prepare(`

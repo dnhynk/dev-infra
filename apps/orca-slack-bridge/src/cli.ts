@@ -1652,6 +1652,10 @@ export async function runDaemonCommand(
         // existing one-second refresh timer rebuild the fail-closed status cache.
       }
     });
+    // The automation block trusts routing rows as last-known-good when the health row records
+    // this config. Drop them before a config change is recorded; otherwise, if the first pass
+    // under the new config fails, the next start takes the old config's routing as proven.
+    if (previousHealth?.configFingerprint !== configFingerprint) store.clearDiscoveryRouting();
     await health.daemonStarted({
       instanceId,
       buildFingerprint,

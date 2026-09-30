@@ -40,6 +40,10 @@ import type {
   OperationalStatusSnapshotLease,
   OperationalStatusSnapshotLeaseStore,
 } from '../src/operational/status-capability.js';
+import {
+  fingerprintOperationalBuild,
+  fingerprintOperationalConfig,
+} from '../src/operational/status.js';
 
 const GATE_ID = 'gate_daemon';
 const RUN_ID = 'run_daemon';
@@ -550,6 +554,66 @@ describe('daemon production wiring', () => {
       state: 'failed', errorCode: 'discovery.schema_drift', consecutiveFailures: 1,
     });
     reopened.close();
+  });
+
+  it('does not revive routing from the previous config after the first pass under a new config fails', async () => {
+    // A daemon under CONFIG discovered and bound one Orca repository.
+    const previousAt = new Date(Date.now() - 60_000).toISOString();
+    const seeded = new SqliteDigestStore(statePath);
+    seeded.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'reconcile',
+      repositories: [{
+        canonicalKey: 'github.com/acme/widget', nameWithOwner: 'acme/widget',
+        githubRepositoryId: 101, projectKey: 'auto:github.com/acme/widget',
+        projectOrigin: 'auto', evidence: 'verified',
+      }],
+      bindings: [{
+        orcaRepositoryId: 'orca-widget', canonicalKey: 'github.com/acme/widget',
+        projectKey: 'auto:github.com/acme/widget', origin: 'discovered', evidence: 'verified',
+      }],
+      issues: [], at: previousAt,
+    });
+    seeded.recordDaemonStart({
+      instanceId: 'previous-daemon',
+      buildFingerprint: fingerprintOperationalBuild('development'),
+      configFingerprint: fingerprintOperationalConfig(ENABLED_CONFIG),
+      at: previousAt,
+    });
+    seeded.close();
+
+    const changed = parseConfig({
+      ...CONFIG,
+      slack: { ...CONFIG.slack, channels: { ...CONFIG.slack.channels, prDigest: 'C0PRDIGEST2' } },
+    });
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const start = (orca: OrcaRunner): Promise<number> => runDaemonCommand(parsed, changed, {
+      channelServer: new FakeChannelServer([]),
+      orca,
+      slack: new ObserverSlack([]),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-config-transition-test',
+    });
+
+    // The first pass under the new config dies before it proves any routing.
+    expect(await start(new ObserverOrca([], { discoverySchema: true }))).toBe(1);
+    let reopened = new SqliteDigestStore(statePath);
+    const firstFailure = reopened.findDaemonJobOutcome('repository-discovery')?.errorCode;
+    reopened.close();
+
+    // The restart runs the same new config, which the health row now records. Routing written
+    // under the previous config must still not come back as last-known-good.
+    expect(await start(new ObserverOrca([]))).toBe(0);
+    reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')?.state).toBe('succeeded');
+    expect(reopened.readEffectiveDiscoverySnapshot().bindings).toEqual([]);
+    reopened.close();
+    // With no stale routing left to guard, the failure keeps its own cause.
+    expect(firstFailure).toBe('discovery.schema_drift');
   });
 
   it('announces a fatal observer drift once per cause across the restart loop', async () => {

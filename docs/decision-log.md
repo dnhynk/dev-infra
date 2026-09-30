@@ -781,3 +781,19 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - `gate_id`를 untrusted로 다루고 거기서 질문·결정·소유자·행동을 추론하지 않는 규칙은 그대로다.
 - skill은 `--channels` 기동 여부를 부팅 조건으로 검사하지 않는다. 세션은 자기 channel opt-in을 알 수
   없고(T5), instructions는 flag가 없어도 보인다. 기동 방법은 skill 호출 형태에 운영 안내로 둔다.
+
+## 2026-09-30 · config 변경과 routing LKG
+
+### DL-069 · config가 바뀐 기동은 새 fingerprint를 기록하기 전에 routing을 비운다
+
+- 사용자 결정: daemon은 health의 config fingerprint가 현재 config와 다르면 새 fingerprint를 기록하기 전에
+  `orca_repository_binding`과 `repository_registry`를 비운다. issue 이력은 replace 경로처럼 남긴다. 그래서
+  남은 routing 행은 언제나 health가 기록한 config에서 만든 것이다.
+- 근거: 기동 시 LKG 증거는 `daemon_health.config_fingerprint` 하나다. daemon은 이 값을 discovery 성공과
+  무관하게 기동 직후 기록한다. 그래서 새 config의 첫 pass가 실패하면, 같은 config로 다시 기동한 daemon이
+  옛 config의 routing을 검증된 LKG로 읽었다. 회귀 테스트가 수정 전 코드에서 옛 binding이 되살아나는 것을
+  재현했다.
+- 결과: config 변경 직후 첫 pass가 실패하면 `config_drift`가 아니라 원래 원인 코드로 보고되고, 치명 여부도
+  그 원인을 따른다. 예를 들어 확인 deadline 초과는 재시도한다. 비워 둔 routing은 첫 성공 pass가 다시 만든다.
+- 기각: routing 세대의 fingerprint를 그 세대를 쓴 transaction에 durable하게 기록하는 방식. 가장 정확하지만
+  state schema v17 migration이 필요하다.

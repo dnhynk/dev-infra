@@ -450,7 +450,9 @@ scan 뒤 yield 전에 모든 handle을 닫으므로 Windows rotation을 막지 �
 
 daemon startup은 writable v13 store와 fixed Channel pipe를 먼저 소유하고 D2 Gate·D3 Channel recovery를
 끝낸다. 호환되는 config fingerprint의 LKG routing만 읽은 뒤 같은 observer lane에서 bounded repository
-discovery를 즉시 수행하고, 그 pass가 끝난 뒤 Slack Socket을 연다. Socket open 직후 Run observer를 due로
+discovery를 즉시 수행하고, 그 pass가 끝난 뒤 Slack Socket을 연다. config fingerprint가 health 기록과 다르면
+새 fingerprint를 기록하기 전에 routing 두 표를 비우므로, 남은 routing 행은 언제나 health가 기록한 config에서
+만든 것이다(DL-069). Socket open 직후 Run observer를 due로
 만들고 PR digest의 첫 due는 60초 뒤다. 이후 discovery/Run/digest는 각각 300/120/900초 completion-based
 schedule, 30/90/300초 deadline, installation-seeded deterministic jitter와 30초 시작 exponential backoff를
 쓴다. 세 job은 due bit만 coalesce하는 round-robin lane 하나를 공유해 backlog나 observer 간 overlap을 만들지
