@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { OperationalStoreError } from '../store/sqlite.js';
 import { entityIdentity, type OperationalTelemetrySink } from '../operational/logger.js';
 import type {
   OperationalStore,
@@ -167,12 +168,27 @@ export async function postSlackRootAtMostOnce(input: {
 }): Promise<SlackRootCreateResult> {
   const store = rootStore(input.store);
   const runtime = input.runtime ?? processRootIntentRuntime();
-  const prepared = store.prepareSlackRootIntent({
-    ...input.entity,
-    channelId: input.channel,
-    renderFingerprint: input.renderFingerprint,
-    at: input.now().toISOString(),
-  });
+  let prepared: SlackRootIntentRecord;
+  try {
+    prepared = store.prepareSlackRootIntent({
+      ...input.entity,
+      channelId: input.channel,
+      renderFingerprint: input.renderFingerprint,
+      at: input.now().toISOString(),
+    });
+  } catch (error) {
+    if (!(error instanceof OperationalStoreError) || error.code !== 'OPERATIONAL_CONFLICT') {
+      throw error;
+    }
+    // A changed card cannot replace a possibly sent intent's immutable fingerprint. Keep that
+    // attempt fenced instead of crashing every subsequent observer pass. Re-read after the
+    // conflict so a concurrent claim is covered; pending/channel conflicts still fail closed.
+    const existing = store.findSlackRootIntent(input.entity);
+    if (existing === null || existing.state === 'pending' || existing.channelId !== input.channel) {
+      throw error;
+    }
+    prepared = existing;
+  }
   await rootEvent(runtime, input.entity, 'running');
   await runtime.hooks?.afterPrepare?.(prepared);
   if (prepared.state !== 'pending') {
