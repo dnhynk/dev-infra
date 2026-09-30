@@ -224,6 +224,7 @@ export type GateResumeTaskFact = {
 export type GateResumeSnapshot = {
   readonly schemaVersion: 1;
   readonly sourceTaskId: string;
+  /** Actual Dispatch, or reserved derived-<gate_id> correlation; the latter is never a worker fact. */
   readonly sourceDispatchId: string;
   readonly candidates: readonly GateResumeTaskFact[];
 };
