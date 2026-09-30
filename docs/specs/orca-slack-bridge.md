@@ -406,8 +406,8 @@ pre-read와 현재 exact Gate의 Run·Task·선택지를 대조한 뒤, 해당 T
 Gate의 기존 source Dispatch 검증과 과거 `unavailable` baseline의 소급 관찰 금지는 유지한다.
 
 이 경로는 `CodexTerminalDeliveryTransport`와 delivery state regression으로 hermetic 검증했다. 실제
-`gpt-6-astra` coordinator, plugin hook trust, Slack action을 함께 쓰는 live acceptance는
-[Codex coordinator 운영 절차](../ops/codex-coordinator-setup.md)에 남아 있다.
+Codex coordinator, plugin hook trust, Slack action을 함께 쓰는 live acceptance는 2026-09-08에
+통과했다([실측 기록](../evidence/codex-coordinator-acceptance.md)).
 
 ## 9. Durability와 멱등성
 
