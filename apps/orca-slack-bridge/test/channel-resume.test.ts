@@ -6,6 +6,7 @@ import {
   readGateResumeSnapshot,
 } from '../src/channel/resume.js';
 import {
+  listWorkerPage,
   readExactResumeDispatch,
   readStrictResumeWorkers,
   type OrcaRunner,
@@ -59,6 +60,31 @@ class ResumeOrca implements OrcaRunner {
       }
     }
     return Promise.reject(new Error(`unexpected ${args.join(' ')}`));
+  }
+}
+
+/** Orca 1.4.216 worker-list: at most one page per call, `counts` and `page.total` cover the whole Run. */
+class PagedWorkerOrca implements OrcaRunner {
+  readonly calls: string[][] = [];
+
+  constructor(
+    readonly pages: readonly (readonly Record<string, unknown>[])[],
+    readonly totals: readonly number[] = pages.map(() => pages.flat().length),
+  ) {}
+
+  run(args: readonly string[]): Promise<string> {
+    this.calls.push([...args]);
+    if (args[1] !== 'worker-list') return Promise.reject(new Error(`unexpected ${args.join(' ')}`));
+    const at = args.indexOf('--cursor');
+    const index = at === -1 ? 0 : Number(args[at + 1]!.slice('cursor-'.length));
+    const hasMore = index + 1 < this.pages.length;
+    const total = this.totals[index]!;
+    return Promise.resolve(ok({
+      counts: { released: total },
+      page: { limit: 100, total, hasMore, nextCursor: hasMore ? `cursor-${index + 1}` : null },
+      scope: { run: RUN, source: 'flag' },
+      workers: this.pages[index],
+    }));
   }
 }
 
@@ -218,6 +244,33 @@ describe('strict normalized Task/Dispatch resume evidence', () => {
       null,
       counts,
     ), RUN)).rejects.toThrow(/counts/);
+  });
+
+  it('reads every Orca 1.4.216 worker-list page before checking the run-wide counts', async () => {
+    const orca = new PagedWorkerOrca([
+      [worker('ctx_a', 'task_a', 'completed'), worker('ctx_b', 'task_b', 'completed')],
+      [worker('ctx_c', 'task_c', 'dispatched')],
+    ]);
+    await expect(readStrictResumeWorkers(orca, RUN)).resolves.toHaveLength(3);
+    expect(orca.calls.map((args) => args.includes('--cursor'))).toEqual([false, true]);
+  });
+
+  it('lists every Orca 1.4.216 worker page so run evidence stays complete', async () => {
+    const orca = new PagedWorkerOrca([
+      [worker('ctx_a', 'task_a', 'completed'), worker('ctx_b', 'task_b', 'completed')],
+      [worker('ctx_c', 'task_c', 'dispatched')],
+    ]);
+    const page = await listWorkerPage(orca, RUN);
+    expect(page.workers.map((row) => row.dispatchId)).toEqual(['ctx_a', 'ctx_b', 'ctx_c']);
+    expect(page.repositoryEvidenceComplete).toBe(true);
+  });
+
+  it('fails closed when worker-list pages disagree on the run-wide total', async () => {
+    const orca = new PagedWorkerOrca([
+      [worker('ctx_a', 'task_a', 'completed')],
+      [worker('ctx_b', 'task_b', 'completed')],
+    ], [2, 3]);
+    await expect(readStrictResumeWorkers(orca, RUN)).rejects.toThrow(/page/);
   });
 
   it('freezes source plus transitive descendants deterministically and excludes unrelated work', async () => {

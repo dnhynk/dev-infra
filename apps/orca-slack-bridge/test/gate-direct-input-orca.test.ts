@@ -149,6 +149,43 @@ describe('direct-input Orca mutation privacy boundary', () => {
     }
   });
 
+  it('reads the coordinator from the Orca 1.4.216 run-show that dropped pane and home database', async () => {
+    const shown = JSON.parse(runShowEnvelope()) as { result: { run: Record<string, unknown> } };
+    delete shown.result.run['home_database'];
+    delete shown.result.run['coordinator_pane_key'];
+    const calls: string[][] = [];
+    const runner: OrcaRunner = {
+      run: (args) => {
+        calls.push([...args]);
+        if (args[1] === 'run-show') return Promise.resolve(JSON.stringify(shown));
+        return Promise.resolve(JSON.stringify({
+          id: 'resolve',
+          ok: true,
+          result: {
+            gate: {
+              id: IDENTITY.gateId,
+              run_id: IDENTITY.runId,
+              task_id: IDENTITY.taskId,
+              question: 'continue?',
+              options: JSON.stringify(IDENTITY.options),
+              status: 'resolved',
+              resolution: '현행 유지',
+              created_at: '2026-08-26 09:00:00',
+              resolved_at: '2026-08-26 09:01:00',
+            },
+            mutation: { requestId: RETRY_REQUEST, replayed: false },
+          },
+        }));
+      },
+    };
+
+    await resolveExactGate(runner, IDENTITY, '현행 유지', RETRY_REQUEST);
+
+    expect(calls[1]?.slice(0, 4)).toEqual([
+      'orchestration', 'gate-resolve', '--from', 'term_current_coordinator',
+    ]);
+  });
+
   it.each([
     {
       label: 'missing run',
@@ -163,8 +200,13 @@ describe('direct-input Orca mutation privacy boundary', () => {
       output: runShowEnvelope({ coordinator_handle: null }),
     },
     {
-      label: 'unexpected authority field',
-      output: runShowEnvelope({ unexpected: 'not-allowed' }),
+      // Unknown run-show fields are ignored (DL-066); the read coordinator field is still required.
+      label: 'absent coordinator field',
+      output: (() => {
+        const shown = JSON.parse(runShowEnvelope()) as { result: { run: Record<string, unknown> } };
+        delete shown.result.run['coordinator_handle'];
+        return JSON.stringify(shown);
+      })(),
     },
   ])('fails closed before gate-resolve for $label', async ({ output }) => {
     const calls: string[][] = [];
