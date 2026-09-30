@@ -45,6 +45,7 @@ export class GhCli implements GhRunner {
     try {
       const { stdout } = await execFileAsync(this.bin, [...args], {
         encoding: 'utf8',
+        windowsHide: true,
         maxBuffer: MAX_GITHUB_COMMAND_OUTPUT_BYTES,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         ...(options.timeoutMs === undefined ? {} : { timeout: Math.trunc(options.timeoutMs) }),

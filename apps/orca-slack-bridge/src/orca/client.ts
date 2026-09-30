@@ -67,6 +67,7 @@ export class OrcaCli implements OrcaRunner {
   async run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
     const { stdout } = await execFileAsync(this.bin, [...args], {
       encoding: 'utf8',
+      windowsHide: true,
       maxBuffer: 32 * 1024 * 1024,
       env: orcaServiceEnvironment(process.env),
       ...(this.timeoutMs === undefined ? {} : { timeout: this.timeoutMs }),
