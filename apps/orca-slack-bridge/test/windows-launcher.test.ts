@@ -54,6 +54,8 @@ function createLauncherFixture(options: {
   readonly protectedManifest?: boolean;
   readonly taskBinding?: boolean;
   readonly manifestMutation?: 'self-digest' | 'launcher-hash';
+  /** The fixture daemon writes stderr lines and exits 1 right after passing the launch checks. */
+  readonly daemonFailure?: boolean;
 } = {}) {
   const botValue = options.botValue ?? syntheticBot;
   const appValue = options.appValue ?? syntheticApp;
@@ -150,7 +152,11 @@ const argumentsAreExact = JSON.stringify(process.argv.slice(2)) === JSON.stringi
 if (!tokensAreFresh || process.env.ORCA_SLACK_BRIDGE_BUILD !== expected || !argumentsAreExact) {
   process.exit(41);
 }
-`;
+${options.daemonFailure === true
+    ? "process.stderr.write('daemon.failure name=Error\\n');\n" +
+      "process.stderr.write('기동 실패: snapshot lease를 얻지 못했다\\n');\n" +
+      'process.exit(1);\n'
+    : ''}`;
   writeFileSync(join(distDirectory, 'cli.js'), cliSource);
   const digest = computeReleaseBuildDigest(stagingRoot);
   const releaseRoot = join(releasesRoot, digest);
@@ -200,6 +206,7 @@ if (!tokensAreFresh || process.env.ORCA_SLACK_BRIDGE_BUILD !== expected || !argu
     nestedPayload: join(releaseRoot, 'node_modules', 'fixture-dependency', 'nested', 'payload.txt'),
     tokenReadMarker,
     daemonMarker,
+    logDirectory,
     run: () => spawnSync(powerShell, [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', launcherPath, '-SettingsPath', manifestPath,
@@ -292,6 +299,22 @@ describe('versioned Windows launcher', () => {
     expect(readFileSync(fixture.tokenReadMarker, 'utf8')).toBe('botappopenai');
     expect(readFileSync(fixture.daemonMarker, 'utf8')).toBe('launched');
     expect(`${result.stdout}${result.stderr}`).not.toContain(sentinel);
+  }, 30_000);
+
+  windowsIt('keeps every UTF-8 stderr line of a daemon that exits right after writing', () => {
+    // The crash loop left only "daemon exited" lines and garbled Korean; the lines that explain a
+    // death are written just before exit, so they must survive the child exiting immediately.
+    const fixture = createLauncherFixture({ daemonFailure: true });
+    const result = fixture.run();
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(1);
+    const log = readFileSync(join(fixture.logDirectory, 'daemon-stderr.log'), 'utf8');
+    const failure = log.indexOf('daemon.failure name=Error');
+    const korean = log.indexOf('기동 실패: snapshot lease를 얻지 못했다');
+    const exited = log.indexOf('daemon exited code=1');
+    expect(failure).toBeGreaterThanOrEqual(0);
+    expect(korean).toBeGreaterThan(failure);
+    expect(exited).toBeGreaterThan(korean);
   }, 30_000);
 
   windowsIt('keeps absent User-scope tokens on a static non-secret failure path', () => {

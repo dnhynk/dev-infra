@@ -687,41 +687,46 @@ try {
   #
   # 비동기로 읽는다. 동기로 읽으면 파이프 버퍼가 차는 순간 daemon이 쓰기에서 막힌다 — 계측이
   # 대상을 멈추게 하는 것이 가장 나쁜 종류다.
-  $start.RedirectStandardError = $true
+  #
+  # PowerShell event(-Action)로 받지 않고 .NET이 바이트를 그대로 파일에 복사한다. event action은
+  # launcher가 WaitForExit에서 막혀 있는 동안 실행되지 않고, 종료 직후 구독을 해제하면 남은 줄이
+  # 버려졌다 — 죽기 직전에 쓴, 원인을 말하는 줄이 가장 자주 사라졌다. 콘솔 코드페이지로 해석하지
+  # 않으므로 daemon의 UTF-8 한국어도 깨지지 않는다. 버퍼 없이 열어 launcher가 끊겨도 쓴 만큼 남는다.
   $stderrPath = [IO.Path]::Combine([string]$runtime.logDirectory, 'daemon-stderr.log')
-  $stderrWriter = $null
-  $stderrSubscription = $null
+  $stderrLog = $null
   try {
-    $stderrWriter = [IO.StreamWriter]::new($stderrPath, $true)
-    $stderrWriter.AutoFlush = $true
-  } catch { $stderrWriter = $null }
+    $stderrLog = [IO.FileStream]::new(
+      $stderrPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+    # 무한히 커지지 않게 상한을 둔다. 넘으면 새로 시작한다 — 최근 것이 원인에 가깝다.
+    if ($stderrLog.Length -gt 4194304) { $stderrLog.SetLength(0) }
+    $null = $stderrLog.Seek(0, [IO.SeekOrigin]::End)
+  } catch { $stderrLog = $null }
+  $start.RedirectStandardError = $null -ne $stderrLog
+  $writeStderrLine = {
+    param([string]$text)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+      ('{0:o} {1}' -f (Get-Date).ToUniversalTime(), $text) + [Environment]::NewLine)
+    $stderrLog.Write($bytes, 0, $bytes.Length)
+  }
 
   $daemon = [Diagnostics.Process]::new()
   $daemon.StartInfo = $start
-  if ($null -ne $stderrWriter) {
-    $stderrSubscription = Register-ObjectEvent -InputObject $daemon -EventName ErrorDataReceived -MessageData $stderrWriter -Action {
-      $line = $EventArgs.Data
-      if ($null -eq $line) { return }
-      try {
-        # 무한히 커지지 않게 상한을 둔다. 넘으면 새로 시작한다 — 최근 것이 원인에 가깝다.
-        $writer = $Event.MessageData
-        if ($writer.BaseStream.Length -gt 4194304) { $writer.BaseStream.SetLength(0) }
-        $writer.WriteLine(('{0:o} {1}' -f (Get-Date).ToUniversalTime(), $line))
-      } catch { }
-    }
-  }
-  $daemon.EnableRaisingEvents = $true
   if (-not $daemon.Start()) { throw 'daemon start' }
-  if ($null -ne $stderrWriter) { $daemon.BeginErrorReadLine() }
+  $stderrCopy = $null
+  if ($null -ne $stderrLog) {
+    try {
+      & $writeStderrLine ('daemon started pid={0}' -f $daemon.Id)
+      $stderrCopy = $daemon.StandardError.BaseStream.CopyToAsync($stderrLog)
+    } catch { $stderrCopy = $null }
+  }
   $daemon.WaitForExit()
   $exitCode = $daemon.ExitCode
-  if ($null -ne $stderrSubscription) {
-    try { Unregister-Event -SourceIdentifier $stderrSubscription.Name -ErrorAction SilentlyContinue } catch { }
-  }
-  if ($null -ne $stderrWriter) {
+  if ($null -ne $stderrLog) {
     try {
-      $stderrWriter.WriteLine(('{0:o} daemon exited code={1}' -f (Get-Date).ToUniversalTime(), $exitCode))
-      $stderrWriter.Dispose()
+      # 종료 줄보다 먼저 daemon이 쓴 바이트가 모두 들어가게 한다.
+      if ($null -ne $stderrCopy) { $null = $stderrCopy.Wait(5000) }
+      & $writeStderrLine ('daemon exited code={0}' -f $exitCode)
+      $stderrLog.Dispose()
     } catch { }
   }
   $daemon.Dispose()

@@ -79,6 +79,10 @@ reparse point, hard link, tree 변화 및 release digest를 다시 검증한다.
 Windows User scope에서 정확히 한 번씩 다시 읽어 daemon child 환경에만 넣고, build identity는
 release digest로 고정한다. token 누락이나 runtime/release drift는 값 없이 static error로 종료한다.
 
+daemon child의 stderr는 운영 log directory의 `daemon-stderr.log`에 UTF-8 바이트 그대로 붙는다. 실행마다
+`daemon started pid=…`와 `daemon exited code=…` 줄이 그 사이의 stderr를 감싸고, 파일이 4MiB를 넘으면 다음
+실행이 비우고 시작한다. daemon이 운영 로그를 만들기 전에 죽으면 원인은 이 파일에만 남는다.
+
 설치 preflight의 Orca readiness probe는 trusted known-folder API로 얻어 canonicalize한 `APPDATA`와
 `LOCALAPPDATA`만 기존의 최소 Windows system 환경에 추가해 `orca status --json`을 실행한다. exit,
 bounded timeout, ready 사실(`ok`, local target, 실행 중인 app과 사용 가능한 desktop window, ready·reachable
