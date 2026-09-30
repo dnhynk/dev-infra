@@ -10,10 +10,10 @@
 | 항목 | 값 |
 |---|---|
 | Claude Code | `2.1.241` (2026-08-22 실측 시점은 `2.1.238`) |
-| 계정 | 개인 Max, 배너 표기 `donghyun9282@gmail.com's Organization` |
+| 계정 | 개인 Max, 배너 표기 `<account-email>'s Organization` |
 | OS / Node | Windows 11 26200 / `v26.7.0` |
 | MCP SDK | `@modelcontextprotocol/sdk`, `LATEST_PROTOCOL_VERSION = 2025-11-25` |
-| 하니스 위치 | `C:\Users\dongh\AppData\Local\Temp\orca-THROWAWAY-t5-channel` (레포 밖) |
+| 하니스 위치 | `C:\Users\<user>\AppData\Local\Temp\orca-THROWAWAY-t5-channel` (레포 밖) |
 
 하니스는 두 프로세스다. `daemon.mjs`는 별도로 실행되는 Bridge daemon 역할로 named pipe·TCP loopback·HTTP control plane을 연다. `adapter.mjs`는 `.mcp.json`에 등록돼 Claude Code가 stdio로 spawn하는 Channel Adapter 후보이며, `capabilities.experimental["claude/channel"]`과 reply tool 3종(`orca_report_receipt`, `orca_list_pending`, `orca_whoami`)을 선언한다.
 
@@ -648,14 +648,14 @@ Adapter가 부팅 시 덤프한 identity(발췌):
 ```json
 {
   "pid": 28468, "ppid": 29888,
-  "cwd": "C:\\Users\\dongh\\AppData\\Local\\Temp\\orca-THROWAWAY-t5-channel",
+  "cwd": "C:\\Users\\<user>\\AppData\\Local\\Temp\\orca-THROWAWAY-t5-channel",
   "argv": ["C:\\nvm4w\\nodejs\\node.exe", "...\\adapter.mjs"],
-  "CLAUDE_CODE_SESSION_ID": "6601fead-619d-4ff6-95ca-46e1eaa7b51b",
+  "CLAUDE_CODE_SESSION_ID": "<session-id>",
   "CLAUDE_PID": null,
-  "CLAUDE_PROJECT_DIR": "C:\\Users\\dongh\\AppData\\Local\\Temp\\orca-THROWAWAY-t5-channel",
-  "ORCA_TERMINAL_HANDLE": "term_df8bf929-6fba-4932-ba25-ae43d41cd2c3",
-  "ORCA_PANE_KEY": "28767aff-...:889461c0-...",
-  "ORCA_WORKTREE_ID": "ccb3c8ee-...::C:/Users/dongh/orca/workspaces/dev-infra/phase0-t5-channel",
+  "CLAUDE_PROJECT_DIR": "C:\\Users\\<user>\\AppData\\Local\\Temp\\orca-THROWAWAY-t5-channel",
+  "ORCA_TERMINAL_HANDLE": "term_<redacted>",
+  "ORCA_PANE_KEY": "<pane-key>",
+  "ORCA_WORKTREE_ID": "<worktree-id>::C:/Users/<user>/orca/workspaces/dev-infra/phase0-t5-channel",
   "ORCA_WORKSPACE_ID": null,
   "ORCA_AGENT_HOOK_PORT": "52428"
 }
@@ -665,13 +665,13 @@ Adapter가 부팅 시 덤프한 identity(발췌):
 
 ```text
 Resume this session with:
-claude --resume 6601fead-619d-4ff6-95ca-46e1eaa7b51b
+claude --resume <session-id>
 ```
 
 대화형 세션 2개를 동시에 띄우고 daemon이 본 연결:
 
 ```text
-tcp#2 tcp 88510fdb-c527-4ec1-9d64-ed26953ccb5d term_df8bf929-... pane 28767aff-...:889461c0-...
+tcp#2 tcp <session-id-2> term_df8bf929-... pane <pane-key>
 tcp#3 tcp c4d18686-2f88-4eca-8512-2fee50e528af term_07ecc0b1-... pane 8e3b6677-...:442d21bd-...
 ```
 
@@ -689,8 +689,8 @@ receipt from tcp#3 ev_routeB processed
 ```text
 claude                                        → CLAUDE_CODE_SESSION_ID = 7de6d430-e6bc-4b84-bf19-ddc4ebfae22d  (fresh)
 claude --dangerously-load-...                 → CLAUDE_CODE_SESSION_ID = 828805fb-b7e5-408a-afc0-71bb2b024389  (fresh)
-claude --resume 6601fead-619d-4ff6-95ca-46e1eaa7b51b --dangerously-load-...
-                                              → CLAUDE_CODE_SESSION_ID = 6601fead-619d-4ff6-95ca-46e1eaa7b51b  (동일)
+claude --resume <session-id> --dangerously-load-...
+                                              → CLAUDE_CODE_SESSION_ID = <session-id>  (동일)
 ```
 
 ### 근거 4 — opt-in 자기 인지 (핵심)
@@ -774,9 +774,9 @@ Adapter는 자기 `ppid`를 안다(근거 1 identity). 그 ppid의 프로세스 
 
 ```text
 # flag 세션 (boot-spoof-<pid>.json, chain[0])
-claude.exe :: "C:\Users\dongh\.local\bin\claude.exe" --dangerously-load-development-channels server:orca-t5
+claude.exe :: "C:\Users\<user>\.local\bin\claude.exe" --dangerously-load-development-channels server:orca-t5
 # no-flag 세션 (boot-noflag-<pid>.json, chain[0])
-claude.exe :: "C:\Users\dongh\.local\bin\claude.exe"
+claude.exe :: "C:\Users\<user>\.local\bin\claude.exe"
 ```
 
 즉 Adapter가 볼 수 있는 곳에 opt-in을 가르는 신호가 **있다.** 다만 이것은 문서화된 계약이 아니라 프로세스 트리 관측이며 아래 조건에서 깨진다.

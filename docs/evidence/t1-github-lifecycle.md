@@ -1079,6 +1079,6 @@ existing test name: 'correlated지만 task가 없으면 task_missing이다'
 - [관측] app 바인딩 재현은 `dnhynk/THROWAWAY-orca-c2-appbind-c6ddffc0`, `-e573a79e`, `-87d9fc5f` 세
   repository에서 실행했다. 앞의 둘은 절차를 만들면서 쓴 것이고 §OD-032 추가 관측의 출력은 마지막
   `-87d9fc5f`의 것이다. 셋 다 archived 상태로 남는다.
-- [관측] 시스템 temp clone `C:\Users\dongh\AppData\Local\Temp\THROWAWAY-orca-github-lifecycle-bc06` 삭제는 안전 정책이 두 차례 명령 실행 전에 거부해 남아 있다.
+- [관측] 시스템 temp clone `C:\Users\<user>\AppData\Local\Temp\THROWAWAY-orca-github-lifecycle-bc06` 삭제는 안전 정책이 두 차례 명령 실행 전에 거부해 남아 있다.
 - [관측] repository 안에는 이 문서 한 파일만 추가했고 다른 tracked 파일은 수정하지 않았다.
 - [실행하지 않음] `pnpm install`, test, build는 Task 공통 규칙에 따라 실행하지 않았다.
