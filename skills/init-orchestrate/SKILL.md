@@ -338,18 +338,18 @@ Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·mo
 
 | # | 작업 종류 | 판정 기준 | agent | model | effort |
 |---|---|---|---|---|---|
-| 1 | 아키텍처·스키마·계약 설계 | 되돌리기 비싼 구조 결정, 여러 대안의 trade-off 비교가 필요 | `claude` | `opus` | `max` |
-| 2 | 어려운 구현 | 동시성·상태기계·성능 등 정확성 논증이 필요하고 테스트로 전부 잡히지 않음 | `claude` | `opus` | `xhigh` |
-| 3 | 기본 코드 구현과 테스트 작성 | 스펙이 정해진 기능 구현, 새 테스트 설계 | `claude` | `opus` | `high` |
-| 4 | 버그 재현·디버깅 | 원인 가설 → 반증 관측 절차가 필요 | `claude` | `opus` | `xhigh` |
-| 5 | 단순 반복·기계적 작업 | 판단 없이 확정된 규칙만 적용 (rename, import 정리, 정형 케이스 추가, 규칙이 확정된 대량 마이그레이션) | `codex` | `gpt-5.6-luna` | `medium` |
-| 6 | 병렬 리서치·조사 | 여러 소스를 넓게 훑어 사실을 수집 | `codex` | `gpt-5.6-sol` | `ultra` |
+| 1 | 아키텍처·스키마·계약 설계 | 되돌리기 비싼 구조 결정, 여러 대안의 trade-off 비교가 필요 | `codex` | `gpt-6-astra` | `max` |
+| 2 | 어려운 구현 | 동시성·상태기계·보안·수치 정확성·성능 등 정확성 논증이 필요하고 테스트로 전부 잡히지 않음 | `codex` | `gpt-6-astra` | `xhigh` |
+| 3 | 기본 코드 구현과 테스트 작성 | 스펙이 정해진 기능 구현, 새 테스트 설계 | `codex` | `gpt-5.6-sol` | `high` |
+| 4 | 버그 재현·디버깅 | 원인 가설 → 구별 관측 → 반증 절차가 필요 | `codex` | `gpt-6-astra` | `xhigh` |
+| 5 | 단순 반복·기계적 작업 | 판단 없이 확정된 규칙만 적용 (rename, import 정리, 정형 케이스 추가, 규칙이 확정된 대량 마이그레이션) | `codex` | `gpt-5.6-luna` | `low` |
+| 6 | 병렬 리서치·조사 | 여러 1차 자료나 저장소 영역을 넓게 훑어 근거를 종합 | `codex` | `gpt-5.6-terra` | `high` |
 | 7 | PR 리뷰 | | `codex` | `gpt-5.6-sol` | `xhigh` |
-| 7b | 조용한-실패 위험 코드 리뷰 | 변경이 돈·단위·부호·확률·통계 추정·시간 경계(누수)·보안 경계·동시성 불변식·비가역 마이그레이션을 만지고, 그 정확성을 기존 테스트가 판정하지 못함 — 신호가 하나라도 관측될 때만. 리뷰 프레임은 적대적(반박·실패 시나리오 요구)으로 지정한다 | `claude` | `fable` | `high` ~ `max` |
-| 8 | 추론이 필요한 문서·스펙 집필 | 설계 판단이 문서 내용에 들어감 | `codex` | `gpt-5.6-sol` | `high` ~ `xhigh` |
+| 7b | 조용한-실패 위험 코드 리뷰 | 변경이 돈·단위·부호·확률·통계 추정·시간 경계(누수)·보안 경계·동시성 불변식·비가역 마이그레이션을 만지고, 그 정확성을 기존 테스트가 판정하지 못함 — 신호가 하나라도 관측될 때만. 리뷰 프레임은 적대적(반박·실패 시나리오 요구)으로 지정한다 | `codex` | `gpt-6-astra` | `max` |
+| 8 | 추론이 필요한 문서·스펙 집필 | 설계 판단이 문서 내용에 들어감 | `codex` | `gpt-5.6-sol` | `high` |
 | 9 | 사실 정리형 문서 | 확정된 사실을 구조화 (레퍼런스, README, 변경 요약) | `codex` | `gpt-5.6-terra` | `medium` |
 | 10 | 리뷰 지적 반영 수정 | | 원 Dispatch와 동일 배치 | | |
-| 11 | 깊은 논증이 필요한 Task의 실패·저확신 결과 | 1~4행 배치로 dispatch한 Task가 같은 원인으로 2회 연속 실패했거나, 완료 보고가 확답에 이르지 못했다 (아래 신호) | `claude` | `fable` | `max` |
+| 11 | 깊은 논증이 필요한 Task의 실패·저확신 결과 | 1~4행 배치로 dispatch한 Task가 같은 원인으로 2회 연속 실패했거나, 완료 보고가 확답에 이르지 못했다 (아래 신호) | 새 `codex` | `gpt-6-astra` | `max` |
 
 11행은 escalation이므로 원 배치를 override한다. 지켜야 할 규율:
 
@@ -374,8 +374,12 @@ Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·mo
 - **배치가 다른 후속 Task에 terminal을 재사용하지 않는다.** `--model`/`--effort`는 `--terminal`과
   결합할 수 없어 재사용 경로는 이전 배치를 유지한다. 다른 배치가 필요하면 `worker-release` 후
   새 agent terminal을 만든다.
-- **모델이 지원하지 않는 effort를 지정하지 않는다.** `ultra`는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만
-  있고 Claude에는 없다. Claude의 최대는 `max`다.
+- **모델이 지원하지 않는 effort를 지정하지 않는다.** 이 표에서는 `ultra`를 쓰지 않는다. 현재 관측한
+  5.6 runtime에서 nested delegation을 도입할 수 있고 Task DAG의 fan-out은 coordinator가 소유하기 때문이다.
+- **`gpt-6-astra` 요청이 적용됐다고 가정하지 않는다.** 이전 계정의 오류를 일반화하지 않는다. 현재 계정에서 새로 관측한
+  exact `model is not supported when using Codex with a ChatGPT account` 오류일 때는 호환 coordinator/worker
+  `gpt-5.6-sol` `max`로 새로 배치하고 `astra_unavailable`을 근거와 함께 기록한다. 이를 Astra 작업으로
+  부르지 않는다. 다른 unavailable, mismatch, provider 오류는 조용히 fallback하지 말고 Gate로 올린다.
 - `gpt-5.4`와 `gpt-5.4-mini`는 은퇴 예정이므로 쓰지 않는다.
 - service tier(`fast`)는 `worker-start`로 지정할 수 없다. 필요하다고 판단되면 임의로 supervised
   경로를 벗어나지 말고 사용자에게 올린다.

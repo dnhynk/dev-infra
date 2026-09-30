@@ -253,10 +253,11 @@ orca orchestration worker-start --task <task_id>
 
 **Claude**: `--model` alias `opus`, `sonnet`, `fable`, `haiku` 또는 풀네임. `--effort` `low`, `medium`, `high`, `xhigh`, `max`. `ultra`는 없다.
 
-**Codex** (models_cache 기준. 설명은 벤더 원문):
+**Codex** (2026-09-07 local models_cache와 공식 Astra model page 기준. 설명은 벤더 원문):
 
 | slug | 벤더 설명 | 기본 effort | 지원 effort | ctx | tier |
 |---|---|---|---|---|---|
+| `gpt-6-astra` | Most capable model for complex professional work | 미관측 | low, medium, high, xhigh, max | **1,050k** | local cache 미노출 |
 | `gpt-5.6-sol` | Latest frontier agentic coding model | low | low, medium, high, xhigh, max, **ultra** | 272k | fast |
 | `gpt-5.6-terra` | Balanced agentic coding model for everyday work | medium | low, medium, high, xhigh, max, **ultra** | 272k | fast |
 | `gpt-5.6-luna` | Fast and affordable agentic coding model | medium | low, medium, high, xhigh, max | 272k | fast |
@@ -286,7 +287,8 @@ effort 단계의 벤더 정의:
 
 `service_tiers`는 상위 모델 모두 `{"id": "priority", "name": "Fast", "1.5x speed, increased usage"}` 하나이고 `additional_speed_tiers`는 `["fast"]`다.
 
-`~/.codex/config.toml`의 전역 기본값은 `model = "gpt-5.6-sol"`, `model_reasoning_effort = "xhigh"`다. `--model` 없이 dispatch된 codex worker는 이 값을 쓴다.
+현재 effective `CODEX_HOME/config.toml`의 전역 기본값은 `model = "gpt-5.6-sol"`,
+`model_reasoning_effort = "max"`다. `--model` 없이 dispatch된 codex worker는 이 값을 쓴다.
 
 사용자 표기 `sol high fast`는 서로 다른 세 축이다: model `gpt-5.6-sol` + effort `high` + service tier `priority`. **`worker-start`에 service tier 인자가 없으므로 tier는 이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나 `worker_done` 권위를 잃는다.
 
@@ -294,6 +296,9 @@ effort 단계의 벤더 정의:
 
 - Orca terminal 입력과 orchestration inbox는 서로 다른 표면이다.
 - `terminal send`는 live terminal에 직접 입력한다.
+- `terminal send --text ... --enter`로 입력을 제출한다. `--interrupt`도 존재하지만 실제 Codex
+  0.153.4 유휴 TUI를 종료시킨다. Codex wake에는 쓰지 않는다. acceptance는 실제 model 처리나 Gate
+  effect를 뜻하지 않는다.
 - `orchestration send`는 durable inbox/worker relay다.
 - Orca에 Claude Channel을 관리하는 전용 명령은 없다.
 
@@ -303,7 +308,7 @@ effort 단계의 벤더 정의:
 
 ```text
 terminal create --worktree <selector> --title <name> --command <text> --focus --json
-terminal send   --terminal <handle> --text <text> --enter --interrupt
+terminal send   --terminal <handle> --text <text> --enter
 terminal wait   --terminal <handle> --for exit|tui-idle --timeout-ms <n>
 terminal read   --terminal <handle> --screen | --cursor <n> --limit <n>
 ```
@@ -596,6 +601,7 @@ PR body에도 `## Task`(`T-ID`, ticket 경로)/`## Why`/`## What` 규약이 있�
 | 전제조건 | 실패 모드 | 확인 |
 |---|---|---|
 | skill 설치 대상에 `claude-code` 포함 | 공유 디렉터리에만 설치되어 Claude Code가 skill을 못 봄 (§3.1) | `ls ~/.claude/skills` |
+| `orca-orchestration` Codex plugin 설치·hook 신뢰 | Codex가 `$init-orchestrate`를 못 보거나 Stop hook을 건너뜀 (§8) | `codex plugin list --json`, 새 thread의 `/hooks` |
 | git 커밋 identity | `~/.gitconfig` 부재로 worker가 커밋·PR을 만들 수 없음 | `git var GIT_AUTHOR_IDENT` |
 | `NVM_HOME`·`NVM_SYMLINK` 정의 | 사용자 PATH 항목이 두 변수 참조로 되어 있어 미정의면 빈 문자열로 확장되고 `node`·`npm`·`npx`가 전부 사라짐 | `node -v` |
 | nvm 활성 버전 26.x | 24.19.0이 활성일 수 있다. OD-001과 `node:sqlite` 근거가 26.x 기준 | `nvm list` |
@@ -632,3 +638,76 @@ PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의�
 이 두 항목은 검증 완료로 보지 않는다. 다만 OD-020이 위험을 명시적으로 감수하고 D1 진행을 결정했으므로
 §7.1의 구현 완료 차단 조건에는 포함하지 않는다. Orca 플랫폼 동작이 바뀌면 live/stale 판정이 깨지므로
 재검증해야 한다.
+
+## 8. Codex
+
+검증 기준일은 2026-09-08이고 로컬 CLI는 `codex-cli 0.153.4`다. 제품 동작은 버전 의존이므로
+[Codex skills](https://learn.chatgpt.com/docs/build-skills),
+[Codex hooks](https://learn.chatgpt.com/docs/hooks),
+[GPT-6 Astra model](https://developers.openai.com/api/docs/models/gpt-6-astra)을 권위 자료로 쓴다.
+
+### 8.1 Skill과 plugin discovery
+
+- Codex는 repository 상위 경로의 `.agents/skills`와 user-level `$HOME/.agents/skills`를 읽고 symlink도
+  따른다. 이 repository는 배포와 Stop hook을 한 단위로 만들기 위해
+  `plugins/orca-orchestration/` plugin을 원본으로 둔다.
+- plugin은 기본 위치 `hooks/hooks.json`을 자동 발견한다. hook command에는 설치 root인
+  `PLUGIN_ROOT`와 writable data root인 `PLUGIN_DATA`가 주입된다.
+- Windows 전용 command override의 JSON key는 `commandWindows`다. plugin 설치/enable만으로 hook이
+  신뢰되지는 않으며 현재 정의를 새 thread에서 검토·신뢰하기 전까지 건너뛴다.
+- skill 호출은 `$init-orchestrate`; Claude용 `/init-orchestrate`를 그대로 복사한 slash command가 아니다.
+
+### 8.2 Session, transcript, Stop hook
+
+- 현재 Orca-managed Codex terminal에는 `CODEX_SESSION_ID`와 `CODEX_THREAD_ID`가 있고 같은 session
+  identity를 가리킨다. Run marker는 전자를 우선한다.
+- Stop payload는 최소 `session_id`, `transcript_path`, `cwd`, `stop_hook_active`,
+  `last_assistant_message`를 제공한다. `decision:block`과 `reason`을 반환하면 현재 turn을 계속한다.
+- 실제 JSONL의 현재-context 관측점은 `type=event_msg`, `payload.type=token_count`,
+  `info.last_token_usage`와 `info.model_context_window`다. `info.total_token_usage`는 thread 누적이므로
+  rollover 점유량으로 쓰지 않는다.
+- Codex monitor는 마지막 valid `last_token_usage.total_tokens`를 사용하고 transcript window를 marker
+  fallback보다 우선한다. 기본 reserve는 window 12%, 최소 64k/최대 128k이며 marker가 exact 값을
+  override할 수 있다. recursive Stop은 `stop_hook_active`로 pass-through하고 한 session 지시는 3회로
+  제한한다.
+
+### 8.3 Model과 effort
+
+- OpenAI의 model page가 밝히는 `gpt-6-astra` context window는 1,050,000이고 지원 reasoning effort는
+  `low`, `medium`, `high`, `xhigh`, `max`다. 이 프로젝트의 최고 worker lane으로 쓴다.
+- coordinator 기본은 Astra `xhigh`; cross-task 판단 품질을 유지하면서 장기 loop의 latency를 줄인다.
+  `max`는 아키텍처/계약, silent-risk adversarial review, 두 번 실패한 escalation처럼 좁고 비싼
+  Task에만 쓴다.
+- 이전 Orca 계정의 model cache에는 5.6 계열만 있었고, `codex exec -m gpt-6-astra`는 ChatGPT account
+  미지원 400 `invalid_request`를 반환했다. 같은 날 후속 runtime-home 세션의 `turn_context`는
+  `gpt-6-astra` / `max`이며 응답이 진행됐다. 따라서 가용성은 계정/runtime별 사실이다. 이전 계정의
+  결과로 현재 세션을 자동 downgrade하지 않는다.
+- `worker-start --model/--effort` 결과는 `launch.effective`가 권위다. 위 exact account-availability 오류만
+  `astra_unavailable` 근거를 남기고 `gpt-5.6-sol` `max`로 재배치한다. 이를 Astra로 표시하지 않는다.
+  다른 unavailable/mismatch/provider 오류는 fallback하지 않고 Gate로 올린다.
+- 현재 관측한 5.6 `ultra`는 nested delegation 성격이 있어 worker table에서는 제외한다. Task DAG
+  fan-out은 coordinator가 소유한다.
+- 2026-09-08 새 supervised worker `ctx_918167ae7527`에서 requested/effective `gpt-6-astra` / `xhigh`
+  일치, 실제 도구 실행과 성공 보고, release를 확인했다. 이전 계정의 availability 실패와 구분한다.
+
+### 8.4 Existing-session wake surface
+
+- Orca `terminal show --json`은 handle, worktree path, `tabId`, `leafId`, connected/writable을 제공하고
+  `terminal send`는 `--interrupt`를 지원한다.
+- `send.accepted=true`는 Orca가 입력을 수락했다는 application receipt일 뿐, 모델이
+  읽었거나 Gate effect를 만들었다는 증거가 아니다.
+- Bridge는 marker와 current Run의 terminal/pane/generation, `terminal show` route를 전후 대조하고
+  wake-only Run/Gate identity만 보낸다. exact Gate reread로 effect를 관찰한 뒤에만 consumed로 바꾼다.
+- plugin은 local marketplace에 설치했고 새 disposable thread에서 `$init-orchestrate` discovery와 Windows
+  Stop hook 두 개의 완료를 확인했다. 이 probe는 trust bypass였으므로 persistent interactive trust를
+  대신하지 않는다.
+- 2026-09-08 새 interactive TUI의 `/hooks`에서 Stop hook 설치 2개·활성 2개를 관찰했다. 같은 날
+  실제 Slack→Codex coordinator wake·Task 재개와 설치된 Stop hook의 1회 context rollover를 관찰했다
+  ([실측 기록](evidence/codex-coordinator-acceptance.md#d-2026-09-08-gate-wakerollover-완료)).
+- custom `codex --model ...`의 제한된 도구 셸은 bare/absolute Orca CLI 실행에 모두 실패했다.
+  sandbox 밖 guide 실행 확인창에는 `terminal send`도 `agent_prompt_blocked`를 반환했다.
+  실행 경로 지정만으로 해결됐다고 보지 않으며, 상세 관찰은
+  [Codex acceptance evidence](evidence/codex-coordinator-acceptance.md#c-2026-09-08-승인-후-live-검증)에 있다.
+- 실제 유휴 coordinator에 `--interrupt`를 보낸 첫 wake는 Codex를 종료시켰다. 해당 delivery는
+  queue receipt와 Gate effect를 관찰했지만 Task 재개 evidence는 없었다. Codex transport는 중단
+  신호 없이 `--text ... --enter`를 쓰도록 수정했다. active-turn steering을 검증한 것으로 확대하지 않는다.

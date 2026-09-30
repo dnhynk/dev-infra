@@ -132,7 +132,7 @@
 
 ## 2026-08-22 · Agent 배치
 
-### DL-019 · 작업 종류별 agent 배치를 동적으로 한다
+### DL-019 · 작업 종류별 agent 배치를 동적으로 한다 — worker brand/model 표는 DL-064로 SUPERSEDED
 
 - coordinator는 모든 worker를 같은 기본 agent로 배치하지 않는다. 작업 종류와 난이도에 따라 brand·model·effort를 선택한다.
 - 정책 표는 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다. 각 작업 종류에 대해 agent·model·effort를 지정한다.
@@ -140,6 +140,8 @@
 - 적용 여부는 요청값이 아니라 receipt의 `launch.effective`로 검증한다.
 - 배치가 다른 후속 Task에는 terminal을 재사용하지 않는다. `--model`/`--effort`가 `--terminal`과 결합 불가하기 때문이다.
 - 상세 정책은 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다.
+- 동적 분류, `launch.effective` 검증, terminal 재사용 제약은 유지한다. 당시의 Claude/혼합 worker
+  model 선택과 `ultra` 사용만 DL-064가 대체한다.
 
 ## 2026-08-22 · S0 설계 방향
 
@@ -669,3 +671,37 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - read-only aggregate의 `job.absent`, `registry.rejected`, `work.pending`는 별도 D3
   `LIVE_CHANNEL_UNVERIFIED`와 기존 backlog를 숨기지 않는 진단이다. schema/config/build/task mismatch,
   stale heartbeat 또는 O1 background job failure가 아니므로 이 별도 상태가 O1 PASS를 취소하지 않는다.
+
+## 2026-09-07 · Codex coordinator와 GPT worker 전환
+
+### DL-064 · Codex를 first-class coordinator로 추가하고 worker 배치를 GPT 계열로 통일한다
+
+- Claude coordinator와 historical Channel acceptance는 호환용으로 유지한다. Codex에는 Claude Markdown을
+  그대로 복제하지 않고, plugin-native `$init-orchestrate`, progressive references, marker helper, Stop
+  hook으로 별도 패키징한다.
+- coordinator 기본은 `gpt-6-astra` `xhigh`다. `max`는 architecture/contract, hard silent-risk review,
+  두 번 실패한 escalation처럼 경계가 좁고 정확성 비용이 큰 worker Task에만 쓴다.
+- worker는 모두 `codex`/GPT 계열이다. 최고 lane은 `gpt-6-astra`; 표준 구현/리뷰는
+  `gpt-5.6-sol`, 기계적 작업은 `gpt-5.6-luna`, 폭넓은 사실 조사와 사실형 문서는
+  `gpt-5.6-terra`를 쓴다. 기존 DL-019의 동적 분류와 receipt 검증은 유지하지만 혼합 brand/model 표와
+  worker `ultra`는 이 결정이 대체한다.
+- 요청값은 적용 근거가 아니다. `worker-start` receipt의 `launch.effective`를 확인한다. 현재 host에서
+  `codex exec -m gpt-6-astra`는 ChatGPT account 미지원 400 `invalid_request`를 반환했다. 이 exact
+  availability 오류에는 `gpt-5.6-sol` `max` compatibility 배치를 쓰고 `astra_unavailable` 근거를
+  남기며, Astra로 표시하지 않는다. 다른 unavailable/mismatch/provider 오류는 Orca Gate로 올린다.
+- Codex Run은 `~/.codex/orchestration/runs/<run_id>.json` marker로 session/terminal/pane/generation/worktree를
+  opt-in한다. Stop hook은 Codex transcript의 마지막 `token_count.last_token_usage`와
+  `model_context_window`로 reserve를 계산하며 thread 누적 total을 쓰지 않는다.
+- Slack Gate notification은 authenticated Claude Channel exact route를 먼저 쓴다. 그 결과가
+  `pending/no_candidate`일 때만 Codex marker와 current Run/terminal route를 전후 대조해 wake-only
+  Run/Gate identity를 `terminal send --interrupt`로 queue한다. queue acceptance는 application receipt일
+  뿐이며 exact Gate effect 재조회 뒤에만 consumed로 바꾼다.
+- plugin/marker/monitor와 Codex route의 hermetic tests, local marketplace 설치, 새 disposable thread의
+  skill discovery와 Windows Stop hook 실행은 완료했다. persistent interactive hook trust, Astra-enabled
+  account launch, Slack action과 rollover의 live end-to-end는 별도 acceptance residual이다.
+- 같은 날 후속 runtime-home 세션에서 `gpt-6-astra` / `max` 응답을 확인했다. 위 400은 이전 Orca
+  계정의 관측이며 host 전체의 금지가 아니다. fallback은 현재 계정에서 새로 관측한 exact 오류에만
+  적용한다. 기존 Astra 세션 응답과 새 supervised worker receipt는 별도로 검증한다.
+- 2026-09-08 live 검증에서 위 `--interrupt` 방식은 유휴 Codex 0.153.4 TUI를 종료시켰다. 이 관측으로
+  Codex wake 방식만 `terminal send --text ... --enter`로 정정한다. queue receipt, exact route 전후
+  검증, Gate effect와 실제 Task 재개 evidence의 구분은 유지한다.

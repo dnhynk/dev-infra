@@ -183,7 +183,9 @@ worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree i
 
 O1 discovery는 설치된 `orca repo list --json`의 success envelope key를 정확히 `id`, `ok`, `result`,
 `_meta`, result key를 정확히 `repos`로 읽는다. repository row는 설치 버전에서 관측한 `repoIcon` 포함
-14-key 형태 또는 그 key만 생략한 13-key 형태의 explicit union과 각 type을 exact 검증하며
+14-key 형태를 기준으로 `repoIcon`과 `projectHostSetupMethod`의 독립적인 생략만 허용한다.
+Orca 1.4.188의 실제 git row에서 setup preference 생략을 확인했다(2026-09-08). 나머지 필드와 각 type은
+exact 검증하고, 존재하는 `projectHostSetupMethod`는 string이어야 하며
 `gitRemoteIdentity`는 `null` 또는 `canonicalKey`, `remoteName`, `remoteUrl` string 세 필드의 exact
 object다. 존재하는 `repoIcon`은 null/object, `hookSettings`는 object까지만 검사하고 내부 raw field를
 export하지 않는다. envelope/result/row schema drift는 pass 전체 실패다.

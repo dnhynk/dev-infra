@@ -2,7 +2,7 @@
 
 상태: **Draft · Size 확인 전 잠정 분할 가설**
 
-이 문서는 세부 기술을 미리 고정하지 않고, 각 단계에서 실제 Orca·Claude Code·Slack·GitHub 계약을 관측한 뒤 작업 크기를 산정하고 쪼개기 위한 순서를 정의한다.
+이 문서는 세부 기술을 미리 고정하지 않고, 각 단계에서 실제 Orca·Claude Code·Codex·Slack·GitHub 계약을 관측한 뒤 작업 크기를 산정하고 쪼개기 위한 순서를 정의한다.
 
 아래 S0/C1/C2/D1/D2 이름과 경계는 Bridge 사전 Size Gate 결과에 따라 유지·병합·재분할할 수 있다.
 D3는 배포 경로 제약과 research preview 변동성 때문에 이번 Run에서 분리해 별도 Run으로 산정하기로 확정했다(OD-056, DL-049).
@@ -23,7 +23,9 @@ TBD는 이 과정에서만 확정한다. 구현자가 편의상 먼저 채우지
 
 ## 2. Workstream AB · Bootstrap & Continuity
 
-`/init-orchestrate`와 컨텍스트 열화·handoff lifecycle은 하나의 문제로 묶어 처리한다.
+Claude `/init-orchestrate`와 Codex `$init-orchestrate`, 컨텍스트 열화·handoff lifecycle은 하나의
+문제로 묶어 처리한다. provider별 packaging/transcript/wake surface는 분리하되 Run ownership과
+completion contract는 공유한다.
 
 이 workstream 내부에서 구현 단계를 나눌 수는 있지만, A만 구현하고 B까지 해결됐다고 선언하지 않는다.
 
@@ -48,7 +50,7 @@ TBD는 이 과정에서만 확정한다. 구현자가 편의상 먼저 채우지
 
 ### AB-1 · Bootstrap + durable handoff contract
 
-- `/init-orchestrate` 표준 운영 계약
+- `/init-orchestrate`와 `$init-orchestrate`의 provider별 표준 운영 계약
 - run-specific 추가 지시
 - worker/reviewer/PR metadata/Gate 규칙 전파
 - handoff 의미 schema

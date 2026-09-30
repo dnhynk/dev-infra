@@ -284,6 +284,11 @@ ID: OD-010
 결정일: 2026-08-22
 ```
 
+2026-09-07 보완: 이 결정은 Claude 진입점의 역사적 계약으로 유지한다. DL-064는 Codex 진입점을
+repository marketplace의 `orca-orchestration` plugin과 `$init-orchestrate` skill로 별도 추가했다. Codex의
+skill discovery, Stop hook, Windows command, 설치/trust 수명주기가 Claude와 달라 Markdown 파일을 단순
+복제하지 않는다.
+
 ```text
 ID: OD-012
 상태: DECIDED

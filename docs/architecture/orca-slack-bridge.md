@@ -1,6 +1,6 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · C1~D3와 O1 구현 완료 · O1-7 production acceptance PASS · D3 exact-build 재수용 대기**
+상태: **Draft · C1~D3와 O1 구현 완료 · O1-7 production acceptance PASS · Claude D3 exact-build 재수용 대기 · Codex wake hermetic 검증 완료/live 대기**
 
 이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 
@@ -23,15 +23,16 @@
 │                          ├→ summarizer           │
 │                          ├→ Slack renderer       │
 │                          └→ durable store        │
-└──────────────────┬───────────────────────────────┘
-                   │ named pipe / pending events
-                   ▼
-┌──────────────────────────────────────────────────┐
-│ Claude Channel Adapter                           │
-│ resolved Gate → 열린 coordinator session에 push │
-└──────────────────┬───────────────────────────────┘
-                   ▼
-          기존 coordinator session
+└──────────────┬───────────────────────┬───────────┘
+               │ named pipe            │ exact marker + Orca input
+               ▼                       ▼
+┌───────────────────────────┐  ┌───────────────────────────┐
+│ Claude Channel Adapter    │  │ Codex terminal wake route │
+│ MCP notification/receipt  │  │ wake-only identity/queue  │
+└──────────────┬────────────┘  └──────────────┬────────────┘
+               └───────────────┬───────────────┘
+                               ▼
+                    기존 coordinator session
 ```
 
 Slack은 daemon과 `@slack/socket-mode` WebSocket으로 연결한다. 공개 inbound HTTP endpoint는 운영하지 않는다.
@@ -137,14 +138,29 @@ Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설
 - transport write와 application receipt를 구분하고, reply tool 왕복으로 receipt를 daemon에 돌려준다. 이 경로를 유일하다고 규정하지 않는다(OD-054, OD-059).
 - coordinator는 `gate_id`로 Orca를 다시 읽고 이미 효과가 반영됐으면 no-op으로 처리한다(OD-057).
 
+### Codex Terminal Wake Router
+
+- Claude Channel에서 exact candidate가 `no_candidate`일 때만 fallback한다. `unverified`, ambiguous,
+  stale generation, write failure를 Codex 경로로 우회하지 않는다.
+- `~/.codex/orchestration/runs/<run_id>.json` marker가 `provider=codex`로 opt-in한 Run만 후보로 본다.
+- marker의 session/terminal/pane/generation/worktree를 current `run-list` row와
+  `terminal show`의 connected/writable route에 exact 대조한다. 입력 수락 뒤 marker, terminal,
+  Run을 다시 읽어 replacement/movement/takeover race도 가능한 범위에서 닫는다.
+- `terminal send --text ... --enter`에는 `[orca-gate-wakeup v1 run_id=... gate_id=...]` identity와 재조회 지시만
+  보낸다. Slack resolution 본문은 prompt에 싣지 않는다.
+- Orca의 `send.accepted=true`는 `application_queued` receipt일 뿐이다. durable delivery는
+  `receipted`로 남고 exact Gate effect를 다시 읽은 뒤에만 `consumed`가 된다.
+
 ## 3. 프로세스 경계
 
-목표 최종형은 두 프로세스다.
+목표 최종형은 daemon과 provider별 wake surface다. Claude 경로는 두 프로세스이고 Codex 경로는
+daemon이 기존 Orca-managed terminal에 직접 입력하므로 session subprocess가 없다.
 
 | 프로세스 | 수명 | 책임 |
 |---|---|---|
 | daemon | PC에서 상시 실행 | Slack, Orca/GitHub 관찰, DB, Slack projection |
 | Channel Adapter | coordinator 세션별 subprocess | pending Gate ID push, reply tool application receipt 반환 |
+| Codex coordinator | 기존 Orca terminal의 interactive process | wake-only 입력 수신, exact Gate 재조회, 후속 orchestration |
 
 D3 구현은 별도 Run에서 완료됐고, daemon과 session Adapter는 실제 process/pipe 경계로 분리된다.
 development flag의 매 기동 확인은 사람이 수행하며 allowlist plugin 등재는 포함하지 않는다(OD-056).
@@ -165,7 +181,7 @@ Slack action ACK 또는 modal open fast path
   → Orca Gate open 재확인
   → Orca gate-resolve
   → durable outbox에 pending 기록
-  → Channel delivery attempt
+  → provider notification attempt (Claude Channel 우선, exact Codex marker fallback)
   → coordinator가 Orca Gate 재조회
   → 후속 Orca 상태 관찰
   → Slack에 실제 재개 표시
@@ -198,7 +214,8 @@ OPEN_IN_ORCA
 ```
 
 - `TRANSPORT_WRITE_ATTEMPTED`는 전달을 증명하지 않고 application receipt만 전달 신호다(OD-054).
-- `RECEIPTED`는 reply tool 왕복으로 관측하며 재시도 backoff만 늦춘다(OD-059, OD-066).
+- `RECEIPTED`는 Claude reply tool 왕복 또는 exact route 검증 뒤 Orca가 수락한 Codex 입력으로
+  관측하며 재시도 backoff만 늦춘다. 둘 다 coordinator effect 증거는 아니다(OD-059, OD-066, DL-064).
 - Orca 효과는 대상 Gate의 `pending`→`resolved` 전이고, 이를 관찰한 뒤 `CONSUMED`로 바꾼다(OD-055).
 - `RECEIPTED`에서 멈춘 event는 재조회 대상으로 남고 `CONSUMED`에서만 재조회를 억제한다(OD-066).
 - coordinator는 항상 Orca 상태를 다시 읽어 중복을 no-op으로 만들며 별도 dedup 저장소를 두지 않는다(OD-057).

@@ -51,7 +51,7 @@ Slack button/modal
   → Orca에서 Gate 최신 상태 확인
   → Orca gate-resolve
   → durable delivery record
-  → Channel wake-up 시도
+  → provider별 coordinator wake-up 시도
   → coordinator가 Orca Gate를 다시 읽음
   → dependent task 재개
 ```
@@ -275,7 +275,7 @@ Gate가 해결되면 thread에서 다음을 구분해 보여준다.
 - coordinator 통지 상태
 - 실제 Orca 상태로 관찰된 후속 작업 재개
 
-Channel transport write만 성공했다고 “작업 재개”로 표시하지 않는다.
+notification transport write/queue만 성공했다고 “작업 재개”로 표시하지 않는다.
 
 카드에는 degraded 상태를 항상 표시한다. Channel pending·미해결 Gate·correlation 실패처럼 owner 개입 없이는
 진행되지 않는 상태만 thread에 알리고, summarizer 실패·source stale처럼 자가 복구되는 상태는 badge만
@@ -305,14 +305,17 @@ exponential backoff을 적용하고 reconnect 단절 구간의 event replay는 �
 6. Orca의 공식 `gate-resolve` interface로 resolution을 기록한다.
 7. Gate별 직렬화, 같은 논리 요청의 retry request ID 재사용과 `mutation.replayed` 처리, resolve 전후 재조회로
    결과를 확정하고 durable outbox와 reconcile한다. Orca 내부 transaction 원자성은 가정하지 않는다.
-8. 기존 coordinator에 Channel notification을 시도한다.
+8. 기존 coordinator에 notification을 시도한다. Claude Channel exact candidate를 우선하고, 후보가
+   없을 때만 opt-in된 Codex Run marker의 exact terminal route로 fallback한다.
 9. coordinator는 Orca Gate source of truth를 다시 읽고 후속 orchestration을 진행한다.
 
-Slack payload를 바로 Claude prompt로 보내거나 Slack을 결정 저장소로 사용하지 않는다.
+Slack payload를 바로 coordinator prompt로 보내거나 Slack을 결정 저장소로 사용하지 않는다.
 
 직접 입력 action은 예외적인 fast path를 가진다. sender/action을 빠르게 검증하고 button payload의 `trigger_id`가 만료되기 전에 ACK와 `views.open`을 3초 안에 끝낸다. 비-owner에게 modal을 열지 않는다. modal submission의 로컬 형식·필수값 오류는 3초 안에 input `block_id`별 `response_action=errors`로 ACK해 modal을 유지한다. 유효한 제출은 ACK한 뒤 원격 Orca 작업을 비동기로 수행한다(OD-071).
 
-## 8. Channel Adapter
+## 8. Coordinator notification adapters
+
+### 8.1 Claude Channel Adapter
 
 Channel은 새 Web session이나 새 clone을 만드는 수단이 아니라 이미 열린 기존 로컬 coordinator 세션에 외부 이벤트를 push하는 수단이다.
 
@@ -368,6 +371,43 @@ actual Claude Code 2.1.243 opt-in과 실제 Task resume 경로는 2026-08-26 사
 관찰됐다. 다만 session Adapter와 authority-repaired daemon이 하나의 exact build가 아니었으므로
 release 상태는 `LIVE_CHANNEL_UNVERIFIED`다. 구체 ID를 제거한 근거와 잔여 조건은
 [D3 live Channel acceptance evidence](../evidence/d3-live-channel-acceptance.md)에 있다.
+
+### 8.2 Codex terminal wake route
+
+Codex에는 이 시스템이 의존할 수 있는 Claude Channels-equivalent inbound Adapter가 없다. Codex
+coordinator는 `$init-orchestrate`가 원자적으로 기록한
+`~/.codex/orchestration/runs/<run_id>.json` marker로 notification을 opt-in하고, daemon은 기존
+Orca-managed terminal의 입력 surface를 사용한다.
+
+라우팅 순서는 다음과 같다.
+
+1. 기존 Claude Channel route를 먼저 판정한다. 정확한 결과가 `pending/no_candidate`일 때만 Codex를 본다.
+2. marker schema/provider/run ID를 strict parse하고 크기를 제한한다.
+3. current Run row의 coordinator handle/pane/consumer generation과 marker를 exact 대조한다.
+4. `terminal show`의 handle, `tabId:leafId`, worktree path, `connected`, `writable`을 다시 대조한다.
+5. `[orca-gate-wakeup v1 run_id=... gate_id=...]`와 “결정을 추론하지 말고 exact Gate를 재조회하라”는
+   고정 문구만 `terminal send --text ... --enter`로 queue한다. resolution text는 싣지 않는다.
+   `--interrupt`는 유휴 Codex TUI를 종료시키므로 사용하지 않는다.
+6. queue 수락 뒤 marker, terminal route, current Run을 다시 읽어 replacement, movement, takeover가
+   없었는지 확인한다.
+7. `send.accepted=true`를 `application_queued` application receipt로 durable하게 기록하되, normal
+   exact Gate reread에서 coordinator effect를 관찰하기 전에는 `consumed`로 바꾸지 않는다.
+
+marker 부재는 정상적인 no-candidate다. malformed marker, route mismatch, stale generation,
+ambiguous Run, terminal write failure는 fail closed하며 다른 route로 우회하지 않는다. 이 receipt는
+Codex가 prompt를 해석했다는 증거도, dependent Task를 재개했다는 증거도 아니다. 실제 재개 표시는 기존
+Orca Task/Dispatch 관측으로만 한다.
+
+coordinator가 직접 만든 Gate에는 원래 worker Dispatch가 없다. 이때 sidecar의
+`derived-<gate_id>`는 Gate correlation용 예약값이며 worker fact가 아니다. Bridge는 저장된 D2
+pre-read와 현재 exact Gate의 Run·Task·선택지를 대조한 뒤, 해당 Task와 의존 Task의 기준 관찰을
+전송 전에 저장한다. 이후 실제 새 Dispatch 또는 검증된 상태 전이만 작업 재개 근거로 삼는다.
+예약값을 실제 worker로 돌려주는 응답과 Gate 누락·중복·identity 불일치는 거부한다. 등록된 worker
+Gate의 기존 source Dispatch 검증과 과거 `unavailable` baseline의 소급 관찰 금지는 유지한다.
+
+이 경로는 `CodexTerminalDeliveryTransport`와 delivery state regression으로 hermetic 검증했다. 실제
+`gpt-6-astra` coordinator, plugin hook trust, Slack action을 함께 쓰는 live acceptance는
+[Codex coordinator 운영 절차](../ops/codex-coordinator-setup.md)에 남아 있다.
 
 ## 9. Durability와 멱등성
 

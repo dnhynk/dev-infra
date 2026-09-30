@@ -11,11 +11,11 @@
 | coordinator가 spec과 resume 시 `HANDOFF.md`를 완전히 읽음 | 확정 | [Fresh/Resume boot](specs/orchestration-bootstrap-and-continuity.md#3-부팅-계약) |
 | 흐릿한 부분을 추측하지 않고 질문 또는 공인 자료로 해소 | 확정 | [부팅 계약](specs/orchestration-bootstrap-and-continuity.md#31-공통-전제), [작업 규약](process/working-agreement.md) |
 | worker를 branch가 checkout된 worktree에 배정하고 PR 생성 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
-| review 전담 Codex `sol high fast` | 확정, mapping 완료 | [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책), [배치 표면](platform-capabilities.md#28-agent-배치-표면) |
-| 작업 종류·난이도별 brand/model/effort 동적 배치 | 사용자 확정 | [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책) |
+| review 전담 Codex `gpt-5.6-sol xhigh`; silent-risk는 `gpt-6-astra max` | 사용자 확정 (DL-064) | [GPT worker routing](../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md), [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책) |
+| 작업 종류·난이도별 GPT model/effort 동적 배치, 최고 모델 `gpt-6-astra` | 사용자 확정 (DL-064) | [GPT worker routing](../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md), [Codex model 검증](platform-capabilities.md#83-model과-effort) |
 | coordinator가 review를 확인하고 merge·다음 작업까지 무인 진행 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
 | A: 장문 부팅 prompt 복사·붙여넣기 제거 | 확정 | [A 문제](product-vision.md#a-반복되는-부팅-프롬프트), [통합 스펙](specs/orchestration-bootstrap-and-continuity.md) |
-| `/orchestration` + `/init-orchestrate 데모까지만 구현` UX | 확정 목표, 패키징 확정 (OD-010) | [목적](specs/orchestration-bootstrap-and-continuity.md#1-목적) |
+| Claude `/init-orchestrate`, Codex `$init-orchestrate`의 짧은 부팅 UX | 확정 목표, 양 provider 패키징 구현 (OD-010, DL-064) | [목적](specs/orchestration-bootstrap-and-continuity.md#1-목적), [Codex 운영](ops/codex-coordinator-setup.md) |
 | B: context 열화 감지·handoff·새 session 부팅 자동화 | 확정 목표, 감지·승계 수단 확정 (OD-014, OD-015, DL-017) | [B 문제](product-vision.md#b-수동-컨텍스트-승계), [승계 lifecycle](specs/orchestration-bootstrap-and-continuity.md#6-컨텍스트-승계-lifecycle) |
 | A와 B를 하나의 workstream으로 처리 | 사용자 확정 | [로드맵 AB](roadmap.md#2-workstream-ab--bootstrap--continuity) |
 | C: Agent 대화가 아니라 상태 변화를 요약 | 확정 | [설계 철학](product-vision.md#상태-변화가-중심이다), [Bridge 원칙](specs/orca-slack-bridge.md#2-필수-원칙) |
@@ -41,17 +41,18 @@
 | Gate question/options/recommendation/reason/impact 표시 | 사람용 요약은 Gate, 기계 판정 metadata는 Gate ID 연결 sidecar (OD-050) | [Gate 표시](specs/orca-slack-bridge.md#62-gate-표시), [Gate UX](ux/slack-surfaces.md#33-gate-결정-카드) |
 | ask/reply와 사람용 Gate correlation | sidecar의 message/thread/dispatch/task/gate mapping이 권위 (OD-019) | [Gate 생성 계약](contracts/observation-and-correlation.md#4-gate-생성-계약) |
 | 버튼 클릭 시 owner/open/duplicate 검증 후 `gate-resolve` | Gate별 직렬화·retry replay·전후 재조회·durable outbox 확정 (OD-051) | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
-| Slack 결정을 Claude prompt로 바로 보내지 않고 Orca Gate에 먼저 기록 | 확정 | [처리 순서](specs/orca-slack-bridge.md#72-처리-순서) |
-| 기존 로컬 coordinator를 Channel로 깨움 | D3 offline failure matrix 완료, 사람 승인 actual 2.1.243 경로 관찰; exact-build 재수용 전 `LIVE_CHANNEL_UNVERIFIED` (OD-056) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter), [운영 acceptance](ops/channel-adapter-acceptance.md), [live evidence](evidence/d3-live-channel-acceptance.md) |
+| Slack 결정을 coordinator prompt로 바로 보내지 않고 Orca Gate에 먼저 기록 | 확정 | [처리 순서](specs/orca-slack-bridge.md#72-처리-순서) |
+| 기존 Claude coordinator를 Channel로 깨움 | D3 offline failure matrix 완료, 사람 승인 actual 2.1.243 경로 관찰; exact-build 재수용 전 `LIVE_CHANNEL_UNVERIFIED` (OD-056) | [Claude Channel Adapter](specs/orca-slack-bridge.md#81-claude-channel-adapter), [운영 acceptance](ops/channel-adapter-acceptance.md), [live evidence](evidence/d3-live-channel-acceptance.md) |
+| 기존 Codex coordinator를 exact marker+Orca 입력으로 깨움 | hermetic route/delivery 검증·Windows 배포·Astra worker receipt·Slack live acceptance 완료 (DL-064) | [Codex terminal wake](specs/orca-slack-bridge.md#82-codex-terminal-wake-route), [Codex 운영 acceptance](ops/codex-coordinator-setup.md#5-slack-gate-wake-수용), [실측 기록](evidence/codex-coordinator-acceptance.md) |
 | `@Claude`의 새 cloud session/clone과 기존 coordinator push를 구분 | 확정 | [플랫폼 비교](platform-capabilities.md#35-claude와의-차이) |
 | Standard Slack MCP는 외부→현재 session push 해결책이 아님 | 확정 일반 원리, 특정 plugin 명령 미검증 | [Channels 검증](platform-capabilities.md#33-channels-계약) |
 | Slack Socket Mode로 공개 endpoint 없이 개인 PC 연결 | `@slack/socket-mode`, reconnect/ACK 계약 확정 (OD-041) | [시스템 컨텍스트](architecture/orca-slack-bridge.md#1-시스템-컨텍스트) |
 | Slack owner/workspace/App authorization | team+exact user+optional api_app_id, Socket signing secret 불필요 (OD-042) | [Control Plane](specs/orca-slack-bridge.md#7-slack-control-plane) |
-| Gate resolve→durable storage→Channel wake-up | 직렬화·retry replay·outbox reconciliation 확정 (OD-051) | [Gate 순서](architecture/orca-slack-bridge.md#4-gate-처리-순서와-crash-경계) |
+| Gate resolve→durable storage→provider notification | 직렬화·retry replay·outbox reconciliation, Claude-first/Codex fallback 확정 (OD-051, DL-064) | [Gate 순서](architecture/orca-slack-bridge.md#4-gate-처리-순서와-crash-경계) |
 | daemon과 Channel Adapter 분리 | named pipe owner/client와 bounded lifecycle 구현·offline 검증 (OD-052, OD-056) | [프로세스 경계](architecture/orca-slack-bridge.md#3-프로세스-경계), [D3-4 evidence](evidence/d3-4-lifecycle-acceptance.md) |
 | coordinator reply/status가 Adapter를 통해 daemon으로 돌아오는 경로 | reply tool을 관측된 반환 경로로 채택, 유일성은 규정하지 않음 (OD-059) | [Channel Adapter](architecture/orca-slack-bridge.md#channel-adapter) |
 | Channel delivery 단계 | transport write는 신호 아님, application receipt와 Gate pending→resolved 효과를 분리 (OD-054, OD-055) | [Delivery 상태](architecture/orca-slack-bridge.md#5-개념-delivery-상태) |
-| Channel opt-in·중복·재조회 | dead-window-safe probe, Orca-state no-op, receipted→consumed 경계 확정 (OD-057, OD-058, OD-066) | [Channel Adapter](specs/orca-slack-bridge.md#8-channel-adapter) |
+| Channel opt-in·중복·재조회 | dead-window-safe probe, Orca-state no-op, receipted→consumed 경계 확정 (OD-057, OD-058, OD-066) | [Claude Channel Adapter](specs/orca-slack-bridge.md#81-claude-channel-adapter) |
 | custom Channel 배포 | development flag만 가능하고 매 기동 사람 확인 필요; 자동 설치·승인 금지 (OD-056) | [Channel 운영 acceptance](ops/channel-adapter-acceptance.md) |
 | Gate가 있어도 독립 Task 계속 실행 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
 | Gate 선택지 button과 직접 입력 modal | 로컬 validation은 3초 내 errors, 원격 Orca 작업은 post-ACK (OD-071) | [Gate UX](ux/slack-surfaces.md#33-gate-결정-카드), [Modal UX](ux/slack-surfaces.md#34-자유형-결정-modal) |
