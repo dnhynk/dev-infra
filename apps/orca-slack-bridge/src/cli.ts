@@ -1188,7 +1188,7 @@ export function fairDigestCycle(
     };
   }
   if (unique.length === 0) {
-    return { repositories: [], checkpoint: 0, deferred: 0, prLimit };
+    return { repositories: [], checkpoint, deferred: 0, prLimit };
   }
   const repositoryBudget = Math.max(1,
     Math.floor(automation.prDigest.globalPrBudget / prLimit));
@@ -1198,7 +1198,9 @@ export function fairDigestCycle(
     unique[(start + offset) % unique.length]!);
   return {
     repositories: selected,
-    checkpoint: (start + count) % unique.length,
+    // The store requires monotonic progress. Only repository selection wraps; persisting the
+    // modulo cursor makes the next completion fail its checkpoint fence and stops the daemon.
+    checkpoint: checkpoint + count,
     deferred: (unique.length - count) * perRepository + count * (perRepository - prLimit),
     prLimit,
   };

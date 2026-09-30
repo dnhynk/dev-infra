@@ -715,12 +715,65 @@ describe('daemon production wiring', () => {
         repositories: ['owner/alpha'], checkpoint: 1,
       });
       expect(fairDigestCycle(effective, 1)).toMatchObject({
-        repositories: ['owner/beta'], checkpoint: 0,
+        repositories: ['owner/beta'], checkpoint: 2,
       });
     } finally {
       localeCompare.mockRestore();
     }
   });
+
+  it.each(['succeeded', 'failed'] as const)(
+    'persists %s digest cycles across rotation, empty discovery, and repository shrink',
+    (status) => {
+      const store = new SqliteDigestStore(statePath);
+      const at = (seconds: number): string => new Date(Date.parse(AT) + seconds * 1_000).toISOString();
+      try {
+        const seedClaim = store.startDaemonJob('pr-digest', at(0));
+        if (seedClaim === null) throw new Error('initial digest claim failed');
+        expect(store.completeDaemonJobSuccess({
+          claim: seedClaim, at: at(1), nextRunAt: at(2), durationMs: 1_000, checkpoint: 10,
+        })).not.toBeNull();
+        const selected: (readonly string[])[] = [];
+        for (const [index, names] of [
+          ['alpha', 'beta'], ['alpha', 'beta'], [], ['alpha'],
+        ].entries()) {
+          const effective: EffectiveBridgeConfig = {
+            base: {
+              ...ENABLED_CONFIG,
+              automation: {
+                ...ENABLED_CONFIG.automation,
+                prDigest: { ...ENABLED_CONFIG.automation.prDigest, prLimit: 1, globalPrBudget: 1 },
+              },
+            },
+            configFingerprint: 'f'.repeat(64), revision: 1, bindings: [], diagnostics: [],
+            routing: { status: 'ready' },
+            projects: [{
+              key: 'project', name: 'project', origin: 'explicit', orcaRepositoryIds: [],
+              repositories: names.map((name) => ({
+                canonicalKey: `github.com/owner/${name}`, nameWithOwner: `owner/${name}`,
+              })),
+            }],
+          };
+          const claim = store.startDaemonJob('pr-digest', at(2 + index * 2));
+          if (claim === null) throw new Error('next digest claim failed');
+          const cycle = fairDigestCycle(effective, store.findDaemonJobOutcome('pr-digest')!.checkpoint);
+          selected.push(cycle.repositories);
+          const completion = {
+            claim, at: at(3 + index * 2), durationMs: 1_000, checkpoint: cycle.checkpoint,
+          };
+          const result = status === 'succeeded'
+            ? store.completeDaemonJobSuccess({ ...completion, nextRunAt: at(4 + index * 2) })
+            : store.completeDaemonJobFailure({ ...completion, errorCode: 'digest.timeout' });
+          expect(result, `cycle ${index} must preserve the durable checkpoint contract`).not.toBeNull();
+          expect(result?.state).toBe(status);
+        }
+        expect(selected).toEqual([['owner/alpha'], ['owner/beta'], [], ['owner/alpha']]);
+        expect(store.findDaemonJobOutcome('pr-digest')?.checkpoint).toBe(13);
+      } finally {
+        store.close();
+      }
+    },
+  );
 
   it('keeps the legacy reconciliation cadence independent while startup discovery is pending', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
