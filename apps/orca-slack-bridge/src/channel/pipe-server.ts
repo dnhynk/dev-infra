@@ -104,7 +104,17 @@ export type ChannelRouteDecision =
 
 export type ChannelDeliverySendResult =
   | Exclude<ChannelRouteDecision, { readonly kind: 'eligible' }>
-  | { readonly kind: 'sent'; readonly epoch: string; readonly generation: number };
+  | {
+      readonly kind: 'sent';
+      readonly epoch: string;
+      readonly generation: number;
+      /**
+       * The non-Channel Codex route has no Adapter receipt callback. `application_queued` means
+       * Orca accepted an interrupt after an exact Run/marker/terminal recheck. It is still not Gate
+       * effect evidence; the durable delivery remains due for the normal exact Gate reread.
+       */
+      readonly receipt?: 'application_queued';
+    };
 
 export type ChannelProductionDeliveryEvent = {
   readonly gateId: string;

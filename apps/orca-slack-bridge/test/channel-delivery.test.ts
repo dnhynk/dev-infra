@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +10,7 @@ import {
   type GateChannelDeliveryErrorCode,
   type GateChannelDeliveryTransport,
 } from '../src/channel/delivery.js';
+import { CodexTerminalDeliveryTransport } from '../src/channel/codex-terminal.js';
 import type {
   ChannelDeliverySendResult,
   ChannelProductionDeliveryEvent,
@@ -398,6 +399,75 @@ function engine(
 }
 
 describe('durable Channel delivery engine', () => {
+  it('reconciles a Codex wake through the real marker route and durable Gate reread', async () => {
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    const gateOrca = new FakeOrca();
+    const handle = 'term_codex-integration';
+    const time = clock();
+    const sends: string[][] = [];
+    let generation = 2;
+    const orca: OrcaRunner = {
+      run: (args) => {
+        const reply = (result: unknown) => Promise.resolve(JSON.stringify({ ok: true, result }));
+        if (args[0] === 'terminal' && args[1] === 'show') {
+          return reply({ terminal: {
+            handle, tabId: 'tab-codex', leafId: 'pane-codex', worktreePath: dir,
+            connected: true, writable: true,
+          } });
+        }
+        if (args[0] === 'terminal' && args[1] === 'send') {
+          sends.push([...args]);
+          return reply({ send: { accepted: true } });
+        }
+        if (args[1] === 'run-list') {
+          return reply({ runs: [{
+            id: RUN_ID, objective: 'Codex integration', coordinator_handle: handle,
+            coordinator_pane_key: 'tab-codex:pane-codex', consumer_generation: generation,
+            legacy: false, created_at: AT, updated_at: AT,
+          }] });
+        }
+        return gateOrca.run(args);
+      },
+    };
+    try {
+      resolveD2(store);
+      writeFileSync(join(dir, `${RUN_ID}.json`), JSON.stringify({
+        schema_version: 1, provider: 'codex', run_id: RUN_ID, worktree_path: dir,
+        coordinator_session_id: 'session-codex', coordinator_terminal_handle: handle,
+        coordinator_pane_key: 'tab-codex:pane-codex', coordinator_generation: 1,
+      }));
+      const transport = new CodexTerminalDeliveryTransport({ orca, markerRoot: dir });
+      const delivery = engine(store, orca, transport, time);
+      await delivery.reconcile();
+      expect(sends).toHaveLength(0);
+      expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+        state: 'pending', lastErrorCode: 'route_pending_stale_generation',
+      });
+
+      generation = 1;
+      time.advance(1_000);
+      await delivery.reconcile();
+      expect(sends).toHaveLength(1);
+      expect(sends[0]).not.toContain('--interrupt');
+      expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+        state: 'receipted', consumedAt: null,
+      });
+      expect(gateOrca.calls).toHaveLength(0);
+
+      time.advance(3_000);
+      await delivery.reconcile();
+      expect(store.findGateChannelDelivery(GATE)?.state).toBe('consumed');
+      expect(gateOrca.calls).toEqual([
+        ['orchestration', 'gate-list', '--run', RUN_ID, '--json'],
+      ]);
+      time.advance(3_000);
+      await delivery.reconcile();
+      expect(sends).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it('경로를 못 찾는 delivery는 나이가 들면 정상 상태 간격으로 물러난다', async () => {
     /*
      * 재시도 간격이 고정이었다. 받을 코디네이터가 없는 delivery 하나가 같은 간격으로 영원히
@@ -487,6 +557,37 @@ describe('durable Channel delivery engine', () => {
     ]);
     expect(delivery.recordReceipted(callback())?.state).toBe('consumed');
     expect(delivery.recordAttempted(callback())?.state).toBe('consumed');
+    store.close();
+  });
+
+  it('turns an accepted Codex interrupt into a receipt but still requires exact Gate evidence', async () => {
+    const store = new SqliteDigestStore(path, { monotonicNow: () => 0 });
+    resolveD2(store);
+    const orca = new FakeOrca();
+    const transport = new FakeTransport();
+    transport.result = {
+      kind: 'sent',
+      epoch: 'codex:session_test',
+      generation: 1,
+      receipt: 'application_queued',
+    };
+    const time = clock();
+    const seen: string[] = [];
+    const delivery = engine(store, orca, transport, time, [], {
+      onTransition: (state) => { seen.push(state); },
+    });
+
+    await delivery.reconcile();
+    expect(store.findGateChannelDelivery(GATE)).toMatchObject({
+      state: 'receipted', attemptCount: 1, consumedAt: null,
+    });
+    expect(seen).toEqual(['receipted']);
+    expect(orca.calls).toHaveLength(0);
+
+    await delivery.reconcile();
+    expect(store.findGateChannelDelivery(GATE)?.state).toBe('consumed');
+    expect(seen).toEqual(['receipted', 'consumed']);
+    expect(orca.calls).toHaveLength(1);
     store.close();
   });
 

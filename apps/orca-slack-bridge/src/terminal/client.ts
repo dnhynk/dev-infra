@@ -1,4 +1,4 @@
-import type { OrcaRunner } from '../orca/client.js';
+import type { OrcaRunOptions, OrcaRunner } from '../orca/client.js';
 
 /**
  * Orca `terminal` 표면의 read-only 조회와 입력 전송.
@@ -35,6 +35,15 @@ export type TerminalSummary = {
   readonly title: string;
 };
 
+/** Identity and routability facts returned by `terminal show`; no screen content is retained. */
+export type TerminalRoute = {
+  readonly handle: string;
+  readonly paneKey: string;
+  readonly worktreePath: string;
+  readonly connected: boolean;
+  readonly writable: boolean;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -43,8 +52,14 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-async function call<T>(runner: OrcaRunner, args: readonly string[]): Promise<T> {
-  const out = await runner.run(args);
+async function call<T>(
+  runner: OrcaRunner,
+  args: readonly string[],
+  options?: OrcaRunOptions,
+): Promise<T> {
+  options?.signal?.throwIfAborted();
+  const out = await (options === undefined ? runner.run(args) : runner.run(args, options));
+  options?.signal?.throwIfAborted();
   let raw: unknown;
   try {
     raw = JSON.parse(out);
@@ -99,6 +114,34 @@ export async function readTerminalScreen(
   return { handle, status: text(terminal['status']), rows };
 }
 
+/** Read the exact terminal/pane/worktree route used to fence a coordinator wake-up. */
+export async function readTerminalRoute(
+  runner: OrcaRunner,
+  handle: string,
+  options?: OrcaRunOptions,
+): Promise<TerminalRoute | null> {
+  const result = await call<{ terminal?: unknown }>(runner, [
+    'terminal', 'show', '--terminal', handle, '--json',
+  ], options);
+  const terminal = result.terminal;
+  if (!isRecord(terminal)) return null;
+  const actualHandle = text(terminal['handle']);
+  const tabId = text(terminal['tabId']);
+  const leafId = text(terminal['leafId']);
+  const worktreePath = text(terminal['worktreePath']);
+  if (actualHandle === '' || tabId === '' || leafId === '' || worktreePath === '') return null;
+  if (typeof terminal['connected'] !== 'boolean' || typeof terminal['writable'] !== 'boolean') {
+    return null;
+  }
+  return {
+    handle: actualHandle,
+    paneKey: `${tabId}:${leafId}`,
+    worktreePath,
+    connected: terminal['connected'],
+    writable: terminal['writable'],
+  };
+}
+
 /**
  * 입력을 보낸다. `text`가 비고 `enter`가 참이면 Enter만 보낸다.
  *
@@ -109,11 +152,12 @@ export async function sendTerminalInput(
   runner: OrcaRunner,
   handle: string,
   input: { readonly text?: string; readonly enter?: boolean },
+  options?: OrcaRunOptions,
 ): Promise<boolean> {
   const args = ['terminal', 'send', '--terminal', handle];
   if (input.text !== undefined) args.push('--text', input.text);
   if (input.enter === true) args.push('--enter');
-  const result = await call<{ send?: unknown }>(runner, [...args, '--json']);
+  const result = await call<{ send?: unknown }>(runner, [...args, '--json'], options);
   const send = result.send;
   return isRecord(send) && send['accepted'] === true;
 }

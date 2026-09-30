@@ -521,6 +521,20 @@ export class GateChannelDeliveryEngine {
         return;
       }
       if (signal.aborted) return;
+      if (result.kind === 'sent' && result.receipt === 'application_queued') {
+        // Codex has no Channel Adapter callback. Orca accepted the prompt only after the
+        // transport revalidated Run generation, marker, pane, and worktree. Record that bounded
+        // application receipt now, then leave the delivery due for the same exact Gate-effect
+        // reread used by the Channel path. This is deliberately not consumption evidence.
+        this.recordReceipted({
+          gateId: wireId(current.gateKey),
+          runId: wireId(current.runKey),
+          consumerGeneration: result.generation,
+          connectionEpoch: result.epoch,
+        });
+        released = true;
+        return;
+      }
       const errorCode = result.kind === 'sent'
         ? effectCode
         : (`route_${result.kind}_${result.code}` as const);

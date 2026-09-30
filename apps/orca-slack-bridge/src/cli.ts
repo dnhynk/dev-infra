@@ -73,6 +73,10 @@ import {
 import { ChannelMcpServer, type ChannelReceiptHandler } from './channel/mcp-server.js';
 import { GateChannelDeliveryEngine } from './channel/delivery.js';
 import {
+  CodexTerminalDeliveryTransport,
+  CoordinatorDeliveryTransport,
+} from './channel/codex-terminal.js';
+import {
   ChannelPipeServer,
   type ChannelDeliverySendResult,
   type ChannelPipeErrorCode,
@@ -1519,13 +1523,17 @@ export async function runDaemonCommand(
     // Acquire the single fixed pipe before recovery or Slack ingress. A second daemon fails closed
     // here and cannot become either the Channel owner or an interactive consumer.
     channelServer = dependencies.channelServer ?? new ChannelPipeServer({ orca });
+    const coordinatorDeliveryTransport = new CoordinatorDeliveryTransport(
+      channelServer,
+      new CodexTerminalDeliveryTransport({ orca }),
+    );
     /** 코드별 연속 실패 수. 5초 재시도를 무제한으로 적으면 로그가 운영 이력을 밀어낸다. */
     const channelFailureStreak = new Map<OperationalFailureCode, number>();
     channelDelivery = dependencies.createChannelDelivery?.(store, orca, channelServer) ??
       new GateChannelDeliveryEngine({
         store,
         orca,
-        transport: channelServer,
+        transport: coordinatorDeliveryTransport,
         // The Channel round trip was the one production path with no operational trace at all.
         // Without these the daemon reports every job `succeeded` while a coordinator silently
         // never wakes, which is exactly the failure shape DL-031 forbids.
