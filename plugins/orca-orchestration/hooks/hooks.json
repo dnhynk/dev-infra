@@ -1,0 +1,18 @@
+{
+  "description": "Monitor opted-in Codex Orca coordinators and reserve enough context for a safe handoff.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/skills/init-orchestrate/scripts/rollover-monitor.mjs\"",
+            "commandWindows": "node \"$env:PLUGIN_ROOT\\skills\\init-orchestrate\\scripts\\rollover-monitor.mjs\"",
+            "timeout": 15,
+            "statusMessage": "Checking Orca coordinator context reserve"
+          }
+        ]
+      }
+    ]
+  }
+}
