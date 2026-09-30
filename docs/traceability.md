@@ -11,8 +11,8 @@
 | coordinator가 spec과 resume 시 `HANDOFF.md`를 완전히 읽음 | 확정 | [Fresh/Resume boot](specs/orchestration-bootstrap-and-continuity.md#3-부팅-계약) |
 | 흐릿한 부분을 추측하지 않고 질문 또는 공인 자료로 해소 | 확정 | [부팅 계약](specs/orchestration-bootstrap-and-continuity.md#31-공통-전제), [작업 규약](process/working-agreement.md) |
 | worker를 branch가 checkout된 worktree에 배정하고 PR 생성 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
-| review 전담 Codex `gpt-5.6-sol xhigh`; silent-risk는 `gpt-6-astra max` | 사용자 확정 (DL-064) | [GPT worker routing](../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md), [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책) |
-| 작업 종류·난이도별 GPT model/effort 동적 배치, 최고 모델 `gpt-6-astra` | 사용자 확정 (DL-064) | [GPT worker routing](../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md), [Codex model 검증](platform-capabilities.md#83-model과-effort) |
+| 일반 PR 리뷰는 Codex 계열, silent-risk review는 Claude 계열 | 사용자 확정 (DL-065) | [worker routing](../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md), [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책) |
+| 작업 종류로 worker 계열을 정하고 model/effort는 dispatch 시점 런타임 카탈로그에서 선택 | 사용자 확정 (DL-065) | [worker routing](../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md), [Codex model 검증](platform-capabilities.md#83-model과-effort) |
 | coordinator가 review를 확인하고 merge·다음 작업까지 무인 진행 | 확정 | [Coordinator 계약](specs/orchestration-bootstrap-and-continuity.md#4-coordinator-운영-계약) |
 | A: 장문 부팅 prompt 복사·붙여넣기 제거 | 확정 | [A 문제](product-vision.md#a-반복되는-부팅-프롬프트), [통합 스펙](specs/orchestration-bootstrap-and-continuity.md) |
 | Claude `/init-orchestrate`, Codex `$init-orchestrate`의 짧은 부팅 UX | 확정 목표, 양 provider 패키징 구현 (OD-010, DL-064) | [목적](specs/orchestration-bootstrap-and-continuity.md#1-목적), [Codex 운영](ops/codex-coordinator-setup.md) |

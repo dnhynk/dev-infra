@@ -251,26 +251,16 @@ orca orchestration worker-start --task <task_id>
 
 `--model`은 Orca가 검증하지 않는 opaque provider id다. 유효 값은 각 provider CLI가 정한다.
 
-**Claude**: `--model` alias `opus`, `sonnet`, `fable`, `haiku` 또는 풀네임. `--effort` `low`, `medium`, `high`, `xhigh`, `max`. `ultra`는 없다.
+**Claude**: `claude --help`의 `--model` 설명이 alias와 풀네임을 받는다고 밝힌다. alias는 해당 계열의 최신
+model로 풀린다(2026-09-30 도움말 예: `fable`, `opus`, `sonnet`). `--effort` 단계도 같은 도움말에
+있다(2026-09-30: `low`, `medium`, `high`, `xhigh`, `max`). `ultra`는 없다.
 
-**Codex** (2026-09-07 local models_cache와 공식 Astra model page 기준. 설명은 벤더 원문):
-
-| slug | 벤더 설명 | 기본 effort | 지원 effort | ctx | tier |
-|---|---|---|---|---|---|
-| `gpt-6-astra` | Most capable model for complex professional work | 미관측 | low, medium, high, xhigh, max | **1,050k** | local cache 미노출 |
-| `gpt-5.6-sol` | Latest frontier agentic coding model | low | low, medium, high, xhigh, max, **ultra** | 272k | fast |
-| `gpt-5.6-terra` | Balanced agentic coding model for everyday work | medium | low, medium, high, xhigh, max, **ultra** | 272k | fast |
-| `gpt-5.6-luna` | Fast and affordable agentic coding model | medium | low, medium, high, xhigh, max | 272k | fast |
-| `gpt-5.5` | Frontier model for complex coding, **research**, and real-world work | medium | low, medium, high, xhigh | 272k | fast |
-| `gpt-5.3-codex-spark` | Ultra-fast coding model (1.5k tok/s, 동기 협업용) | high | low, medium, high, xhigh | **128k** | 없음 |
-| `gpt-5.4` | **deprecated** → `gpt-5.6-terra`로 이전 | medium | low, medium, high, xhigh | 272k | fast |
-| `gpt-5.4-mini` | **deprecated** → `gpt-5.6-luna`로 이전 | medium | low, medium, high, xhigh | 272k | 없음 |
-
-`gpt-5.4`와 `gpt-5.4-mini`는 models_cache에 `upgrade` 필드와 `retirement_at`이 설정된 은퇴 예정 모델이다. 새 배치 정책에 쓰지 않는다.
-
-`gpt-5.6` 계열은 `tool_mode`가 `code_mode_only`이고 `gpt-5.5`는 제한이 없다. **벤더 설명에서 "research"를 명시한 모델은 `gpt-5.5`가 유일하다.**
-
-`visibility: hide`인 모델 두 개가 더 있다. `gpt-reserve`(luna와 동일 설명)와 `codex-auto-review`("Automatic approval review model for Codex", 272k, effort max까지 지원)다. 모델 선택 UI에 노출되지 않지만 `--model`이 opaque passthrough이므로 지정 자체는 가능할 수 있다. PR 리뷰 전용 모델 후보이나 **동작 미검증이다.**
+**Codex**: `codex debug models`가 설치된 CLI가 쓰는 model 카탈로그를 JSON으로 출력한다. model마다
+`slug`, `display_name`, `description`, `visibility`(`list`는 선택 UI에 노출, `hide`는 노출하지 않음),
+`priority`(카탈로그 정렬 순서), `default_reasoning_level`, `supported_reasoning_levels`,
+`context_window`, `tool_mode`, `service_tiers` 등이 있다. 목록은 CLI 버전과 계정에 따라 바뀐다.
+2026-09-07 표에 없던 `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`가 2026-09-30 카탈로그에 올라왔으므로
+문서에 model 목록을 고정하지 않는다.
 
 effort 단계의 벤더 정의:
 
@@ -283,14 +273,14 @@ effort 단계의 벤더 정의:
 | `max` | Maximum reasoning depth for the hardest problems |
 | `ultra` | Maximum reasoning **with automatic task delegation** |
 
-`ultra`("Maximum reasoning with automatic task delegation")는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만 있다.
+`ultra` 지원 여부는 model마다 `supported_reasoning_levels`에 있다.
 
-`service_tiers`는 상위 모델 모두 `{"id": "priority", "name": "Fast", "1.5x speed, increased usage"}` 하나이고 `additional_speed_tiers`는 `["fast"]`다.
+`--model` 없이 dispatch된 codex worker는 effective `CODEX_HOME/config.toml`의 `model`과
+`model_reasoning_effort`를 쓴다.
 
-현재 effective `CODEX_HOME/config.toml`의 전역 기본값은 `model = "gpt-5.6-sol"`,
-`model_reasoning_effort = "max"`다. `--model` 없이 dispatch된 codex worker는 이 값을 쓴다.
-
-사용자 표기 `sol high fast`는 서로 다른 세 축이다: model `gpt-5.6-sol` + effort `high` + service tier `priority`. **`worker-start`에 service tier 인자가 없으므로 tier는 이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나 `worker_done` 권위를 잃는다.
+model, effort, service tier는 서로 다른 축이다. **`worker-start`에 service tier 인자가 없으므로 tier는
+이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나
+`worker_done` 권위를 잃는다.
 
 ### 2.9 Wake-up 표면
 
@@ -642,9 +632,9 @@ PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의�
 ## 8. Codex
 
 검증 기준일은 2026-09-08이고 로컬 CLI는 `codex-cli 0.153.4`다. 제품 동작은 버전 의존이므로
-[Codex skills](https://learn.chatgpt.com/docs/build-skills),
-[Codex hooks](https://learn.chatgpt.com/docs/hooks),
-[GPT-6 Astra model](https://developers.openai.com/api/docs/models/gpt-6-astra)을 권위 자료로 쓴다.
+[Codex skills](https://learn.chatgpt.com/docs/build-skills)와
+[Codex hooks](https://learn.chatgpt.com/docs/hooks)를 권위 자료로 쓴다. model 목록은 런타임
+카탈로그(§2.8)에서 읽는다.
 
 ### 8.1 Skill과 plugin discovery
 
@@ -673,20 +663,13 @@ PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의�
 
 ### 8.3 Model과 effort
 
-- OpenAI의 model page가 밝히는 `gpt-6-astra` context window는 1,050,000이고 지원 reasoning effort는
-  `low`, `medium`, `high`, `xhigh`, `max`다. 이 프로젝트의 최고 worker lane으로 쓴다.
-- coordinator 기본은 Astra `xhigh`; cross-task 판단 품질을 유지하면서 장기 loop의 latency를 줄인다.
-  `max`는 아키텍처/계약, silent-risk adversarial review, 두 번 실패한 escalation처럼 좁고 비싼
-  Task에만 쓴다.
-- 이전 Orca 계정의 model cache에는 5.6 계열만 있었고, `codex exec -m gpt-6-astra`는 ChatGPT account
-  미지원 400 `invalid_request`를 반환했다. 같은 날 후속 runtime-home 세션의 `turn_context`는
-  `gpt-6-astra` / `max`이며 응답이 진행됐다. 따라서 가용성은 계정/runtime별 사실이다. 이전 계정의
-  결과로 현재 세션을 자동 downgrade하지 않는다.
-- `worker-start --model/--effort` 결과는 `launch.effective`가 권위다. 위 exact account-availability 오류만
-  `astra_unavailable` 근거를 남기고 `gpt-5.6-sol` `max`로 재배치한다. 이를 Astra로 표시하지 않는다.
-  다른 unavailable/mismatch/provider 오류는 fallback하지 않고 Gate로 올린다.
-- 현재 관측한 5.6 `ultra`는 nested delegation 성격이 있어 worker table에서는 제외한다. Task DAG
-  fan-out은 coordinator가 소유한다.
+- model 가용성은 계정과 runtime마다 다르다. 같은 host에서 이전 Orca 계정의 `codex exec -m gpt-6-astra`는
+  ChatGPT account 미지원 400 `invalid_request`를 반환했지만, 같은 날 후속 runtime-home 세션은 같은
+  model로 응답했다. 한 계정의 결과를 다른 계정에 일반화하지 않는다.
+- 현재 가용 model과 effort 단계는 dispatch 시점에 [§2.8](#28-agent-배치-표면)의 런타임 표면에서 읽는다.
+- `worker-start --model/--effort` 결과는 `launch.effective`가 권위다.
+- 관측한 5.6 `ultra`는 nested delegation 성격이 있었다. 다른 model의 `ultra`는 확인하지 않았으므로
+  worker에는 쓰지 않는다. Task DAG fan-out은 coordinator가 소유한다.
 - 2026-09-08 새 supervised worker `ctx_918167ae7527`에서 requested/effective `gpt-6-astra` / `xhigh`
   일치, 실제 도구 실행과 성공 보고, release를 확인했다. 이전 계정의 availability 실패와 구분한다.
 

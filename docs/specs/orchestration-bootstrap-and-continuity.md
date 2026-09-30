@@ -118,32 +118,36 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 
 ### 4.2 Agent 배치 정책
 
-coordinator provider와 무관하게 worker는 전부 `codex`/GPT 계열로 배치한다. 정책 표의 원본은 Codex
-plugin의 [GPT worker routing](../../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md)이고,
-Claude용 [`/init-orchestrate` 스킬](../../skills/init-orchestrate/SKILL.md)이 같은 표를 mirror한다. 이
-repository는 별도 override를 두지 않는다.
+coordinator provider와 무관하게 작업 종류가 worker 계열(`--agent`)을 정한다. 논리 추론과 창의성이
+핵심인 작업(아키텍처·계약 설계, 어려운 구현, 조용한-실패 위험 리뷰, 추론이 필요한 문서, 실패 뒤
+escalation)은 `claude`, 코드 작업·디버깅·리서치·일반 PR 리뷰·사실 정리형 문서는 `codex`다. 정책 표는
+Claude용 [`/init-orchestrate` 스킬](../../skills/init-orchestrate/SKILL.md)과 Codex plugin의
+[worker routing](../../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md)에
+같은 내용으로 둔다. 이 repository는 별도 override를 두지 않는다.
 
-배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §2.8](../platform-capabilities.md#28-agent-배치-표면)을 따른다.
+배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 표면과 제약은 [플랫폼 검증 §2.8](../platform-capabilities.md#28-agent-배치-표면)을 따른다.
 
 배치 근거:
 
-- 최고 lane을 `gpt-6-astra`로 두고 worker를 GPT 계열로 통일하는 것은 2026-09-07 **사용자 판단**이다.
-- 장기 coordinator는 `gpt-6-astra` `xhigh`를 기본으로 하고 `max`는 아키텍처, silent-risk review,
-  두 번 실패한 escalation처럼 경계가 좁고 정확성 비용이 큰 Task에만 쓴다.
-- 기본 구현/리뷰는 `gpt-5.6-sol`, 기계적 변경은 `gpt-5.6-luna`, 폭넓은 사실 조사와 사실형 문서는
-  `gpt-5.6-terra`로 나눠 비용과 latency를 낮춘다.
-- 이 표는 `ultra`를 쓰지 않는다. 현재 관측한 5.6 runtime에서 nested delegation을 유발할 수 있고
-  Task DAG의 fan-out은 coordinator가 소유하기 때문이다.
-- 리뷰 지적 반영 수정이 원 Dispatch 배치를 따르는 것은 [Coordinator 운영 계약](#4-coordinator-운영-계약)의 "수정 요청은 가능한 한 원 worker에게 돌린다"를 따른 결과다.
-- 실패·저확신 escalation은 fresh `gpt-6-astra` `max` context에 이전 가설과 반증 근거를 넘겨
+- 계열 배정과 model/effort를 고정하지 않는 것은 2026-09-30 **사용자 판단**이다(DL-065). provider가
+  모델을 자주 내놓아 고정 표가 금방 낡는다.
+- model과 effort는 dispatch 시점의 런타임에서 후보를 읽어 고른다. Claude는 `claude --help`의
+  `--model` alias와 `--effort` 단계, Codex는 `codex debug models` 카탈로그의 `visibility=list` 모델과
+  그 모델의 `supported_reasoning_levels`다. 같은 결과를 낼 수 있는 가장 낮은 설정을 고르고, 되돌리기
+  비싼 결정·정확성 논증·silent-risk review·escalation에만 계열에서 가장 강한 추론 설정을 쓴다.
+- 후보를 확인할 수 없으면 `--model`/`--effort`를 생략해 사용자가 설정한 agent 기본값을 상속한다.
+  Orca guide도 사용자가 지명하지 않은 model은 생략하라고 한다. 요청 model이 거부되면 같은 계열의 다음
+  후보로 새로 배치하고, 계열을 조용히 바꾸지 않는다.
+- worker에 `ultra`를 쓰지 않는다. nested delegation을 유발할 수 있고 Task DAG의 fan-out은
+  coordinator가 소유하기 때문이다.
+- 리뷰 지적 반영 수정이 원 Dispatch 계열을 따르는 것은 [Coordinator 운영 계약](#4-coordinator-운영-계약)의 "수정 요청은 가능한 한 원 worker에게 돌린다"를 따른 결과다.
+- 실패·저확신 escalation은 fresh `claude` context에 이전 가설과 반증 근거를 넘겨
   counter-hypothesis를 요구한다. 같은 terminal/context를 재사용하지 않는다.
 - escalation 트리거에 관측 가능한 저확신 신호 목록을 붙인 것은 무인 coordinator가 주관으로 판정할 수 없기 때문이다. 신호 없이 escalate를 허용하면 11행이 가장 비싼 기본 배치가 된다.
 
-`launch.requested`가 아니라 `launch.effective`가 적용 근거다. 이전 Orca 계정은 Astra를 거절했지만
-후속 계정에서는 실행을 확인했다. 현재 계정에서 새로 관측한
-`model is not supported when using Codex with a ChatGPT account` exact availability 오류에만
-`gpt-5.6-sol` `max`를 compatibility 배치로 쓰고 `astra_unavailable`을
-기록하며, Astra로 표시하지 않는다. 다른 unavailable, mismatch, provider 오류는 Gate로 올린다.
+`launch.requested`가 아니라 `launch.effective`가 적용 근거다. 고른 model·effort와 이유는 Task에 남긴다.
+Codex coordinator는 사용자가 띄운 model/effort로 동작하고, successor는 marker에 기록된 effective 값을
+이어받는다.
 
 ## 5. Worker와 PR 관찰 계약
 

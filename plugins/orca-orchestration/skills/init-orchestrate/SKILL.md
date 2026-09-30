@@ -3,7 +3,7 @@ name: init-orchestrate
 description: >-
   Boot or resume a Codex session as the coordinator of an Orca orchestration Run. Use when the
   user asks for "$init-orchestrate", orchestration startup, a GPT/Codex coordinator, unattended
-  worker coordination, or continuation from an Orca handoff. It owns the Task DAG, GPT-only worker
+  worker coordination, or continuation from an Orca handoff. It owns the Task DAG, Claude/Codex worker
   routing, PR/review/merge lifecycle, Slack Gate decisions, cleanup, and safe context rollover. Do
   not use for one worker task or ordinary terminal control.
 ---
@@ -51,7 +51,7 @@ win. Do not silently reconcile a conflict that changes product direction.
 ## Fresh Run
 
 Before implementation, show the understood objective, exclusions, completion checks, proposed DAG,
-and each task's GPT model/effort row. Record existing rollover approval for this Run, or ask once
+and each task's routing row, family, and chosen model/effort. Record existing rollover approval for this Run, or ask once
 when it has not been decided. Do not
 dispatch a coding worker or edit product code until the user settles any material direction choice.
 
@@ -145,11 +145,6 @@ At the reserve it blocks the stop and instructs this coordinator to execute the 
 rollover sequence in [run-lifecycle.md](references/run-lifecycle.md). A repeated hook invocation is
 bounded; hook failure is pass-through, never authority to mutate the Run.
 
-Prefer `gpt-6-astra` with `xhigh` for the coordinator. Availability depends on the account/runtime:
-an earlier Orca account rejected Astra, while a later session successfully ran it. Only on a fresh
-exact `model is not supported when using Codex with a ChatGPT account` error use the compatibility coordinator
-lane `gpt-5.6-sol` `max`, record `astra_unavailable`, and keep using the effective lane for rollover.
-Do not label it Astra. For Astra, reserve `max` for the bounded worker cases in the routing table and
-escalation; `xhigh` keeps the long-running coordinator responsive while retaining deep reasoning for
-cross-task reconciliation. Verify the launched model rather than assuming a requested slug was
-honored.
+The coordinator runs on the model and effort the user launched it with; this skill does not fix a
+coordinator model. Record the effective values from the session in the marker and carry them into a
+successor. Verify the launched model rather than assuming a requested slug was honored.

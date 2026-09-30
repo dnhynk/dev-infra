@@ -108,8 +108,8 @@ coordinator_session_id = CODEX_SESSION_ID
 coordinator_terminal_handle = ORCA_TERMINAL_HANDLE
 coordinator_pane_key = ORCA_PANE_KEY
 coordinator_generation = current Run consumer_generation
-coordinator_model = gpt-6-astra
-coordinator_effort = xhigh
+coordinator_model = 이 session의 effective model
+coordinator_effort = 이 session의 effective effort
 ```
 
 marker는 Bridge wake와 rollover의 route proof다. session takeover 때 원자 교체하고 Run cleanup 완료 뒤
@@ -117,26 +117,20 @@ exact marker를 제거한다. 수동 JSON 편집은 acceptance 근거가 아니�
 
 ## 4. Model 수용
 
-이전 Orca 계정의 `codex exec -m gpt-6-astra` 프로브는 ChatGPT account 미지원 400
-`invalid_request`로 끝났다. 그러나 현재 runtime-home에서 실행 중인 후속 세션의 `turn_context`는
-`gpt-6-astra` / `max`이고 실제 응답이 진행됐다. 가용성은 계정/runtime별로 판단하며 이전 계정의
-오류만으로 현재 Astra 요청을 낮추지 않는다.
+model 가용성은 계정/runtime별로 다르다. 한 계정의 거부나 성공을 다른 계정에 일반화하지 않는다.
+coordinator는 사용자가 띄운 model/effort로 동작하고 worker model은
+[worker routing](../../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md)이
+dispatch 시점의 런타임 카탈로그에서 고른다.
 
-현재 계정에서 같은 exact availability 오류가 새로 관측될 때만 `gpt-5.6-sol` `max`로 시작하고
-marker의 effective model/effort도 그대로 적으며 `astra_unavailable` 근거를 Run/handoff에 남긴다.
-이를 Astra PASS로 기록하지 않는다. 기존 세션의 Astra 응답은 새 worker launch receipt나 rollover
-성공을 대신하지 않는다.
+model 선택 경로를 수용할 때 disposable Task에서 `worker-start --agent <계열> --model <고른 model>
+--effort <고른 effort>` receipt를 읽고 다음을 확인한다.
 
-Astra-enabled surface를 수용할 때 disposable Task에서
-`worker-start --agent codex --model gpt-6-astra --effort xhigh` receipt를 읽고 다음을 확인한다.
-
-- `launch.requested.model = gpt-6-astra`
-- `launch.requested.effort = xhigh`
-- `launch.effective`가 둘과 exact 일치
+- `launch.requested`의 model/effort가 요청과 같다
+- `launch.effective`가 `launch.requested`와 exact 일치
 - worker report가 model/effort를 추측해 재서술하지 않음
 
-위 exact ChatGPT-account availability 오류에만 compatibility fallback을 자동 적용한다. 다른 unavailable,
-mismatch, provider 오류는 `ASTRA_LIVE_UNVERIFIED`로 두고 Gate로 올린다.
+요청 model이 거부되면 같은 계열의 다음 후보로 다시 배치하고 거부 오류를 남긴다. 다른 mismatch나
+provider 오류는 조용히 넘기지 않고 Gate로 올린다.
 
 ## 5. Slack Gate wake 수용
 
@@ -174,9 +168,7 @@ Stop decision:block
 ```
 
 successor 준비와 prompt 제출은 `terminal read --screen`으로 확인한다. marker는 successor session으로
-교체되어야 하고 predecessor hook은 더 이상 그 Run을 소유하지 않는다. §4의 exact availability 오류로
-compatibility fallback을 사용한 경우에는 `gpt-5.6-sol` `max` successor로 실제 rollover를 검증할 수
-있지만, 그 결과는 Astra launch PASS가 아니다.
+교체되어야 하고 predecessor hook은 더 이상 그 Run을 소유하지 않는다.
 
 ## 7. 제거와 갱신
 

@@ -84,13 +84,12 @@ authority repair 전 build에서 시작됐고 daemon만 repair 후 build로 바�
 검증과 merged-main 배포 잔여 조건은 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 있다.
 
 2026-09-07부터 Codex coordinator는 `plugins/orca-orchestration/`의 `$init-orchestrate` 스킬과 Stop
-hook을 사용한다. worker 배치는 Claude coordinator를 포함해 GPT 계열로 통일했고 최고 lane은
-`gpt-6-astra`; coordinator 기본은 `xhigh`, 구조·silent-risk·실패 escalation만 `max`다. Slack Gate는
-기존 Claude Channel을 먼저 시도하고 후보가 없을 때 exact Codex Run 마커와 Orca terminal route를 대조한
-뒤 `terminal send --text ... --enter`로 wake-only identity를 보낸다. plugin 설치, 새 thread의 skill discovery,
-Windows Stop hook 실행, 이 경로의 타입/단위 검증은 완료했다. 이전 Orca 계정은 Astra를 400으로
-거절했지만 후속 runtime-home 세션에서는 Astra 응답을 확인했다. 현재 계정에서 exact 미지원 오류가
-새로 관측될 때만 `gpt-5.6-sol` `max` compatibility 경로를 쓴다. 2026-09-08에는 새 Astra `xhigh`
+hook을 사용한다. worker 계열은 coordinator와 무관하게 작업 종류로 정한다. 논리 추론·창의성은 Claude,
+코드 작업·디버깅·리서치는 Codex이고, model과 effort는 고정하지 않고 dispatch 시점의 런타임 카탈로그에서
+고른다(DL-065). Slack Gate는 기존 Claude Channel을 먼저 시도하고 후보가 없을 때 exact Codex Run 마커와
+Orca terminal route를 대조한 뒤 `terminal send --text ... --enter`로 wake-only identity를 보낸다. plugin
+설치, 새 thread의 skill discovery, Windows Stop hook 실행, 이 경로의 타입/단위 검증은 완료했다.
+2026-09-08에는 새 Astra `xhigh`
 worker의 requested/effective receipt, 실제 응답과 release, 수정한 Windows Bridge 배포를 확인했다.
 새 TUI의 Stop hook은 설치 2개·활성 2개로 관찰됐다. 사용자가 승인한 throwaway Run에서 stale generation
 무전송, 실제 Slack Gate 응답 뒤 wake와 Task 재개, 설치된 Stop hook이 지시한 1회 rollover(Run

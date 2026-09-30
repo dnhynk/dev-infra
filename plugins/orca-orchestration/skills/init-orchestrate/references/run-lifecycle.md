@@ -63,10 +63,8 @@ When the Stop hook directs rollover, or context quality is visibly degraded:
 
 1. Fence this session: stop new dispatches and merges; let already-running independent workers run.
 2. Atomically finalize the handoff, including in-flight effects and the next executable action.
-3. Launch a successor in the current worktree with the marker's **effective** model and effort.
-   Preferred: `codex --model gpt-6-astra -c 'model_reasoning_effort="xhigh"'`. On the recorded
-   ChatGPT-account availability fallback:
-   `codex --model gpt-5.6-sol -c 'model_reasoning_effort="max"'`.
+3. Launch a successor in the current worktree with the marker's **effective** model and effort:
+   `codex --model <marker model> -c 'model_reasoning_effort="<marker effort>"'`.
    Carry the already-resolved CLI executable into the successor's launch environment as
    `ORCA_CLI_COMMAND` and include that exact selector in the resume prompt. On Windows, invoke
    absolute executable paths with PowerShell's `&` operator. Do not change User/system PATH or

@@ -674,7 +674,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 
 ## 2026-09-07 · Codex coordinator와 GPT worker 전환
 
-### DL-064 · Codex를 first-class coordinator로 추가하고 worker 배치를 GPT 계열로 통일한다
+### DL-064 · Codex를 first-class coordinator로 추가하고 worker 배치를 GPT 계열로 통일한다 — worker 배치와 coordinator model 기본값은 DL-065로 SUPERSEDED
 
 - Claude coordinator와 historical Channel acceptance는 호환용으로 유지한다. Codex에는 Claude Markdown을
   그대로 복제하지 않고, plugin-native `$init-orchestrate`, progressive references, marker helper, Stop
@@ -705,3 +705,30 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - 2026-09-08 live 검증에서 위 `--interrupt` 방식은 유휴 Codex 0.153.4 TUI를 종료시켰다. 이 관측으로
   Codex wake 방식만 `terminal send --text ... --enter`로 정정한다. queue receipt, exact route 전후
   검증, Gate effect와 실제 Task 재개 evidence의 구분은 유지한다.
+- Codex coordinator, marker, Stop hook, Gate wake 결정은 유지한다. worker를 GPT 계열로 통일한 표,
+  고정 model/effort, Astra compatibility fallback, coordinator 기본 model은 DL-065가 대체한다.
+
+## 2026-09-30 · worker 계열 배치와 런타임 model 선택
+
+### DL-065 · worker 계열은 작업 종류로 정하고 model/effort는 dispatch 시점 런타임에서 고른다
+
+- 사용자 결정: 논리 추론과 창의성이 핵심인 작업은 Claude, 코드 작업·디버깅·리서치는 Codex 계열에
+  배치한다. model과 effort는 스킬에 고정하지 않는다. provider가 model을 자주 내놓아 고정 표가 금방
+  낡기 때문이다.
+- `claude`: 아키텍처·스키마·계약 설계, 어려운 구현, silent-risk adversarial review, 추론이 필요한
+  문서·스펙, 실패·저확신 escalation. `codex`: 기본 구현·테스트, 버그 재현·디버깅, 기계적 작업, 리서치,
+  일반 PR 리뷰, 사실 정리형 문서. 리뷰 지적 반영은 원 Dispatch 계열을 따른다.
+- Claude 쪽은 Opus로 한정하지 않고 Claude model 전체에서 고른다(사용자 결정).
+- 후보는 dispatch 시점 런타임에서 읽는다. Claude는 `claude --help`의 `--model` alias와 `--effort` 단계,
+  Codex는 `codex debug models`의 `visibility=list` model과 각 model의 `supported_reasoning_levels`다.
+  같은 결과를 낼 수 있는 가장 낮은 설정을 고르고, 되돌리기 비싼 결정·정확성 논증·silent-risk
+  review·escalation에만 계열에서 가장 강한 추론 설정을 쓴다. 고른 값과 이유를 Task에 남긴다.
+- 후보를 확인할 수 없으면 `--model`/`--effort`를 생략해 사용자가 설정한 agent 기본값을 상속한다. 요청
+  model이 거부되면 같은 계열의 다음 후보로 새로 배치하고 계열을 조용히 바꾸지 않는다. 후보가 없으면
+  Gate로 올린다.
+- Codex coordinator는 사용자가 띄운 model/effort로 동작하고 successor는 marker의 effective 값을
+  이어받는다.
+- 유지: DL-019의 동적 분류, `launch.effective` 검증, 배치가 다른 Task의 terminal 재사용 금지, worker
+  `ultra` 금지, service tier 임의 지정 금지.
+- 기각: model ID와 effort를 표에 고정하는 방식(DL-064). 2026-09-07 표에 없던 `gpt-6.1-sol`,
+  `gpt-6-sol`, `gpt-6-luna`가 2026-09-30 `codex debug models` 카탈로그에 올라와 표의 lane이 낡았다.
