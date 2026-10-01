@@ -163,6 +163,19 @@ function context(lines: readonly string[]): SlackBlock {
   };
 }
 
+/**
+ * 여러 줄을 그대로 유지하는 작은 글씨 블록.
+ *
+ * `context`는 한 줄로 잇는다. 목록을 그렇게 이으면 binding 네 개가 가운뎃점으로 이어진 한
+ * 문단이 되어 어느 것이 어느 세대인지 읽을 수 없다. 항목이 여럿인 사실은 줄을 지켜야 한다.
+ */
+function contextLines(lines: readonly string[]): SlackBlock {
+  return {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: capSectionText(lines.join('\n')) }],
+  };
+}
+
 /** Splits logical lines across section blocks without ever slicing a structured ref token. */
 function labelledSections(label: string, lines: readonly string[]): SlackBlock[] {
   const blocks: SlackBlock[] = [];
@@ -392,13 +405,27 @@ function structuredDegradedSuffix(d: RunDegraded): string {
   return parts.length === 0 ? '' : ` · ${parts.join(' · ')}`;
 }
 
+/**
+ * 구조화 count를 사람이 읽는 절로 옮긴다.
+ *
+ * `counts blockingReasons=1, observedRepositories=1, resolvedProjects=0`은 값은 맞지만 읽는
+ * 사람에게 아무 말도 하지 않는다. 알려진 key는 우리말 이름을 주고, 모르는 key는 원문 그대로
+ * 남긴다 — 이름이 없다고 사실을 지우지는 않는다.
+ */
+const COUNT_LABEL: Readonly<Record<string, string>> = {
+  observedRepositories: '관측된 repository',
+  resolvedProjects: '확정된 Project',
+  blockingReasons: '막은 사유',
+  observedRuns: '관측된 Run',
+};
+
 function structuredCountsSuffix(d: RunDegraded): string {
   if (d.counts === undefined) return '';
   const counts = Object.entries(d.counts)
     .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-    .map(([key, value]) => `${esc(key)}=${value}`)
+    .map(([key, value]) => `${esc(COUNT_LABEL[key] ?? key)} ${value}`)
     .join(', ');
-  return ` · counts ${counts || '없음'}`;
+  return counts === '' ? '' : ` · ${counts}`;
 }
 
 function degradedLine(d: RunDegraded): string {
@@ -422,6 +449,8 @@ function unregisteredDegradedLine(d: RunDegraded): string {
 
 /** Mandatory route-zero summary; potentially large ref detail is emitted afterwards. */
 function unregisteredDegradedSummaryLine(d: RunDegraded): string {
+  // counts는 파생 상태다. 왜 빠졌는지는 kind와 detail이 답하고, 무엇을 고칠지는 refs가 답한다.
+  // `blockingReasons=1, observedRepositories=1, resolvedProjects=0`은 둘 다 아니다.
   return `    ↳ [${d.kind}] ${esc(cut(d.detail, DETAIL_CAP))}${structuredCountsSuffix(d)}`;
 }
 
@@ -429,21 +458,21 @@ function referenceLines(label: string, refs: readonly string[]): string[] {
   const ordered = [...new Set(refs)].sort();
   const visible = ordered.slice(0, STRUCTURED_REF_CAP);
   const omitted = ordered.length - visible.length;
-  const summary = `    ↳ ${label} count=${ordered.length}` +
-    (omitted === 0 ? '' : ` · omittedRefs=${omitted}`);
-  if (visible.length === 0) return [summary, '    ↳ refs 없음'];
+  const summary = `    ↳ ${label} ${ordered.length}건` +
+    (omitted === 0 ? '' : ` · ${omitted}건은 싣지 않았다`);
+  if (visible.length === 0) return [summary];
 
   const lines: string[] = [];
-  let current = '    ↳ refs ';
+  let current = '        ';
   for (const ref of visible) {
     const token = esc(cut(ref, DETAIL_CAP));
-    const candidate = current.endsWith('refs ') ? `${current}${token}` : `${current}, ${token}`;
+    const candidate = current.endsWith('        ') ? `${current}${token}` : `${current}, ${token}`;
     if (candidate.length <= REFERENCE_LINE_CAP) {
       current = candidate;
       continue;
     }
     lines.push(current);
-    current = `    ↳ refs 계속 ${token}`;
+    current = `        ${token}`;
   }
   lines.push(current);
   return [summary, ...lines];
@@ -463,7 +492,9 @@ function unregisteredLines(unregistered: UnregisteredRuns): string[] {
   for (const u of unregistered.runs.slice(0, ENTRY_CAP)) {
     const runIdentity = u.runRef ?? u.runId;
     if (u.repositoryRefs !== undefined) {
-      lines.push(`• ${esc(runIdentity)} — route-zero structured evidence`);
+      // 사람이 먼저 보는 것은 어느 Run이 왜 빠졌는가다. `route-zero structured evidence`는 그
+      // 답이 아니라 이 블록의 내부 이름이었다. 사실은 아래 줄들이 이미 싣고 있다.
+      lines.push(`• ${esc(runIdentity)}`);
       const visibleDegraded = u.degraded.slice(0, UNREGISTERED_DEGRADED_CAP);
       lines.push(...visibleDegraded.map(unregisteredDegradedSummaryLine));
       if (u.degraded.length > visibleDegraded.length) {
@@ -478,12 +509,12 @@ function unregisteredLines(unregistered: UnregisteredRuns): string[] {
 
       // repositoryRefs and route-block entityRefs normally name the same set. Emit the set once,
       // then only additional structured refs, so the supported maximum fits in bounded chunks.
-      lines.push(...referenceLines('redacted repository refs', u.repositoryRefs));
+      lines.push(...referenceLines('repository 참조', u.repositoryRefs));
       const repositoryRefs = new Set(u.repositoryRefs);
       const additionalRefs = visibleDegraded.flatMap((degraded) =>
         (degraded.entityRefs ?? []).filter((ref) => !repositoryRefs.has(ref)));
       if (additionalRefs.length > 0) {
-        lines.push(...referenceLines('additional structured refs', additionalRefs));
+        lines.push(...referenceLines('추가 참조', additionalRefs));
       }
     } else {
       lines.push(
@@ -503,12 +534,8 @@ function unregisteredLines(unregistered: UnregisteredRuns): string[] {
       `• omittedRuns=${omittedRuns.length}` + (omittedRefs === 0 ? '' : ` · omittedRefs=${omittedRefs}`),
     );
   }
-  // 모두에게 "등록하라"고 말하지 않는다. 조회가 실패한 Run은 등록 여부가 아직 미판정이다.
-  lines.push(
-    '각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의' +
-      ' projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해' +
-      ' 등록 여부를 아직 판정하지 못한 것이다',
-  );
+  // 카드가 자기 사용법을 설명하지 않는다. 각 줄의 degraded kind가 이미 판정 근거이고, 그 kind의
+  // 뜻은 문서가 가진다. 매 카드에 같은 문단을 붙이면 사실보다 설명이 길어진다.
   return lines;
 }
 
@@ -555,7 +582,7 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   }
   // binding 계보는 소유권을 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다.
   // liveness 판정 자체는 위 헤더 줄에 이미 라벨로 나와 있고, 여기에는 그 판정의 근거가 남는다.
-  blocks.push(context(['*Run identity*', ...identityLines]));
+  blocks.push(contextLines(['*Run identity*', ...identityLines]));
 
   /*
    * 진행 절(OD-069).
@@ -582,19 +609,16 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
     dispatchLines.push(...run.dispatches.byStatus.map((s) => `${esc(s.status)} ${s.count}`));
   }
   dispatchLines.push(`재시도가 있었던 Task ${run.dispatches.retriedTasks}`);
-  dispatchLines.push(
-    'attempt 이력이다. retry는 Task 수를 늘리지 않으므로 진행 절과 더하지 않는다',
-  );
+  // OD-069. 두 수를 더해 읽는 것을 막는 유일한 문구다.
+  dispatchLines.push('_retry는 Task 수를 늘리지 않는다_');
   // 작은 글씨로 둔다. 진행 절과 시각적으로도 다른 무게가 되어야 두 수를 더해 읽지 않는다.
-  blocks.push(context(['*Dispatch attempts*', ...dispatchLines]));
+  blocks.push(contextLines(['*Dispatch attempts*', ...dispatchLines]));
 
   // PR 절. 재료는 store에 있는 것뿐이고 그 경계를 같은 자리에서 밝힌다.
   const prLines =
     pullRequests.length === 0 ? ['store에 기록된 PR 없음'] : pullRequests.map(pullRequestLine);
-  prLines.push(
-    'digest가 관측하고 correlation에 성공한 PR만 여기 있다. 그 밖의 PR은 이 Run이 만들었더라도' +
-      ' 카드에 나타나지 않는다',
-  );
+  // 목록의 경계를 밝힌다. 없으면 "이 Run이 만든 PR 전부"로 읽힌다.
+  prLines.push('_correlation에 성공한 PR만_');
   blocks.push(labelled('PR', prLines));
 
   /*
@@ -608,22 +632,20 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   const windowed = badgeLines(run.blockers.badges, WINDOWED_SOURCES);
   if (windowed.length > 0) {
     blocks.push(
-      labelled('blocker · 관찰 창 안에서만 판정', [
-        ...windowed,
-        '미답 여부를 inbox 조회 창 안에서만 판정했다. degraded에 inbox_saturated가 있으면 이 수를' +
-          ' 확정으로 읽지 않는다',
-      ]),
+      // 라벨이 이미 "관찰 창 안에서만 판정"이라고 말하므로 같은 말을 문단으로 반복하지 않는다.
+      // 다만 inbox가 실제로 포화됐을 때는 이 수를 확정으로 읽으면 안 된다는 사실이 추가되므로
+      // **그때만** 한 줄 덧붙인다. 늘 붙이면 해당되지 않는 카드에서도 사실이 밀려난다.
+      labelled('blocker · 관찰 창 안에서만 판정', run.degraded.some(
+        (d) => d.kind === 'inbox_saturated',
+      ) ? [...windowed, '_inbox_saturated — 확정으로 읽지 않는다_'] : windowed),
     );
   }
 
   const history = badgeLines(run.blockers.badges, HISTORY_SOURCES);
   if (history.length > 0) {
     blocks.push(
-      labelled('blocker · 누적 이력 (현재 blocker가 아니다)', [
-        ...history,
-        '만료가 없는 수다. 이미 retry로 완료된 Task의 과거 실패와 이미 해소된 escalation도 계속' +
-          ' 셈된다. 지금 막혀 있다는 뜻이 아니다',
-      ]),
+      // 라벨의 "(현재 blocker가 아니다)"가 이미 오독을 막는다.
+      labelled('blocker · 누적 이력 (현재 blocker가 아니다)', history),
     );
   }
 
@@ -712,15 +734,9 @@ export function renderRunCollectionCard(input: RunCollectionCardInput): Rendered
   const headline = `📋 *관찰 요약* · Run 카드 ${cards}장 · 등록되지 않은 Run ${collection.unregistered.count}건`;
 
   const blocks: SlackBlock[] = [];
-  blocks.push(
-    section(
-      [
-        headline,
-        '이 메시지는 관찰마다 갱신되는 컬렉션 루트다. 등록된 Run이 하나도 없어도 남는다 —' +
-          ' 등록 열쇠가 통째로 어긋난 구간에서도 미등록 수가 보여야 하기 때문이다',
-      ].join('\n'),
-    ),
-  );
+  // headline만 싣는다. 이 메시지가 왜 등록 Run 수와 무관하게 항상 게시되는지(OD-080)는 문서가
+  // 답할 일이고, 매 관찰마다 카드에 같은 문단을 다시 그릴 이유가 아니다.
+  blocks.push(section(headline));
 
   // Run 카드와 같은 함수를 쓴다. 0이어도 그린다.
   blocks.push(...labelledSections('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
@@ -731,11 +747,11 @@ export function renderRunCollectionCard(input: RunCollectionCardInput): Rendered
    * 여기 싣는 것은 관찰 전체의 degraded뿐이다. Run 하나에 귀속되는 degraded는 그 Run의 카드에
    * 있고, 여기로 옮기면 어느 것이 어느 Run의 사실인지 잃는다.
    */
+  // 라벨이 이미 범위를 말한다. Run별 degraded가 어디 있는지는 카드가 설명하지 않는다.
   const degraded = ['관찰 전체'];
   degraded.push(
     ...(collection.degraded.length === 0 ? ['• 없음'] : collection.degraded.map(degradedLine)),
   );
-  degraded.push('Run 하나에 귀속되는 degraded는 그 Run의 카드에 있다');
   blocks.push(labelled('degraded', degraded));
 
   // blocks를 그리지 못하는 자리에서도 두 수가 남아야 한다. 그 자리도 mrkdwn으로 해석되므로

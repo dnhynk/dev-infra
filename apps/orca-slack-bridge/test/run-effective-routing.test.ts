@@ -256,9 +256,9 @@ describe('O1-3 effective Run routing', () => {
       expect(rendered).toContain(ref);
     }
     for (const ref of degraded?.entityRefs ?? []) expect(rendered).toContain(ref);
-    expect(rendered).toContain('observedRepositories=2');
-    expect(rendered).toContain('resolvedProjects=2');
-    expect(rendered).toContain('blockingReasons=1');
+    expect(rendered).toContain('관측된 repository 2');
+    expect(rendered).toContain('확정된 Project 2');
+    expect(rendered).toContain('막은 사유 1');
     expect(rendered).not.toContain('private-orca-one');
     expect(rendered).not.toContain('private-orca-two');
   });
@@ -311,11 +311,11 @@ describe('O1-3 effective Run routing', () => {
     const refs = forward.result.unregistered.runs[0]?.repositoryRefs ?? [];
     expect(new Set(refs).size).toBe(256);
     for (const ref of refs) expect(rendered).toContain(ref);
-    expect(rendered).toContain('observedRepositories=256');
-    expect(rendered).toContain('resolvedProjects=2');
-    expect(rendered).toContain('blockingReasons=1');
+    expect(rendered).toContain('관측된 repository 256');
+    expect(rendered).toContain('확정된 Project 2');
+    expect(rendered).toContain('막은 사유 1');
     expect(rendered).not.toContain('omittedRefs=');
-    expect(rendered.indexOf('observedRepositories=256')).toBeLessThan(
+    expect(rendered.indexOf('관측된 repository 256')).toBeLessThan(
       rendered.indexOf(refs[0]!),
     );
     expect(forward.card.blocks.length).toBeLessThanOrEqual(50);

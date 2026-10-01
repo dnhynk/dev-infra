@@ -35,6 +35,12 @@ export type ThreadReplyInput = {
   readonly threadTs: string;
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /**
+   * Slack `reply_broadcast`. thread reply는 그 thread를 따르지 않는 사람에게 알림을 보내지
+   * 않고 채널에도 나타나지 않는다. 자리에 없는 owner에게는 사실상 보이지 않는다는 뜻이다.
+   * owner가 알림으로 받겠다고 지정한 사실에만 켠다. 전부 켜면 결정이 필요한 것이 묻힌다.
+   */
+  readonly broadcast?: boolean;
   /** Cooperative cancellation for an at-most-once thread attempt. Never serialized to Slack. */
   readonly signal?: AbortSignal;
 };
@@ -402,6 +408,7 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
         thread_ts: input.threadTs,
         text: input.text,
         blocks: input.blocks,
+        ...(input.broadcast === true ? { reply_broadcast: true } : {}),
       },
       false,
       input.signal,

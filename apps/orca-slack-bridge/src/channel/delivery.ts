@@ -15,6 +15,13 @@ export const DEFAULT_DELIVERY_ATTEMPT_DELAYS_MS = [5_000, 10_000, 20_000, 30_000
 export const DEFAULT_DELIVERY_RECEIPT_BACKOFF_MS = 30_000;
 export const DEFAULT_DELIVERY_RECONCILE_DEADLINE_MS = 20_000;
 export const DEFAULT_DELIVERY_CONCURRENCY = 8;
+/**
+ * baseline을 포기하기까지의 마감.
+ *
+ * baseline은 알림 이전 상태의 스냅샷이므로 늦게 찍을수록 증거로서 무의미해진다. 짧게 두어
+ * 일시적인 Orca 실패는 흡수하되 영구히 읽히지 않는 baseline에서 빠져나온다.
+ */
+export const DEFAULT_RESUME_BASELINE_DEADLINE_MS = 15 * 60_000;
 const DELIVERY_OWNER_ABORT_REASON = 'delivery_owner_aborted';
 
 export type GateChannelDeliveryTransport = {
@@ -49,8 +56,16 @@ export type GateChannelDeliveryEngineOptions = {
   readonly batchLimit?: number;
   readonly concurrency?: number;
   readonly reconcileDeadlineMs?: number;
+  readonly resumeBaselineDeadlineMs?: number;
   /** Bounded codes only. No downstream message or payload is exposed. */
   readonly onError?: (code: GateChannelDeliveryErrorCode) => void;
+  /**
+   * Reports each durable delivery transition. Without it the whole daemon→Adapter→coordinator
+   * round trip leaves no operational trace, so a coordinator that never wakes cannot be
+   * distinguished from one that was never notified (DL-031). Carries the gate key only; the
+   * logger hashes it at the persistence boundary.
+   */
+  readonly onTransition?: (state: 'attempted' | 'receipted' | 'consumed', gateKey: string) => void;
   /** Test seam; production always uses the strict persisted resume engine. */
   readonly resume?: Pick<GateResumeEngine, 'ensureBaseline' | 'reconcile'>;
 };
@@ -86,7 +101,9 @@ export class GateChannelDeliveryEngine {
   readonly #batchLimit: number;
   readonly #concurrency: number;
   readonly #reconcileDeadlineMs: number;
+  readonly #resumeBaselineDeadlineMs: number;
   readonly #onError: (code: GateChannelDeliveryErrorCode) => void;
+  readonly #onTransition: (state: 'attempted' | 'receipted' | 'consumed', gateKey: string) => void;
   readonly #resume: Pick<GateResumeEngine, 'ensureBaseline' | 'reconcile'>;
   #singleSlotPrefersSeed = true;
 
@@ -124,7 +141,12 @@ export class GateChannelDeliveryEngine {
     if (this.#reconcileDeadlineMs >= this.#leaseMs) {
       throw new TypeError('delivery_reconcile_deadline_must_precede_lease_expiry');
     }
+    this.#resumeBaselineDeadlineMs = finiteMs(
+      options.resumeBaselineDeadlineMs ?? DEFAULT_RESUME_BASELINE_DEADLINE_MS,
+      'delivery_resume_baseline_deadline_invalid',
+    );
     this.#onError = options.onError ?? (() => undefined);
+    this.#onTransition = options.onTransition ?? (() => undefined);
     this.#resume = options.resume ?? new GateResumeEngine({
       store: options.store,
       orca: options.orca,
@@ -252,6 +274,39 @@ export class GateChannelDeliveryEngine {
    * Adapter-confirmed MCP transport write only: no Orca call or receipt authority, and the row
    * retains a finite attempt retry deadline so this historical fact cannot suppress replay.
    */
+  /** Reporting never breaks delivery. A sink failure must not roll back a committed transition. */
+  #report(state: 'attempted' | 'receipted' | 'consumed', gateKey: string): void {
+    try { this.#onTransition(state, gateKey); } catch { /* observability is not a delivery fence */ }
+  }
+
+  /**
+   * baseline 조회가 실패했을 때의 유일한 경로.
+   *
+   * baseline은 알림 **이전** 상태의 스냅샷이다. 마감을 넘겨서 찍은 것은 "이전"이 아니므로 증거로
+   * 쓸 수 없고, 그러면 계속 재시도해도 얻을 것이 없다. 실측에서 사흘 된 delivery 하나가 5초마다
+   * 영원히 재시도하고 있었다 — 의존 Task들이 그동안 완료되고 worker가 release되어 strict worker
+   * correlation이 다시는 성립할 수 없는 상태였다.
+   *
+   * 마감 안에서는 그대로 재시도한다(Orca 일시 실패는 흔하다). 마감을 넘으면 `unavailable`로
+   * 넘겨 **전달은 살리고 재개 증거만 포기한다.** 넘기지 못하면(경합·lease 만료) 재시도로 돌아간다.
+   */
+  #failBaseline(current: GateChannelDelivery, owner: string): boolean {
+    this.#onError('resume_baseline_read_failed');
+    const age = this.#now().getTime() - new Date(current.createdAt).getTime();
+    if (Number.isFinite(age) && age >= this.#resumeBaselineDeadlineMs) {
+      const abandoned = this.#store.markGateResumeBaselineUnavailable(
+        current.gateKey,
+        current.revision,
+        owner,
+        this.#now().toISOString(),
+      );
+      if (abandoned !== null) {
+        return this.#defer(abandoned, owner, this.#retryDelay(abandoned), null);
+      }
+    }
+    return this.#defer(current, owner, this.#retryDelay(current), 'resume_baseline_read_failed');
+  }
+
   recordAttempted(
     event: ChannelProductionDeliveryEvent,
     commitFence?: ChannelProductionCommitFence,
@@ -272,6 +327,7 @@ export class GateChannelDeliveryEngine {
       commitFence,
     );
     if (attempted === null) throw new Error('delivery_not_found');
+    this.#report('attempted', key);
     return attempted;
   }
 
@@ -292,6 +348,7 @@ export class GateChannelDeliveryEngine {
     // The pipe withholds its ACK when this throws, so an unknown production Gate can never be
     // acknowledged without corresponding durable state.
     if (receipted === null) throw new Error('delivery_not_found');
+    this.#report('receipted', key);
     return receipted;
   }
 
@@ -357,25 +414,13 @@ export class GateChannelDeliveryEngine {
       try {
         const baselined = await this.#resume.ensureBaseline(current, owner, signal);
         if (baselined === null) {
-          this.#onError('resume_baseline_read_failed');
-          released = this.#defer(
-            current,
-            owner,
-            this.#retryDelay(current),
-            'resume_baseline_read_failed',
-          );
+          released = this.#failBaseline(current, owner);
           return;
         }
         current = baselined;
       } catch {
         if (signal.aborted) return;
-        this.#onError('resume_baseline_read_failed');
-        released = this.#defer(
-          current,
-          owner,
-          this.#retryDelay(current),
-          'resume_baseline_read_failed',
-        );
+        released = this.#failBaseline(current, owner);
         return;
       }
       if (signal.aborted) return;
@@ -415,6 +460,7 @@ export class GateChannelDeliveryEngine {
             this.#now().toISOString(),
           );
           if (consume.kind === 'consumed' || consume.kind === 'duplicate') {
+            if (consume.kind === 'consumed') this.#report('consumed', candidate.gateKey);
             released = true;
             return;
           }

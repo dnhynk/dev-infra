@@ -218,6 +218,9 @@ export async function publishGateCard(
       threadTs: rootMessageTs,
       text: stagedCard.text,
       blocks: stagedCard.blocks,
+      // Gate는 owner가 결정하기 전에는 아무것도 진행되지 않는 유일한 사실이다. thread reply만으로는
+      // 그 thread를 따르지 않는 owner에게 도달하지 않으므로 채널에도 함께 띄운다(OD-072).
+      broadcast: true,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
     await options.fault?.('after_staged_first_reply_before_mapping', gate.key);

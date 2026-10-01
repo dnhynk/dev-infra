@@ -1,0 +1,13 @@
+{
+  "name": "dev-infra",
+  "owner": {
+    "name": "dnhynk"
+  },
+  "plugins": [
+    {
+      "name": "orca-slack-channel",
+      "description": "Orca Slack Bridge Channel Adapter. Delivers resolved Gate IDs from the Bridge daemon into this coordinator session.",
+      "source": "./orca-slack-channel"
+    }
+  ]
+}

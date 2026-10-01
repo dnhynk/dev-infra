@@ -42,6 +42,7 @@ import {
   identityLine,
   renderCard,
   renderFingerprint,
+  BROADCAST_TRANSITIONS,
   renderThreadEvent,
   type RenderedCard,
 } from './render.js';
@@ -499,6 +500,7 @@ async function digestOne(
         threadTs,
         text: event.text,
         blocks: event.blocks,
+        ...(BROADCAST_TRANSITIONS.has(t.kind) ? { broadcast: true } : {}),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
       options.store.recordThreadEvent({

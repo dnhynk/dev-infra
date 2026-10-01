@@ -5,12 +5,14 @@ param(
 
 $botTokenName = 'ORCA_SLACK_BRIDGE_BOT_TOKEN'
 $appTokenName = 'ORCA_SLACK_BRIDGE_APP_TOKEN'
+$openAiKeyName = 'ORCA_SLACK_BRIDGE_OPENAI_KEY'
 $buildIdentityName = 'ORCA_SLACK_BRIDGE_BUILD'
 
 # Task Scheduler may cache a logon environment. Remove both inherited values before doing any
 # manifest work; only fresh Windows User-scope values are copied into the daemon child below.
 [Environment]::SetEnvironmentVariable($botTokenName, $null, [EnvironmentVariableTarget]::Process)
 [Environment]::SetEnvironmentVariable($appTokenName, $null, [EnvironmentVariableTarget]::Process)
+[Environment]::SetEnvironmentVariable($openAiKeyName, $null, [EnvironmentVariableTarget]::Process)
 [Environment]::SetEnvironmentVariable($buildIdentityName, $null, [EnvironmentVariableTarget]::Process)
 
 Set-StrictMode -Version Latest
@@ -355,6 +357,7 @@ function Assert-ReleaseClosure($Runtime, [byte[]]$ManifestBytes) {
   $start.Arguments = (($arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
   [void]$start.EnvironmentVariables.Remove($botTokenName)
   [void]$start.EnvironmentVariables.Remove($appTokenName)
+  [void]$start.EnvironmentVariables.Remove($openAiKeyName)
   [void]$start.EnvironmentVariables.Remove($buildIdentityName)
   $process = [Diagnostics.Process]::new()
   $process.StartInfo = $start
@@ -498,6 +501,7 @@ function Assert-TaskBinding($Runtime, [string]$RuntimeSettingsPath) {
   $start.Arguments = (($arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
   [void]$start.EnvironmentVariables.Remove($botTokenName)
   [void]$start.EnvironmentVariables.Remove($appTokenName)
+  [void]$start.EnvironmentVariables.Remove($openAiKeyName)
   [void]$start.EnvironmentVariables.Remove($buildIdentityName)
   $process = [Diagnostics.Process]::new()
   $process.StartInfo = $start
@@ -630,12 +634,16 @@ try {
   $manifestStream.Dispose()
   $manifestStream = $null
 
-  # These are the only two Windows User-scope reads performed by the launcher.
+  # These are the only Windows User-scope reads performed by the launcher.
   $botToken = [Environment]::GetEnvironmentVariable($botTokenName, [EnvironmentVariableTarget]::User)
   $appToken = [Environment]::GetEnvironmentVariable($appTokenName, [EnvironmentVariableTarget]::User)
   if ([String]::IsNullOrWhiteSpace($botToken) -or [String]::IsNullOrWhiteSpace($appToken)) {
     Exit-StaticFailure 'windows.launcher.required_environment_absent'
   }
+  # 요약 키는 **선택**이다. 없으면 요약 없는 카드가 되고, 그것은 기동을 막을 이유가 아니다.
+  # 반대로 여기서 넘겨주지 않으면 daemon은 키가 있어도 볼 수 없다 — Task Scheduler가 띄운
+  # 프로세스에는 User-scope 값이 들어오지 않고, 이 launcher가 명시적으로 넣는 것만 전달된다.
+  $openAiKey = [Environment]::GetEnvironmentVariable($openAiKeyName, [EnvironmentVariableTarget]::User)
 
   $daemonArguments = @(
     [string]$runtime.distCli, 'daemon',
@@ -652,9 +660,13 @@ try {
   $start.Arguments = (($daemonArguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
   [void]$start.EnvironmentVariables.Remove($botTokenName)
   [void]$start.EnvironmentVariables.Remove($appTokenName)
+  [void]$start.EnvironmentVariables.Remove($openAiKeyName)
   [void]$start.EnvironmentVariables.Remove($buildIdentityName)
   $start.EnvironmentVariables[$botTokenName] = $botToken
   $start.EnvironmentVariables[$appTokenName] = $appToken
+  if (-not [String]::IsNullOrWhiteSpace($openAiKey)) {
+    $start.EnvironmentVariables[$openAiKeyName] = $openAiKey
+  }
   $start.EnvironmentVariables[$buildIdentityName] = [string]$runtime.releaseDigest
 
   $daemon = [Diagnostics.Process]::new()

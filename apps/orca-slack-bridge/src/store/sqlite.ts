@@ -4683,6 +4683,67 @@ export class SqliteDigestStore implements DigestStore, RunStore, GateStore, Oper
     }
   }
 
+  /**
+   * baseline을 끝내 읽지 못한 delivery를 `unavailable`로 넘긴다.
+   *
+   * baseline은 알림 **이전** 상태의 스냅샷이다. 제때 못 찍으면 나중에 찍은 것은 "이전"이 아니라
+   * 증거로서 무의미하다. 그런데 실패 경로에 포기가 없어서, 읽히지 않는 baseline 하나가 5초마다
+   * 영원히 재시도했다 — 실측에서 사흘 된 delivery 하나가 그렇게 돌고 있었다.
+   *
+   * `unavailable`은 이미 v11 legacy delivery가 쓰던 상태이고 뜻이 정확히 같다: **전달 liveness는
+   * 유지하되 재개 증거는 얻지 못한다.** 그 의미를 "읽을 수 없는 baseline" 일반으로 넓힌다.
+   *
+   * CAS 규율은 `recordGateResumeBaseline`과 같다.
+   */
+  markGateResumeBaselineUnavailable(
+    gateKey: GateKey,
+    expectedDeliveryRevision: number,
+    owner: string,
+    at: string,
+  ): GateChannelDelivery | null {
+    storedRevision(expectedDeliveryRevision, `${gateKey}.resume baseline delivery revision`);
+    const safeOwner = storedLeaseOwner(owner, `${gateKey}.resume baseline owner`);
+    const markedAt = storedIso(at, `${gateKey}.resume baseline at`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const delivery = this.findGateChannelDelivery(gateKey);
+      if (
+        delivery === null || delivery.revision !== expectedDeliveryRevision ||
+        delivery.leaseOwner !== safeOwner || delivery.leaseExpiresAt === null ||
+        delivery.resumeBaselineState !== 'required' || delivery.state !== 'pending' ||
+        delivery.attemptCount !== 0
+      ) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const effectiveAt = this.channelDeliveryLogicalAt(markedAt, delivery);
+      if (delivery.leaseExpiresAt <= effectiveAt) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const updated = this.db.prepare(
+        `UPDATE gate_channel_delivery
+            SET revision = revision + 1, resume_baseline_state = 'unavailable', updated_at = ?
+          WHERE gate_key = ? AND revision = ? AND lease_owner = ?
+            AND lease_expires_at > ? AND resume_baseline_state = 'required'
+            AND state = 'pending' AND attempt_count = 0`,
+      ).run(effectiveAt, gateKey, expectedDeliveryRevision, safeOwner, effectiveAt);
+      if (Number(updated.changes) !== 1) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
+      const current = this.findGateChannelDelivery(gateKey);
+      if (current === null) {
+        throw new Error(`${gateKey}의 unavailable baseline delivery를 다시 읽지 못했다`);
+      }
+      this.db.exec('COMMIT');
+      return current;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   findGateResumeObservation(gateKey: GateKey): GateResumeObservation | null {
     const row = this.db.prepare(SELECT_GATE_RESUME_OBSERVATION).get(gateKey) as
       | GateResumeObservationRow
@@ -6802,6 +6863,10 @@ export class ReadOnlyDigestStore implements DigestStore, RunStore, GateStore {
 
   recordGateResumeBaseline(): GateChannelDelivery | null {
     throw new Error(`dry-run은 store에 쓰지 않는다. resume baseline을 기록하려 했다: ${this.path}`);
+  }
+
+  markGateResumeBaselineUnavailable(): GateChannelDelivery | null {
+    throw new Error(`dry-run은 store에 쓰지 않는다. resume baseline을 포기하려 했다: ${this.path}`);
   }
 
   findGateResumeObservation(gateKey: GateKey): GateResumeObservation | null {

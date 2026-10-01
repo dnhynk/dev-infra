@@ -25,9 +25,12 @@ const temporaryRoots: string[] = [];
 const sentinel = 'INHERITED_SENTINEL_DO_NOT_PRINT';
 const syntheticBot = 'SYNTHETIC_BOT_FIXTURE_VALUE';
 const syntheticApp = 'SYNTHETIC_APP_FIXTURE_VALUE';
+const syntheticOpenAi = 'SYNTHETIC_OPENAI_FIXTURE_VALUE';
 const userScopeReads = [
   '[Environment]::GetEnvironmentVariable($botTokenName, [EnvironmentVariableTarget]::User)',
   '[Environment]::GetEnvironmentVariable($appTokenName, [EnvironmentVariableTarget]::User)',
+  // 요약 키도 같은 규율을 따른다. 무결성 검증이 전부 통과한 뒤에만 읽어야 한다.
+  '[Environment]::GetEnvironmentVariable($openAiKeyName, [EnvironmentVariableTarget]::User)',
 ] as const;
 const knownLocalAppDataRead =
   '[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)';
@@ -92,6 +95,10 @@ function createLauncherFixture(options: {
     .replace(
       userScopeReads[1],
       `$([IO.File]::AppendAllText((${psPath(tokenReadMarker)}), 'app'); ${psString(appValue)})`,
+    )
+    .replace(
+      userScopeReads[2],
+      `$([IO.File]::AppendAllText((${psPath(tokenReadMarker)}), 'openai'); ${psString(syntheticOpenAi)})`,
     )
     .replace(knownLocalAppDataRead, `(${psPath(knownLocalAppData)})`)
     .replaceAll('(Test-PrivateAcl $manifestParent $true)', protectedResult)
@@ -274,7 +281,7 @@ describe('versioned Windows launcher', () => {
   windowsIt('uses fresh resolver values and the verified manifest digest in the daemon child', () => {
     const source = launcherSource();
     expect(userScopeReads.reduce((count, expression) =>
-      count + source.split(expression).length - 1, 0)).toBe(2);
+      count + source.split(expression).length - 1, 0)).toBe(3);
     expect(source.split(knownLocalAppDataRead).length - 1).toBe(1);
     const fixture = createLauncherFixture();
     const result = fixture.run();
@@ -282,7 +289,7 @@ describe('versioned Windows launcher', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.stderr).toBe('');
-    expect(readFileSync(fixture.tokenReadMarker, 'utf8')).toBe('botapp');
+    expect(readFileSync(fixture.tokenReadMarker, 'utf8')).toBe('botappopenai');
     expect(readFileSync(fixture.daemonMarker, 'utf8')).toBe('launched');
     expect(`${result.stdout}${result.stderr}`).not.toContain(sentinel);
   }, 30_000);

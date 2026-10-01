@@ -209,8 +209,7 @@ export function aggregateBlockers(input: BlockerInput): BlockerFacts {
       {
         source: 'ciFailure',
         reason:
-          'Orca Task/Gate/Dispatch/message schema에 CI 전용 상태나 필드가 없다' +
-          '(docs/evidence/t3-orca-gate-and-aggregation.md §(b)). GitHub 축을 조인하는 쪽이 채운다',
+          'Orca 관측 표면에 CI 상태가 없다 — GitHub 축이 채운다',
       },
     ],
   };
