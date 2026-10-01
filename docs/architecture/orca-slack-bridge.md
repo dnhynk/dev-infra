@@ -430,8 +430,9 @@ source directory entry가 그대로다. owner cache/capability가 absent/stale/m
 `state.snapshot_unavailable` exit 2로 fail closed한다.
 closed DB scratch는 모든 판정 뒤 제거하며 v13일 때만 O1-2 strict store API로 읽는다.
 `automation.enabled=false`이면 repository discovery, Run observer,
-PR digest row는 intentionally disabled라 absent/old failure가 health를 낮추지 않지만 Gate reconcile과 Channel
-delivery는 계속 required다. task ownership은 O1-6이 주입할 facet이며 현재 기본
+PR digest row는 intentionally disabled라 absent/old failure가 health를 낮추지 않지만 Gate reconcile은 계속
+required다. Channel delivery는 supervisor job이 아니다. daemon의 5초 reconcile 루프가 돌리고 job row를 남기지
+않으므로 그 row는 판정하지 않으며, 적체는 `work.pending`·`work.dead`가 드러낸다. task ownership은 O1-6이 주입할 facet이며 현재 기본
 `unavailable`은 중립이다. exit은 healthy 0, degraded/stale 1, absent/stopped/schema/config mismatch 2다.
 output에는 fingerprint 값, instance/repository/Slack/Orca ID, source path가 없고 match state, static code,
 timestamp와 aggregate count만 있다. O1-2가 diagnostic으로 보존하는 legacy `notification_state` count는
