@@ -643,7 +643,9 @@ describe('daemon production wiring', () => {
     // The Scheduled Task restarts the daemon every minute; the owner hears about the cause once.
     expect(await start()).toBe(1);
     expect(await start()).toBe(1);
-    const notices = slack.posts.filter((post) => post.text.includes('discovery.schema_drift'));
+    // 카드는 원인 코드 대신 사람이 읽는 원인을 싣는다(DL-074). 코드는 운영 로그에 있다.
+    const notices = slack.posts.filter((post) =>
+      post.text.includes('데몬 중단 · Orca 데이터 형식 변경'));
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatchObject({ channel: CHANNEL });
     expect(notices[0]!.text).toContain('<@U0OWNER>');

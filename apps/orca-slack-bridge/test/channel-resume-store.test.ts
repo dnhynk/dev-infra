@@ -593,8 +593,10 @@ describe('v12 durable resume evidence and existing-card projection', () => {
     });
     expect(slack.updates).toHaveLength(1);
     expect(slack.updates[0]).toMatchObject({ channel: CHANNEL, ts: MESSAGE_TS });
-    expect(slack.updates[0]?.text).toContain('task_followup');
-    expect(slack.updates[0]?.text).toContain('ctx_followup');
+    // 재개 증거의 Task·Dispatch ID는 위 store 단언이 확인한다. 카드는 ID를 싣지 않는다(DL-074).
+    expect(slack.updates[0]?.text).toContain('▶️ 작업 재개');
+    expect(JSON.stringify(slack.updates[0])).not.toContain('task_followup');
+    expect(JSON.stringify(slack.updates[0])).not.toContain('ctx_followup');
     store.close();
   });
 
@@ -690,8 +692,8 @@ describe('v12 durable resume evidence and existing-card projection', () => {
       expect(slack.updates).toHaveLength(1);
       expect(slack.updates[0]).toMatchObject({ channel: CHANNEL, ts: MESSAGE_TS });
       expect(slack.updates[0]?.text).toContain('▶️ 작업 재개');
-      expect(slack.updates[0]?.text).toContain('task_followup');
-      expect(slack.updates[0]?.text).toContain('ctx_followup');
+      expect(JSON.stringify(slack.updates[0])).not.toContain('task_followup');
+      expect(JSON.stringify(slack.updates[0])).not.toContain('ctx_followup');
 
       const observationAfterSuccessor = store.findGateResumeObservation(GATE);
       const deliveryAfterSuccessor = store.findGateChannelDelivery(GATE);
@@ -1245,8 +1247,8 @@ describe('v12 durable resume evidence and existing-card projection', () => {
     expect(slack.updates).toHaveLength(1);
     expect(slack.updates[0]).toMatchObject({ channel: CHANNEL, ts: MESSAGE_TS });
     expect(slack.updates[0]?.text).toContain('▶️ 작업 재개');
-    expect(slack.updates[0]?.text).toContain('task_followup');
-    expect(slack.updates[0]?.text).toContain('ctx_followup');
+    expect(JSON.stringify(slack.updates[0])).not.toContain('task_followup');
+    expect(JSON.stringify(slack.updates[0])).not.toContain('ctx_followup');
     expect(store.findGateResolutionOutbox(GATE)).toMatchObject({ cardPending: true });
     store.close();
 

@@ -612,8 +612,9 @@ describe('post-ACK exact Orca resolve and reconciliation', () => {
     });
     const degradedCard = JSON.stringify(slack.updates.at(-1));
     expect(degradedCard).toContain('degraded');
-    expect(degradedCard).toContain('Bridge 요청의 결과인지 확인할 수 없어');
-    expect(degradedCard).not.toContain('sidecar 또는 mapping');
+    expect(degradedCard).toContain('이 Bridge 요청의 결과인지 확인하지 못했습니다');
+    expect(degradedCard).toContain('확인 불가 · 요청 소유 불명');
+    expect(degradedCard).not.toContain('sidecar 또는 매핑');
     store.close();
   });
 

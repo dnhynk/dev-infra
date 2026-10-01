@@ -1,5 +1,4 @@
-import { createHash } from 'node:crypto';
-
+import { renderFingerprint } from '../digest/render.js';
 import type { OrcaRunner } from '../orca/client.js';
 import type { SlackPoster } from '../slack/post.js';
 import type { RunKey } from '../identity/keys.js';
@@ -96,13 +95,6 @@ export type TerminalPromptPassReport = {
   readonly refused: number;
   readonly failed: number;
 };
-
-function renderFingerprint(text: string, blocks: unknown): string {
-  return createHash('sha256')
-    .update(`${text}\n${JSON.stringify(blocks)}`, 'utf8')
-    .digest('hex')
-    .slice(0, 32);
-}
 
 export async function runTerminalPromptPass(
   deps: TerminalPromptPassDeps,
@@ -225,14 +217,14 @@ async function publishCard(
   at: string,
 ): Promise<'posted' | 'updated' | 'skipped'> {
   const card = renderTerminalPromptCard({ prompt: record, runLabel: candidate.runLabel });
-  const fingerprint = renderFingerprint(card.text, card.blocks);
+  // 다른 카드와 같은 지문 함수다. attachments에 실린 본문까지 지문에 들어간다.
+  const fingerprint = renderFingerprint(card);
 
   if (record.messageTs === null) {
     try {
       const posted = await deps.slack.post({
         channel: candidate.channelId,
-        text: card.text,
-        blocks: card.blocks,
+        ...card,
       });
       deps.store.recordTerminalPromptCard({
         handle: record.terminalHandle,
@@ -256,8 +248,7 @@ async function publishCard(
     await deps.slack.update({
       channel: record.channelId ?? candidate.channelId,
       ts: record.messageTs,
-      text: card.text,
-      blocks: card.blocks,
+      ...card,
     });
     deps.store.updateTerminalPromptCard(
       record.terminalHandle, record.fingerprint, fingerprint, at,

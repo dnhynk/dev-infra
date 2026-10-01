@@ -95,19 +95,15 @@ export type BlockerInput = {
  * badge 안의 entry 순서. **입력 순서에 tie를 남기지 않는 total order다.**
  *
  * entry는 Orca `task-list`·`gate-list`·`worker-list`·`inbox`가 준 순서 그대로 쌓인다. 그 순서에
- * 기대면 Orca 정렬이 바뀔 때 `render.ts`가 싣는 상위 ENTRY_CAP건과 그 나열이 관찰마다 뒤바뀌고,
- * 사실이 그대로여도 렌더 지문이 흔들려 `publish.ts`의 `skip`이 발화하지 않는다. `collect.ts`가
- * Run 목록에, `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 PR 목록에 거는 것과 같은 규율이다.
+ * 기대면 Orca 정렬이 바뀔 때 `runs` 보고(`collect.ts`의 `formatRunCollection`)와 `--json`의 나열이
+ * 관찰마다 뒤바뀐다. 카드는 badge의 수만 싣는다(DL-074). `collect.ts`가 Run 목록에,
+ * `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 PR 목록에 거는 것과 같은 규율이다.
  *
  * **`detail`까지 키에 넣는다.** 앞의 네 ID가 모두 같은 두 entry가 생기면 그 tie가 입력 순서로
  * 갈리고, 그러면 이 함수가 막으려던 것이 그 자리에 그대로 남는다.
  *
- * **이 순서는 우선순위가 아니다.** ID 순이라 심각도 순도 최신순도 아니다. `render.ts`가 싣는 상위
- * ENTRY_CAP건은 그래서 임의-안정 부분집합이다 — 관찰마다 같다는 것만 말하고, 그 badge에서 가장
- * 급한 것이라고는 말하지 않는다.
- *
- * **완전성은 상위 ENTRY_CAP건이 아니라 badge의 수와 "외 N건" 줄이 진다.** 카드에 실린 목록에서
- * 무엇이 빠졌는지 읽으려 하지 말고 그 둘을 봐라.
+ * **이 순서는 우선순위가 아니다.** ID 순이라 심각도 순도 최신순도 아니다. 관찰마다 같다는 것만
+ * 말하고, 앞의 entry가 그 badge에서 가장 급한 것이라고는 말하지 않는다. 완전성은 badge의 수가 진다.
  *
  * **시간순 키를 쓰지 않은 이유.** entry의 원천은 넷(`task-list`·`gate-list`·`worker-list`·`inbox`)
  * 이고 `worker-list` 행에는 timestamp가 없다. 없는 사실로 시간순을 만들 수 없으므로 네 원천의

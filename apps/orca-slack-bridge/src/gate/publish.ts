@@ -9,7 +9,7 @@ import {
   type ThreadPoster,
 } from '../slack/post.js';
 import type { GateStore } from '../store/schema.js';
-import { renderGateDecisionCard } from './render.js';
+import { renderGateDecisionCard, type GateCardContext } from './render.js';
 import { projectGateResolutionCard } from './resolution-project.js';
 import { renderGateResolutionCard } from './resolution-render.js';
 import type { GateLocalObservation, GateObservationSaveResult } from './resolution-types.js';
@@ -87,10 +87,14 @@ function dryRun(options: GatePublishOptions): boolean {
   return options.slack === null;
 }
 
-/** A first reply is inert until its Slack identity and matched observation are durable. */
+/**
+ * A first reply is inert until its Slack identity and matched observation are durable.
+ *
+ * 버튼만 걷는다. 카드 본문(attachments)은 그대로 둔다 — 첫 게시가 본문 없는 머리만 남기지 않는다.
+ */
 function stagedGateCard(card: RenderedCard): RenderedCard {
   const blocks = card.blocks.filter((block) => block['type'] !== 'actions');
-  return blocks.length === card.blocks.length ? card : { text: card.text, blocks };
+  return blocks.length === card.blocks.length ? card : { ...card, blocks };
 }
 
 /** Publish or update exactly one Gate reply under its existing Run root. */
@@ -99,8 +103,10 @@ export async function publishGateCard(
   runKey: RunKey,
   rootMessageTs: string | null,
   gate: GateDecisionFacts,
+  /** 카드에 그릴 Run 목표와 Project. 같은 Gate는 매번 같은 값으로 불러야 지문이 흔들리지 않는다. */
+  context: GateCardContext | null = null,
 ): Promise<GatePublishResult> {
-  const card = renderGateDecisionCard(gate);
+  const card = renderGateDecisionCard(gate, context);
   const fingerprint = renderFingerprint(card);
   const base = { gate, fingerprint, card } as const;
   const existing = options.store.findGateMessage(gate.key);
@@ -262,15 +268,13 @@ export async function publishGateCard(
       // 답할 카드만 오는 채널이다. 최상위 메시지 자체가 알림이므로 broadcast가 필요 없다.
       ? await options.slack.post({
           channel: options.channel,
-          text: stagedCard.text,
-          blocks: stagedCard.blocks,
+          ...stagedCard,
           ...(options.signal === undefined ? {} : { signal: options.signal }),
         })
       : await boundedSlackReply(options.thread, {
           channel: options.channel,
           threadTs: rootMessageTs!,
-          text: stagedCard.text,
-          blocks: stagedCard.blocks,
+          ...stagedCard,
           // Gate는 owner가 결정하기 전에는 아무것도 진행되지 않는 유일한 사실이다. thread
           // reply만으로는 그 thread를 따르지 않는 owner에게 도달하지 않으므로 채널에도 함께
           // 띄운다(OD-072).
@@ -297,7 +301,7 @@ export async function publishGateCard(
       // Re-enter the ordinary bounded update path now that the exact Slack identity is durable.
       // A crash before/during this update leaves an inert mapped card that the next observer can
       // safely update in place; a duplicate first publisher can leave only an inert orphan.
-      await publishGateCard(options, runKey, rootMessageTs, gate);
+      await publishGateCard(options, runKey, rootMessageTs, gate, context);
     }
     return { ...base, action: 'create', messageTs: posted.ts };
   }
@@ -354,8 +358,7 @@ export async function publishGateCard(
     updated = await boundedSlackUpdate(options.slack, {
       channel: existing.channelId,
       ts: existing.messageTs,
-      text: card.text,
-      blocks: card.blocks,
+      ...card,
       // fence를 잡은 갱신은 job 기한으로 끊지 않는다. daemon 종료와 `slackTimeoutMs`만 멈춘다.
       ...(options.shutdownSignal === undefined ? {} : { signal: options.shutdownSignal }),
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);

@@ -271,13 +271,20 @@ function insertSidecar(store: SqliteDigestStore): void {
   });
 }
 
-/** 이 카드가 상호작용 요소를 하나도 싣지 않았는지. section/context/divider는 모두 비-상호작용이다. */
-const INERT_BLOCK_TYPES = new Set(['section', 'context', 'divider']);
+/**
+ * 이 카드가 상호작용 요소를 하나도 싣지 않았는지. header/section/context/divider는 모두
+ * 비-상호작용이다. 카드 본문은 attachment에 있으므로 그쪽도 함께 본다.
+ */
+const INERT_BLOCK_TYPES = new Set(['header', 'section', 'context', 'divider']);
 
-function noActionBlocks(input: { readonly blocks: readonly Record<string, unknown>[] }): boolean {
-  const encoded = JSON.stringify(input.blocks);
+function noActionBlocks(input: {
+  readonly blocks: readonly Record<string, unknown>[];
+  readonly attachments?: readonly { readonly blocks: readonly Record<string, unknown>[] }[];
+}): boolean {
+  const blocks = [...input.blocks, ...(input.attachments ?? []).flatMap((a) => a.blocks)];
+  const encoded = JSON.stringify(blocks);
   return (
-    input.blocks.every((block) => INERT_BLOCK_TYPES.has(String(block['type']))) &&
+    blocks.every((block) => INERT_BLOCK_TYPES.has(String(block['type']))) &&
     !encoded.includes('"type":"actions"') &&
     !encoded.includes('"type":"button"') &&
     !encoded.includes('action_id')
@@ -371,7 +378,9 @@ describe('collect → project → render → existing Run thread publish', () =>
       expect(noActionBlocks(promoted ?? { blocks: [] })).toBe(false);
       expect(JSON.stringify(promoted?.blocks)).toContain('"value":"keep"');
       expect(slack.replies[0]?.text).toContain('정적 Gate card');
-      expect(JSON.stringify(promoted?.blocks)).toContain('현재 소비자와 호환된다');
+      // 버튼 없는 첫 게시도 카드 본문을 싣는다. 버튼만 걷고 attachment는 그대로 둔다.
+      expect(JSON.stringify(slack.replies[0]?.attachments)).toContain('현재 소비자와 호환된다');
+      expect(JSON.stringify(promoted?.attachments)).toContain('현재 소비자와 호환된다');
       // 파생 카드도 누를 수 있어야 한다. 이것이 없으면 등록을 빠뜨린 Gate를 폰에서 해결할 수 없다.
       const derived = slack.updates.find((update) => update.ts === '1787554800.000103');
       expect(noActionBlocks(derived ?? { blocks: [] })).toBe(false);

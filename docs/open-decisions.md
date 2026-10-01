@@ -1109,6 +1109,9 @@ ID: OD-067
                 docs/ux/slack-surfaces.md §3, docs/traceability.md
 검증 방법: 겹치는 Gate/Task와 question/escalation fixture에서 원천 badge는 보존되고 고유 총합은 표시되지 않는지 확인한다.
 결정일: 2026-08-23
+후속: "같은 `taskId`·`dispatchId`·Gate ID·message ID를 함께 노출한다"의 노출 자리는 DL-074가 Slack 카드에서 `runs`
+      명령의 사실 보고로 옮겼다. 카드는 원천별 수만 싣는다. 원천별 badge, 고유 총합 미표시, `agentWait`의 넓은
+      "interaction 대기" 표시는 유효하다.
 ```
 
 ```text
@@ -1670,4 +1673,7 @@ ID: OD-080
            새로 만든 v6 파일과 스키마(컬럼 순서·notnull·PK·인덱스)와 CHECK 동작을 대조하고,
            기존 여섯 표의 행이 보존되며 실패 시 v5로 되돌아가는지 확인한다.
 결정일: 2026-08-24
+후속: "관측 시각은 카드에 싣지 않는다"는 DL-074가 대체했다. 카드는 게시 직전 시각을 "갱신"으로 싣고 렌더 지문은 그
+      시각을 비운 렌더에서 계산하므로 시각만 바뀐 관찰은 여전히 `skip`이다. 미등록 목록은 사유별 수로 접고 Run별
+      목록은 `runs` 명령의 사실 보고에 둔다. 컬렉션 루트를 등록 Run 수와 무관하게 항상 게시하는 결정은 유효하다.
 ```

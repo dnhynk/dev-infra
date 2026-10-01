@@ -203,8 +203,9 @@ export async function publishRunCard(
   input: RunCardInput,
 ): Promise<RunPublishResult> {
   const signal = options.signal ?? options.rootIntent?.signal;
-  const card = renderRunCard(input);
-  const fingerprint = renderFingerprint(card);
+  // 카드는 게시 시각을 "갱신"으로 싣고, 지문은 그 시각을 비운 렌더에서 계산한다(DL-074).
+  const card = renderRunCard(input, options.now().toISOString());
+  const fingerprint = renderFingerprint(renderRunCard(input, null));
   const runKey = input.run.identity.key;
   const base = { run: input.run, fingerprint, card } as const;
 
@@ -216,9 +217,9 @@ export async function publishRunCard(
   }
 
   if (existing !== null && existing.renderFingerprint === fingerprint) {
-    // 카드가 그대로다. Slack도 store도 부르지 않는다. 이 경로가 살아 있으려면 카드에
-    // 관찰 시각이 없어야 한다 — 시각을 그리면 사실이 그대로여도 지문이 매번 달라져 `skip`이
-    // 실운영에서 발화하지 않는다. 근거는 `store/schema.ts`의 지문 규칙과 `run/render.ts`에 있다.
+    // 카드가 그대로다. Slack도 store도 부르지 않는다. 이 경로가 살아 있으려면 지문에 관찰 시각이
+    // 없어야 한다 — 시각을 넣으면 사실이 그대로여도 지문이 매번 달라져 `skip`이 실운영에서
+    // 발화하지 않는다. 그래서 지문은 갱신 시각을 비운 렌더에서 계산한다(`run/render.ts`).
     return { ...base, action: 'skip', messageTs: existing.messageTs };
   }
 
@@ -238,7 +239,7 @@ export async function publishRunCard(
       entity: { kind: 'run', key: runKey },
       channel: options.channel,
       renderFingerprint: fingerprint,
-      message: { text: card.text, blocks: card.blocks },
+      message: card,
       mapping: { kind: 'run' },
       slack: options.slack,
       now: options.now,
@@ -259,8 +260,7 @@ export async function publishRunCard(
     updated = await boundedSlackUpdate(options.slack, {
       channel: existing.channelId,
       ts: existing.messageTs,
-      text: card.text,
-      blocks: card.blocks,
+      ...card,
       ...(signal === undefined ? {} : { signal }),
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (error) {
@@ -287,11 +287,13 @@ export async function publishRunCollectionCard(
   collection: RunCollection,
 ): Promise<RunPublishOutcome> {
   const signal = options.signal ?? options.rootIntent?.signal;
-  const card = renderRunCollectionCard({
+  const input = {
     cards: collection.runs.length,
     collection: { degraded: collection.degraded, unregistered: collection.unregistered },
-  });
-  const fingerprint = renderFingerprint(card);
+  };
+  // Run 카드와 같다. 갱신 시각은 카드에만 싣고 지문은 시각을 비운 렌더에서 계산한다(DL-074).
+  const card = renderRunCollectionCard(input, options.now().toISOString());
+  const fingerprint = renderFingerprint(renderRunCollectionCard(input, null));
   const base = { fingerprint, card } as const;
 
   // **루트 재사용의 유일한 근거다.** 이 조회를 끊으면 관찰마다 새 루트가 생긴다.
@@ -321,7 +323,7 @@ export async function publishRunCollectionCard(
       entity: { kind: 'run_collection', key: 'run_collection' },
       channel: options.channel,
       renderFingerprint: fingerprint,
-      message: { text: card.text, blocks: card.blocks },
+      message: card,
       mapping: { kind: 'run_collection' },
       slack: options.slack,
       now: options.now,
@@ -342,8 +344,7 @@ export async function publishRunCollectionCard(
     updated = await boundedSlackUpdate(options.slack, {
       channel: existing.channelId,
       ts: existing.messageTs,
-      text: card.text,
-      blocks: card.blocks,
+      ...card,
       ...(signal === undefined ? {} : { signal }),
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (error) {
@@ -408,7 +409,7 @@ export async function publishRunCollection(
   const signal = options.signal ?? options.rootIntent?.signal;
   const collectionResult = await publishRunCollectionCard(options, collection);
 
-  // 관측 시각을 싣지 않는다. 카드에 그리지 않기 때문이고, 그 근거는 `run/render.ts`에 있다.
+  // 관측 시각을 싣지 않는다. 카드의 갱신 시각은 `publishRunCard`가 게시 직전에 찍는다.
   const context: RunCollectionContext = {
     degraded: collection.degraded,
     unregistered: collection.unregistered,
@@ -472,6 +473,8 @@ export async function publishRunCollection(
           run.identity.key,
           rootMessageTs,
           gate,
+          // 결정 카드는 다른 채널에 놓이므로 어느 Run의 결정인지 카드가 직접 말해야 한다.
+          { runObjective: run.identity.objective, project: run.project },
         ),
       );
     }
@@ -571,6 +574,8 @@ function outcomeLines(
   if (dryRun) {
     lines.push('  blocks');
     lines.push(JSON.stringify(outcome.card.blocks, null, 2));
+    lines.push('  attachments');
+    lines.push(JSON.stringify(outcome.card.attachments ?? [], null, 2));
   }
   return lines;
 }
@@ -596,6 +601,8 @@ export function formatRunObserveReport(report: RunObserveReport): string {
   }
   for (const gate of report.published.gates) {
     lines.push(...outcomeLines(`Gate ${gate.gate.gateId}`, gate, report.dryRun));
+    // 카드는 판정 제한의 수만 싣는다. 사유 문장에 Task·Gate ID가 들어 있어서다(DL-074).
+    for (const reason of gate.gate.degraded) lines.push(`  degraded ${reason}`);
     lines.push('');
   }
   lines.push(

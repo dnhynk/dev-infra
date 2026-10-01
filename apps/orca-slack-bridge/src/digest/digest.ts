@@ -464,8 +464,10 @@ async function digestOne(
     });
   }
 
-  const card = renderCard({ pr, summary });
-  const fingerprint = renderFingerprint(card);
+  // 카드는 게시 시각을 "갱신"으로 싣고, 지문은 그 시각을 비운 렌더에서 계산한다. 시각만 바뀐
+  // 관찰이 `chat.update`를 만들지 않는다(DL-074).
+  const card = renderCard({ pr, summary }, options.now().toISOString());
+  const fingerprint = renderFingerprint(renderCard({ pr, summary }, null));
   // 이름이 `observation`이 아닌 것이 의도다. 위의 `observation`은 reconcile 결과이고 이것은
   // `pr_message` 한 행에 남길 지문 둘과 요약이다. 두 값의 수명과 용도가 다르다.
   const record = {
@@ -531,8 +533,7 @@ async function digestOne(
       const posted = await boundedSlackReply(options.thread, {
         channel: options.channel,
         threadTs,
-        text: event.text,
-        blocks: event.blocks,
+        ...event,
         ...(BROADCAST_TRANSITIONS.has(t.kind) ? { broadcast: true } : {}),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
@@ -584,7 +585,7 @@ async function digestOne(
       entity: { kind: 'pr', key: pr.key },
       channel: options.channel,
       renderFingerprint: fingerprint,
-      message: { text: card.text, blocks: card.blocks },
+      message: card,
       mapping: {
         kind: 'pr',
         factsFingerprint: factsFp,
@@ -610,8 +611,7 @@ async function digestOne(
   const updated = await boundedSlackUpdate(options.slack, {
     channel: existing.channelId,
     ts: existing.messageTs,
-    text: card.text,
-    blocks: card.blocks,
+    ...card,
     ...(signal === undefined ? {} : { signal }),
   }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   options.store.updateObservation(pr.key, record, at);
@@ -688,6 +688,8 @@ export function formatReport(report: DigestReport): string {
     if (report.dryRun) {
       lines.push('  blocks');
       lines.push(JSON.stringify(r.card.blocks, null, 2));
+      lines.push('  attachments');
+      lines.push(JSON.stringify(r.card.attachments ?? [], null, 2));
     }
     lines.push('');
   }

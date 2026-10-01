@@ -1,6 +1,15 @@
 import type { RenderedCard } from '../digest/render.js';
+import {
+  cut,
+  esc,
+  listText,
+  renderCardShell,
+  type CardField,
+  type CardFooter,
+  type CardTone,
+} from '../slack/card.js';
 import type { SlackBlock } from '../slack/post.js';
-import type { GateDecisionFacts, GateTaskFacts } from './types.js';
+import type { GateDecisionFacts } from './types.js';
 import {
   gateActionId,
   gateBlockId,
@@ -9,127 +18,87 @@ import {
   gateDirectBlockId,
 } from './actions.js';
 
-const SECTION_TEXT_CAP = 3000;
-const SECTION_TRUNCATION_MARK = '\n…(표시 한도 3000자를 넘어 잘림)';
 const DETAIL_CAP = 500;
-const TASK_CAP = 20;
+const OBJECTIVE_CAP = 80;
+const TITLE_CAP = 80;
+/** `대기 중` 칸에 이름을 싣는 Task 수. 나머지는 수로 남긴다. */
+const TITLE_LIST_CAP = 5;
 
-function esc(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/**
+ * 결정 카드가 속한 Run. 결정 카드는 Run 카드와 다른 채널(`decisions`)에 놓이므로 어느 Run의
+ * 결정인지 카드가 직접 말해야 한다. Run 카드가 그리는 것과 같은 값이다.
+ */
+export type GateCardContext = {
+  readonly runObjective: string;
+  readonly project: string | null;
+};
+
+type GateHead = { readonly tone: CardTone; readonly emoji: string; readonly kind: string };
+
+const OPEN_HEAD: GateHead = { tone: 'attention', emoji: '❓', kind: '결정 필요' };
+const RESOLVED_HEAD: GateHead = { tone: 'success', emoji: '✅', kind: '결정됨' };
+/** pending도 resolved도 아닌 status. 지원하지 않는 Orca 상태를 결정된 것처럼 그리지 않는다. */
+const UNKNOWN_HEAD: GateHead = { tone: 'status', emoji: '⚪', kind: '확인 불가' };
+
+const NO_BUTTONS_NOTE =
+  '선택지를 Orca 기록과 맞추지 못해 버튼을 만들지 않았습니다 → Orca에서 직접 결정하세요.';
+
+/** sidecar 상세(권장·영향)가 없는 자리. 파생 행과 metadata가 없거나 어긋난 카드가 쓴다. */
+const NO_DETAIL = '확인 불가 · 상세 미등록';
+
+function titleLines(gate: GateDecisionFacts): string {
+  if (gate.waitingTasks.length === 0) return '없음';
+  const shown = gate.waitingTasks.slice(0, TITLE_LIST_CAP).map((task) =>
+    task.title.trim() === '' ? '확인 불가 · 제목 없음' : esc(cut(task.title, TITLE_CAP)));
+  const hidden = gate.waitingTasks.length - shown.length;
+  return [...shown, ...(hidden > 0 ? [`외 ${hidden}개`] : [])].join('\n');
 }
 
-function cut(value: string, cap: number): string {
-  const trimmed = value.trim();
-  return trimmed.length <= cap ? trimmed : `${trimmed.slice(0, cap)}…`;
-}
-
-function capSectionText(text: string): string {
-  if (text.length <= SECTION_TEXT_CAP) return text;
-  const budget = SECTION_TEXT_CAP - SECTION_TRUNCATION_MARK.length;
-  let end = 0;
-  for (const point of text) {
-    if (end + point.length > budget) break;
-    end += point.length;
+/**
+ * 판정 제한 칸. **수만 싣는다.**
+ *
+ * `degraded` 사유 문장에는 Task·Gate ID가 들어 있다(`gate/project.ts`). 카드는 ID를 싣지 않으므로
+ * 사유는 `runs` 보고(`formatRunObserveReport`)가 출력한다. dependency를 판정하지 못한 Task는
+ * 독립으로 접지 않고 따로 센다.
+ */
+function limitValue(gate: GateDecisionFacts): string {
+  const lines = [gate.degraded.length === 0 ? '없음' : `${gate.degraded.length}건 · runs 보고 참고`];
+  if (gate.unclassifiedTasks.length > 0) {
+    lines.push(`의존 판정 불가 Task ${gate.unclassifiedTasks.length}개`);
   }
-  return `${text.slice(0, end)}${SECTION_TRUNCATION_MARK}`;
+  return lines.join('\n');
 }
 
-function section(text: string): SlackBlock {
-  return { type: 'section', text: { type: 'mrkdwn', text: capSectionText(text) } };
-}
-
-function labelled(label: string, lines: readonly string[]): SlackBlock {
-  return section([`*${label}*`, ...lines].join('\n'));
-}
-
-/** 작은 글씨 한 줄. 결정에 쓰지 않는 운영 사실을 지우지 않고 뒤로 물린다. */
-function context(lines: readonly string[]): SlackBlock {
-  return {
-    type: 'context',
-    elements: [{ type: 'mrkdwn', text: capSectionText(lines.join('  ·  ')) }],
-  };
-}
-
-function taskLines(tasks: readonly GateTaskFacts[]): readonly string[] {
-  if (tasks.length === 0) return ['없음'];
-  const shown = tasks.slice(0, TASK_CAP).map((task) => {
-    const title = task.title.trim() === '' ? '(title 없음)' : cut(task.title, DETAIL_CAP);
-    return `• ${esc(task.taskId)} · ${esc(task.status)} · ${esc(title)}`;
-  });
-  if (tasks.length > TASK_CAP) return [...shown, `• 외 ${tasks.length - TASK_CAP}건은 카드에 싣지 않았다`];
-  return shown;
+function optionLines(gate: GateDecisionFacts): readonly string[] {
+  if (gate.options.length === 0) return ['표시할 option 없음'];
+  // 라벨과 설명을 한 줄로 잇는다. 두 줄로 나누면 선택지 넷이 여덟 줄이 된다. 파생 행에는 설명이 없다.
+  return gate.options.map((option) => option.description === null
+    ? esc(cut(option.label, DETAIL_CAP))
+    : `${esc(cut(option.label, DETAIL_CAP))} — ${esc(cut(option.description, DETAIL_CAP))}`);
 }
 
 /**
  * Render a Gate card. Only an exactly correlated pending fixed-option Gate receives actions.
  *
- * 이 카드는 사람이 자리에 없을 때 폰에서 읽고 누르는 화면이다. 그래서 **결정에 필요한 것이
- * 먼저 오고, 운영 디버그 사실은 작은 글씨로 뒤로 간다.** 표시하는 사실은 스펙 §6.2가 요구하는
- * 여덟 가지 그대로이며 무엇도 빼지 않는다 — 순서와 무게만 결정 순서에 맞춘다:
- * 질문 → 권장과 이유 → 선택지 → 영향 → 무엇이 막히나 → 버튼 → correlation/degraded.
+ * 이 카드는 사람이 자리에 없을 때 폰에서 읽고 누르는 화면이다. 그래서 질문과 버튼이 머리에 오고,
+ * 그 아래 색 바 안에 Run·권장·영향·대기 Task가 칸으로 온다. 표시하는 사실은 스펙 §6.2가 요구하는
+ * 여덟 가지다: 질문 → 버튼(선택지·직접 입력) → 권장과 이유 → 선택지 설명 → 영향 → 대기 Task와
+ * 독립 Task.
+ *
+ * Gate·Task·Run ID, correlation(ask·thread·dispatch), option ID는 싣지 않는다(DL-074). 버튼의 기계
+ * 판정은 store가 sidecar metadata로 다시 계산하고(`store/sqlite.ts`), 추적용 ID는 `runs` 보고에 있다.
+ * 현재 시각을 읽지 않는다. 열린 카드에는 시각이 없고 결정된 카드는 Orca의 `resolvedAt`을 쓴다.
  */
-export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
+export function renderGateDecisionCard(
+  gate: GateDecisionFacts,
+  context: GateCardContext | null = null,
+): RenderedCard {
   const open = gate.status === 'pending';
-  const headline = open ? '⚠️ 결정 필요' : '✅ Gate 결정 기록';
-  // 질문이 headline 본문이다. 이전에는 gate id가 큰 줄이고 질문이 `*문제*` 라벨 아래 있었는데,
-  // 폰에서 먼저 읽어야 하는 것은 id가 아니라 무엇을 물었는가다.
-  const blocks: SlackBlock[] = [
-    section(`${headline}\n*${esc(cut(gate.question, SECTION_TEXT_CAP)) || '(question 없음)'}*`),
-    context([`gate ${esc(gate.gateId)}`, `task ${esc(gate.taskId)}`, `run ${esc(gate.runId)}`]),
-  ];
+  const resolved = gate.status === 'resolved';
+  const head = open ? OPEN_HEAD : resolved ? RESOLVED_HEAD : UNKNOWN_HEAD;
+  const question = gate.question.trim();
 
-  // 권장을 선택지보다 먼저 둔다. 3초 안에 누르려는 사람이 찾는 한 줄이다.
-  blocks.push(
-    labelled(
-      'Coordinator 권장',
-      gate.recommendation === null
-        ? ['sidecar metadata가 없거나 어긋나 표시하지 않음']
-        : [
-            `*${esc(gate.recommendation.label)}* (${esc(gate.recommendation.optionId)})`,
-            `_이유 · ${esc(cut(gate.recommendation.reason, DETAIL_CAP))}_`,
-          ],
-    ),
-  );
-
-  const optionLines: string[] = [];
-  if (gate.options.length === 0) {
-    optionLines.push('표시할 option 없음');
-  } else {
-    for (const option of gate.options) {
-      // 라벨과 설명을 한 줄로 잇는다. 두 줄로 나누면 선택지 넷이 여덟 줄이 되고 버튼이
-      // 화면 밖으로 밀린다.
-      const description = option.description === null
-        ? '설명 metadata 없음'
-        : esc(cut(option.description, DETAIL_CAP));
-      optionLines.push(`• *${esc(cut(option.label, DETAIL_CAP))}* — ${description}`);
-    }
-  }
-  blocks.push(labelled('선택지', optionLines));
-
-  blocks.push(
-    labelled(
-      '영향',
-      gate.impact === null
-        ? ['sidecar metadata가 없거나 어긋나 추측하지 않음']
-        : [esc(cut(gate.impact, SECTION_TEXT_CAP))],
-    ),
-  );
-
-  // 대기와 계속 가능은 서로 대조해서 읽는 사실이다("이 결정을 미루면 무엇이 멈추나").
-  // 한 블록에 나란히 두어야 그 대조가 보인다.
-  const blocked: string[] = [
-    `*이 Gate 때문에 대기* (${gate.waitingTasks.length}건)`,
-    ...taskLines(gate.waitingTasks),
-    `*독립적으로 계속 가능* (${gate.independentTasks.length}건)`,
-    ...taskLines(gate.independentTasks),
-  ];
-  if (gate.unclassifiedTasks.length > 0) {
-    blocked.push(`*dependency 판정 불가* (${gate.unclassifiedTasks.length}건)`);
-    blocked.push(...taskLines(gate.unclassifiedTasks));
-    blocked.push('_independent로 접지 않았다_');
-  }
-  blocks.push(section(blocked.join('\n')));
-
+  const actions: SlackBlock[] = [];
   const actionable =
     gate.status === 'pending' &&
     gate.metadataState === 'matched' &&
@@ -139,7 +108,7 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
     // 여기서 요구하면 등록을 빠뜨린 Gate가 다시 누를 수 없는 카드가 된다.
     gate.options.every((option) => option.id !== null && option.resolution !== null);
   if (actionable) {
-    blocks.push({
+    actions.push({
       type: 'actions',
       block_id: gateBlockId(gate.key),
       elements: gate.options.map((option) => ({
@@ -155,7 +124,7 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
   const directActionable =
     gate.status === 'pending' && gate.metadataState === 'matched' && gate.correlation !== null;
   if (directActionable) {
-    blocks.push({
+    actions.push({
       type: 'actions',
       block_id: gateDirectBlockId(gate.key),
       elements: [{
@@ -167,36 +136,63 @@ export function renderGateDecisionCard(gate: GateDecisionFacts): RenderedCard {
     });
   }
 
-  if (gate.resolution !== null) {
-    blocks.push(
-      labelled('Orca Gate resolution', [
-        esc(cut(gate.resolution, SECTION_TEXT_CAP)),
-        gate.resolvedAt === null ? 'resolved_at 없음' : `resolved_at ${esc(gate.resolvedAt)}`,
-      ]),
-    );
+  const objective = context === null
+    ? ''
+    : cut(context.runObjective.split('\n')[0] ?? '', OBJECTIVE_CAP);
+  const fields: CardField[] = [];
+  if (!open && gate.resolution !== null) {
+    fields.push(['결정', esc(cut(gate.resolution, DETAIL_CAP))]);
   }
-
-  // correlation ID와 degraded는 운영자가 추적할 때 필요한 사실이지 결정에 쓰는 사실이 아니다.
-  // 지우지 않되 버튼 아래 작은 글씨로 내린다. degraded는 owner가 알아야 하므로 앞에 둔다.
-  const correlation = gate.correlation;
-  const footnotes: string[] = [];
-  if (gate.degraded.length > 0) {
-    footnotes.push(`degraded — ${gate.degraded.map((r) => esc(cut(r, DETAIL_CAP))).join(' · ')}`);
-  } else {
-    footnotes.push('degraded 없음');
-  }
-  footnotes.push(
-    correlation === null
-      ? `metadata ${esc(gate.metadataState)} · action correlation 사용 불가`
-      : `correlation · ask ${esc(correlation.askMessageId)} · thread ${esc(correlation.questionThreadId)}` +
-        ` · dispatch ${esc(correlation.dispatchId)} · task ${esc(correlation.taskId)}` +
-        ` · gate ${esc(correlation.gateId)}`,
+  fields.push(
+    [
+      'Run',
+      context === null
+        ? '확인 불가 · Run 정보 없음'
+        : objective === '' ? '확인 불가 · 목표 없음' : esc(objective),
+    ],
+    [
+      'Project',
+      context === null
+        ? '확인 불가 · Run 정보 없음'
+        : context.project === null ? '확인 불가 · Project 미등록' : esc(context.project),
+    ],
+    // 권장을 선택지보다 먼저 둔다. 3초 안에 누르려는 사람이 찾는 한 칸이다.
+    ['권장', gate.recommendation === null ? NO_DETAIL : esc(cut(gate.recommendation.label, DETAIL_CAP))],
+    // 대기와 계속 가능은 서로 대조해서 읽는 사실이다("이 결정을 미루면 무엇이 멈추나").
+    ['대기 Task', `${gate.waitingTasks.length}개`],
+    ['영향', gate.impact === null ? NO_DETAIL : esc(cut(gate.impact, DETAIL_CAP))],
+    ['계속 가능', `${gate.independentTasks.length}개`],
   );
-  blocks.push(context(footnotes));
 
-  const question = cut(gate.question, 160) || '(question 없음)';
-  return {
-    text: `${headline} · ${esc(gate.gateId)} · ${esc(question)}`,
-    blocks,
-  };
+  const sections: string[] = [];
+  if (open && !actionable) sections.push(NO_BUTTONS_NOTE);
+  if (gate.recommendation !== null) {
+    sections.push(`권장 이유: ${esc(cut(gate.recommendation.reason, DETAIL_CAP))}`);
+  }
+  sections.push(listText('선택지', optionLines(gate)));
+
+  // 열린 카드에는 시각을 싣지 않는다. 결정된 카드는 Orca가 기록한 결정 시각만 쓴다.
+  const footer: CardFooter = open
+    ? {
+        at: null,
+        verb: 'Coordinator 질문',
+        basis: gate.recommendation !== null || gate.impact !== null ? '등록 상세 기준' : 'Orca 기록 기준',
+      }
+    : { at: gate.resolvedAt, verb: '결정', basis: 'Orca Gate 기준' };
+
+  return renderCardShell({
+    tone: head.tone,
+    emoji: head.emoji,
+    kind: head.kind,
+    head: question === '' ? '확인 불가 · 질문 없음' : question,
+    text: `${head.emoji} ${head.kind} · ${esc(cut(gate.question, 160) || '(question 없음)')}`,
+    actions,
+    fields,
+    sections,
+    dashboard: [
+      ['대기 중', titleLines(gate)],
+      ['판정 제한', limitValue(gate)],
+    ],
+    footer,
+  });
 }

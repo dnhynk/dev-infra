@@ -10,6 +10,7 @@ import type {
   OrcaRepositoryBindingRecord,
   RepositoryRegistryRecord,
 } from '../src/store/operational-types.js';
+import { allBlocks, visibleTexts } from './card-text.js';
 
 const OBSERVED_AT = new Date('2026-08-26T12:00:00.000Z');
 const EVIDENCE_AT = '2026-08-26T00:00:00.000Z';
@@ -252,15 +253,15 @@ describe('O1-3 effective Run routing', () => {
       cards: result.runs.length,
       collection: { degraded: result.degraded, unregistered: result.unregistered },
     }));
+    // 카드는 사유별 수만 싣는다. hash ref와 구조화 count는 `runs` 보고에 있다(DL-074).
+    expect(rendered).toContain('Project 확정 불가 1건');
     for (const ref of result.unregistered.runs[0]?.repositoryRefs ?? []) {
-      expect(rendered).toContain(ref);
+      expect(rendered).not.toContain(ref);
     }
-    for (const ref of degraded?.entityRefs ?? []) expect(rendered).toContain(ref);
-    expect(rendered).toContain('관측된 repository 2');
-    expect(rendered).toContain('확정된 Project 2');
-    expect(rendered).toContain('막은 사유 1');
+    for (const ref of degraded?.entityRefs ?? []) expect(rendered).not.toContain(ref);
     expect(rendered).not.toContain('private-orca-one');
     expect(rendered).not.toContain('private-orca-two');
+    expect(rendered).not.toContain('run_cross');
   });
 
   it('preserves summary-first route-zero evidence at 16 repositories times 16 Orca IDs', async () => {
@@ -310,19 +311,11 @@ describe('O1-3 effective Run routing', () => {
     const rendered = JSON.stringify(forward.card);
     const refs = forward.result.unregistered.runs[0]?.repositoryRefs ?? [];
     expect(new Set(refs).size).toBe(256);
-    for (const ref of refs) expect(rendered).toContain(ref);
-    expect(rendered).toContain('관측된 repository 256');
-    expect(rendered).toContain('확정된 Project 2');
-    expect(rendered).toContain('막은 사유 1');
-    expect(rendered).not.toContain('omittedRefs=');
-    expect(rendered.indexOf('관측된 repository 256')).toBeLessThan(
-      rendered.indexOf(refs[0]!),
-    );
-    expect(forward.card.blocks.length).toBeLessThanOrEqual(50);
-    for (const block of forward.card.blocks) {
-      const text = (block['text'] as { readonly text?: string } | undefined)?.text ?? '';
-      expect(text.length).toBeLessThanOrEqual(3_000);
-    }
+    // 지원 상한의 route-zero 증거도 카드에서는 사유 한 줄이다. ref 256개는 `runs` 보고가 싣는다.
+    expect(rendered).toContain('Project 확정 불가 1건');
+    for (const ref of refs) expect(rendered).not.toContain(ref);
+    expect(allBlocks(forward.card).length).toBeLessThanOrEqual(50);
+    for (const text of visibleTexts(forward.card)) expect(text.length).toBeLessThanOrEqual(3_000);
     expect(rendered).not.toContain('private-run-maximum');
     for (const id of ids) expect(rendered).not.toContain(id);
   });

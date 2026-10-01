@@ -174,7 +174,8 @@ Renderer는 다음을 보장해야 한다.
 - `orca-run`은 있고 필수 `orca-task`가 없는 PR은 invalid/degraded input이며 Task 카드를 만들지 않는다.
   별도 `run_correlated` kind는 Run-level 제품 의미가 필요해질 때만 도입한다(OD-077).
 - C1의 첫 외부 write는 실제 `#pr-digest`에 한다.
-- 모든 카드 상단은 Project가 등록됐으면 `[Project] owner/repo #N`, 아니면 `owner/repo #N`으로 표시한다.
+- 카드 머리는 상태와 PR 제목이고, 첫 칸이 `owner/repo · #N`과 Project다. 알림용 대체 텍스트는 Project가 등록됐으면
+  `[Project] owner/repo #N`, 아니면 `owner/repo #N`을 싣는다. commit SHA와 finding의 파일 경로는 카드에 싣지 않는다(DL-074).
 - PR 하나당 루트 메시지 하나를 만든다.
 - 상태가 바뀌면 Bridge 자신이 작성한 같은 메시지를 `chat.update`로 갱신한다.
 - 저장된 Slack 메시지를 갱신할 수 없으면 GitHub current snapshot, Orca facts, Bridge store identity로
@@ -193,22 +194,24 @@ Orca Run 하나를 Slack 루트 메시지 하나에 대응시킨다.
 루트 메시지는 현재 상태를 보여준다.
 
 - project/repository
-- Run identity와 제목
-- 실행 중·결정 필요·완료 등 현재 상태
+- Run 제목(objective)
+- 결정 필요·막힘·진행 중·Task 완료·확인 불가 중 현재 카드 종류
 - 현재 `task-list.count`와 Task 상태별 수
 - Task 진행 상태와 분리된 Dispatch attempt 이력
 - 관련 PR과 핵심 상태
-- 원천별 blocker badge와 correlation ID
+- 원천별 blocker 수
 - 현재 사람 개입 필요 여부
 
-Task를 분모 단위로 삼아 `현재 Task 상태별 수 / 현재 task-list.count`를 표시하고 실행 중 추가된 Task를
-즉시 반영한다. Dispatch는 attempt 이력으로 분리한다. 완료율·성공률 공식은 만들지 않으며 Orca 원천에는
+Run ID, binding handle, blocker의 correlation ID는 카드에 싣지 않고 `runs` 명령의 사실 보고에 남긴다(DL-074).
+
+Task를 분모 단위로 삼아 현재 Task 상태별 수와 현재 `task-list.count`를 서로 다른 칸에 표시하고 실행 중
+추가된 Task를 즉시 반영한다. Dispatch는 attempt 이력으로 분리한다. 완료율·성공률 공식은 만들지 않으며 Orca 원천에는
 `cancelled` Task 상태가 없다(OD-069).
 
 `blocker`, open Gate, Gate에 blocked된 Task, dependency waiting, worker ask, CI failure, interaction 대기는
-서로 다른 원천 badge로 표시하고 `taskId`·`dispatchId`·Gate ID·message ID를 함께 노출한다. 고유 blocker
-총합은 dedup 정책이 확정되기 전에는 표시하지 않는다. `agentWait`는 provider별 근거가 더 있을 때만
-permission 등으로 세분화한다(OD-067).
+서로 다른 원천의 수로 표시한다. `taskId`·`dispatchId`·Gate ID·message ID는 `runs` 명령의 사실 보고에 함께
+노출한다(DL-074). 고유 blocker 총합은 dedup 정책이 확정되기 전에는 표시하지 않는다. `agentWait`는 provider별
+근거가 더 있을 때만 permission 등으로 세분화한다(OD-067).
 
 D1은 설정 파일에 수동 등록한 repository만 관찰한다. 자동 발견, Git remote 기반 자동 등록, 자동 발견된
 다중 repository routing은 O1 범위다(OD-068).
@@ -271,10 +274,11 @@ durable하게 저장하고 이를 권위 correlation으로 쓴다. Gate question
 Gate가 해결되면 thread에서 다음을 구분해 보여준다.
 
 - Orca Gate에 결정이 기록됨
-- 누가 언제 어떤 결정을 했는가
+- 언제 어떤 결정을 버튼과 직접 입력 중 어느 방식으로 했는가
 - coordinator 통지 상태
 - 실제 Orca 상태로 관찰된 후속 작업 재개
 
+누가 결정했는지(Slack user)는 카드에 싣지 않고 store의 결정 기록(`gate_resolution` row)에 남긴다(DL-074).
 notification transport write/queue만 성공했다고 “작업 재개”로 표시하지 않는다.
 
 카드에는 degraded 상태를 항상 표시한다. Channel pending·미해결 Gate·correlation 실패처럼 owner 개입 없이는
