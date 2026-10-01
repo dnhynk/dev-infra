@@ -2045,6 +2045,9 @@ export async function inspectOperationalStatus(
       ]);
   for (const job of snapshot.value.jobs) {
     if (disabledObserverJobs.has(job.job)) continue;
+    // Channel 전달은 감독 job이 아니다. daemon의 5초 reconcile 루프가 돌리고 job 기록을 남기지 않으므로
+    // 기록이 없는 것이 정상이다. 전달 적체는 `work.pending`과 `work.dead`가 드러낸다.
+    if (job.job === 'channel-delivery') continue;
     if (job.state === 'absent') add('job.absent', 1);
     else if (job.state === 'failed') add('job.failed', 1);
     else if (job.state === 'backoff') add('job.backoff', 1);
