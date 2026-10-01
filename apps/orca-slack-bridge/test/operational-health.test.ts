@@ -47,7 +47,7 @@ describe('O1-5 daemon-facing health/telemetry seam', () => {
       claim, at: AT2, durationMs: 1_000, processedCount: 4, deferredCount: 1,
       nextRunAt: AT3,
     });
-    await health.daemonCleanStopped(INSTANCE, AT3);
+    await health.daemonCleanStopped(INSTANCE, AT3, 'parent_exit');
 
     expect(store.readDaemonHealth()).toMatchObject({ state: 'stopped', heartbeatAt: AT3 });
     expect(store.findDaemonJobOutcome('repository-discovery')).toMatchObject({
@@ -61,7 +61,7 @@ describe('O1-5 daemon-facing health/telemetry seam', () => {
         event: 'job.succeeded', job: 'repository-discovery', durationMs: 1_000,
         counts: { processed: 4, deferred: 1 },
       },
-      { event: 'daemon.stopped' },
+      { event: 'daemon.stopped', stopReason: 'parent_exit' },
     ]);
     expect(JSON.stringify(observed)).not.toContain(INSTANCE);
     expect(JSON.stringify(observed)).not.toContain('build-fingerprint');

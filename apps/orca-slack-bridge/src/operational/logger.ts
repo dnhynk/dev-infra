@@ -90,11 +90,24 @@ export const OPERATIONAL_COUNT_FIELDS = [
   'dead',
   'total',
 ] as const;
+/*
+ * daemon이 정상 종료한 이유. `daemon.stopped`에 싣는다.
+ *
+ * - parent_exit: launcher가 사라져 stdin이 닫혔다.
+ * - signal: SIGINT 또는 SIGTERM.
+ * - desired_state: 상태 DB의 desired state가 stopped다.
+ * - requested: 주입된 `waitForStop`이 끝났다(test seam). 치명 종료도 이 값으로 멈추지만
+ *   `daemon.stopped`를 남기지 않는다.
+ *
+ * 이것이 없으면 정상 종료 줄만으로는 사람이 멈춘 것과 launcher가 죽어 따라 멈춘 것을 가릴 수 없다.
+ */
+export const OPERATIONAL_STOP_REASONS = ['parent_exit', 'signal', 'desired_state', 'requested'] as const;
 
 export type OperationalLogEvent = typeof OPERATIONAL_LOG_EVENTS[number];
 export type OperationalLogLevel = typeof OPERATIONAL_LOG_LEVELS[number];
 export type OperationalLogOutcome = typeof OPERATIONAL_LOG_OUTCOMES[number];
 export type OperationalCountField = typeof OPERATIONAL_COUNT_FIELDS[number];
+export type OperationalStopReason = typeof OPERATIONAL_STOP_REASONS[number];
 export type EntityIdentity = object & { readonly __entityIdentity: unique symbol };
 export type EntityRef = string & { readonly __entityRef: unique symbol };
 
@@ -111,6 +124,7 @@ export type OperationalLogInput = {
   readonly errorCode?: OperationalFailureCode;
   readonly retryable?: boolean;
   readonly counts?: OperationalLogCounts;
+  readonly stopReason?: OperationalStopReason;
   /** Opaque raw identity token. The concrete logger hashes it at the persistence boundary. */
   readonly entityIdentity?: EntityIdentity;
 };
@@ -131,6 +145,7 @@ export type OperationalLogRecord = {
   readonly errorCode?: OperationalFailureCode;
   readonly retryable?: boolean;
   readonly counts?: OperationalLogCounts;
+  readonly stopReason?: OperationalStopReason;
   readonly entityRef?: EntityRef;
 };
 
@@ -174,15 +189,15 @@ export type OperationalLoggerOptions = {
 
 const LOG_FIELDS = [
   'ts', 'level', 'service', 'schemaVersion', 'build', 'event', 'job', 'outcome', 'attempt',
-  'durationMs', 'nextRunAt', 'errorCode', 'retryable', 'counts', 'entityRef',
+  'durationMs', 'nextRunAt', 'errorCode', 'retryable', 'counts', 'stopReason', 'entityRef',
 ] as const;
 const INPUT_FIELDS = [
   'level', 'event', 'job', 'outcome', 'attempt', 'durationMs', 'nextRunAt', 'errorCode',
-  'retryable', 'counts', 'entityIdentity',
+  'retryable', 'counts', 'stopReason', 'entityIdentity',
 ] as const;
 const PARSED_INPUT_FIELDS = [
   'level', 'event', 'job', 'outcome', 'attempt', 'durationMs', 'nextRunAt', 'errorCode',
-  'retryable', 'counts',
+  'retryable', 'counts', 'stopReason',
 ] as const;
 export const OPERATIONAL_JOB_NAMES: readonly DaemonJobName[] = [
   'repository-discovery', 'run-observer', 'pr-digest', 'gate-reconcile', 'channel-delivery',
@@ -307,6 +322,10 @@ function normalizeCommonInput(
     const counts = normalizeCounts(value['counts']);
     if (counts === null) return null;
     normalized['counts'] = counts;
+  }
+  if (value['stopReason'] !== undefined) {
+    if (!isCatalogValue(value['stopReason'], OPERATIONAL_STOP_REASONS)) return null;
+    normalized['stopReason'] = value['stopReason'];
   }
   return normalized as Omit<
     OperationalLogRecord,

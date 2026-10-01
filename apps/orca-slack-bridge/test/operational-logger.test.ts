@@ -7,6 +7,7 @@ import {
   MAX_OPERATIONAL_LOG_LINE_BYTES,
   OPERATIONAL_COUNT_FIELDS,
   OPERATIONAL_LOG_FILE,
+  OPERATIONAL_STOP_REASONS,
   OperationalNdjsonLogger,
   entityIdentity,
   parseOperationalLogLine,
@@ -86,7 +87,7 @@ describe('allowlist-only redacted operational logger', () => {
       expect(parseOperationalLogLine(line)).not.toBeNull();
       expect(Object.keys(JSON.parse(line) as object).every((key) => [
         'ts', 'level', 'service', 'schemaVersion', 'build', 'event', 'job', 'outcome', 'attempt',
-        'durationMs', 'nextRunAt', 'errorCode', 'retryable', 'counts', 'entityRef',
+        'durationMs', 'nextRunAt', 'errorCode', 'retryable', 'counts', 'stopReason', 'entityRef',
       ].includes(key))).toBe(true);
     }
   });
@@ -158,6 +159,33 @@ describe('allowlist-only redacted operational logger', () => {
       succeeded: 5, failed: 6, uncertain: 7, dead: 8, total: 9,
     });
     expect(parseOperationalLogLine(rawLines()[1] as string)?.event).toBe('telemetry.rejected');
+  });
+
+  it('round-trips each catalogued daemon stop reason and rejects free-form reasons', async () => {
+    const reasons = ['parent_exit', 'signal', 'desired_state', 'requested'] as const;
+    const logger = await OperationalNdjsonLogger.create({ logDir: dir, buildIdentity: 'build', clock: () => AT });
+    for (const stopReason of reasons) {
+      await logger.log({ level: 'info', event: 'daemon.stopped', outcome: 'stopped', stopReason });
+    }
+    for (const stopReason of ['windows terminal closed', 'SIGNAL', '', 1, null]) {
+      await logger.log({ level: 'info', event: 'daemon.stopped', outcome: 'stopped', stopReason });
+    }
+    await logger.close();
+
+    const parsed = rawLines().map((line) => parseOperationalLogLine(line));
+    expect(parsed.slice(0, reasons.length)).toMatchObject(reasons.map((stopReason) => ({
+      event: 'daemon.stopped', outcome: 'stopped', stopReason,
+    })));
+    expect(parsed.slice(reasons.length)).toHaveLength(5);
+    for (const record of parsed.slice(reasons.length)) {
+      expect(record).toMatchObject({ event: 'telemetry.rejected', errorCode: 'validation.failed' });
+      expect(record).not.toHaveProperty('stopReason');
+    }
+    // The read path applies the same catalog to a line that was edited on disk.
+    const edited = (rawLines()[0] as string).replace('"parent_exit"', '"windows terminal closed"');
+    expect(edited).not.toBe(rawLines()[0]);
+    expect(parseOperationalLogLine(edited)).toBeNull();
+    expect(OPERATIONAL_STOP_REASONS).toEqual(reasons);
   });
 
   it('flushes already accepted writes on close and rejects later writes without touching the file', async () => {
