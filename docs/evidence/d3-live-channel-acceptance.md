@@ -59,8 +59,9 @@ operator help.
   acceptance checks. The task repetition restarted it after 2 minutes and after 19 seconds. One
   click in the first window was not delivered. Both times the operator had closed or reopened
   Windows Terminal. On this host it holds the launcher's console as a minimized window, so the
-  launcher ended and the daemon stopped on stdin EOF. A fix is tracked separately. After the first
-  restart, the same Adapter reconnected and receipted the new probe without asking.
+  launcher ended and the daemon stopped on stdin EOF. The launcher now detaches from its console at
+  start (DL-072). After the first restart, the same Adapter reconnected and receipted the new probe
+  without asking.
 
 ## 2026-08-26 split-build observation
 

@@ -19,8 +19,24 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 다른 어떤 작업보다 먼저 콘솔에서 떨어진다.
+#
+# 기본 터미널이 "Let Windows decide"인 host에서는 Task의 콘솔을 Windows Terminal이 띄우고, 그때
+# `-WindowStyle Hidden`은 창을 최소화할 뿐이다. 사람이 Windows Terminal을 닫거나 다시 열면 그
+# 콘솔에 붙은 launcher가 CTRL_CLOSE로 `daemon exited` 줄도 남기지 못하고 끝나고, daemon은 stdin
+# EOF로 따라 멈춘다. 떨어진 프로세스에는 콘솔 이벤트가 오지 않는다. 아래에서 띄우는 node 자식은
+# 모두 CreateNoWindow로 자기 콘솔을 따로 가지므로 이 콘솔을 쓰지 않는다.
+#
+# 분리에 실패해도 붙은 채로 계속한다. 결과는 `daemon started` 줄의 `console=`에 남는다.
+$consoleDetached = $false
+try {
+  Add-Type -Namespace OrcaSlackBridge -Name NativeConsole -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool FreeConsole();'
+  $consoleDetached = [OrcaSlackBridge.NativeConsole]::FreeConsole()
+} catch { }
+
 function Exit-StaticFailure([string]$Code) {
-  [Console]::Error.WriteLine($Code)
+  # 콘솔에서 떨어진 뒤의 stderr는 갈 곳이 없고 쓰기가 실패할 수도 있다. 어느 경우에도 exit 2다.
+  try { [Console]::Error.WriteLine($Code) } catch { }
   exit 2
 }
 
@@ -715,7 +731,9 @@ try {
   $stderrCopy = $null
   if ($null -ne $stderrLog) {
     try {
-      & $writeStderrLine ('daemon started pid={0}' -f $daemon.Id)
+      # `console=attached`면 콘솔 host가 닫힐 때 launcher도 함께 끝날 수 있다.
+      & $writeStderrLine ('daemon started pid={0} console={1}' -f $daemon.Id,
+        $(if ($consoleDetached) { 'detached' } else { 'attached' }))
       $stderrCopy = $daemon.StandardError.BaseStream.CopyToAsync($stderrLog)
     } catch { $stderrCopy = $null }
   }

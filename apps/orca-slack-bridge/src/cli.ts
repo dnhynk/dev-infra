@@ -111,6 +111,7 @@ import {
   OperationalNdjsonLogger,
   entityIdentity,
   resolveOperationalLogDir,
+  type OperationalStopReason,
   type OperationalTelemetrySink,
 } from './operational/logger.js';
 import { OperationalHealthTelemetry } from './operational/health.js';
@@ -1088,7 +1089,7 @@ export type DaemonDependencies = {
 };
 
 type ProcessStopLatch = {
-  readonly promise: Promise<void>;
+  readonly promise: Promise<'signal' | 'parent_exit'>;
   dispose(): void;
 };
 
@@ -1103,16 +1104,19 @@ const STOP_ON_PARENT_EXIT = 'ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT';
 const STARTUP_SNAPSHOT_LEASE_WAIT_MS = 10_000;
 const STARTUP_SNAPSHOT_LEASE_RETRY_MS = 250;
 
-function processStop(): ProcessStopLatch {
+export function processStop(input: Readable = process.stdin): ProcessStopLatch {
   let dispose = (): void => undefined;
-  const promise = new Promise<void>((resolve) => {
+  const promise = new Promise<'signal' | 'parent_exit'>((resolve) => {
     let settled = false;
-    const stop = (): void => {
+    const stop = (reason: 'signal' | 'parent_exit'): void => {
       if (settled) return;
       settled = true;
       dispose();
-      resolve();
+      resolve(reason);
     };
+    // SIGINT와 SIGTERM은 listener 하나를 같이 쓴다. 둘은 같은 이유 `signal`이다.
+    const onSignal = (): void => { stop('signal'); };
+    const onParentExit = (): void => { stop('parent_exit'); };
     /*
      * 부모(launcher)가 죽으면 stdin 파이프의 쓰기 끝이 닫히고 여기서 EOF로 관측된다.
      *
@@ -1125,20 +1129,20 @@ function processStop(): ProcessStopLatch {
      */
     const watchParent = process.env[STOP_ON_PARENT_EXIT] === '1';
     dispose = (): void => {
-      process.off('SIGINT', stop);
-      process.off('SIGTERM', stop);
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
       if (watchParent) {
-        process.stdin.off('end', stop);
-        process.stdin.off('close', stop);
-        process.stdin.pause();
+        input.off('end', onParentExit);
+        input.off('close', onParentExit);
+        input.pause();
       }
     };
-    process.once('SIGINT', stop);
-    process.once('SIGTERM', stop);
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
     if (watchParent) {
-      process.stdin.once('end', stop);
-      process.stdin.once('close', stop);
-      process.stdin.resume();
+      input.once('end', onParentExit);
+      input.once('close', onParentExit);
+      input.resume();
     }
   });
   return { promise, dispose: () => dispose() };
@@ -1333,10 +1337,10 @@ export async function runDaemonCommand(
   const inboundAbort = new AbortController();
   const reconciliationAbort = new AbortController();
   const acceptedWorkAbort = new AbortController();
-  let stopReason: 'requested' | 'pipe_failure' | null = null;
+  let stopReason: OperationalStopReason | 'pipe_failure' | null = null;
   let resolveStop!: () => void;
   const stopRequested = new Promise<void>((resolve) => { resolveStop = resolve; });
-  const requestStop = (reason: 'requested' | 'pipe_failure'): void => {
+  const requestStop = (reason: OperationalStopReason | 'pipe_failure'): void => {
     if (stopReason !== null) return;
     stopReason = reason;
     reconciliationAbort.abort();
@@ -1369,7 +1373,7 @@ export async function runDaemonCommand(
     if (cause instanceof Error) process.stderr.write(`daemon.failure cause=${cause.name}\n`);
   };
   if (processStopLatch !== null) {
-    void processStopLatch.promise.then(() => requestStop('requested'));
+    void processStopLatch.promise.then((reason) => requestStop(reason));
   }
   let acceptingInbound = false;
   const drainAcceptedWork = async (): Promise<void> => {
@@ -1695,7 +1699,7 @@ export async function runDaemonCommand(
       });
       statusOwnerServer.refresh();
     }
-    if (store.readDaemonHealth()?.desiredState === 'stopped') requestStop('requested');
+    if (store.readDaemonHealth()?.desiredState === 'stopped') requestStop('desired_state');
     if (reconciliationAbort.signal.aborted) return stopReason === 'pipe_failure' ? 1 : 0;
 
     const configuredInterval = dependencies.reconcileIntervalMs ?? 5_000;
@@ -1746,7 +1750,7 @@ export async function runDaemonCommand(
               requestStop('requested');
               return;
             }
-            if (record.desiredState === 'stopped') requestStop('requested');
+            if (record.desiredState === 'stopped') requestStop('desired_state');
             else armHeartbeat();
           })
           .catch(() => {
@@ -2256,7 +2260,9 @@ export async function runDaemonCommand(
         // Pipe shutdown failure cannot authorize a second daemon or a different external write.
       }
     }
-    if (daemonHealthStarted && !commandFailed && !observerDrainTimedOut &&
+    // 정상 반환은 모두 requestStop을 거치므로 여기서 stopReason은 null이 아니다. TypeScript가
+    // closure 안의 대입을 보지 못해 null 검사를 조건에 적는다.
+    if (daemonHealthStarted && !commandFailed && !observerDrainTimedOut && stopReason !== null &&
         stopReason !== 'pipe_failure' && !fatalOperationalFailure && health !== null) {
       let cleanStopped = false;
       for (let attempt = 0; attempt < 4 && !cleanStopped; attempt += 1) {
@@ -2264,6 +2270,7 @@ export async function runDaemonCommand(
           cleanStopped = await health.daemonCleanStopped(
             instanceId,
             observerClock.wallNow().toISOString(),
+            stopReason,
           ) !== null;
         } catch {
           if (attempt < 3) {

@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { PassThrough } from 'node:stream';
 import {
   fairDigestCycle,
   parseArgs,
+  processStop,
   runDaemonCommand as runDaemonCommandWithNativeStatus,
 } from '../src/cli.js';
 import type { EffectiveBridgeConfig } from '../src/discovery/types.js';
@@ -933,6 +936,7 @@ describe('daemon production wiring', () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
     let socketStarts = 0;
+    const logged: unknown[] = [];
     const code = await runDaemonCommand(parsed, CONFIG, {
       channelServer: new FakeChannelServer(),
       orca: new FakeOrca(),
@@ -944,6 +948,10 @@ describe('daemon production wiring', () => {
         },
         close: () => Promise.resolve(),
       }),
+      telemetry: {
+        log: async (input) => { logged.push(input); return { ok: true as const }; },
+        close: async () => undefined,
+      },
       waitForStop: () => Promise.resolve(),
     });
 
@@ -954,6 +962,10 @@ describe('daemon production wiring', () => {
       desiredState: 'stopped', state: 'stopped',
     });
     reopened.close();
+    expect(logged.filter((input) =>
+      (input as { readonly event?: unknown }).event === 'daemon.stopped')).toEqual([
+      { level: 'info', event: 'daemon.stopped', outcome: 'stopped', stopReason: 'desired_state' },
+    ]);
   });
 
   it('holds the snapshot lease from before writable store open through owner shutdown', async () => {
@@ -1887,5 +1899,86 @@ describe('daemon production wiring', () => {
       lifecycle: 'uncertain', lastErrorCode: 'pre_read_failed', leaseOwner: null,
     });
     reopened.close();
+  });
+});
+
+describe('daemon stop latch', () => {
+  const STOP_ON_PARENT_EXIT = 'ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT';
+  let previousFlag: string | undefined;
+  beforeEach(() => { previousFlag = process.env[STOP_ON_PARENT_EXIT]; });
+  afterEach(() => {
+    if (previousFlag === undefined) delete process.env[STOP_ON_PARENT_EXIT];
+    else process.env[STOP_ON_PARENT_EXIT] = previousFlag;
+  });
+
+  async function endAndSettle(input: PassThrough): Promise<void> {
+    const ended = once(input, 'end');
+    input.resume();
+    input.end();
+    await ended;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  it('reports parent_exit on stdin EOF only when the launcher set the flag', async () => {
+    delete process.env[STOP_ON_PARENT_EXIT];
+    const unwatched = new PassThrough();
+    const ignoring = processStop(unwatched);
+    let ignoredReason: string | null = null;
+    void ignoring.promise.then((reason) => { ignoredReason = reason; });
+    expect(unwatched.listenerCount('end')).toBe(0);
+    await endAndSettle(unwatched);
+    expect(ignoredReason).toBeNull();
+    ignoring.dispose();
+
+    process.env[STOP_ON_PARENT_EXIT] = '1';
+    const watched = new PassThrough();
+    const latch = processStop(watched);
+    watched.end();
+    await expect(latch.promise).resolves.toBe('parent_exit');
+    expect(watched.listenerCount('end')).toBe(0);
+    expect(watched.listenerCount('close')).toBe(0);
+  });
+
+  it('reports signal through the one listener SIGINT and SIGTERM share', async () => {
+    delete process.env[STOP_ON_PARENT_EXIT];
+    const beforeSigint = process.listeners('SIGINT');
+    const beforeSigterm = process.listeners('SIGTERM');
+    const latch = processStop(new PassThrough());
+    const addedSigint = process.listeners('SIGINT').filter(
+      (listener) => !beforeSigint.includes(listener),
+    );
+    const addedSigterm = process.listeners('SIGTERM').filter(
+      (listener) => !beforeSigterm.includes(listener),
+    );
+    expect(addedSigint).toHaveLength(1);
+    expect(addedSigterm).toEqual(addedSigint);
+    (addedSigint[0] as () => void)();
+    await expect(latch.promise).resolves.toBe('signal');
+    expect(process.listeners('SIGINT')).toEqual(beforeSigint);
+    expect(process.listeners('SIGTERM')).toEqual(beforeSigterm);
+  });
+
+  it('removes every listener on dispose and then ignores EOF', async () => {
+    process.env[STOP_ON_PARENT_EXIT] = '1';
+    const beforeSigint = process.listeners('SIGINT');
+    const beforeSigterm = process.listeners('SIGTERM');
+    const input = new PassThrough();
+    const endBefore = input.listenerCount('end');
+    const closeBefore = input.listenerCount('close');
+    const latch = processStop(input);
+    let reason: string | null = null;
+    void latch.promise.then((value) => { reason = value; });
+    expect(process.listeners('SIGINT')).toHaveLength(beforeSigint.length + 1);
+    expect(process.listeners('SIGTERM')).toHaveLength(beforeSigterm.length + 1);
+    expect(input.listenerCount('end')).toBe(endBefore + 1);
+    expect(input.listenerCount('close')).toBe(closeBefore + 1);
+
+    latch.dispose();
+    expect(process.listeners('SIGINT')).toEqual(beforeSigint);
+    expect(process.listeners('SIGTERM')).toEqual(beforeSigterm);
+    expect(input.listenerCount('end')).toBe(endBefore);
+    expect(input.listenerCount('close')).toBe(closeBefore);
+    await endAndSettle(input);
+    expect(reason).toBeNull();
   });
 });
