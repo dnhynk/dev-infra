@@ -1,6 +1,6 @@
 # Channel Adapter 운영·live acceptance 절차
 
-상태: **offline acceptance 완료·사람 승인 live 경로 관찰 · exact-build 재수용 대기 · `LIVE_CHANNEL_UNVERIFIED`**
+상태: **offline acceptance 완료 · exact merged build live acceptance 완료(2026-10-01) · `LIVE_CHANNEL_UNVERIFIED` 해제**
 
 이 문서는 D3 daemon/Channel Adapter를 사람이 검토한 뒤 제한된 live smoke로 확인하는 절차다.
 자동 하니스는 Claude Code를 실행하지 않고, 사용자 `.mcp.json`·Bridge 설정·persistent 환경변수를
@@ -117,6 +117,10 @@ Set-Content -Path 'C:\Program Files\ClaudeCode\managed-settings.json' -Encoding 
 claude --channels plugin:orca-slack-channel@dev-infra
 ```
 
+세션을 연 직후 첫 사람 지시나 도구 호출 전에 도착한 probe를 받을 때는 instructions와 receipt 도구가
+아직 세션에 보이지 않는다(DL-070). 이때 세션은 빈 이벤트가 무엇인지 사용자에게 물을 수 있다. daemon은
+receipt가 올 때까지 probe를 다시 보내므로 첫 지시 뒤에 route가 확인된다.
+
 ## 4. interactive smoke
 
 이 단계는 coordinator가 실제 live write 대상을 검토한 뒤 수동으로 수행한다. 자동 하니스나 Agent가
@@ -131,7 +135,7 @@ claude --dangerously-load-development-channels server:orca-slack
 - interactive session을 사용한다. `-p` headless session은 어떤 구성에서도 channel 이벤트가 도달하지
   않으므로 acceptance 대상이 아니다.
 - 대상 Claude Code 버전을 기록한다. Channels는 research preview이므로 버전이 오르면 계약을 다시
-  확인한다. 현재 호스트는 `2.1.246`이고 D3 production code는 `2.1.243` target surface에 고정돼 있다.
+  확인한다. 2026-10-01 live acceptance는 `2.1.286`에서 수행했다.
 - 매 기동 표시되는 development-channel 경고의 server 이름과 위험 문구를 사람이 읽고 직접
   승인한다. 승인 여부를 기억시키거나 keypress/click으로 자동 통과시키지 않는다.
 - flag가 없거나 조직 policy가 Channel을 막으면 MCP transport가 연결돼도 probe receipt가 오지 않을
@@ -159,16 +163,15 @@ shape와 commit SHA, 시각, pass/fail로 남긴다.
 
 ## 6. 상태 해제 조건과 cleanup
 
-다음 두 조건이 같은 reviewed build에서 모두 성립하기 전에는
-`LIVE_CHANNEL_UNVERIFIED`를 삭제하거나 완화하지 않는다.
+daemon과 session Adapter가 같은 reviewed release일 때 다음 두 조건이 모두 성립해야
+`LIVE_CHANNEL_UNVERIFIED`를 해제한다.
 
-- interactive Claude Code 2.1.243 development-channel smoke가 사람이 직접 경고를 승인한 세션에서 통과
-- 그 세션의 receipt 뒤 실제 post-baseline Orca Task/Dispatch resume와 기존 Slack card 갱신이 관찰됨
+- channel에 opt-in한 interactive session이 daemon의 exact-epoch probe에 receipt한다. opt-in은 §3.5
+  plugin 경로이거나, 사람이 경고를 직접 승인한 development flag 경로다.
+- 그 세션의 receipt 뒤 실제 post-baseline Orca Task/Dispatch resume와 기존 Slack card 갱신이 관찰된다.
 
-2026-08-26 사람이 승인한 session에서 두 기능 경로와 duplicate/late receipt, daemon restart,
-Adapter reconnect를 실제로 관찰했다. 그러나 session Adapter는 authority repair 전 build에서 시작됐고
-daemon만 repair 후 build로 바뀌어 위의 **같은 reviewed build** 조건을 충족하지 못했다. 따라서
-`LIVE_CHANNEL_UNVERIFIED`를 유지한다. 실제 ID를 제거한 관찰 기록과 최종 재수용 조건은
+2026-10-01 merged main release에서 §3.5 plugin 경로 session으로 §5 항목 1~6을 관찰해 두 조건을
+충족했고 상태를 해제했다(DL-071). 실제 ID를 제거한 관찰 기록은
 [D3 live Channel acceptance evidence](../evidence/d3-live-channel-acceptance.md)에 있다.
 
 종료할 때는 먼저 interactive Claude session을 정상 종료해 Adapter stdio를 닫고, daemon에

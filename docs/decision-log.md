@@ -770,7 +770,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 
 ## 2026-09-30 · Channel 이벤트 receipt 규칙
 
-### DL-068 · coordinator는 channel 이벤트를 묻지 않고 즉시 receipt한다
+### DL-068 · coordinator는 channel 이벤트를 묻지 않고 즉시 receipt한다 — 근거는 DL-070으로 SUPERSEDED
 
 - 사용자 결정: Channel MCP instructions와 Claude `/init-orchestrate` skill이 둘 다 이 규칙을 명시한다.
   빈 본문은 설계이고, receipt는 판단이 필요 없는 가시성 확인이므로 사용자에게 묻지 않고 즉시 1회
@@ -797,3 +797,27 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   그 원인을 따른다. 예를 들어 확인 deadline 초과는 재시도한다. 비워 둔 routing은 첫 성공 pass가 다시 만든다.
 - 기각: routing 세대의 fingerprint를 그 세대를 쓴 transaction에 durable하게 기록하는 방식. 가장 정확하지만
   state schema v17 migration이 필요하다.
+
+## 2026-10-01 · D3 live acceptance
+
+### DL-070 · channel 이벤트로 시작된 턴에는 MCP instructions와 도구 안내가 붙지 않는다
+
+- 관측: Claude Code 2.1.285·2.1.286 transcript에서 channel 서버의 `mcp_instructions_delta`와
+  `deferred_tools_delta`는 channel 이벤트로 시작된 턴에 붙지 않았다. 다음 사람 지시(2026-09-30)나 첫 도구
+  호출 결과(2026-10-01)에 붙었다. 두 세션 모두 그 전에 온 probe 네 번에 instructions도 receipt 도구도 없이
+  응답해 사용자에게 물었다. 안내가 붙은 뒤로는 모든 이벤트에 묻지 않고 receipt했다.
+- 결과: DL-068의 근거("기존 instructions만으로는 receipt를 부르지 않았다")는 원인을 잘못 짚었다. 그
+  세션은 instructions를 보지 못한 상태였다. 강화한 문안과 skill 규칙은 유지한다. 기존 문안으로도 충분했는지는
+  확인하지 않았다.
+- 운영: 세션을 연 직후 첫 사람 지시 전에 오는 probe에는 세션이 물을 수 있다. daemon은 receipt가 올 때까지
+  probe를 다시 보내므로 첫 지시 뒤 route가 확인된다. 실제 Gate 이벤트는 그 뒤에 온다.
+
+### DL-071 · exact merged build의 live acceptance로 D3 `LIVE_CHANNEL_UNVERIFIED`를 해제한다
+
+- 2026-10-01 merged `main@7c80b6c`와 digest가 같은 release로 daemon과 session Adapter를 모두 실행한 상태에서
+  운영 절차 §5 항목 1~6을 관찰했다. 항목 7(coordinator takeover)은 일어나지 않았다.
+- session은 §3.5 plugin channel 경로(`--channels plugin:orca-slack-channel@dev-infra`, Claude Code 2.1.286)로
+  열었다. 이 경로에는 development-channel 경고가 없으므로, 사람이 경고를 승인해야 한다는 조건은 development
+  flag 경로에만 적용된다.
+- 후속 Task는 Codex worker로 재개됐다(Orca 1.4.217). coordinator 지시문에는 channel 규칙이 없었다.
+- 근거는 [D3 live Channel acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다.

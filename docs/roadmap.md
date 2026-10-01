@@ -187,10 +187,9 @@ live/stale은 generation으로 구분한다. pane은 그 handle의 `terminal sho
 
 ## 9. Bridge Slice D3 · Channel Adapter와 재개 관찰
 
-**D3-1~D3-4 구현·offline acceptance 완료, live 경로 관찰·exact-build 재수용 대기.** D3는 원래
-계획대로 별도 Run에서 transport, durable delivery, actual Task-resume evidence, lifecycle acceptance로
-나눴다(OD-056, DL-049). 2026-08-26 사람이 승인한 Claude Code 2.1.243 session에서 live 경로를
-관찰했지만 Adapter와 repaired daemon의 build가 갈려 상태는 `LIVE_CHANNEL_UNVERIFIED`다.
+**D3-1~D3-4 구현·offline acceptance 완료, exact merged build live acceptance 완료(2026-10-01).** D3는
+원래 계획대로 별도 Run에서 transport, durable delivery, actual Task-resume evidence, lifecycle
+acceptance로 나눴다(OD-056, DL-049).
 
 분리 근거:
 
@@ -220,12 +219,10 @@ live/stale은 generation으로 구분한다. pane은 그 handle의 `terminal sho
 - Fresh/Resume coordinator session의 opt-in이 end-to-end probe로 확인되고 pending Gate를 재조회함
 
 D3-4의 hermetic 하니스는 위 출구 조건의 crash/restart·routing·projection 경계를 검증하지만 실제
-Claude Code opt-in을 대신하지 않는다. interactive Claude Code 2.1.243 development-channel smoke,
-post-baseline Task/Dispatch resume, 같은 Slack message update, duplicate/restart 경로는 관찰됐지만
-하나의 exact reviewed build에서 수행되지 않았다. 최종 merged build에서 같은 조건을 다시 충족하기
-전에는 `LIVE_CHANNEL_UNVERIFIED`를 해제하지 않는다. 근거는
-[D3 live acceptance](evidence/d3-live-channel-acceptance.md)에 있다. 이 잔여 수동 경계와 독립적인 O1
-운영 자동화 구현은 진행할 수 있다.
+Claude Code opt-in을 대신하지 않는다. 실제 opt-in, post-baseline Task/Dispatch resume, 같은 Slack
+message update, duplicate/restart 경로는 2026-10-01 merged main release에서 plugin channel session으로
+관찰했고 `LIVE_CHANNEL_UNVERIFIED`를 해제했다(DL-071). 근거는
+[D3 live acceptance](evidence/d3-live-channel-acceptance.md)에 있다.
 
 ## 10. Bridge Slice O1 · 운영 자동화
 
@@ -274,8 +271,7 @@ gate로 묶었다. 단일 workspace package의 complete bridge Vitest suite는 `
 beyond-boundary ownership 관측을 통과해 Task supervisor 조건을 닫았다. 이후 `status`의
 `state.snapshot_unavailable`이 15초 capability rotation 경계와 맞물려 반복 관측되어 final O1 production
 acceptance는 다시 열렸다. protected capability read와 owner authentication 사이의 generation 전환은 그
-현상을 설명하는 코드상 가능한 interleaving이며, D3의 `LIVE_CHANNEL_UNVERIFIED`는 이 O1 상태와 독립적으로
-그대로 유지한다.
+현상을 설명하는 코드상 가능한 interleaving이다. D3 live acceptance는 이 O1 상태와 독립적으로 판정한다.
 
 O1-7 실측에서 `RestartOnFailure`가 이미 시작된 Exec의 exit 23을 재실행하지 않는 O1-6 gap이
 드러났다. 최소 수리는 managed AtLogOn trigger의 duration 없는 PT1M repetition이며, 기존

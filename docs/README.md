@@ -1,7 +1,7 @@
 # dev-infra 문서 인덱스
 
-상태: **AB Claude 경로 완료 · Codex `$init-orchestrate`/rollover/Gate wake hermetic 구현·Windows Bridge 배포·Astra worker 수용 완료 · C1~D3·O1 구현 완료 · O1-7 production acceptance PASS · Claude D3는 `LIVE_CHANNEL_UNVERIFIED` 유지 · Codex Slack Gate wake·rollover live acceptance 완료**
-기준일: **2026-09-08**
+상태: **AB Claude 경로 완료 · Codex `$init-orchestrate`/rollover/Gate wake hermetic 구현·Windows Bridge 배포·Astra worker 수용 완료 · C1~D3·O1 구현 완료 · O1-7 production acceptance PASS · Claude D3 exact merged build live acceptance PASS · Codex Slack Gate wake·rollover live acceptance 완료**
+기준일: **2026-10-01**
 
 이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
 
@@ -76,11 +76,10 @@
 ## 현재 산출물 경계
 
 이 문서 세트는 C1~D3 구현과 검증 결과, 후속 slice의 현재 계약을 함께 보존한다. D3의 daemon,
-durable delivery, Task-resume evidence, existing-card projection은 hermetic failure matrix를 통과했고,
-사람이 승인한 Claude Code 2.1.243 session에서 live 경로도 관찰됐다. 다만 그 session의 Adapter는
-authority repair 전 build에서 시작됐고 daemon만 repair 후 build로 바뀌어 exact-build 조건을 충족하지
-못했다. 따라서 상태는 `LIVE_CHANNEL_UNVERIFIED`이며 redacted 관찰과 잔여 조건은
-[D3 live acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다. O1의 hermetic/Windows
+durable delivery, Task-resume evidence, existing-card projection은 hermetic failure matrix를 통과했다.
+2026-10-01에는 merged main과 같은 release에서 daemon과 session Adapter를 함께 실행해 live acceptance도
+통과했다(DL-071). redacted 관찰은 [D3 live acceptance evidence](evidence/d3-live-channel-acceptance.md)에
+있다. O1의 hermetic/Windows
 검증과 merged-main 배포 잔여 조건은 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 있다.
 
 2026-09-07부터 Codex coordinator는 `plugins/orca-orchestration/`의 `$init-orchestrate` 스킬과 Stop

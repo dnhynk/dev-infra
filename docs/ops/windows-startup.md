@@ -16,7 +16,7 @@ O1-7 상태와 redacted disposable-task cleanup 증거는
 [O1 operational acceptance evidence](../evidence/o1-operational-acceptance.md)를 따른다. exact merged-main
 release `1eb41697c6c22f51893adbf4e89fdd864bb399d4a6e0fdba8ed4a978cd93fd38`는 Task `Running`과 하나의
 direct daemon child, fresh heartbeat, matched build/config/schema를 332초 동안 유지해 관측된 2~4분
-경계를 넘겼고 production install은 accepted다. D3 `LIVE_CHANNEL_UNVERIFIED`와는 별도 조건이다.
+경계를 넘겼고 production install은 accepted다. D3 live acceptance와는 별도 조건이다.
 대상: Windows PowerShell 5.1, Node.js 26.x, pnpm 11.22.0
 
 ## 불변 release 만들기
