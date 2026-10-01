@@ -1,130 +1,112 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`renderCard > 스냅샷: merged 1`] = `
-"fallback: ✅ [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 병합 완료 — https://github.com/dnhynk/dev-infra/pull/7
----
-✅ *카드 layout을 코드로 고정*
----
-(context) [dev-infra] dnhynk/dev-infra #7  ·  병합 완료
----
-PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
-_왜 필요한가 — 모델이 layout이나 링크를 만들지 않게 하기 위해서다._
----
-⎯⎯⎯
----
-*리뷰*
-reviewer_result가 관찰되지 않았다
----
-*CI*
-required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
-• typecheck: SUCCESS
----
-(context) worker 보고 없음
----
-[PR 보기](https://github.com/dnhynk/dev-infra/pull/7)"
+"fallback: ✅ [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 병합 완료
+✅  병합 완료 · 카드 layout을 코드로 고정
+[PR 보기]
+┃purple
+┃ 저장소  dnhynk/dev-infra · #7
+┃ Project  dev-infra
+┃ 리뷰  결과 없음
+┃ CI  통과
+┃ 위험도  계산 불가 · 리뷰 결과 없음
+┃ 병합 준비  완료 · required check 기준 · 리뷰·merge queue·최신화 조건 미확인
+┃ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다. 모델이 layout이나 링크를 만들지 않게 하기 위해서다.
+┃ *check*
+┃ typecheck · 성공
+┃ ───
+┃ worker 보고  없음
+┃ 관측 범위  전체
+┃ 요약  있음
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · GitHub·Orca 기준"
 `;
 
 exports[`renderCard > 스냅샷: review approve · head가 움직임 1`] = `
-"fallback: 🟢 [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 리뷰 통과 — https://github.com/dnhynk/dev-infra/pull/7
----
-🟢 *카드 layout을 코드로 고정*
----
-(context) [dev-infra] dnhynk/dev-infra #7  ·  리뷰 통과  ·  위험도 낮음 (reviewer findings severity 기준)
----
-PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
-_왜 필요한가 — 모델이 layout이나 링크를 만들지 않게 하기 위해서다._
----
-⎯⎯⎯
----
-*리뷰*
-판정: approve
-reviewer가 본 commit이 현재 head와 다르다
-보고된 finding 없음
----
-*CI*
-required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
-• typecheck: SUCCESS
----
-(context) worker 보고 결과: succeeded
----
-[PR 보기](https://github.com/dnhynk/dev-infra/pull/7)"
+"fallback: 🟢 [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 리뷰 통과
+🟢  리뷰 통과 · 카드 layout을 코드로 고정
+[PR 보기]
+┃green
+┃ 저장소  dnhynk/dev-infra · #7
+┃ Project  dev-infra
+┃ 리뷰  통과 · finding 없음 · 이전 커밋 기준
+┃ CI  통과
+┃ 위험도  낮음
+┃ 병합 준비  완료 · required check 기준 · 리뷰·merge queue·최신화 조건 미확인
+┃ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다. 모델이 layout이나 링크를 만들지 않게 하기 위해서다.
+┃ *check*
+┃ typecheck · 성공
+┃ ───
+┃ worker 보고  완료
+┃ 관측 범위  전체
+┃ 요약  있음
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · GitHub·Orca 기준"
 `;
 
 exports[`renderCard > 스냅샷: review request_changes 1`] = `
-"fallback: ⚠️ [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 리뷰에서 수정 요청 — https://github.com/dnhynk/dev-infra/pull/7
----
-⚠️ *카드 layout을 코드로 고정*
----
-(context) [dev-infra] dnhynk/dev-infra #7  ·  리뷰에서 수정 요청  ·  위험도 높음 (reviewer findings severity 기준)
----
-PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
-_왜 필요한가 — 모델이 layout이나 링크를 만들지 않게 하기 위해서다._
----
-⎯⎯⎯
----
-*리뷰*
-판정: request_changes  ·  finding 12건
-• [blocker] src/digest/render.ts:88 — esc()를 거치지 않은 경로가 있다
-• [minor] src/slack/post.ts — 주석 오타
-외 10건은 카드에 싣지 않았다
-_리뷰 핵심 — 이스케이프 누락 경로를 하나 더 막아야 한다._
----
-*CI*
-required check: 아직 결론 나지 않은 것이 있다
-• typecheck: SUCCESS
-• test: IN_PROGRESS
----
-(context) worker 보고 결과: succeeded
----
-[PR 보기](https://github.com/dnhynk/dev-infra/pull/7)"
+"fallback: ⚠️ [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 수정 요청
+⚠️  수정 요청 · 카드 layout을 코드로 고정
+[PR 보기]
+┃amber
+┃ 저장소  dnhynk/dev-infra · #7
+┃ Project  dev-infra
+┃ 리뷰  수정 요청 · finding 12건
+┃ CI  진행 중
+┃ 위험도  높음
+┃ 병합 준비  미판정 · 리뷰·merge queue·최신화 조건 미확인
+┃ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다. 모델이 layout이나 링크를 만들지 않게 하기 위해서다.
+┃ *finding*
+┃ _이스케이프 누락 경로를 하나 더 막아야 한다._
+┃ 높음 · esc()를 거치지 않은 경로가 있다
+┃ 낮음 · 주석 오타
+┃ 외 10건은 카드에 싣지 않았다
+┃ *check*
+┃ typecheck · 성공
+┃ test · 진행 중
+┃ ───
+┃ worker 보고  완료
+┃ 관측 범위  전체
+┃ 요약  있음
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · GitHub·Orca 기준"
 `;
 
 exports[`renderCard > 스냅샷: 요약 성공 · review 없음 1`] = `
-"fallback: 🟡 [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 리뷰 결과 없음 — https://github.com/dnhynk/dev-infra/pull/7
----
-🟡 *카드 layout을 코드로 고정*
----
-(context) [dev-infra] dnhynk/dev-infra #7  ·  리뷰 결과 없음
----
-PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다.
-_왜 필요한가 — 모델이 layout이나 링크를 만들지 않게 하기 위해서다._
----
-⎯⎯⎯
----
-*리뷰*
-reviewer_result가 관찰되지 않았다
----
-*CI*
-required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
-• typecheck: SUCCESS
----
-(context) worker 보고 결과: succeeded
----
-[PR 보기](https://github.com/dnhynk/dev-infra/pull/7)"
+"fallback: 🟡 [dev-infra] dnhynk/dev-infra #7 · 카드 layout을 코드로 고정 — 리뷰 결과 없음
+🟡  리뷰 결과 없음 · 카드 layout을 코드로 고정
+[PR 보기]
+┃blue
+┃ 저장소  dnhynk/dev-infra · #7
+┃ Project  dev-infra
+┃ 리뷰  결과 없음
+┃ CI  통과
+┃ 위험도  계산 불가 · 리뷰 결과 없음
+┃ 병합 준비  완료 · required check 기준 · 리뷰·merge queue·최신화 조건 미확인
+┃ PR 사실을 Slack 카드로 옮기는 렌더러를 추가했다. 모델이 layout이나 링크를 만들지 않게 하기 위해서다.
+┃ *check*
+┃ typecheck · 성공
+┃ ───
+┃ worker 보고  완료
+┃ 관측 범위  전체
+┃ 요약  있음
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · GitHub·Orca 기준"
 `;
 
 exports[`renderCard > 스냅샷: 요약 실패 1`] = `
-"fallback: 🟡 [dev-infra] dnhynk/dev-infra #7 · feat(c1): deterministic renderer — 리뷰 결과 없음 — https://github.com/dnhynk/dev-infra/pull/7
----
-🟡 *feat(c1): deterministic renderer*
----
-(context) [dev-infra] dnhynk/dev-infra #7  ·  리뷰 결과 없음
----
-*요약 실패*
-HTTP 429 | why에 링크가 있다. 모델은 링크를 만들지 않는다
----
-⎯⎯⎯
----
-*리뷰*
-reviewer_result가 관찰되지 않았다
----
-*CI*
-required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다. merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다
-• typecheck: SUCCESS
----
-*worker 보고*
-worker 보고 결과: succeeded
-renderer를 구현했다. layout이 코드에만 있음을 확인했다. 게시는 T5가 남았다.
----
-[PR 보기](https://github.com/dnhynk/dev-infra/pull/7)"
+"fallback: 🟡 [dev-infra] dnhynk/dev-infra #7 · feat(c1): deterministic renderer — 리뷰 결과 없음
+🟡  리뷰 결과 없음 · feat(c1): deterministic renderer
+[PR 보기]
+┃blue
+┃ 저장소  dnhynk/dev-infra · #7
+┃ Project  dev-infra
+┃ 리뷰  결과 없음
+┃ CI  통과
+┃ 위험도  계산 불가 · 리뷰 결과 없음
+┃ 병합 준비  완료 · required check 기준 · 리뷰·merge queue·최신화 조건 미확인
+┃ renderer를 구현했다. layout이 코드에만 있음을 확인했다. 게시는 T5가 남았다.
+┃ *check*
+┃ typecheck · 성공
+┃ ───
+┃ worker 보고  완료
+┃ 관측 범위  전체
+┃ 요약  실패 · HTTP 429 | why에 링크가 있다. 모델은 링크를 만들지 않는다
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · GitHub·Orca 기준"
 `;

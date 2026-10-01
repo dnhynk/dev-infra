@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import type { SlackBlock } from '../slack/post.js';
+import type { SlackAttachment, SlackBlock } from '../slack/post.js';
+import {
+  cut,
+  esc,
+  kst,
+  listText,
+  renderCardShell,
+  type CardField,
+  type CardTone,
+} from '../slack/card.js';
 import type { Risk } from '../summarize/validate.js';
 import type { CheckFact } from '../github/pull-request.js';
 import type { FindingFacts } from '../summarize/contract.js';
@@ -16,14 +25,19 @@ import type { DigestStatus, MergePolicy, ProjectedPr, RenderInput } from './type
  *
  * 카드에 나타나는 사실의 유일한 source는 `RenderInput`이다. 여기서 GitHub·Orca·Slack을
  * 다시 읽지 않는다. 그래서 같은 입력이면 항상 같은 출력이고 `renderFingerprint`가 의미를
- * 가진다.
+ * 가진다. 예외는 게시 직전에 찍는 "갱신" 시각 하나이고, 지문은 그 시각을 비운 렌더에서
+ * 계산한다(`digest/digest.ts`).
  *
  * 주장하지 않는 것: 성공·안전성·검증·테스트 통과. source fact에 있는 값만 옮긴다.
- * `병합 준비 완료`는 `mergePolicy` 축이 `passing`일 때만 나오고, 같은 줄이 판정하지 않은
- * 조건(merge queue·required review·up-to-date·conversation resolution)을 함께 밝힌다(OD-032).
+ * `병합 준비`는 `mergePolicy` 축이 `passing`이고 그 check가 현재 head의 것일 때만 `완료`이고,
+ * 같은 칸이 판정하지 않은 조건(merge queue·required review·up-to-date·conversation resolution)을
+ * 함께 밝힌다(OD-032).
+ *
+ * 껍데기와 시각 문법은 `slack/card.ts`가 정한다(DL-074). 이 카드는 commit SHA와 finding의 파일
+ * 경로를 싣지 않는다. 그 사실은 PR 원문(버튼)에 있다.
  */
 
-/** 게시할 카드 한 장. `SlackPoster`의 `text`/`blocks`에 그대로 넘긴다. */
+/** 게시할 카드 한 장. `SlackPoster`의 `text`/`blocks`/`attachments`에 그대로 넘긴다. */
 export type RenderedCard = {
   /**
    * blocks를 그리지 못하는 자리(알림, 검색 결과)용 대체 텍스트. 비지 않는다.
@@ -31,64 +45,65 @@ export type RenderedCard = {
    * blocks와 **같은** 이스케이프를 거친 값으로 만든다. 이 자리도 mrkdwn으로 해석된다.
    */
   readonly text: string;
+  /** 카드 머리와 버튼. 버튼은 이 자리에만 둔다(`slack/card.ts`). */
   readonly blocks: readonly SlackBlock[];
+  /** 색 바를 입힌 카드 본문. 없으면 transport가 보내지 않는다. */
+  readonly attachments?: readonly SlackAttachment[];
 };
 
 /**
- * 상태 라벨.
+ * 상태별 카드 머리.
  *
  * emoji와 텍스트 라벨을 항상 함께 둔다. 색이나 emoji만으로 상태를 구분하지 않는다(UX §1).
  *
  * 문구는 관찰된 사실을 넘지 않는다. `awaiting_review`는 "리뷰 진행 중"이 아니라
  * "reviewer_result가 없다"는 뜻이고, `review_approved`는 병합 준비 완료라는 주장이 아니다.
- * draft·checks·mergePolicy는 headline에 접히지 않으므로 여기 없다. `현재` 절과 `CI` 절이 표시한다.
+ * draft·checks·mergePolicy는 머리에 접히지 않는다. fields가 따로 표시한다.
  */
-const STATUS_LABEL: Readonly<
-  Record<DigestStatus, { readonly emoji: string; readonly label: string }>
+const STATUS_HEAD: Readonly<
+  Record<DigestStatus, { readonly tone: CardTone; readonly emoji: string; readonly kind: string }>
 > = {
-  merged: { emoji: '✅', label: '병합 완료' },
-  closed: { emoji: '⛔', label: '병합 없이 닫힘' },
-  changes_requested: { emoji: '⚠️', label: '리뷰에서 수정 요청' },
-  review_approved: { emoji: '🟢', label: '리뷰 통과' },
-  awaiting_review: { emoji: '🟡', label: '리뷰 결과 없음' },
+  merged: { tone: 'change', emoji: '✅', kind: '병합 완료' },
+  closed: { tone: 'status', emoji: '⛔', kind: '병합 없이 닫힘' },
+  changes_requested: { tone: 'attention', emoji: '⚠️', kind: '수정 요청' },
+  review_approved: { tone: 'success', emoji: '🟢', kind: '리뷰 통과' },
+  awaiting_review: { tone: 'entry', emoji: '🟡', kind: '리뷰 결과 없음' },
 };
 
 /**
- * required check 축 한 줄.
+ * required check 축 한 칸(`CI`).
  *
  * `mergePolicy`는 base branch의 effective required rule과 head rollup의 조인을 접은 값이고
  * 파생은 `digest/state.ts`의 `deriveMergePolicy`가 한다. renderer는 그 값을 문구로 옮기기만
  * 한다. 여기서 다시 판정하면 두 곳이 어긋난다.
  *
- * `passing` 문구가 `docs/contracts/observation-and-correlation.md` §6의 두 파생 의미
- * (`CI 통과`, `병합 준비 완료`)를 카드에 내는 자리다. §6은 `Merge Ready`를 GitHub 단일 필드가
- * 아니라 **required check만으로 판정하는 derived state**로 정의했고 OD-032가 그렇게 확정했다.
- * 그래서 이 문구는 그 두 의미를 말하되 **같은 줄에서 판정하지 않은 조건을 명시한다.** 범위를
- * 밝히지 않으면 required review로 막힌 PR을 병합 가능으로 읽게 된다.
+ * `통과`는 `passing`에만 붙는다. 다른 값에는 그 문구를 붙이지 않는다.
  *
- * 다른 값에는 그 문구를 붙이지 않는다.
- *
- * - `no_required_rules`: §6의 `병합 준비 완료`는 "required checks가 **모두 passing**"이다.
- *   required가 0개면 통과한 check가 없고 `CI 통과`는 그대로 거짓이다. 아무것도 돌지 않은 PR을
- *   통과로 그리지 않는다. 이 축이 막지 않는다는 사실만 적는다.
+ * - `no_required_rules`: required가 0개면 통과한 check가 없고 `CI 통과`는 그대로 거짓이다.
+ *   아무것도 돌지 않은 PR을 통과로 그리지 않는다. 이 축이 막지 않는다는 사실만 적는다.
  * - `rules_unreadable`: rule 집합을 모르므로 어떤 충족 주장도 관측을 넘는다.
- * - `missing`과 `indeterminate`도 같은 문구로 합치지 않는다. 앞은 아무도 보고하지 않았다는
+ * - `missing`과 `indeterminate`를 같은 문구로 합치지 않는다. 앞은 아무도 보고하지 않았다는
  *   확정이고 뒤는 보고 주체를 관측할 수 없어 판정 자체가 불가능한 상태다
  *   (`github/required-checks.ts`).
  */
-const MERGE_POLICY_LINE: Readonly<Record<MergePolicy, string>> = {
-  no_required_rules:
-    'required check: base branch에 required rule이 없다 — 통과할 CI가 지정되지 않았다.' +
-    ' 이 축은 merge를 막지 않는다',
-  rules_unreadable: 'required check: base branch의 required rule을 읽지 못해 판정할 수 없다',
-  passing:
-    'required check: 모두 통과 — CI 통과이며 required check 기준 병합 준비 완료다.' +
-    ' merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다',
-  pending: 'required check: 아직 결론 나지 않은 것이 있다',
-  failing: 'required check: 실패한 것이 있다',
-  missing: 'required check: 보고되지 않은 required context가 있다',
-  indeterminate: 'required check: 보고 주체를 관측할 수 없어 충족을 판정할 수 없다',
+const MERGE_POLICY_VALUE: Readonly<Record<MergePolicy, string>> = {
+  no_required_rules: '지정 없음 · merge를 막지 않음',
+  rules_unreadable: '확인 불가 · required 규칙 미판독',
+  passing: '통과',
+  pending: '진행 중',
+  failing: '실패',
+  missing: '미보고 · required check 누락',
+  indeterminate: '판정 불가 · 보고 주체 미확인',
 };
+
+/**
+ * required check 축이 보지 않는 merge 조건(OD-032).
+ *
+ * required review·conversation resolution(리뷰), merge queue, up-to-date(최신화)다. `병합 준비` 칸과
+ * `required check 통과` 전이가 이 문구를 함께 단다. 범위를 밝히지 않으면 required review로 막힌
+ * PR을 병합 가능으로 읽게 된다.
+ */
+const UNJUDGED_CONDITIONS = '리뷰·merge queue·최신화 조건 미확인';
 
 const RISK_LABEL: Readonly<Record<Risk, string>> = {
   high: '높음',
@@ -96,17 +111,54 @@ const RISK_LABEL: Readonly<Record<Risk, string>> = {
   low: '낮음',
 };
 
+/** finding severity. 위험도 파생(`summarize/validate.ts`의 `deriveRisk`)과 같은 순서다. */
+const SEVERITY_LABEL: Readonly<Record<FindingFacts['severity'], string>> = {
+  blocker: '높음',
+  major: '보통',
+  minor: '낮음',
+};
+
 /**
  * finding 한 줄의 문구 상한.
  *
- * `FindingFacts.summary`는 reviewer가 쓰는 자유 문자열이고 계약에 상한이 없다. Slack
- * section text는 3000자를 넘을 수 없고 findings는 최대 10건이므로(OD-033) 줄마다 상한을
- * 둔다. 자른 줄은 말줄임표로 잘렸음을 드러낸다. 조용히 지우지 않는다.
+ * `FindingFacts.summary`는 reviewer가 쓰는 자유 문자열이고 계약에 상한이 없다. findings는 최대
+ * 10건이므로(OD-033) 줄마다 상한을 둔다. 자른 줄은 말줄임표로 잘렸음을 드러낸다.
  */
 const FINDING_SUMMARY_CAP = 200;
 
 /** 요약 실패 사유 문구 상한. provider 오류와 검증 위반이 누적되면 길어진다. */
 const FAILURE_REASON_CAP = 300;
+
+/** check 이름 한 줄의 상한. 이름은 workflow가 정하는 자유 문자열이다. */
+const CHECK_NAME_CAP = 100;
+
+/** check 목록에 싣는 줄 수. 나머지는 수로 남긴다. */
+const CHECK_LIST_CAP = 10;
+
+/**
+ * GitHub check 결론의 우리말. 모르는 값은 원문 그대로 둔다 — 이름이 없다고 사실을 지우지 않는다.
+ *
+ * `CheckRun.conclusion`·`CheckRun.status`·`StatusContext.state`가 같은 표를 쓴다.
+ */
+const CHECK_CONCLUSION: Readonly<Record<string, string>> = {
+  SUCCESS: '성공',
+  FAILURE: '실패',
+  ERROR: '오류',
+  NEUTRAL: '중립',
+  CANCELLED: '취소',
+  SKIPPED: '건너뜀',
+  TIMED_OUT: '시간 초과',
+  ACTION_REQUIRED: '조치 필요',
+  STALE: '오래됨',
+  STARTUP_FAILURE: '시작 실패',
+  PENDING: '대기',
+  EXPECTED: '보고 대기',
+  QUEUED: '대기',
+  WAITING: '대기',
+  REQUESTED: '요청됨',
+  IN_PROGRESS: '진행 중',
+  COMPLETED: '완료',
+};
 
 /**
  * 요약 실패 카드가 싣는 worker 본문 상한.
@@ -117,122 +169,81 @@ const FAILURE_REASON_CAP = 300;
 const WORKER_BODY_CAP = 400;
 
 /**
- * section block `text`의 문자 수 상한.
- *
- * Slack이 고정한 값이다. "Minimum length for the `text` in this field is 1 and maximum length
- * is 3000 characters."(`https://docs.slack.dev/reference/block-kit/composition-objects/text-object`)
- * 넘기면 `chat.postMessage`가 `invalid_blocks`로 거절하고 **카드 전체가 게시되지 않는다.**
- * identity와 PR 링크가 항상 표시돼야 한다는 C1 출구 조건이 입력 하나로 깨진다.
- *
- * 줄 단위 상한(`FINDING_SUMMARY_CAP` 등)으로는 막을 수 없다. 상한이 없는 입력이 여럿이고
- * (`WorkerReport.body`, `ProjectedPr.title`, findings 10줄의 합) 한 절이 그 합으로 넘친다.
- * 그래서 renderer가 section을 만드는 **한 지점**에서 일반적으로 적용한다.
- */
-const SECTION_TEXT_CAP = 3000;
-
-/**
- * 상한에서 잘렸음을 카드에 남기는 표시.
- *
- * 조용히 자르지 않는다. 부분만 보여 주고 전부인 척하지 않는 것은 `ObservationTruncation`과
- * 같은 규칙이다(UX §6). 다만 이것은 **관측 절단이 아니라 표시 한도**이므로 `ProjectedPr`에
- * 싣지 않는다. 관측은 전부 했고 Slack이 그만큼만 그릴 수 있을 뿐이다.
- */
-const SECTION_TRUNCATION_MARK = '\n…(표시 한도 3000자를 넘어 잘림)';
-
-/**
- * Slack mrkdwn 예약 문자를 이스케이프한다.
- *
- * PR 제목, 모델 출력, 파일 경로에 `<`나 `&`가 들어오면 Slack이 링크나 entity로 해석해
- * 원문과 다른 것을 보여준다. 대상은 Slack이 명시한 세 문자뿐이다.
- */
-function esc(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function cut(value: string, cap: number): string {
-  const v = value.trim();
-  return v.length <= cap ? v : `${v.slice(0, cap)}…`;
-}
-
-/**
- * section text를 Slack 상한 안으로 맞춘다.
- *
- * 이스케이프 뒤의 길이로 센다. Slack이 보는 것은 전송된 문자열이고 `&amp;`는 5자다.
- * 자른 결과가 그대로 카드에 실리므로 `renderFingerprint`도 자른 결과를 해싱한다.
- *
- * **code point 경계에서 자른다.** 상한은 UTF-16 code unit 단위이고 `String.prototype.slice`도
- * code unit 단위다. astral plane 문자(emoji 등)는 2 code unit이므로 자르는 지점이 그 문자
- * 가운데에 떨어지면 surrogate pair가 갈라져 lone surrogate가 남는다. 그래서 code point를
- * 하나씩 훑으며 예산 안에 **통째로** 들어가는 지점까지만 남긴다. 예산은 개수가 아니라 code
- * unit 길이로 센다. code point 하나가 1 code unit일 수도 2 code unit일 수도 있어서다.
- *
- * 경계는 code point까지다. grapheme cluster(ZWJ emoji, 결합 문자)는 보존하지 않는다. Slack이
- * 세는 단위가 code unit이고 카드가 거절되는 원인은 lone surrogate와 길이 초과뿐이다.
- * `Intl.Segmenter`를 끌어오는 것은 이 상한이 요구하지 않는 일반화다.
- */
-function capSectionText(text: string): string {
-  if (text.length <= SECTION_TEXT_CAP) return text;
-  const budget = SECTION_TEXT_CAP - SECTION_TRUNCATION_MARK.length;
-  // `for...of`는 문자열을 code point 단위로 훑는다. `cp.length`가 그 code point의 code unit 수다.
-  let end = 0;
-  for (const cp of text) {
-    if (end + cp.length > budget) break;
-    end += cp.length;
-  }
-  // end <= budget이므로 mark를 붙인 결과도 SECTION_TEXT_CAP 이하다.
-  return `${text.slice(0, end)}${SECTION_TRUNCATION_MARK}`;
-}
-
-function section(text: string): SlackBlock {
-  return { type: 'section', text: { type: 'mrkdwn', text: capSectionText(text) } };
-}
-
-function labelled(label: string, lines: readonly string[]): SlackBlock {
-  return section([`*${label}*`, ...lines].join('\n'));
-}
-
-const DIVIDER: SlackBlock = { type: 'divider' };
-
-/**
- * 작은 글씨 한 줄.
- *
- * identity, 상태 배지, 관측 한계처럼 **읽는 사람이 먼저 보지 않아도 되는** 사실을 담는다.
- * section으로 쓰면 본문과 같은 크기라 카드가 전부 같은 무게로 읽히고, 모바일에서 실제로 봐야
- * 하는 한 줄이 묻힌다. 사실을 지우는 것이 아니라 위계를 준다.
- */
-function context(lines: readonly string[]): SlackBlock {
-  return {
-    type: 'context',
-    elements: [{ type: 'mrkdwn', text: capSectionText(lines.join('  ·  ')) }],
-  };
-}
-
-/** 가운뎃점으로 잇는 한 줄. 빈 조각은 버린다. */
-function joinInline(parts: readonly (string | null)[]): string {
-  return parts.filter((p): p is string => p !== null && p !== '').join('  ·  ');
-}
-
-/**
- * 카드 최상단 identity.
+ * PR identity.
  *
  * Project가 설정에 있으면 `[Project] owner/repo #N`, 없으면 `owner/repo #N`이다(OD-047).
- * repository 이름은 표시용이며 동등성 판정에 쓰지 않는다.
+ * repository 이름은 표시용이며 동등성 판정에 쓰지 않는다. 카드에서는 대체 텍스트와 thread
+ * 전이의 머리가 쓰고, 루트 카드 본문은 같은 사실을 `저장소`·`Project` 칸으로 나눠 싣는다.
  */
 export function identityLine(pr: ProjectedPr): string {
   const base = `${pr.repository.nameWithOwner} #${pr.number}`;
   return pr.project === null ? base : `[${pr.project}] ${base}`;
 }
 
-function findingLine(f: FindingFacts): string {
-  const where = f.line === null ? f.file : `${f.file}:${f.line}`;
-  return `• [${f.severity}] ${esc(where)} — ${esc(cut(f.summary, FINDING_SUMMARY_CAP))}`;
+function reviewValue(pr: ProjectedPr): string {
+  if (pr.review === null) return '결과 없음';
+  const total = pr.review.findingsTotal;
+  return [
+    pr.review.verdict === 'approve' ? '통과' : '수정 요청',
+    total === 0 ? 'finding 없음' : `finding ${total}건`,
+    // 사실 진술이다. 이전 approval이 아직 유효한지 판정하지 않는다(OD-031, C2).
+    pr.review.headMatch === 'different'
+      ? '이전 커밋 기준'
+      : pr.review.headMatch === 'unknown'
+        ? '커밋 대조 불가'
+        : null,
+  ].filter((part): part is string => part !== null).join(' · ');
 }
 
+function ciValue(pr: ProjectedPr): string {
+  const axis = MERGE_POLICY_VALUE[pr.mergePolicy];
+  // 조회 계층의 bounded 재관측(OD-044) 뒤에도 남은 불일치다. 이 한정 없이 축을 그리면 다른
+  // commit의 결론이 현재 head의 것으로 읽힌다.
+  return pr.checksHeadSha === pr.headSha ? axis : `${axis} · 최신 커밋 기준 아님`;
+}
+
+/**
+ * `병합 준비` 칸.
+ *
+ * `docs/contracts/observation-and-correlation.md` §6은 `Merge Ready`를 GitHub 단일 필드가 아니라
+ * **required check만으로 판정하는 derived state**로 정의했고 OD-032가 그렇게 확정했다. 그래서
+ * `완료`는 축이 `passing`일 때만 나오고 같은 칸이 판정하지 않은 조건을 밝힌다. check가 현재
+ * head의 것이 아니면 `passing`은 다른 commit의 사실이므로 `완료`라고 쓰지 않는다.
+ */
+function mergeReadyValue(pr: ProjectedPr): string {
+  return pr.mergePolicy === 'passing' && pr.checksHeadSha === pr.headSha
+    ? `완료 · required check 기준 · ${UNJUDGED_CONDITIONS}`
+    : `미판정 · ${UNJUDGED_CONDITIONS}`;
+}
+
+/** 관측이 잘린 지점. 원인이 다르므로 둘을 한 표시로 합치지 않는다(UX §6). */
+function observedScope(pr: ProjectedPr): string {
+  const parts = [
+    // 카드 본문이 아니라 요약 입력이 잘렸다. 요약이 본문 전체를 보지 못했다는 뜻이다.
+    pr.truncation.prBody ? '요약 입력 PR 본문 일부' : null,
+    pr.truncation.changedFiles ? '변경 파일 일부' : null,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0 ? '전체' : parts.join(' · ');
+}
+
+function findingLine(f: FindingFacts): string {
+  // 파일 경로를 싣지 않는다(DL-074). 위치는 PR 원문에서 본다.
+  return `${SEVERITY_LABEL[f.severity]} · ${esc(cut(f.summary, FINDING_SUMMARY_CAP))}`;
+}
+
+/**
+ * check 한 줄.
+ *
+ * 집계하지 않고 required/optional을 판정하지도 않는다(OD-032). 결론을 그대로 옮긴다. merge를 막는지는
+ * `CI` 칸(required check 축)이 말한다. 이 목록이 없으면 required rule이 없는 저장소에서 실패한 check가
+ * 카드 어디에도 나타나지 않고, 그 실패는 카드를 갱신하지도 못한다.
+ */
 function checkLine(c: CheckFact): string {
-  // 집계하지 않고 required/optional을 판정하지도 않는다(OD-032). 결론을 그대로 옮긴다.
   // StatusContext row에는 conclusion도 status도 없고 state만 있다.
-  const conclusion = c.conclusion ?? c.state ?? (c.status !== '' ? c.status : 'unknown');
-  return `• ${esc(c.name === '' ? '(이름 없음)' : c.name)}: ${esc(conclusion)}`;
+  const raw = c.conclusion ?? c.state ?? (c.status !== '' ? c.status : null);
+  const conclusion = raw === null ? '확인 불가' : CHECK_CONCLUSION[raw] ?? esc(raw);
+  const name = c.name.trim() === '' ? '확인 불가 · 이름 없음' : esc(cut(c.name, CHECK_NAME_CAP));
+  return `${name} · ${conclusion}`;
 }
 
 /**
@@ -240,181 +251,129 @@ function checkLine(c: CheckFact): string {
  *
  * 요약이 실패해도 카드를 만든다. 요약 없이 사실만 남은 축소 카드를 만들고 "요약 실패"를
  * 표시한다(OD-035). 실패를 성공처럼 숨기지 않는다.
+ *
+ * `refreshedAt`은 게시 직전의 "갱신" 시각이다. null이면 시각 없이 그린다 — 렌더 지문은 그
+ * 렌더에서 계산하므로 시각만 바뀐 관찰은 `chat.update`를 만들지 않는다.
  */
-export function renderCard(input: RenderInput): RenderedCard {
+export function renderCard(input: RenderInput, refreshedAt: string | null = null): RenderedCard {
   const { pr, summary } = input;
   // 파생은 `digest/state.ts` 하나뿐이다. renderer가 같은 판정을 다시 쓰지 않는다.
   const status = deriveDigestStatus(pr);
-  const { emoji, label } = STATUS_LABEL[status];
-  const identity = identityLine(pr);
+  const head = STATUS_HEAD[status];
   // 요약이 실패하면 PR 원문 제목이 카드 제목의 fallback이다(OD-035).
   const title = summary.kind === 'ok' ? summary.draft.title : pr.title;
 
-  // blocks와 fallback text가 **같은** 이스케이프 결과를 쓴다. 두 경로가 각자 이스케이프하면
-  // 한쪽만 고쳐지고, 그때 새는 쪽은 항상 fallback이다. PR 제목은 untrusted input이고(스펙 §10)
-  // 이스케이프하지 않은 `<!channel>` 하나가 카드 한 번에 workspace 전체를 깨운다.
-  const escapedIdentity = esc(identity);
-  const escapedTitle = esc(title);
+  const fields: CardField[] = [
+    ['저장소', `${esc(pr.repository.nameWithOwner)} · #${pr.number}${pr.isDraft ? ' · 초안' : ''}`],
+    ['Project', pr.project === null ? '미등록' : esc(pr.project)],
+    ['리뷰', reviewValue(pr)],
+    ['CI', ciValue(pr)],
+    // 위험도는 reviewer findings severity에서만 나온다(OD-037). 리뷰가 없으면 셀 근거가 없다.
+    ['위험도', summary.risk === null ? '계산 불가 · 리뷰 결과 없음' : RISK_LABEL[summary.risk]],
+    ['병합 준비', mergeReadyValue(pr)],
+  ];
 
-  // 위계: 제목 → 요약 → 판정 사실 → 관측 한계 → action.
-  //
-  // 이전 layout은 사실마다 `*라벨*` + 본문 section을 하나씩 쌓아 열 블록이 모두 같은 무게로
-  // 읽혔고, 모바일에서 실제로 봐야 하는 한 줄(무엇이 바뀌었나, 지금 막혀 있나)이 그 안에 묻혔다.
-  // 표시하는 사실은 그대로 두고 무게만 다르게 준다: 제목이 가장 크고, identity·상태·위험도는
-  // 한 줄 배지로 접히고, 관측 한계는 작은 글씨로 내려간다.
-  const blocks: SlackBlock[] = [];
-
-  // 사람이 `#pr-digest`를 훑을 때 먼저 찾는 것은 저장소가 아니라 **무엇이 바뀌었는가**다.
-  // 그래서 제목이 본문 크기의 첫 줄이고 identity는 바로 아래 작은 줄로 간다.
-  blocks.push(section(`${emoji} *${escapedTitle}*`));
-  blocks.push(context([
-    joinInline([
-      escapedIdentity,
-      label,
-      pr.isDraft ? '초안(draft) PR이다' : null,
-      summary.risk === null
-        ? null
-        : `위험도 ${RISK_LABEL[summary.risk]} (reviewer findings severity 기준)`,
-    ]),
-  ]));
-
+  const sections: string[] = [];
   if (summary.kind === 'ok') {
-    // what은 본문, why는 그 아래 이탤릭 한 줄. 두 블록으로 나누면 같은 한 문단이 두 번
-    // 끊겨 읽힌다. 라벨을 지운 것이 아니라 문장 자체가 라벨 역할을 하도록 붙여 둔다.
-    blocks.push(section([
-      esc(summary.draft.what),
-      `_왜 필요한가 — ${esc(summary.draft.why)}_`,
-    ].join('\n')));
-  } else {
-    blocks.push(
-      // 요약이 없다는 사실과 그 사유만 남긴다. 카드가 자기 구성을 설명하지 않는다.
-      labelled('요약 실패', [esc(cut(summary.reason, FAILURE_REASON_CAP))]),
-    );
+    sections.push(`${esc(summary.draft.what)} ${esc(summary.draft.why)}`);
+  } else if (pr.workerReport !== null) {
+    // 요약이 없으면 worker 보고 본문이 사람이 읽는 유일한 사실 텍스트다. 성공했다면 그 본문은 이미
+    // 위 요약의 입력이었으므로 다시 싣지 않는다.
+    sections.push(esc(cut(pr.workerReport.body, WORKER_BODY_CAP)));
   }
-
-  blocks.push(DIVIDER);
-
-  const review: string[] = [];
-  if (pr.review === null) {
-    review.push('reviewer_result가 관찰되지 않았다');
-  } else {
-    // 판정과 finding 건수를 한 줄에 붙인다. 훑는 사람이 리뷰 절에서 찾는 것은 이 둘이다.
-    const total = pr.review.findingsTotal;
-    review.push(joinInline([
-      `판정: ${pr.review.verdict}`,
-      total === 0 ? null : `finding ${total}건`,
-    ]));
-    if (pr.review.headMatch === 'different') {
-      // 사실 진술이다. 이전 approval이 아직 유효한지 판정하지 않는다(OD-031, C2).
-      review.push('reviewer가 본 commit이 현재 head와 다르다');
-    } else if (pr.review.headMatch === 'unknown') {
-      review.push('reviewer가 본 commit을 알 수 없어 현재 head와 대조하지 못했다');
+  if (pr.review !== null) {
+    const items: string[] = [];
+    // reviewGist는 review findings가 있을 때만 존재한다. 검증이 그것을 이미 강제한다(validate.ts).
+    if (summary.kind === 'ok' && summary.draft.reviewGist !== null) {
+      items.push(`_${esc(summary.draft.reviewGist)}_`);
     }
-    if (pr.review.findings.length === 0) {
-      review.push('보고된 finding 없음');
-    } else {
-      review.push(...pr.review.findings.map(findingLine));
-      if (pr.review.findingsTotal > pr.review.findings.length) {
-        const hidden = pr.review.findingsTotal - pr.review.findings.length;
-        review.push(`외 ${hidden}건은 카드에 싣지 않았다`);
-      }
-    }
+    items.push(...pr.review.findings.map(findingLine));
+    const hidden = pr.review.findingsTotal - pr.review.findings.length;
+    if (hidden > 0) items.push(`외 ${hidden}건은 카드에 싣지 않았다`);
+    if (items.length > 0) sections.push(listText('finding', items));
   }
-  // reviewGist는 review 사실이 있을 때만 존재한다. 검증이 그것을 이미 강제한다(validate.ts).
-  // 리뷰 절 안에 이탤릭으로 붙인다. 따로 블록을 만들면 판정과 그 요약이 갈라져 읽힌다.
-  if (summary.kind === 'ok' && summary.draft.reviewGist !== null) {
-    review.push(`_리뷰 핵심 — ${esc(summary.draft.reviewGist)}_`);
+  if (pr.checks.length > 0) {
+    const checks = pr.checks.slice(0, CHECK_LIST_CAP).map(checkLine);
+    const hidden = pr.checks.length - checks.length;
+    if (hidden > 0) checks.push(`외 ${hidden}개는 카드에 싣지 않았다`);
+    sections.push(listText('check', checks));
   }
-  blocks.push(labelled('리뷰', review));
 
-  const ci: string[] = [];
-  if (pr.checksHeadSha !== pr.headSha) {
-    // 사실 진술이다. 조회 계층의 bounded 재관측(OD-044) 뒤에도 남은 불일치이며, 이 줄 없이
-    // check를 나열하면 다른 commit의 결론이 현재 head의 것으로 읽힌다.
-    ci.push(
-      `check 관측은 현재 head가 아니라 commit ${esc(pr.checksHeadSha.slice(0, 7))}의 것이다` +
-        ` (현재 head ${esc(pr.headSha.slice(0, 7))})`,
-    );
-  }
-  // required check 축을 CI 절에 둔다. 이 축은 `checks`와 같은 commit(`checksHeadSha`)의 사실이라
-  // 위의 head 결속 문구가 축에도 그대로 걸린다. 절을 나누면 그 결속이 축에서 떨어진다.
-  ci.push(MERGE_POLICY_LINE[pr.mergePolicy]);
-  ci.push(...(pr.checks.length === 0 ? ['관찰된 check 없음'] : pr.checks.map(checkLine)));
-  blocks.push(labelled('CI', ci));
-
-  // worker 보고 본문은 요약이 실패했을 때만 사실 텍스트로 필요하다. 성공했다면 그 본문은 이미
-  // 위 요약의 입력이었으므로 결과 한 마디만 남기고 작은 글씨로 내린다.
-  const workerBody = pr.workerReport !== null && summary.kind === 'failed'
-    ? esc(cut(pr.workerReport.body, WORKER_BODY_CAP))
-    : null;
   // worker-read fallback을 쓰지 않으므로 없음이 곧 최종 관찰이다(OD-025, OD-070).
-  const workerLine = pr.workerReport === null
-    ? 'worker 보고 없음'
-    : `worker 보고 결과: ${pr.workerReport.outcome}`;
-  if (workerBody !== null) blocks.push(labelled('worker 보고', [workerLine, workerBody]));
-
-  // 관측 한계와 worker 결과는 판정이 아니라 이 카드가 무엇을 보고 무엇을 못 봤는지에 대한
-  // 단서다. 지우지 않되 본문과 같은 무게로 두지 않는다.
-  const footnotes: string[] = [];
-  if (workerBody === null) footnotes.push(workerLine);
-  if (pr.truncation.prBody) {
-    footnotes.push('관측 범위: PR 본문이 상한에서 잘려 요약이 전체를 보지 못했다');
-  }
-  if (pr.truncation.changedFiles) footnotes.push('관측 범위: 변경 파일 목록을 일부만 관측했다');
-  if (footnotes.length > 0) blocks.push(context(footnotes));
-
-  // PR 링크는 모든 상태에서 존재한다. C1 카드의 유일한 action이며 URL만 싣는다.
-  // C1에는 interaction handler가 없다. 이 버튼은 링크를 여는 것 외에 아무 일도 하지 않는다.
-  blocks.push({
-    type: 'actions',
-    elements: [
-      {
-        type: 'button',
-        action_id: 'pr_open',
-        text: { type: 'plain_text', text: 'PR 보기' },
-        url: pr.url,
-      },
+  const dashboard: CardField[] = [
+    [
+      'worker 보고',
+      pr.workerReport === null ? '없음' : pr.workerReport.outcome === 'succeeded' ? '완료' : '실패',
     ],
+    ['관측 범위', observedScope(pr)],
+    ['요약', summary.kind === 'ok' ? '있음' : `실패 · ${esc(cut(summary.reason, FAILURE_REASON_CAP))}`],
+  ];
+
+  return renderCardShell({
+    tone: head.tone,
+    emoji: head.emoji,
+    kind: head.kind,
+    head: title,
+    // blocks와 fallback text가 **같은** 이스케이프를 쓴다. 두 경로가 각자 이스케이프하면 한쪽만
+    // 고쳐지고, 그때 새는 쪽은 항상 fallback이다. PR 제목은 untrusted input이고(스펙 §10)
+    // 이스케이프하지 않은 `<!channel>` 하나가 카드 한 번에 workspace 전체를 깨운다.
+    text: `${head.emoji} ${esc(identityLine(pr))} · ${esc(title)} — ${head.kind}`,
+    // PR 링크는 모든 상태에서 존재한다. 카드의 유일한 링크이며 URL만 싣는다. 이 버튼은 링크를
+    // 여는 것 외에 아무 일도 하지 않는다.
+    actions: [{
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          action_id: 'pr_open',
+          text: { type: 'plain_text', text: 'PR 보기' },
+          url: pr.url,
+        },
+      ],
+    }],
+    fields,
+    sections,
+    dashboard,
+    footer: { at: refreshedAt, verb: '갱신', basis: 'GitHub·Orca 기준' },
   });
-
-  // blocks를 그리지 못하는 자리에서도 identity·상태·링크가 남아야 한다. 그 자리도 mrkdwn으로
-  // 해석되므로 blocks와 같은 이스케이프를 거친 값을 쓴다.
-  const text = `${emoji} ${escapedIdentity} · ${escapedTitle} — ${label} — ${pr.url}`;
-
-  return { text, blocks };
 }
 
 /**
  * 렌더 지문.
  *
- * 카드가 실제로 표시하는 값에서만 계산한다. 관찰 시각처럼 카드에 없는 값을 넣으면 사실이
- * 바뀌지 않아도 매 실행이 `chat.update`를 만든다(`store/schema.ts`).
+ * 카드가 실제로 표시하는 값에서만 계산한다. 관찰 시각처럼 관찰마다 움직이는 값을 넣으면 사실이
+ * 바뀌지 않아도 매 실행이 `chat.update`를 만든다(`store/schema.ts`). 살아 있는 카드의 "갱신"
+ * 시각은 호출자가 그 시각을 비운 렌더를 넘겨 뺀다.
  *
  * 렌더 결과 자체를 해싱한다. 필드를 손으로 나열하면 카드에 새 사실을 추가할 때 지문에 넣는
  * 것을 빠뜨려도 컴파일이 막지 못한다. 결과를 해싱하면 "지문이 같다"와 "게시할 내용이 같다"가
- * 같은 말이 된다. `renderCard`가 blocks를 고정된 순서로 만들므로 `JSON.stringify`의 키
- * 순서도 고정된다.
+ * 같은 말이 된다. renderer가 blocks를 고정된 순서로 만들므로 `JSON.stringify`의 키 순서도
+ * 고정된다. attachments가 없는 카드의 지문은 attachments를 도입하기 전과 같다.
  */
 export function renderFingerprint(card: RenderedCard): string {
-  const canonical = JSON.stringify({ text: card.text, blocks: card.blocks });
+  const canonical = JSON.stringify(
+    card.attachments === undefined
+      ? { text: card.text, blocks: card.blocks }
+      : { text: card.text, blocks: card.blocks, attachments: card.attachments },
+  );
   return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }
 
 /**
- * thread 전이 한 줄의 라벨과 설명.
+ * thread 전이 한 장의 머리와 판정 칸.
  *
  * `docs/ux/slack-surfaces.md` §5가 정한 thread event 최소 필드는 transition type, occurred/observed
- * time, 짧은 설명 셋이다. type은 emoji + 라벨이 내고, 설명이 여기 있고, 시각은
- * `renderThreadEvent`가 붙인다.
+ * time, 짧은 설명 셋이다. type은 머리가, 설명은 판정 칸이, 시각은 footer가 낸다.
  *
  * 카드와 같은 규율이다. emoji만으로 상태를 구분하지 않고(UX §1), 관찰된 사실을 넘는 문구를
- * 쓰지 않는다. `checks_passing` 문구가 카드의 `passing` 줄과 같은 범위 단서를 다는 이유도
- * 같다 — required check 축은 merge 가능 여부의 최종 답이 아니다(OD-032).
+ * 쓰지 않는다. `checks_passing`이 카드의 `병합 준비`와 같은 범위 단서를 다는 이유도 같다 —
+ * required check 축은 merge 가능 여부의 최종 답이 아니다(OD-032).
  */
-type TransitionLine = {
+type TransitionHead = {
+  readonly tone: CardTone;
   readonly emoji: string;
-  readonly label: string;
-  readonly detail: string;
+  readonly kind: string;
+  readonly field: CardField;
 };
 
 /**
@@ -436,30 +395,32 @@ export const BROADCAST_TRANSITIONS: ReadonlySet<PrTransitionKind> = new Set([
   'checks_passing',
 ]);
 
-const TRANSITION_LINE: Readonly<Record<PrTransitionKind, TransitionLine>> = {
+const TRANSITION_HEAD: Readonly<Record<PrTransitionKind, TransitionHead>> = {
   review_changes_requested: {
+    tone: 'attention',
     emoji: '⚠️',
-    label: '리뷰에서 수정 요청',
-    detail: 'reviewer 판정이 request_changes다',
+    kind: '수정 요청',
+    field: ['리뷰', 'reviewer 판정 수정 요청'],
   },
   review_approved: {
+    tone: 'success',
     emoji: '🟢',
-    label: '리뷰 통과',
-    detail: 'reviewer 판정이 approve다. 병합 준비 완료라는 주장이 아니다',
+    kind: '리뷰 통과',
+    field: ['리뷰', 'reviewer 판정 통과 · 병합 준비 판정 아님'],
   },
   checks_failing: {
-    emoji: '⚠️',
-    label: 'required check 실패',
-    detail: 'required context 중 실패한 것이 있다',
+    tone: 'error',
+    emoji: '❌',
+    kind: 'required check 실패',
+    field: ['CI', 'required check 중 실패 있음'],
   },
   checks_passing: {
+    tone: 'success',
     emoji: '🟢',
-    label: 'required check 통과',
-    detail:
-      'required context 전부가 충족됐다.' +
-      ' merge queue·required review·up-to-date·conversation resolution은 판정하지 않았다',
+    kind: 'required check 통과',
+    field: ['CI', `required check 전부 충족 · ${UNJUDGED_CONDITIONS}`],
   },
-  merged: { emoji: '✅', label: '병합 완료', detail: '이 PR이 병합됐다' },
+  merged: { tone: 'change', emoji: '✅', kind: '병합 완료', field: ['상태', '병합 완료'] },
 };
 
 /** `renderThreadEvent` 입력. 카드와 같은 규율로 여기 없는 값은 thread에 나타나지 않는다. */
@@ -474,31 +435,33 @@ export type ThreadEventInput = {
  * thread reply 하나를 그린다.
  *
  * 카드 renderer와 같은 파일에 둔다. 둘 다 LLM을 부르지 않고 입력에서 결정적으로 나오는
- * Slack 렌더링이며, 이스케이프와 section 상한 판정을 나눠 두면 한쪽만 고쳐지고 새는 쪽이 생긴다.
+ * Slack 렌더링이며, 상태 문구를 나눠 두면 한쪽만 고쳐진다.
  *
- * **발생 시각과 관측 시각을 구분해 적는다.** `occurredAt`이 null이면 그 사실이 시각을 싣고
- * 있지 않다는 뜻이고, 그때 관측 시각을 발생 시각인 척하지 않는다(UX §5).
+ * **발생 시각과 관측 시각을 구분한다.** footer는 발생 시각이 있으면 `발생`으로, 없으면 관측
+ * 시각을 `관측`으로 적는다. 발생 시각이 null이면 그 사실이 시각을 싣고 있지 않다는 뜻이고, 그때
+ * 관측 시각을 발생 시각인 척하지 않는다(UX §5). 둘 다 있으면 관측 시각은 칸으로 남는다.
  */
 export function renderThreadEvent(input: ThreadEventInput): RenderedCard {
   const { pr, transition, observedAt } = input;
-  const { emoji, label, detail } = TRANSITION_LINE[transition.kind];
-  const escapedIdentity = esc(identityLine(pr));
+  const head = TRANSITION_HEAD[transition.kind];
+  const identity = identityLine(pr);
 
-  const lines = [`${emoji} *${esc(label)}*`, esc(detail)];
+  const fields: CardField[] = [head.field];
   if (transition.kind === 'review_changes_requested' && pr.review !== null) {
-    lines.push(
-      pr.review.findingsTotal === 0
-        ? '보고된 finding 없음'
-        : `보고된 finding ${pr.review.findingsTotal}건`,
-    );
+    fields.push(['finding', pr.review.findingsTotal === 0 ? '없음' : `${pr.review.findingsTotal}건`]);
   }
-  lines.push(
-    transition.occurredAt === null
-      ? `관측 ${esc(observedAt)} (이 사실에는 발생 시각이 실려 있지 않다)`
-      : `발생 ${esc(transition.occurredAt)} · 관측 ${esc(observedAt)}`,
-  );
+  if (transition.occurredAt !== null) fields.push(['관측', kst(observedAt)]);
 
-  // thread reply는 루트 아래에 붙지만 알림 자리에는 그 맥락이 없다. identity를 함께 싣는다.
-  const text = `${emoji} ${escapedIdentity} · ${esc(label)} — ${esc(observedAt)}`;
-  return { text, blocks: [section(lines.join('\n'))] };
+  return renderCardShell({
+    tone: head.tone,
+    emoji: head.emoji,
+    kind: head.kind,
+    // thread reply는 루트 아래에 붙지만 broadcast 사본과 알림 자리에는 그 맥락이 없다.
+    head: identity,
+    text: `${head.emoji} ${esc(identity)} · ${head.kind} — ${kst(observedAt)}`,
+    fields,
+    footer: transition.occurredAt === null
+      ? { at: observedAt, verb: '관측', basis: 'GitHub·Orca 기준' }
+      : { at: transition.occurredAt, verb: '발생', basis: 'GitHub·Orca 기준' },
+  });
 }

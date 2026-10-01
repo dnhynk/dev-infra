@@ -467,15 +467,15 @@ export function projectRun(
 /**
  * Run 목록의 순서. **입력 순서에 tie를 남기지 않는 total order다.**
  *
- * `(updatedAt DESC, createdAt DESC, runId ASC)`. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 미등록
- * 목록의 상위 ENTRY_CAP건과 run-row degraded 줄의 순서가 관찰마다 뒤바뀌고, 사실이 그대로여도
- * 렌더 지문이 흔들려 `publish.ts`의 `skip`이 컬렉션 카드와 모든 Run 카드에서 발화하지 않는다.
- * `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 `ORDER BY`로 같은 것을 막는다.
+ * `(updatedAt DESC, createdAt DESC, runId ASC)`. Orca `run-list`의 출력 순서에 기대면 그 정렬이 바뀔 때 이번
+ * 관찰이 보는 working set(`runsPerPass`)과 미등록 목록·run-row degraded의 나열이 관찰마다 뒤바뀐다.
+ * working set이 바뀌면 카드가 그리는 사실이 바뀌어, Orca 상태가 그대로여도 `publish.ts`의 `skip`이
+ * 발화하지 않는다. `sqlite.ts`의 `SELECT_RUN_PULL_REQUESTS`가 `ORDER BY`로 같은 것을 막는다.
  *
- * **최신성 키가 `runId`보다 먼저인 이유.** `runId`는 최신성과 무관해서 상위 ENTRY_CAP건이
- * 임의-안정 부분집합이 된다. 실측(2026-08-24, 미등록 18건)에서 id 순 상위 5건이 폐기용 probe Run을
- * 싣고 그날 만들어진 Run을 밀어냈다. 지문은 안정됐지만 사람이 보는 5건이 무의미해진 것이다.
- * `runId`는 tie만 깬다 — 두 키를 합치면 여전히 total order라 지문 안정성은 그대로다.
+ * **최신성 키가 `runId`보다 먼저인 이유.** `runId`는 최신성과 무관해서 이 순서로 자르는 working set
+ * (`runsPerPass`)과 `runs` 보고의 앞부분이 임의-안정 부분집합이 된다. 실측(2026-08-24, 미등록 18건)에서
+ * id 순 상위 5건이 폐기용 probe Run을 싣고 그날 만들어진 Run을 밀어냈다. `runId`는 tie만 깬다 — 두
+ * 키를 합치면 여전히 total order라 지문 안정성은 그대로다.
  *
  * **문자열 비교를 쓰지 않는다.** `parseOrcaTimestamp`가 받는 형식이 둘이고(`2026-08-21T14:32:45Z`와
  * 타임존 없는 `2026-08-21 14:32:45`), 한 응답에 섞여 나온 것이 실측이다. 문자열 비교는 `' ' < 'T'`

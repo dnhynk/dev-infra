@@ -220,6 +220,9 @@ export async function postSlackRootAtMostOnce(input: {
       channel: input.channel,
       text: input.message.text,
       blocks: input.message.blocks,
+      ...(input.message.attachments === undefined
+        ? {}
+        : { attachments: input.message.attachments }),
     }, runtime, () => { postInvoked = true; });
     if (rootPostAborted(runtime)) throw new Error('root post aborted after response');
     await runtime.hooks?.afterPostResponse?.(posted);

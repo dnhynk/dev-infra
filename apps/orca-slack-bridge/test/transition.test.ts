@@ -7,6 +7,7 @@ import type { ProjectedPr } from '../src/digest/types.js';
 import { pullRequestKey, runKey, taskKey } from '../src/identity/keys.js';
 import { repositoryIdentity } from '../src/identity/repository.js';
 import type { PrStateSnapshot } from '../src/store/schema.js';
+import { cardText, fieldValue, footerText, headerText } from './card-text.js';
 
 /**
  * 관측 사이의 변화(OD-044, OD-046).
@@ -330,28 +331,30 @@ describe('renderThreadEvent', () => {
     return renderThreadEvent({ pr, transition: kind, observedAt });
   }
 
-  it('발생 시각이 있으면 관측 시각과 함께 적는다', () => {
+  it('발생 시각이 있으면 footer에 발생으로, 관측 시각은 칸으로 적는다', () => {
     const out = text(basePr, {
       kind: 'merged',
       dedupeKey: 'terminal:merged',
       occurredAt: '2026-08-23T02:00:00Z',
     });
-    const body = JSON.stringify(out.blocks);
-    expect(body).toContain('병합 완료');
-    expect(body).toContain('발생 2026-08-23T02:00:00Z');
-    expect(body).toContain(`관측 ${observedAt}`);
+    expect(headerText(out)).toBe('✅  병합 완료 · [dev-infra] dnhynk/dev-infra #7');
+    expect(fieldValue(out, '상태')).toBe('병합 완료');
+    expect(footerText(out)).toBe('orca-slack-bridge · 08-23 11:00:00 KST 발생 · GitHub·Orca 기준');
+    expect(fieldValue(out, '관측')).toBe('08-23 12:00:00 KST');
   });
 
   // 관측 시각을 발생 시각인 척하지 않는다(UX §5의 occurred/observed).
-  it('발생 시각이 없으면 없다고 말한다', () => {
+  it('발생 시각이 없으면 관측 시각을 관측으로만 적는다', () => {
     const out = text(basePr, {
       kind: 'review_approved',
       dedupeKey: `review:approve@${HEAD_A}`,
       occurredAt: null,
     });
-    const body = JSON.stringify(out.blocks);
-    expect(body).toContain('발생 시각이 실려 있지 않다');
-    expect(body).not.toContain('발생 2026');
+    expect(footerText(out)).toBe('orca-slack-bridge · 08-23 12:00:00 KST 관측 · GitHub·Orca 기준');
+    expect(cardText(out)).not.toContain('발생');
+    expect(fieldValue(out, '관측')).toBeUndefined();
+    // approve는 병합 준비 완료라는 주장이 아니다.
+    expect(fieldValue(out, '리뷰')).toBe('reviewer 판정 통과 · 병합 준비 판정 아님');
   });
 
   it('changes requested는 finding 수를 함께 적는다', () => {
@@ -366,13 +369,22 @@ describe('renderThreadEvent', () => {
       { ...basePr, review },
       { kind: 'review_changes_requested', dedupeKey: 'x', occurredAt: null },
     );
-    expect(JSON.stringify(out.blocks)).toContain('보고된 finding 3건');
+    expect(fieldValue(out, 'finding')).toBe('3건');
+    expect(out.attachments?.[0]?.color).toBe('#bf8700');
   });
 
   // required check 축은 merge 가능 여부의 최종 답이 아니다(OD-032). 카드와 같은 단서를 단다.
   it('passing 문구가 판정하지 않은 조건을 함께 밝힌다', () => {
     const out = text(basePr, { kind: 'checks_passing', dedupeKey: 'x', occurredAt: null });
-    expect(JSON.stringify(out.blocks)).toContain('merge queue');
+    expect(fieldValue(out, 'CI')).toContain('merge queue');
+    expect(fieldValue(out, 'CI')).toContain('미확인');
+  });
+
+  it('commit SHA와 PR URL을 싣지 않는다', () => {
+    const out = text(basePr, { kind: 'checks_failing', dedupeKey: `checks:failing@${HEAD_A}`, occurredAt: null });
+    expect(JSON.stringify(out)).not.toContain(HEAD_A);
+    expect(JSON.stringify(out)).not.toContain('https://');
+    expect(out.attachments?.[0]?.color).toBe('#cf222e');
   });
 
   // 알림 자리에는 thread 맥락이 없다. identity가 없으면 어느 PR인지 알 수 없다.

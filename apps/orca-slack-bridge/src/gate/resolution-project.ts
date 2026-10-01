@@ -139,8 +139,7 @@ export async function projectGateResolutionCard(
           updated = await boundedSlackUpdate(slack, {
             channel: message.channelId,
             ts: message.messageTs,
-            text: card.text,
-            blocks: card.blocks,
+            ...card,
             ...(signal === undefined ? {} : { signal }),
           }, timeoutMs);
         } catch (error) {

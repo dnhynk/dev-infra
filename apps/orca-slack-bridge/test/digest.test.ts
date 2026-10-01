@@ -21,6 +21,7 @@ import type {
 import { MemorySummaryCache, SummaryProviderError } from '../src/summarize/index.js';
 import type { SummaryProvider } from '../src/summarize/index.js';
 import type { SummaryFacts } from '../src/summarize/contract.js';
+import { fieldValue, footerText } from './card-text.js';
 
 /**
  * digest 1회 실행의 통합 검증.
@@ -494,6 +495,8 @@ type Once = {
   readonly gh?: GhOver;
   readonly slackTimeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** 관찰 시각. 카드의 갱신 시각이 된다. */
+  readonly now?: Date;
 };
 
 /** 매 실행이 store 파일을 새로 연다. 재시작 뒤에도 매핑을 찾는지 함께 본다. */
@@ -518,7 +521,7 @@ async function digestOnce(opts: Once = {}): Promise<DigestReport> {
         ...(opts.summaryMode === undefined ? {} : { summaryMode: opts.summaryMode }),
         prLimit: 50,
         onlyPr: opts.onlyPr ?? null,
-        now: () => new Date('2026-08-22T02:00:00Z'),
+        now: () => opts.now ?? new Date('2026-08-22T02:00:00Z'),
         ...(opts.slackTimeoutMs === undefined ? {} : { slackTimeoutMs: opts.slackTimeoutMs }),
         ...(opts.signal === undefined ? {} : { signal: opts.signal }),
       },
@@ -552,6 +555,20 @@ describe('runDigest 멱등', () => {
     expect(slack.posts).toHaveLength(1);
 
     const second = await digestOnce({ slack });
+    expect(card(second).action).toBe('skip');
+    expect(slack.posts).toHaveLength(1);
+    expect(slack.updates).toHaveLength(0);
+  });
+
+  // 카드는 갱신 시각을 싣지만 지문은 그 시각을 비운 렌더에서 계산한다(DL-074).
+  it('시각만 다른 재관찰은 Slack을 부르지 않고 카드의 갱신 시각도 그대로다', async () => {
+    const slack = new FakeSlack();
+    await digestOnce({ slack, now: new Date('2026-10-01T05:23:05Z') });
+    expect(footerText(slack.posts[0]!)).toBe(
+      'orca-slack-bridge · 10-01 14:23:05 KST 갱신 · GitHub·Orca 기준',
+    );
+
+    const second = await digestOnce({ slack, now: new Date('2026-10-01T06:00:00Z') });
     expect(card(second).action).toBe('skip');
     expect(slack.posts).toHaveLength(1);
     expect(slack.updates).toHaveLength(0);
@@ -851,11 +868,12 @@ describe('runDigest 실패와 경계', () => {
     expect(c.action).toBe('create');
     expect(c.summary.kind).toBe('failed');
     expect(slack.posts).toHaveLength(1);
-    const json = JSON.stringify(slack.posts[0]?.blocks);
-    expect(json).toContain('요약 실패');
+    const post = slack.posts[0]!;
+    expect(fieldValue(post, '요약')?.startsWith('실패 · ')).toBe(true);
     // 요약이 없어도 identity와 PR 링크는 남는다.
-    expect(json).toContain(`${REPO} #7`);
-    expect(json).toContain(`https://github.com/${REPO}/pull/7`);
+    expect(fieldValue(post, '저장소')).toBe(`${REPO} · #7`);
+    expect(post.text).toContain(`${REPO} #7`);
+    expect(JSON.stringify(post.blocks)).toContain(`https://github.com/${REPO}/pull/7`);
   });
 
   it('correlation이 없는 PR에는 카드를 만들지 않는다', async () => {
@@ -905,11 +923,12 @@ describe('C1 출구 조건', () => {
   it('identity와 PR 링크가 항상 표시된다', async () => {
     const slack = new FakeSlack();
     await digestOnce({ slack });
-    const blocks = slack.posts[0]?.blocks ?? [];
-    // identity는 카드 머리(제목 줄과 그 아래 작은 줄)에 있어야 한다. 어느 쪽 block에 놓을지는
-    // layout 결정이고, 요구는 훑을 때 맨 위에서 보인다는 것이다(OD-047).
-    const header = JSON.stringify(blocks.slice(0, 2));
-    expect(header).toContain(`${REPO} #7`);
+    const post = slack.posts[0]!;
+    const blocks = post.blocks;
+    // identity는 카드 본문의 첫 칸과 대체 텍스트에 있다. 머리는 무엇이 바뀌었는가(제목)이고,
+    // 요구는 훑을 때 맨 위에서 보인다는 것이다(OD-047, DL-074).
+    expect(fieldValue(post, '저장소')).toBe(`${REPO} · #7`);
+    expect(post.text).toContain(`${REPO} #7`);
     const actions = blocks.find((b) => b['type'] === 'actions') as
       | { elements: { url: string; action_id: string }[] }
       | undefined;
@@ -1355,11 +1374,11 @@ describe('runDigest check 역순 관측', () => {
   it('완료 뒤에 도착한 진행 snapshot이 카드의 축을 되돌리지 않는다', async () => {
     const slack = new FakeSlack();
     const done = await digestOnce({ slack, gh: REQUIRED });
-    expect(JSON.stringify(card(done).card.blocks)).toContain('required check: 모두 통과');
+    expect(fieldValue(card(done).card, 'CI')).toBe('통과');
 
     const late = await digestOnce({ slack, gh: RUNNING });
 
-    expect(JSON.stringify(card(late).card.blocks)).toContain('required check: 모두 통과');
+    expect(fieldValue(card(late).card, 'CI')).toBe('통과');
     expect(card(late).action).toBe('skip');
     expect(slack.updates).toHaveLength(0);
   });
@@ -1367,13 +1386,11 @@ describe('runDigest check 역순 관측', () => {
   it('진행 뒤에 도착한 완료 snapshot은 그대로 반영한다', async () => {
     const slack = new FakeSlack();
     const running = await digestOnce({ slack, gh: RUNNING });
-    expect(JSON.stringify(card(running).card.blocks)).toContain(
-      'required check: 아직 결론 나지 않은 것이 있다',
-    );
+    expect(fieldValue(card(running).card, 'CI')).toBe('진행 중');
 
     const done = await digestOnce({ slack, gh: REQUIRED });
 
-    expect(JSON.stringify(card(done).card.blocks)).toContain('required check: 모두 통과');
+    expect(fieldValue(card(done).card, 'CI')).toBe('통과');
     expect(card(done).action).toBe('update');
   });
 

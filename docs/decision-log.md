@@ -461,7 +461,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 
 ## 2026-08-24 · Run 컬렉션 루트
 
-### DL-054 · 미등록 사실은 Run 카드와 무관하게 도달하는 루트를 따로 갖는다
+### DL-054 · 미등록 사실은 Run 카드와 무관하게 도달하는 루트를 따로 갖는다 — 관측 시각 규칙은 DL-074로 SUPERSEDED
 
 - OD-078은 "등록 열쇠가 통째로 어긋나 Run이 조용히 사라진다"는 위험을 감수했고, 그 유일한 근거가
   **"미등록 Run을 세어 노출하므로 조용한 실패가 관측 가능해진다"**였다. 그런데 그 수를 표시하는
@@ -883,3 +883,37 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   않는다.
 - 기각: `response_url`로 안내하는 방식. 이 코드는 그 값을 secret으로 다루고 저장하지 않는다.
 - D3 Channel 경로(`src/channel/**`, plugin, Channel Adapter 명령)는 바꾸지 않았다.
+
+## 2026-10-01 · Slack 카드 시각 문법
+
+### DL-074 · Slack 카드는 색 바 attachment에 본문을, 최상위에 머리와 버튼을 두고 내부 ID를 싣지 않는다
+
+- 사용자 결정: 모든 카드(Run·컬렉션·Gate 결정·결정 기록·PR·PR thread 전이·터미널 프롬프트·치명 종료 알림)를
+  trading-room 카드 문법으로 그린다. 종류별 색 바(blue `#2f81f7` 접수·진행 중, green `#1a7f37` 성공, red `#cf222e`
+  오류·막힘, amber `#bf8700` 결정·주의 필요, purple `#8250df` 변경, gray `#6e7781` 상태·판정 불가), 머리
+  `"{emoji}  {종류} · {제목}"`(카드의 유일한 emoji), `*라벨*\n값` 두 열 fields(section당 10칸), 원인 → 행동 한두 문장,
+  divider 아래 두 번째 fields, footer `orca-slack-bridge · MM-DD HH:MM:SS KST <동사> · <기준>`. 값이 없으면
+  `계산 불가`나 `확인 불가 · …`를 쓴다. 구현은 `src/slack/card.ts` 하나이고 문법은 UX §1.1에 있다.
+- 구조: 최상위 `blocks = [header, ...actions]`, `attachments = [{ color, blocks: [fields, …, footer] }]`. attachment 안의
+  버튼 클릭은 `container.type: "message_attachment"`로 오는데 Gate와 직접 입력 handler는 `message`만 받으므로 버튼은
+  최상위에만 둔다. action block과 그 ID(`orca_gate_*`, 터미널 `${promptBlockId}:${row}`)는 바꾸지 않았다. `chat.update`는
+  보내지 않은 attachments를 남기므로 갱신은 항상 attachments를 보낸다(없으면 빈 배열).
+- 카드에 싣지 않는 것: 링크(PR 버튼 URL만 예외), code span, mention, raw JSON, Run·Task·Gate·Dispatch·터미널 ID와 12자
+  이상 hash, 경로, `[snake_case]` 진단 코드. OD-067의 연결 ID 노출은 `runs` 명령의 사실 보고로 옮겼다. Gate degraded
+  사유 문장은 ID를 담고 있어 카드에는 수만 두고 사유는 `runs` 게시 보고가 출력한다. 결정 기록 카드는 누른 사람과
+  mutation request ID를 싣지 않는다. 그 값은 `gate_resolution` row에 있다.
+- 예외(사용자 결정): 치명 종료 알림은 owner mention `<@owner>`를 유지한다. 원인 코드 대신 사람이 읽는 원인을 싣는다.
+  observer 원인 코드는 운영 로그 `job.failed`의 `errorCode`에, 알린 코드는 `fatal-alert.json`에 남는다.
+- 갱신 시각: 살아 있는 카드(Run·컬렉션·PR 루트)는 게시 직전 시각을 `갱신`으로 싣고, 렌더 지문은 그 시각을 비운 렌더에서
+  계산한다. 시각만 바뀐 관찰은 `skip`이므로 카드의 시각은 "마지막으로 내용이 바뀐 시각"이고 관측 신선도를 주장하지
+  않는다. DL-054의 "관측 시각을 카드에 싣지 않는다"를 이 규칙이 대체한다. Gate 결정·결정 기록·터미널 카드는 현재 시각을
+  읽지 않고 저장된 사실의 시각(`resolvedAt`, 선택 `createdAt`, 프롬프트 `createdAt`·`claimedAt`·`settledAt`)만 쓴다. 결정
+  기록 카드가 바뀌면 `rearmGateOutboxProjection`이 다시 걸리므로 움직이는 값을 그리면 투영이 끝나지 않는다.
+- 알림용 대체 텍스트는 유지한다. 컬렉션 카드는 기존 문구 그대로이고, 결정 기록 카드는 `cardState`와 후속 Task 라벨
+  (`Coordinator 통지 대기`, `Coordinator 확인됨 · 후속 Task 재개 미관찰`, `▶️ 작업 재개`)을 그대로 싣는다. `작업 재개`는
+  재개 증거가 있을 때만 나온다. PR 카드의 대체 텍스트는 URL을 싣지 않는다.
+- 결과: 배포 뒤 첫 관찰에서 모든 렌더 지문이 바뀐다. 살아 있는 카드와 아직 관측되는 Gate·터미널 카드는 한 번씩 다시
+  그려지고, 확인된 결정 기록 카드도 renderer drift로 한 번 다시 투영된다. 그 뒤로는 사실이 바뀔 때만 갱신한다.
+- 기각: 버튼까지 attachment에 넣는 구조. 모든 Gate·터미널 클릭이 `message_attachment` container로 와 handler가 거부한다.
+- 기각: 매 관찰 시각을 카드에 그리는 방식. 지문에 넣으면 `skip`이 발화하지 않고, 지문에서만 빼면 `skip`된 관찰 뒤에
+  관측 시각이 낡은 채 남아 신선도를 거짓말한다(DL-054의 근거). 동사를 `갱신`으로 둔 것이 이 근거를 지킨다.

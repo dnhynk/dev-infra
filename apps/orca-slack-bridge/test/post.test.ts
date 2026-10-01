@@ -24,6 +24,10 @@ const BLOCKS: readonly SlackBlock[] = [
   { type: 'section', text: { type: 'mrkdwn', text: '카드' } },
 ];
 
+const ATTACHMENTS = [
+  { color: '#1a7f37', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '본문' } }] },
+] as const;
+
 type Reply = { readonly status?: number; readonly body?: unknown; readonly headers?: Record<string, string> };
 
 /** fetch 대역. 호출을 기록하고 미리 정한 응답을 순서대로 준다. */
@@ -172,6 +176,30 @@ describe('SlackWebApiPoster', () => {
     await poster(fake).update(updateInput);
     expect(fake.calls[0]!.url).toBe('https://slack.com/api/chat.update');
     expect(JSON.parse(String(fake.calls[0]!.init.body))['ts']).toBe('1.1');
+  });
+
+  // 카드 본문은 attachment에 있다(`slack/card.ts`). post와 reply는 받은 그대로 보낸다.
+  it('post는 attachments가 있으면 그대로 싣는다', async () => {
+    const fake = new FakeFetch([{ body: { ok: true, channel: 'C1', ts: '1.1' } }]);
+    await poster(fake).post({ ...postInput, attachments: ATTACHMENTS });
+    expect(JSON.parse(String(fake.calls[0]!.init.body))).toEqual({
+      channel: 'C1',
+      text: '대체 텍스트',
+      blocks: BLOCKS,
+      attachments: ATTACHMENTS,
+    });
+  });
+
+  // chat.update는 보내지 않은 attachments를 그대로 둔다. 빈 배열을 보내야 옛 본문이 지워진다.
+  it('update는 attachments가 없으면 빈 배열을 보내고 있으면 그대로 보낸다', async () => {
+    const fake = new FakeFetch([
+      { body: { ok: true, channel: 'C1', ts: '1.1' } },
+      { body: { ok: true, channel: 'C1', ts: '1.1' } },
+    ]);
+    await poster(fake).update(updateInput);
+    await poster(fake).update({ ...updateInput, attachments: ATTACHMENTS });
+    expect(JSON.parse(String(fake.calls[0]!.init.body))['attachments']).toEqual([]);
+    expect(JSON.parse(String(fake.calls[1]!.init.body))['attachments']).toEqual(ATTACHMENTS);
   });
 
   it('ok:false를 성공으로 처리하지 않고 error 코드를 그대로 올린다', async () => {
@@ -471,6 +499,19 @@ describe('SlackWebApiPoster.reply', () => {
       thread_ts: '1700000000.000100',
       text: '전이 대체 텍스트',
       blocks: BLOCKS,
+    });
+  });
+
+  it('attachments가 있으면 thread reply에도 그대로 싣는다', async () => {
+    const fake = new FakeFetch([{ body: { ok: true, channel: 'C1', ts: '1700000009.000010' } }]);
+    await poster(fake).reply({ ...replyInput, attachments: ATTACHMENTS, broadcast: true });
+    expect(JSON.parse(String(fake.calls[0]!.init.body))).toEqual({
+      channel: 'C1',
+      thread_ts: '1700000000.000100',
+      text: '전이 대체 텍스트',
+      blocks: BLOCKS,
+      attachments: ATTACHMENTS,
+      reply_broadcast: true,
     });
   });
 

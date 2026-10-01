@@ -15,6 +15,7 @@ import type {
   UpdateMessageInput,
 } from '../src/slack/post.js';
 import type { RunCollection, RunFacts } from '../src/run/types.js';
+import { cardText, fieldValue, footerText } from './card-text.js';
 
 /**
  * Run 루트 재사용(로드맵 §7 출구 조건).
@@ -399,13 +400,12 @@ describe('컬렉션 게시', () => {
 
     // 컬렉션 카드 1장 + Run 카드 2장. 미등록 수는 셋 모두에 실린다.
     expect(slack.posts).toHaveLength(3);
-    for (const post of slack.posts) {
-      const text = post.blocks
-        .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
-        .join('\n');
-      expect(text).toContain('*등록되지 않은 Run*');
-      expect(text).toContain('run_aaa');
+    expect(fieldValue(slack.posts[0]!, '미등록 Run')).toBe('2건');
+    for (const post of slack.posts.slice(1)) {
+      expect(fieldValue(post, '미등록 Run')).toBe('2건 · 관찰 요약 참고');
     }
+    // 어느 Run인지는 `runs` 보고가 싣는다. 카드에는 ID가 없다.
+    for (const post of slack.posts) expect(cardText(post)).not.toContain('run_aaa');
   });
 
   it('컬렉션 degraded가 모든 카드에 실린다', async () => {
@@ -422,21 +422,10 @@ describe('컬렉션 게시', () => {
     );
     store.close();
 
-    for (const post of slack.posts) {
-      // degraded는 카드 아래쪽 작은 글씨(context)로 내려갔다. 사실이 실린다는 요구는 그대로이므로
-      // 두 블록 종류를 모두 훑는다.
-      const text = post.blocks
-        .map((b) => {
-          const direct = (b['text'] as { text?: string } | undefined)?.text;
-          if (direct !== undefined) return direct;
-          const elements = b['elements'];
-          return Array.isArray(elements)
-            ? (elements as readonly Record<string, unknown>[])
-              .map((e) => String(e['text'] ?? '')).join('\n')
-            : '';
-        })
-        .join('\n');
-      expect(text).toContain('[unverified_platform_assumption]');
+    // 컬렉션 카드는 사유를 이름으로 싣고, Run 카드는 관찰 전체의 수를 싣는다.
+    expect(fieldValue(slack.posts[0]!, '관측 주의')).toBe('플랫폼 가정 미검증');
+    for (const post of slack.posts.slice(1)) {
+      expect(fieldValue(post, '관측 상태')?.split('\n')[0]).toContain('전체 주의 1건');
     }
   });
 
@@ -468,10 +457,7 @@ describe('컬렉션 게시', () => {
     await publishRunCollection(options(store, slack), collection({ runs: [facts()] }));
     store.close();
 
-    const text = (slack.posts[1]?.blocks ?? [])
-      .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
-      .join('\n');
-    expect(text).toContain('#25 ✅ 병합 완료 · 리뷰 통과');
+    expect(fieldValue(slack.posts[1]!, 'PR')).toBe('#25 병합 완료 · 리뷰 통과');
   });
 
   it('다른 Run의 PR을 이 Run 카드에 싣지 않는다', async () => {
@@ -487,26 +473,16 @@ describe('컬렉션 게시', () => {
     await publishRunCollection(options(store, slack), collection({ runs: [facts()] }));
     store.close();
 
-    const text = (slack.posts[1]?.blocks ?? [])
-      .map((b) => {
-        const direct = (b['text'] as { text?: string } | undefined)?.text;
-        if (direct !== undefined) return direct;
-        const elements = b['elements'];
-        return Array.isArray(elements)
-          ? (elements as readonly Record<string, unknown>[])
-            .map((e) => String(e['text'] ?? '')).join(String.fromCharCode(10))
-          : '';
-      })
-      .join('\n');
-    expect(text).toContain('store에 기록된 PR 없음');
-    expect(text).not.toContain('#26');
+    expect(fieldValue(slack.posts[1]!, 'PR')).toBe('기록 없음');
+    expect(cardText(slack.posts[1]!)).not.toContain('#26');
   });
   /*
    * `skip`이 실운영에서 살아 있는지를 본다.
    *
    * 두 관찰의 Run 사실은 같고 **관측 시각만 다르다** — 컬렉션 `observedAt`도, `digest`가 갱신하는
-   * `pr_state.observed_at`·`pr_task.last_seen_at`도 움직였다. 카드에 그 값이 하나라도 남아 있으면
-   * 지문이 달라져 이 테스트가 `update`를 본다. 고정 시각으로만 도는 테스트는 이 경로를 놓친다.
+   * `pr_state.observed_at`·`pr_task.last_seen_at`도, 게시 시각(`now`)도 움직였다. 지문에 그 값이
+   * 하나라도 남아 있으면 지문이 달라져 이 테스트가 `update`를 본다. 카드의 갱신 시각은 지문을 비운
+   * 렌더에서 계산하므로 움직이지 않는다(DL-074). 고정 시각으로만 도는 테스트는 이 경로를 놓친다.
    *
    * **PR이 붙은 Run으로 한다.** PR 없는 Run으로만 하면 `pullRequestLine`의 시각을 놓친다.
    */
@@ -545,15 +521,14 @@ describe('컬렉션 게시', () => {
 
     // 카드가 PR을 실제로 그렸다는 것을 같은 자리에서 확인한다. 안 그리면 이 테스트가 공허하다.
     // posts[0]은 컬렉션 카드다. Run 카드는 그 다음이다.
-    const text = (slack.posts[1]?.blocks ?? [])
-      .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
-      .join('\n');
-    expect(text).toContain('#27 🟡 열림');
+    expect(fieldValue(slack.posts[1]!, 'PR')).toBe('#27 열림 · 리뷰 결과 없음');
+    // 첫 게시가 찍은 갱신 시각이다. skip된 관찰은 카드를 건드리지 않는다.
+    expect(footerText(slack.posts[1]!)).toContain(' KST 갱신 · Orca 관측 기준');
 
     expect(first.runs[0]?.action).toBe('create');
     expect(second.runs[0]?.action).toBe('skip');
     expect(second.runs[0]?.fingerprint).toBe(first.runs[0]?.fingerprint);
-    // 컬렉션 카드도 같은 이유로 skip이다. 두 카드 모두 관측 시각을 싣지 않는다.
+    // 컬렉션 카드도 같은 이유로 skip이다. 두 카드 모두 갱신 시각을 지문에 넣지 않는다.
     expect(second.collection.action).toBe('skip');
     expect(slack.posts).toHaveLength(2);
     expect(slack.updates).toHaveLength(0);
@@ -577,12 +552,6 @@ describe('컬렉션 카드 (OD-080)', () => {
     degraded: [],
     ...over,
   });
-
-  function blockText(post: PostMessageInput | undefined): string {
-    return (post?.blocks ?? [])
-      .map((b) => (b['text'] as { text?: string } | undefined)?.text ?? '')
-      .join('\n');
-  }
 
   // 등록 Run이 0이어도 미등록 사실이 #agent-runs에 도달한다. 이것이 수용 기준이다.
   it('등록된 Run이 하나도 없어도 미등록 수가 Slack에 도달한다', async () => {
@@ -621,16 +590,16 @@ describe('컬렉션 카드 (OD-080)', () => {
     expect(slack.posts).toHaveLength(1);
     expect(result.collection.action).toBe('create');
 
-    const text = blockText(slack.posts[0]);
-    expect(text).toContain('*등록되지 않은 Run*');
-    expect(text).toContain('run_aaa');
-    expect(text).toContain('run_bbb');
-    // D1-B가 확정한 구분이 이 카드에서도 갈려야 한다. 이 줄들이 없으면 "조회에 실패해서 판정할
-    // 수 없다"와 "조회했더니 등록에 없다"가 바이트 동일해지고, 그러면 이 카드가 두 사건을 함께 센다.
-    expect(text).toContain('[unregistered_repository]');
-    expect(text).toContain('[query_failed]');
+    const post = slack.posts[0]!;
+    expect(fieldValue(post, '미등록 Run')).toBe('2건');
+    // D1-B가 확정한 구분이 이 카드에서도 갈려야 한다. 사유가 접히면 "조회에 실패해서 판정할 수
+    // 없다"와 "조회했더니 등록에 없다"가 바이트 동일해지고, 그러면 이 카드가 두 사건을 함께 센다.
+    expect(cardText(post)).toContain('조회 실패 1건');
+    expect(cardText(post)).toContain('미등록 저장소 1건');
+    // 어느 Run인지는 `runs` 보고가 싣는다.
+    expect(cardText(post)).not.toContain('run_aaa');
     // 대체 텍스트에도 수가 남는다. blocks를 그리지 못하는 자리가 있다.
-    expect(slack.posts[0]?.text).toContain('등록되지 않은 Run 2건');
+    expect(post.text).toContain('등록되지 않은 Run 2건');
   });
 
   // 조건부로 만들면 장치가 조건부가 된다. 등록 Run이 있어도, 미등록이 0이어도 카드는 나간다.
@@ -643,7 +612,7 @@ describe('컬렉션 카드 (OD-080)', () => {
 
     expect(result.collection.action).toBe('create');
     expect(slack.posts).toHaveLength(1);
-    expect(blockText(slack.posts[0])).toContain('*등록되지 않은 Run*');
+    expect(fieldValue(slack.posts[0]!, '미등록 Run')).toBe('0건');
   });
 
   // 컬렉션 카드도 Run 카드와 같은 루트 재사용 규율을 따른다. 관찰마다 새 루트를 만들면

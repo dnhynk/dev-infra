@@ -882,8 +882,10 @@ describe('D3-4 offline lifecycle acceptance', () => {
     )).toBe(true);
     const finalUpdate = slack.updates.at(-1)!;
     expect(finalUpdate.text).toContain('▶️ 작업 재개');
-    expect(finalUpdate.text).toContain(STATEFUL_FOLLOWUP_TASK_ID);
-    expect(finalUpdate.text).toContain(STATEFUL_FOLLOWUP_DISPATCH_ID);
+    // 재개 증거의 Task·Dispatch ID는 위 store 단언이 확인한다. 카드는 ID를 싣지 않는다(DL-074).
+    expect(JSON.stringify(finalUpdate)).toContain('재개 관찰 · 새 Dispatch 시작');
+    expect(JSON.stringify(finalUpdate)).not.toContain(STATEFUL_FOLLOWUP_TASK_ID);
+    expect(JSON.stringify(finalUpdate)).not.toContain(STATEFUL_FOLLOWUP_DISPATCH_ID);
 
     // Settle daemon 1's stale non-cooperative read only after daemon 2 owns the durable witness.
     // Its aborted owner and old revision cannot rewrite the successor evidence or queue a post.

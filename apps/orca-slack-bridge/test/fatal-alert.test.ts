@@ -16,6 +16,7 @@ import {
   type SlackPoster,
   type UpdateMessageInput,
 } from '../src/slack/post.js';
+import { cardText, fieldValue, headerText, sectionTexts } from './card-text.js';
 
 const AT = new Date('2026-09-30T09:00:00.000Z');
 const HOUR = 60 * 60 * 1_000;
@@ -55,16 +56,42 @@ function input(slack: SlackPoster, overrides: Partial<FatalAlertInput> = {}): Fa
 }
 
 describe('fatal daemon exit notice', () => {
-  it('posts one mention with the cause code to the decisions channel and records it', async () => {
+  it('posts one red card with the owner mention and a human cause, and records the code', async () => {
     const slack = new RecordingSlack();
     await expect(announceFatalExit(input(slack))).resolves.toBe('posted');
     expect(slack.posts).toHaveLength(1);
-    expect(slack.posts[0]).toMatchObject({ channel: 'C0DECISIONS' });
-    expect(slack.posts[0]!.text).toContain('<@U0OWNER>');
-    expect(slack.posts[0]!.text).toContain('discovery.schema_drift');
+    const post = slack.posts[0]!;
+    expect(post).toMatchObject({ channel: 'C0DECISIONS' });
+    // mention은 이 알림만의 예외다. 대체 텍스트에 있어야 알림이 간다.
+    expect(post.text).toContain('<@U0OWNER>');
+    expect(headerText(post)).toBe('🚨  중단 · orca-slack-bridge 데몬');
+    expect(post.attachments?.[0]?.color).toBe('#cf222e');
+    expect(fieldValue(post, '원인')).toBe('Orca 데이터 형식 변경');
+    expect(fieldValue(post, '자동 재시작')).toBe('1분마다 · 원인이 남으면 다시 중단');
+    expect(fieldValue(post, '다음 알림')).toBe('같은 원인은 24시간 뒤');
+    expect(sectionTexts(post)).toEqual([
+      '<@U0OWNER> Orca 응답 형식이 바뀌어 데몬이 멈췄습니다 → status 명령과 운영 로그에서 원인을 확인하세요.',
+    ]);
+    // 원인 코드는 카드에 싣지 않는다. 운영 로그와 ledger가 싣는다.
+    expect(cardText(post)).not.toContain('schema_drift');
     expect(JSON.parse(readFileSync(join(logDir, FATAL_ALERT_LEDGER), 'utf8'))).toEqual({
       'discovery.schema_drift': AT.toISOString(),
     });
+  });
+
+  it('maps each fatal code to its cause and falls back without guessing', async () => {
+    const causes: Record<string, string> = {
+      'run.schema_drift': 'Orca 데이터 형식 변경',
+      'daemon.startup_failed': '기동 실패',
+      'daemon.fatal_stop': '실행 중 치명 오류',
+      'observer.unknown_failure': '확인 불가 · 운영 로그 참고',
+    };
+    for (const [code, cause] of Object.entries(causes)) {
+      const slack = new RecordingSlack();
+      await announceFatalExit(input(slack, { code, logDir: join(logDir, code) }));
+      expect(fieldValue(slack.posts[0]!, '원인')).toBe(cause);
+      expect(cardText(slack.posts[0]!)).not.toContain(code);
+    }
   });
 
   it('stays quiet for the same cause inside the window and speaks again after it', async () => {
@@ -72,10 +99,11 @@ describe('fatal daemon exit notice', () => {
     await announceFatalExit(input(slack));
     await expect(announceFatalExit(input(slack, { now: new Date(AT.getTime() + 23 * HOUR) })))
       .resolves.toBe('suppressed');
-    await expect(announceFatalExit(input(slack, { code: 'run.schema_drift' }))).resolves.toBe('posted');
+    await expect(announceFatalExit(input(slack, { code: 'daemon.startup_failed' })))
+      .resolves.toBe('posted');
     await expect(announceFatalExit(input(slack, { now: new Date(AT.getTime() + 25 * HOUR) })))
       .resolves.toBe('posted');
-    expect(slack.posts.map((post) => post.text.includes('run.schema_drift'))).toEqual([false, true, false]);
+    expect(slack.posts.map((post) => post.text.includes('기동 실패'))).toEqual([false, true, false]);
   });
 
   it('retries on the next start after Slack rejects the post', async () => {
@@ -107,6 +135,6 @@ describe('fatal daemon exit notice', () => {
     writeFileSync(join(logDir, FATAL_ALERT_LEDGER), '{not json');
     const slack = new RecordingSlack();
     await expect(announceFatalExit(input(slack, { ownerUserId: null }))).resolves.toBe('posted');
-    expect(slack.posts[0]!.text).not.toContain('<@');
+    expect(cardText(slack.posts[0]!)).not.toContain('<@');
   });
 });

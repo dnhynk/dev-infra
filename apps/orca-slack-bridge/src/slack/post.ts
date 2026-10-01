@@ -19,12 +19,26 @@ import { BOT_TOKEN_VAR, maskToken } from './verify.js';
  */
 export type SlackBlock = Readonly<Record<string, unknown>>;
 
+/**
+ * legacy attachment 하나. 카드는 왼쪽 색 바(`color`)와 그 안의 blocks만 쓴다(`slack/card.ts`).
+ *
+ * **버튼을 여기 넣지 않는다.** attachment 안의 버튼 클릭은 `container.type: "message_attachment"`로
+ * 오고, Gate와 직접 입력 handler는 `message`만 받는다(`gate/action-handler.ts`의 `parseAction`,
+ * `gate/direct-input-handler.ts`). action block은 항상 최상위 `blocks`에 둔다.
+ */
+export type SlackAttachment = {
+  readonly color: string;
+  readonly blocks: readonly SlackBlock[];
+};
+
 export type PostMessageInput = {
   /** 채널 ID. 이름이 아니다. 설정의 `slack.channels.prDigest`에서 온다. */
   readonly channel: string;
   /** blocks를 그리지 못하는 자리(알림, 검색 결과)용 대체 텍스트. 비우지 않는다. */
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /** 카드 본문과 색 바. 없으면 보내지 않는다. */
+  readonly attachments?: readonly SlackAttachment[];
   /** Cooperative cancellation for an at-most-once root attempt. Never serialized to Slack. */
   readonly signal?: AbortSignal;
 };
@@ -35,6 +49,8 @@ export type ThreadReplyInput = {
   readonly threadTs: string;
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /** 카드 본문과 색 바. 없으면 보내지 않는다. */
+  readonly attachments?: readonly SlackAttachment[];
   /**
    * Slack `reply_broadcast`. thread reply는 그 thread를 따르지 않는 사람에게 알림을 보내지
    * 않고 채널에도 나타나지 않는다. 자리에 없는 owner에게는 사실상 보이지 않는다는 뜻이다.
@@ -51,6 +67,13 @@ export type UpdateMessageInput = {
   readonly ts: string;
   readonly text: string;
   readonly blocks: readonly SlackBlock[];
+  /**
+   * 카드 본문과 색 바.
+   *
+   * `chat.update`는 보내지 않은 attachments를 지우지 않고 그대로 둔다. 그래서 구현은 이 값이 없으면
+   * 빈 배열을 보낸다. 빠뜨리면 옛 카드 본문이 새 머리 아래에 남는다.
+   */
+  readonly attachments?: readonly SlackAttachment[];
   /** Cooperative cancellation for bounded, idempotent card projection. Never serialized to Slack. */
   readonly signal?: AbortSignal;
 };
@@ -393,7 +416,12 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster, EphemeralPo
   async post(input: PostMessageInput): Promise<PostedMessage> {
     return this.call(
       'chat.postMessage',
-      { channel: input.channel, text: input.text, blocks: input.blocks },
+      {
+        channel: input.channel,
+        text: input.text,
+        blocks: input.blocks,
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+      },
       false,
       input.signal,
     );
@@ -408,7 +436,14 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster, EphemeralPo
   async update(input: UpdateMessageInput): Promise<PostedMessage> {
     return this.call(
       'chat.update',
-      { channel: input.channel, ts: input.ts, text: input.text, blocks: input.blocks },
+      {
+        channel: input.channel,
+        ts: input.ts,
+        text: input.text,
+        blocks: input.blocks,
+        // 보내지 않으면 Slack이 옛 attachments를 남긴다. 근거는 `UpdateMessageInput.attachments`에 있다.
+        attachments: input.attachments ?? [],
+      },
       true,
       input.signal,
     );
@@ -433,6 +468,7 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster, EphemeralPo
         thread_ts: input.threadTs,
         text: input.text,
         blocks: input.blocks,
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
         ...(input.broadcast === true ? { reply_broadcast: true } : {}),
       },
       false,

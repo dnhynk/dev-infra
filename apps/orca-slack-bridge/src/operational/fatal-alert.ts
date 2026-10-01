@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+import type { RenderedCard } from '../digest/render.js';
+import { renderCardShell } from '../slack/card.js';
 import { SlackApiError, type SlackPoster } from '../slack/post.js';
 
 /**
@@ -53,11 +55,59 @@ function writeLedger(path: string, ledger: Readonly<Record<string, string>>): vo
   }
 }
 
+const HOUR_MS = 60 * 60 * 1_000;
+
+/**
+ * 원인 코드를 사람이 읽는 원인과 할 일로 옮긴다. 코드 자체는 카드에 싣지 않는다(DL-074) —
+ * observer 원인 코드는 운영 로그 `job.failed`의 `errorCode`에 있고, 알린 코드는 `fatal-alert.json`에 남는다.
+ */
+function fatalCause(code: string): { readonly cause: string; readonly note: string } {
+  if (code.endsWith('.schema_drift')) {
+    return { cause: 'Orca 데이터 형식 변경', note: 'Orca 응답 형식이 바뀌어 데몬이 멈췄습니다' };
+  }
+  if (code === 'daemon.startup_failed') {
+    return { cause: '기동 실패', note: '데몬이 시작하지 못하고 멈췄습니다' };
+  }
+  if (code === 'daemon.fatal_stop') {
+    return { cause: '실행 중 치명 오류', note: '데몬이 실행 중 치명 오류로 멈췄습니다' };
+  }
+  return { cause: '확인 불가 · 운영 로그 참고', note: '데몬이 멈췄지만 원인을 분류하지 못했습니다' };
+}
+
+/**
+ * 알림 대체 텍스트. owner mention이 여기 있어야 알림이 간다.
+ *
+ * mention은 이 알림만의 예외다(DL-074). 다른 카드는 사람을 부르지 않는다.
+ */
 export function fatalAlertText(code: string, ownerUserId: string | null): string {
   const mention = ownerUserId === null ? '' : `<@${ownerUserId}> `;
-  return `${mention}orca-slack-bridge daemon이 치명 오류로 멈췄습니다: ${code}\n`
-    + 'Scheduled Task가 다시 띄워도 원인이 그대로면 계속 멈춥니다. '
-    + '`status`와 `logs`로 원인을 확인하세요. 같은 원인은 24시간 동안 다시 알리지 않습니다.';
+  return `${mention}orca-slack-bridge 데몬 중단 · ${fatalCause(code).cause}`;
+}
+
+/** 치명 종료 카드. 시각은 종료를 알린 시각이고 원인 코드는 싣지 않는다. */
+export function fatalAlertCard(
+  code: string,
+  ownerUserId: string | null,
+  now: Date,
+  quietMs: number = FATAL_ALERT_QUIET_MS,
+): RenderedCard {
+  const { cause, note } = fatalCause(code);
+  const mention = ownerUserId === null ? '' : `<@${ownerUserId}> `;
+  return renderCardShell({
+    tone: 'error',
+    emoji: '🚨',
+    kind: '중단',
+    head: 'orca-slack-bridge 데몬',
+    text: fatalAlertText(code, ownerUserId),
+    fields: [
+      ['원인', cause],
+      // Scheduled Task가 1분마다 다시 띄운다. 원인이 그대로면 다시 멈춘다(DL-057).
+      ['자동 재시작', '1분마다 · 원인이 남으면 다시 중단'],
+      ['다음 알림', `같은 원인은 ${Math.max(1, Math.round(quietMs / HOUR_MS))}시간 뒤`],
+    ],
+    sections: [`${mention}${note} → status 명령과 운영 로그에서 원인을 확인하세요.`],
+    footer: { at: now, verb: null, basis: 'Windows 작업 스케줄러 기준' },
+  });
 }
 
 /**
@@ -75,7 +125,12 @@ export async function announceFatalExit(input: FatalAlertInput): Promise<FatalAl
   ) {
     return 'suppressed';
   }
-  const text = fatalAlertText(input.code, input.ownerUserId);
+  const card = fatalAlertCard(
+    input.code,
+    input.ownerUserId,
+    input.now,
+    input.quietMs ?? FATAL_ALERT_QUIET_MS,
+  );
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<'timeout'>((resolve) => {
@@ -89,8 +144,7 @@ export async function announceFatalExit(input: FatalAlertInput): Promise<FatalAl
     const posted = await Promise.race([
       input.slack.post({
         channel: input.channel,
-        text,
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }],
+        ...card,
         signal: controller.signal,
       }).then(() => 'posted' as const),
       timedOut,

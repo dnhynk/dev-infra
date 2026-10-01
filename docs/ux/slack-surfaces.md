@@ -1,21 +1,58 @@
 # Slack 메시지 UX 스펙
 
-상태: **Draft · O1 background update/no-repost 계약 구현, 문구와 Block Kit layout 미확정**
+상태: **Draft · O1 background update/no-repost 계약 구현, 카드 시각 문법 확정(DL-074)**
 
-이 문서는 사용자가 모바일에서 Agent 개발 전체를 빠르게 파악하도록 메시지의 정보 구조와 상태별 의미를 정의한다. 예시는 고정 문구가 아니라 semantic requirement다.
+이 문서는 사용자가 모바일에서 Agent 개발 전체를 빠르게 파악하도록 메시지의 정보 구조와 상태별 의미를 정의한다. §2, §3.4, §4의 예시는 고정 문구가 아니라 semantic requirement다. §3.1~§3.3과 §3.5의 카드 예시는 실제 renderer 출력이다.
 
 ## 1. 공통 원칙
 
-- 최상단에서 어느 project/repository의 어느 PR 또는 Run인지 즉시 보인다.
+- 카드 머리와 첫 칸에서 어느 Project·저장소의 어느 PR 또는 Run인지 즉시 보인다.
 - 루트 메시지는 현재 상태를 보여준다.
 - thread는 중요한 상태 변화의 역사만 보여준다.
 - Agent 장문 reasoning이나 transcript를 복사하지 않는다.
 - LLM이 Block Kit이나 action을 직접 만들지 않는다.
 - 성공, 안전성, 테스트 통과는 source fact가 있을 때만 표시한다.
-- 상태 표현은 한국어 중심으로 하되 product/repository/Run/PR identity는 원본 식별자를 보존한다.
-- 접근성을 위해 emoji나 색상만으로 상태를 구분하지 않는다.
+- 상태 표현은 한국어 중심으로 하되 Project·repository·PR 번호는 원본 이름을 보존한다. Run·Task·Gate·Dispatch·터미널
+  ID와 hash는 카드에 싣지 않는다. 추적에 필요한 ID는 `runs` 명령의 사실 보고, store의 결정 기록, 운영 로그에 있다.
+- 접근성을 위해 emoji나 색상만으로 상태를 구분하지 않는다. 머리의 종류 라벨이 상태를 말한다.
 
-카드 identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되지 않았으면 `owner/repo #N`이다. 예시의 `[toneandmove] PR #184`는 이 표현을 축약한 것이다.
+PR identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되지 않았으면 `owner/repo #N`이다. 알림용 대체 텍스트가
+이 모양을 그대로 싣고, 카드 본문은 같은 사실을 `저장소`(`owner/repo · #N`)와 `Project` 칸으로 나눠 싣는다. §2 예시의
+`[toneandmove] PR #184`는 이 identity를 축약한 것이다.
+
+### 1.1 카드 시각 문법
+
+모든 카드(Run·컬렉션·Gate 결정·결정 기록·PR·PR thread 전이·터미널 프롬프트·치명 종료 알림)는 같은 껍데기를 쓴다.
+구현은 `apps/orca-slack-bridge/src/slack/card.ts` 하나다(DL-074).
+
+```text
+{emoji}  {종류} · {제목}                 ← header. 카드의 유일한 emoji
+[버튼] [버튼]                             ← action block. 있을 때만
+┃{색}                                     ← 아래는 색 바 attachment 안이다
+┃ 라벨  값                                ← section fields, 두 열, section당 10칸
+┃ 원인 → 행동 한두 문장                   ← 선택
+┃ *목록 제목*                             ← 선택, 항목은 한 줄에 하나
+┃ ───                                     ← divider
+┃ 라벨  값                                ← 두 번째 fields(계기판)
+┃ orca-slack-bridge · MM-DD HH:MM:SS KST <동사> · <기준>
+```
+
+- 색 바: blue `#2f81f7` 접수·진행 중, green `#1a7f37` 성공, red `#cf222e` 오류·막힘, amber `#bf8700` 결정·주의
+  필요, purple `#8250df` 변경(병합), gray `#6e7781` 상태·판정 불가.
+- 칸 값 안의 한정어는 ` · `로 잇고 목록은 한 줄에 하나씩 쓴다. 값이 없으면 빈칸 대신 `계산 불가`나 `확인 불가 · …`를 쓴다.
+- 머리와 버튼은 최상위 `blocks`에, 본문은 `attachments[0].blocks`에 둔다. attachment 안의 버튼 클릭은
+  `container.type: "message_attachment"`로 오고 Gate·직접 입력 handler는 `message`만 받기 때문이다. 버튼의 block·action
+  ID는 store가 클릭마다 다시 계산해 대조한다.
+- 카드에 싣지 않는 것: 링크(PR 버튼의 URL만 예외), code span, mention, raw JSON, 내부 ID와 12자 이상 hash, 경로,
+  `[snake_case]` 진단 코드. mention은 치명 종료 알림의 owner mention만 예외다.
+- 시각: 살아 있는 카드(Run·컬렉션·PR 루트)는 게시 직전 시각을 `갱신`으로 싣고, 렌더 지문은 그 시각을 비운 렌더에서
+  계산한다. 시각만 바뀐 관찰은 카드를 갱신하지 않으므로 카드의 시각은 마지막으로 내용이 바뀐 시각이다. Gate 결정·결정
+  기록·터미널 카드는 현재 시각을 읽지 않고 저장된 사실의 시각만 쓴다. 열린 Gate 카드에는 시각이 없다.
+- 알림용 대체 텍스트(`text`)는 블록을 그리지 못하는 자리를 위해 종류 라벨과 identity를 싣는다. mrkdwn으로 해석되므로
+  본문과 같은 이스케이프를 거친다. 머리는 plain_text라 이스케이프하지 않는다.
+
+예시의 `┃` 아래는 색 바 안이고, `라벨  값`은 칸 하나, 값의 다음 줄은 같은 칸의 다음 줄이다. `[버튼 · primary]`는
+권장 선택지의 강조 버튼이다.
 
 ## 2. `#pr-digest`
 
@@ -130,109 +167,70 @@ thread 요구:
 ### 3.1 Run 현재 카드
 
 ```text
-🟢 *[dev-infra] dnhynk/dev-infra* · run_36d28e6e947a · Slack Bridge D1 Run Observer
-
-*Run identity*
-Run ID run_36d28e6e947a
-소유자 binding 🟢 live — Run row의 현재 소유자 binding으로 만들어진 Task를 관측했다
-Run row의 현재 소유자 generation 2 · term_6354ef22
-• ⚫ stale · generation 1 · term_29548394 · 이 binding이 만든 Task 39
-• 🟢 live · generation 2 · term_6354ef22 · 이 binding이 만든 Task 24
-
-*진행*
-task-list.count 10
-completed 6
-dispatched 2
-blocked 1
-ready 1
-
-*Dispatch attempts*
-attempts 71
-completed 57
-failed 13
-dispatched 1
-재시도가 있었던 Task 4
-attempt 이력이다. retry는 Task 수를 늘리지 않으므로 진행 절과 더하지 않는다
-
-*PR*
-• #9 🟡 열림 · 리뷰에서 수정 요청
-• #10 ⛔ 병합 없이 닫힘 · 리뷰 결과 없음
-• #25 ✅ 병합 완료 · 리뷰 통과
-digest가 관측하고 correlation에 성공한 PR만 여기 있다. 그 밖의 PR은 이 Run이 만들었더라도 카드에 나타나지 않는다
-
-*blocker · 현재 상태*
-• open Gate 2
-    ↳ gate gate_a1 · task task_t1 — 구독 취소 시 권한 종료 시점
-    ↳ gate gate_a2 — 두 번째 Gate
-• blocked Task 3
-    ↳ task task_b1 — b1
-    ↳ task task_b2 — b2
-    ↳ task task_b3 — b3
-• interaction 대기 1
-    ↳ task task_w1 · dispatch ctx_w1 — agent: codex-interactive-prompt
-
-*blocker · 관찰 창 안에서만 판정*
-• worker ask 1
-    ↳ task task_q1 · dispatch ctx_q1 · message msg_q1 — 계약을 확인해 달라
-미답 여부를 inbox 조회 창 안에서만 판정했다. degraded에 inbox_saturated가 있으면 이 수를 확정으로 읽지 않는다
-
-*blocker · 누적 이력 (현재 blocker가 아니다)*
-• escalation 1
-    ↳ task task_e1 · dispatch ctx_e1 · message msg_e1 — Blocked: gh 인증
-• failed Dispatch 13
-    ↳ task task_f0 · dispatch ctx_f0 — failed
-    ↳ task task_f1 · dispatch ctx_f1 — failed
-    ↳ task task_f2 · dispatch ctx_f2 — failed
-    ↳ task task_f3 · dispatch ctx_f3 — failed
-    ↳ task task_f4 · dispatch ctx_f4 — failed
-    ↳ 외 8건은 카드에 싣지 않았다
-만료가 없는 수다. 이미 retry로 완료된 Task의 과거 실패와 이미 해소된 escalation도 계속 셈된다. 지금 막혀 있다는 뜻이 아니다
-
-*blocker · 이 관측 표면에서 만들 수 없음*
-• ciFailure — Orca schema에 CI 전용 상태가 없다
-
-*degraded*
-이 Run
-• [liveness_unknown] Task가 없어 Run row와 대조할 binding이 없다
-관찰 전체
-• [unverified_platform_assumption] live/stale 판정은 run-use가 consumer_generation을 올린다는 미검증 가정 위에 있다
-
-*등록되지 않은 Run*
-1
-• run_aaa — 관측된 Orca repository id: other-id
-    ↳ [unregistered_repository] 관측된 Orca repository id가 설정에 없다: other-id
-각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의 projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해 등록 여부를 아직 판정하지 못한 것이다
+❓  결정 필요 · Slack Bridge D1 Run Observer
+┃amber
+┃ Project  dev-infra · dnhynk/dev-infra
+┃ 코디네이터  연결 확인 · 2세대
+┃ Task 상태  완료 6
+┃            진행 2
+┃            막힘 1
+┃            준비 1
+┃ Task 전체  10개
+┃ 사람 필요  Gate 결정 대기 2건
+┃            interaction 대기 1건
+┃            막힌 Task 3개
+┃ PR  #9 열림 · 수정 요청
+┃     #10 병합 없이 닫힘 · 리뷰 결과 없음
+┃     #25 병합 완료 · 리뷰 통과
+┃ Gate 2건이 결정을 기다립니다 → 결정 채널의 카드에서 고르세요.
+┃ ───
+┃ Dispatch  시도 71 · 재시도 Task 4
+┃           실패 이력 13 · escalation 이력 1
+┃           worker 질문 1 · 관찰 창 기준
+┃ CI  확인 불가 · PR 카드 기준
+┃ 관측 상태  이 Run 주의 1건 · 전체 주의 1건
+┃            세대 판정 불가
+┃ 미등록 Run  1건 · 관찰 요약 참고
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · Orca 관측 기준
 ```
 
-위 블록은 `apps/orca-slack-bridge/test/run-render.test.ts`의 fixture로 `renderRunCard`를 돌린
-출력을 손대지 않고 옮긴 것이다 — 그 파일의 `facts()` 기본값에, 같은 파일이 쓰는 PR 3행(`#9`
-open·request_changes, `#10` closed·verdict 없음, `#25` merged·approve)과 미등록 Run 1건
-(`run_aaa`, `unregistered_repository`)을 넣었다. fixture 자체는 실측 Run `run_36d28e6e947a`
-(2026-08-24 관측)의 수에 맞춰 만든 것이다. 블록 사이 빈 줄은 Slack section block 경계이고
-`*…*`는 mrkdwn 굵게 표기다. Slack 알림용 fallback `text`는 이 블록에 없다.
-
-렌더러가 무조건 찍는 설명 줄(Dispatch attempts의 retry 주석, PR 절의 관측 경계, worker ask의
-관찰 창 한정, 누적 이력의 만료 없음, 미등록 절의 판정 근거)을 예시에서 빼지 않는다. 그 줄들이
-카드가 자기 경계를 말하는 자리이고, 빼면 예시가 계약을 축소해 보여준다.
+위 블록은 `apps/orca-slack-bridge/test/run-render.test.ts`의 `facts()` 기본값(실측 Run 2026-08-24 관측의 수에 맞춘
+fixture)에 PR 3행(`#9` open·request_changes, `#10` closed·verdict 없음, `#25` merged·approve), 미등록 Run 1건,
+컬렉션 degraded 1건, 갱신 시각 `2026-10-01T05:23:05Z`를 넣어 `renderRunCard`를 돌린 출력이다. 알림용 대체 텍스트는
+`❓ 결정 필요 · [dev-infra] dnhynk/dev-infra · Slack Bridge D1 Run Observer`다.
 
 표시할 의미:
 
-- project/repository
-- Run identity와 사람이 이해할 수 있는 제목
-- 실행 상태
-- 정의된 규칙에 따른 Task 진행률
-- 관련 PR의 핵심 상태
-- 원천별 blocker badge와 open Gate 수
-- 현재 owner 개입 필요 여부
+- Project와 등록 저장소
+- Run 제목(objective 첫 줄)
+- 카드 종류(아래)와 coordinator 소유 binding 판정·세대
+- Task 상태별 수와 `task-list.count`
+- 관련 PR의 핵심 상태(store에 기록된 PR만)
+- 사람이 필요한 원천별 수
+- Dispatch attempt 이력, 누적 이력, 관찰 창 기준 worker 질문
+- 이 Run과 관찰 전체의 degraded, 미등록 Run 수
 
-진행 표시는 `현재 Task 상태별 수 / 현재 task-list.count`이며 실행 중 추가된 Task를 즉시 반영한다.
-Dispatch retry는 `Dispatch attempts` 이력으로 따로 보이고 완료율·성공률 퍼센트는 만들지 않는다(OD-069).
+카드 종류는 기존 사실에서만 고르고 앞의 것이 이긴다.
 
-blocker는 open Gate, blocked Task, waiting dependency, worker ask, CI failure, interaction 대기 등 원천별 badge와
-연결 ID로 표시한다. 고유 blocker 총합은 dedup 정책 전에는 표시하지 않고 `agentWait`는 provider별 근거 없이
-permission으로 단정하지 않는다(OD-067).
+| 종류 | 색 | 조건 | 설명 문장 |
+|---|---|---|---|
+| ❓ 결정 필요 | amber | open Gate, 답을 기다리는 터미널, interaction 대기 | `Gate N건이 결정을 기다립니다 → 결정 채널의 카드에서 고르세요.` 등 |
+| ⛔ 막힘 | red | blocked Task | `Task N개가 막혀 있습니다 → runs 명령에서 막힌 Task를 확인하세요.` |
+| ✅ Task 완료 | green | Task 전부 completed | 없음 |
+| ⚪ 확인 불가 | gray | Task 0개(legacy Run 포함) | legacy Run이면 조회하지 않았다고 말한다 |
+| 🔵 진행 중 | blue | 그 밖 | 없음 |
 
-비율을 전제하는 그래픽 progress bar는 사용하지 않는다(OD-069).
+`Task 상태`와 `Task 전체`는 다른 칸이다. 한 칸에 `a / b`로 붙이면 분수로 읽힌다. 실행 중 추가된 Task는 즉시 분모에
+반영되고, Dispatch retry는 `Dispatch` 칸의 attempt 이력으로 따로 보이며 완료율·성공률 퍼센트와 비율 progress bar는
+만들지 않는다(OD-069).
+
+blocker는 원천별 수로 표시하고 고유 총합은 dedup 정책 전에는 표시하지 않는다. `agentWait`는 provider별 근거 없이
+permission으로 단정하지 않는다. 연결 ID(`taskId`·`dispatchId`·Gate ID·message ID)는 카드가 아니라 `runs` 명령의 사실
+보고에 남는다(OD-067, DL-074). 누적 이력(`failedDispatch`·`escalation`)은 만료가 없으므로 `사람 필요`가 아니라
+`Dispatch` 칸에 `이력`으로 싣는다. 의존성 대기(`waitingDependency`)는 `Task 상태`의 `대기`와 같은 수다.
+
+degraded는 `[kind]` 코드 대신 사람이 읽는 사유로 싣는다. `관측 상태` 칸은 비어 있어도 `이 Run 정상 · 전체 정상`으로
+남는다. 미등록 Run 수는 0이어도 그리고, 사유별 내역은 §3.2의 컬렉션 카드에 있다.
 
 ### 3.2 컬렉션 루트
 
@@ -241,27 +239,30 @@ permission으로 단정하지 않는다(OD-067).
 Run 카드가 하나도 없는데, 미등록 수를 보여야 하는 구간이 바로 그때이기 때문이다.
 
 ```text
-📋 *관찰 요약* · Run 카드 0장 · 등록되지 않은 Run 1건
-이 메시지는 관찰마다 갱신되는 컬렉션 루트다. 등록된 Run이 하나도 없어도 남는다 — 등록 열쇠가 통째로 어긋난 구간에서도 미등록 수가 보여야 하기 때문이다
-
-*등록되지 않은 Run*
-1
-• run_aaa — 관측된 Orca repository id: other-id
-    ↳ [unregistered_repository] 관측된 Orca repository id가 설정에 없다: other-id
-각 Run의 등록 판정 근거는 그 줄의 degraded에 있다. unregistered_repository는 설정의 projects[].orcaRepositoryIds에 등록해야 표시 대상이 되고, query_failed는 조회가 실패해 등록 여부를 아직 판정하지 못한 것이다
-
-*degraded*
-관찰 전체
-• [unverified_platform_assumption] live/stale 판정은 run-use가 consumer_generation을 올린다는 미검증 가정 위에 있다
-Run 하나에 귀속되는 degraded는 그 Run의 카드에 있다
+📊  관찰 요약 · Run 카드 1장 · 미등록 7건
+┃gray
+┃ Run 카드  1장
+┃ 미등록 Run  7건
+┃ *미등록 사유*
+┃ Project 확정 불가 2건
+┃ 빈 Run · 저장소 없음 5건
+┃ Project를 확정하지 못한 Run 2건은 카드가 없습니다 → runs 명령에서 저장소 등록을 확인하세요.
+┃ ───
+┃ 관측 주의  inbox 한도 도달 · 미답 질문 판정 보류
+┃ orca-slack-bridge · 10-01 14:23:05 KST 갱신 · 등록 Project 기준
 ```
 
-위 블록은 `renderRunCollectionCard`를 `cards: 0`과 §3.1이 쓴 것과 같은 미등록 Run 1건
-(`run_aaa`, `other-id`, `unregistered_repository`) · 컬렉션 degraded 1건
-(`unverified_platform_assumption`)으로 돌린 출력을 손대지 않고 옮긴 것이다. Slack 알림용
-fallback `text`는 `관찰 요약 · Run 카드 0장 · 등록되지 않은 Run 1건`이고 이 블록에 없다.
+위 블록은 `renderRunCollectionCard`를 `cards: 1`, 미등록 Run 7건(`repository_unobservable` 5건,
+`repository_route_blocked` 2건), 컬렉션 degraded `inbox_saturated` 1건, 갱신 시각 `2026-10-01T05:23:05Z`로 돌린
+출력이다. 알림용 대체 텍스트는 `관찰 요약 · Run 카드 1장 · 등록되지 않은 Run 7건`이다.
 
-이 카드에는 Run identity·진행·blocker가 없다. 컬렉션에 귀속되지 않는 사실이기 때문이다.
+미등록 Run은 사유별 수로 접는다. Run 하나는 한 번만, 다음 순서에서 가장 앞선 사유로 센다: 조회 실패, 저장소 판독 불가,
+여러 Project 일치, Project 확정 불가, 미등록 저장소, 빈 Run · 저장소 없음, 표시 한도 밖. 조회 실패를 맨 앞에 두는 이유는
+조회에 실패한 Run이 미등록으로 둔갑하면 미등록 수가 다른 사건을 함께 세기 때문이다(OD-078). 저장소 등록으로 풀리는
+사유가 있으면 설명 문장이 `runs` 명령을 가리키고, 조회 실패는 다음 관찰이 다시 판정한다고 말한다. 어느 Run인지와 그
+근거(hash ref, degraded detail)는 `runs` 명령의 사실 보고에 있다.
+
+이 카드에는 Run 진행·blocker가 없다. 컬렉션에 귀속되지 않는 사실이기 때문이다.
 미등록 Run 수와 컬렉션 수준 degraded는 Run 카드에도 실린다 — **중복은 의도다.** Run 카드 쪽은
 그 Run을 보는 사람이 컬렉션 사실을 함께 보게 하고, 이 카드 쪽은 Run 카드가 하나도 없어도 그
 사실이 남게 한다.
@@ -271,41 +272,46 @@ fallback `text`는 `관찰 요약 · Run 카드 0장 · 등록되지 않은 Run 
 
 ### 3.3 Gate 결정 카드
 
-Run thread에 표시한다.
+daemon은 결정 채널(`slack.channels.decisions`, 설정하지 않으면 `agentRuns`)에 최상위 메시지로 놓는다. 결정 채널을
+넘기지 않는 one-shot `runs` 명령은 Run 루트 아래 답글로 놓는다.
 
 ```text
-⚠️ 결정 필요
-
-문제
-사용자가 구독을 취소했을 때 서비스 이용 권한을
-언제 종료할지 결정이 필요합니다.
-
-A · 즉시 종료
-취소 순간부터 유료 기능을 사용할 수 없음
-
-B · 결제 기간 종료 시 종료
-이미 결제한 기간까지 계속 사용 가능
-
-Coordinator 권장
-B
-
-이유
-일반적인 구독 서비스 동작과 맞고,
-이미 결제한 사용 기간을 보장할 수 있습니다.
-
-영향
-이 결정이 나올 때까지 Backend와 Billing 작업 2개가 대기합니다.
-다른 작업은 계속 진행 중입니다.
-
-[A 즉시 종료] [B 기간 종료] [직접 입력]
+❓  결정 필요 · 구독을 취소하면 유료 기능 권한을 언제 끝낼까?
+[A 즉시 종료] [B 기간 종료 · primary]
+[직접 입력]
+┃amber
+┃ Run  Slack Bridge D1 Run Observer
+┃ Project  dev-infra
+┃ 권장  B 기간 종료
+┃ 대기 Task  2개
+┃ 영향  Backend와 Billing 작업 2개가 이 결정을 기다린다
+┃ 계속 가능  1개
+┃ 권장 이유: 일반적인 구독 동작과 맞고 결제한 기간을 보장한다
+┃ *선택지*
+┃ A 즉시 종료 — 취소 순간부터 유료 기능을 쓸 수 없다
+┃ B 기간 종료 — 이미 결제한 기간까지 계속 쓸 수 있다
+┃ ───
+┃ 대기 중  Backend 권한 종료 처리
+┃          Billing 환불 규칙
+┃ 판정 제한  없음
+┃ orca-slack-bridge · Coordinator 질문 · 등록 상세 기준
 ```
 
-버튼 label은 짧게 유지한다. 사람이 읽는 question/options 요약과 별도로 안정적 option ID·설명·recommendation·impact를
-Bridge sidecar에 저장해 Gate ID와 연결하고, action은 이 metadata로 판정한다(OD-050).
+위 블록은 sidecar를 등록한 pending Gate(선택지 2개, 권장 B, 대기 Task 2개, 독립 Task 1개)를 Run 목표·Project와 함께
+`renderGateDecisionCard`에 넣은 출력이다. 알림용 대체 텍스트는 `❓ 결정 필요 · {질문}`이다.
 
-sidecar를 등록하지 않은 Gate에도 버튼은 나온다. 이때 카드에는 Orca `options` label과 버튼만 있고
-설명·권장안·영향 절이 없으며, 각주가 상세를 등록하지 않았다고 밝힌다(OD-083). `options`를 읽지 못한
-Gate만 버튼 없는 카드로 남는다.
+버튼 label은 짧게 유지한다. 사람이 읽는 question/options 요약과 별도로 안정적 option ID·설명·recommendation·impact를
+Bridge sidecar에 저장해 Gate ID와 연결하고, action은 이 metadata로 판정한다(OD-050). Gate·Task·Run ID, correlation,
+option ID는 카드에 싣지 않는다. 버튼의 ID는 store가 클릭마다 sidecar로 다시 계산해 대조한다.
+
+sidecar를 등록하지 않은 Gate에도 버튼은 나온다. 이때 카드에는 Orca `options` label과 버튼만 있고 `권장`·`영향` 칸은
+`확인 불가 · 상세 미등록`이며 footer 기준이 `Orca 기록 기준`이다(OD-083). `options`를 읽지 못한 Gate는 버튼 없이
+`선택지를 Orca 기록과 맞추지 못해 버튼을 만들지 않았습니다 → Orca에서 직접 결정하세요.`를 싣는다. `판정 제한` 칸은
+degraded 사유의 수와 dependency를 판정하지 못한 Task 수만 싣는다. 사유 문장은 Task·Gate ID를 담고 있어 `runs` 명령의
+게시 보고가 출력한다.
+
+열린 카드에는 시각이 없다. Orca에서 직접 결정된 Gate는 green `✅  결정됨` 카드가 되고 `결정` 칸과 Orca `resolvedAt`
+시각(`… KST 결정 · Orca Gate 기준`)을 싣는다.
 
 버튼 클릭이 일시적으로 거부되면(관측 job이 카드를 갱신하는 중 등) ACK한 뒤 누른 사람에게만 보이는
 안내를 카드 자리에 놓는다. 카드가 thread 답글이면 그 thread에, 최상위 카드면 채널에 놓는다.
@@ -345,27 +351,44 @@ modal 제출 text는 해당 Gate의 `resolution`으로 저장한다. 일반 Slac
 
 ### 3.5 결정 기록과 작업 재개
 
-Orca resolution 성공 뒤:
+버튼이나 직접 입력이 이기면 같은 결정 카드를 결정 기록 카드로 바꾼다. Orca resolution 성공 뒤:
 
 ```text
-✅ 결정됨 · B
-
-결제 기간이 끝날 때 권한을 종료합니다.
-
-14:23 · 김동현
+✅  결정됨 · 결제 기간 종료 시 종료
+┃green
+┃ 결정  결제 기간 종료 시 종료
+┃ Orca 반영  확인됨
+┃ 후속 Task  Coordinator 통지 대기
+┃ 선택 방식  버튼
+┃ orca-slack-bridge · 10-01 14:23:05 KST 선택 · Orca Gate 기준
 ```
 
 coordinator notification 이후 실제 후속 상태를 관찰한 뒤:
 
 ```text
-▶️ 작업 재개
-
-결정이 Coordinator에 전달되었고 후속 Task가 시작됐습니다.
-
-다시 시작:
-- Backend Task #7
-- Billing Task #8
+▶️  작업 재개 · 결제 기간 종료 시 종료
+┃green
+┃ 결정  결제 기간 종료 시 종료
+┃ Orca 반영  확인됨
+┃ 후속 Task  재개 관찰 · 새 Dispatch 시작
+┃ 선택 방식  버튼
+┃ orca-slack-bridge · 10-01 14:23:05 KST 선택 · Orca Gate 기준
 ```
+
+위 두 블록은 `renderGateResolutionCard`에 resolved 결정(선택 시각 `2026-10-01T05:23:05Z`)을 넣고, 둘째에는 재개 증거
+(`new_dispatch`)를 더한 출력이다. 알림용 대체 텍스트는 `{cardState} · {결정} · {후속 Task 라벨}`이고 후속 Task 라벨은
+`Coordinator 통지 대기`, `Coordinator 확인됨 · 후속 Task 재개 미관찰`, `▶️ 작업 재개` 셋이다.
+
+| 상태 | 머리 | 색 | 설명 문장 |
+|---|---|---|---|
+| 반영 중 | ⏳ 반영 중 | blue | 없음 |
+| 결정됨 | ✅ 결정됨 | green | 없음 |
+| 충돌 | ⛔ 충돌 | red | `다른 결정이 먼저 기록됐습니다 → Orca에서 확인하세요.` |
+| 확인 필요 | ⚠️ 확인 필요 | amber | 원격 결과 미확정, 요청 소유 불명, sidecar·매핑 미확인 중 해당하는 원인과 할 일 |
+
+footer 시각은 선택 시각이다. 카드는 현재 시각을 읽지 않는다 — 결정 기록 카드가 바뀌면 투영이 다시 걸리므로 움직이는
+값을 그리면 투영이 끝나지 않는다. 누가 결정했는지(Slack user), Orca mutation request ID와 replay 여부, ask·thread·
+Dispatch·Task ID는 카드에 싣지 않는다. 그 값은 store의 결정 기록(`gate_resolution` row)에 남는다.
 
 Channel write만 성공했으면 `작업 재개`라고 쓰지 않는다. 그때는 `Coordinator 통지 대기` 또는 확정될 pending 표현을 사용한다.
 application receipt가 전달 신호이고, 대상 Gate의 `pending`→`resolved` 전이가 Orca 효과다. receipt 뒤에도
@@ -398,13 +421,18 @@ repository마다 채널을 새로 만들지 않고 identity와 thread로 구분�
 
 | Surface | 최소 필드 |
 |---|---|
-| PR root | Project/Repository identity, PR number, title, current status, PR URL |
+| PR root | Project/Repository identity, PR number, title, current status, CI·병합 준비 판정, PR 버튼, 갱신 시각 |
 | PR semantic detail | what, why, 검증된 impact/risk/review/validation 중 해당 항목 |
-| PR thread event | transition type, occurred/observed time, 짧은 설명 |
-| Run root | Project/Repository identity, Run ID/title, status, Task summary, blocker/Gate summary |
-| Gate card | Gate ID 연결, question, options, impact, action controls |
-| Gate resolution | resolution, Slack owner identity, timestamp, Orca result |
+| PR thread event | transition type, occurred/observed time, 짧은 판정 |
+| Run root | Project/Repository identity, Run title, 카드 종류, Task 상태별 수와 전체, 사람 필요 원천별 수, 갱신 시각 |
+| Run collection root | Run 카드 수, 미등록 Run 수와 사유별 수, 관찰 전체 degraded, 갱신 시각 |
+| Gate card | Run과 Project, question, options, recommendation, impact, 대기·독립 Task 수, action controls |
+| Gate resolution | resolution, Orca 반영 결과, 후속 Task 상태, 선택 방식, 선택 시각 |
 | Resume event | notification 상태와 실제 재개 증거를 구분 |
+| Terminal prompt | question, Run, 위치, 선택지, action controls, 상태 시각 |
+
+Gate ID와 Run ID는 카드가 아니라 버튼 ID(기계 판정), `runs` 명령의 사실 보고, store에 있다. Slack owner identity는
+store의 결정 기록(`gate_resolution` row)에 있다.
 
 ## 6. Error와 degraded UX
 
@@ -419,17 +447,29 @@ repository마다 채널을 새로 만들지 않고 identity와 thread로 구분�
 - Channel delivery는 시도했지만 처리 여부를 모름
 
 카드에는 모든 degraded 상태를 표시한다. owner 개입 없이는 진행되지 않는 Channel pending, 미해결 Gate,
-correlation 실패만 thread에 알린다. summarizer 실패와 source stale처럼 자가 복구되는 상태는 badge만 표시하고
+correlation 실패만 thread에 알린다. summarizer 실패와 source stale처럼 자가 복구되는 상태는 칸에만 표시하고
 thread 알림을 보내지 않는다(OD-072).
+
+degraded는 `[kind]` 코드가 아니라 사람이 읽는 사유와 수로 싣는다. 코드와 원문 detail은 `runs` 명령의 사실 보고와 운영
+로그에 있다.
+
+| 카드 | 자리 |
+|---|---|
+| Run | `관측 상태` 칸: `이 Run 정상` 또는 `이 Run 주의 N건`과 사유, `전체 정상` 또는 `전체 주의 N건`. 비어 있어도 남는다 |
+| 컬렉션 | `관측 주의` 칸: 관찰 전체 degraded의 사유. 없으면 `없음` |
+| Gate 결정 | `판정 제한` 칸: degraded 수와 dependency를 판정하지 못한 Task 수 |
+| 결정 기록 | `⚠️ 확인 필요` 머리, `Orca 반영` 칸의 원인, 원인 → 행동 문장 |
+| 터미널 | `⚠️ 전송 실패` 머리와 원인 → 행동 문장. 오류 코드는 싣지 않는다 |
+| 치명 종료 | `원인` 칸. 원인 코드는 싣지 않는다 |
 
 C1 카드에서만 확정한 degraded 표시:
 
-- summarizer가 실패하면 축소 카드에 `요약 실패`를 표시한다.
-- 입력 상한을 넘겨 일부만 관측했으면 잘림을 표시한다.
-- 연결된 `worker_done`이 없으면 `worker 보고 없음`을 표시한다.
+- summarizer가 실패하면 `요약` 칸에 `실패 · {사유}`를 표시하고 worker 보고 본문을 사실 텍스트로 싣는다.
+- 입력 상한을 넘겨 일부만 관측했으면 `관측 범위` 칸에 잘린 지점을 표시한다.
+- 연결된 `worker_done`이 없으면 `worker 보고` 칸에 `없음`을 표시한다.
 - correlation 실패 PR은 카드를 만들지 않으므로 Slack에 degraded 표시도 없다.
 
-D1/D2에서 thread 알림 여부와 무관하게 degraded badge 자체는 항상 유지한다.
+D1/D2에서 thread 알림 여부와 무관하게 degraded 표시 자체는 항상 유지한다.
 
 ## 7. 초기 비허용 UI
 
