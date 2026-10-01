@@ -10,9 +10,9 @@
 
 | 도구 | 버전 | 비고 |
 |---|---|---|
-| Orca | `1.4.216` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready. 2026-09-30 확인. 앱이 스스로 업데이트되며 출력 형식 변화는 §2.2 |
-| Claude Code | `2.1.246` | `C:\Users\<user>\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 production code는 `2.1.243` target surface에 고정돼 있다. research preview이므로 D3 재수용 전에 이 버전에서 다시 검증한다 |
-| codex-cli | `0.149.0` | `C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
+| Orca | `1.4.217` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready. 2026-10-01 확인. 앱이 스스로 업데이트되며 출력 형식 변화는 §2.2. Codex 0.158 이상 worker의 준비 판정은 1.4.217부터 통과한다. 1.4.216 이하는 Codex 0.158이 없앤 시작 화면의 `model:`·`directory:` 라벨을 기다리다 `agent_readiness` timeout으로 실패한다 |
+| Claude Code | `2.1.286` | `C:\Users\<user>\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 live acceptance는 `2.1.286`에서 했다. research preview이므로 버전이 오르면 다시 검증한다 |
+| codex-cli | `0.159.0` | `C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
 | gh | `2.98.0` | |
 | git | `2.55.0.windows.4` | |
 | pnpm | `11.22.0` | |
@@ -443,12 +443,15 @@ claude --dangerously-load-development-channels server:<mcp-server-name>  # 개�
 
 로컬 2.1.238, 개인 Max 계정, Windows 11에서 custom channel end-to-end 전달을 확인했다. 15초 간격 반복 push에 대해 `seq=1`~`18`이 **유실 0, 중복 0**으로 도착했다.
 
-D3 production code는 Claude Code 2.1.243 target surface에 맞춰 고정했고 fake MCP/Orca/Slack 경계의
-offline lifecycle matrix를 통과했다. 사람이 경고를 승인한 actual 2.1.243 session에서 probe receipt,
-실제 post-baseline Dispatch, 같은 Slack message update, duplicate receipt 무효화, daemon restart와
-Adapter 재연결도 관찰했다. 그러나 Adapter는 authority repair 전 build, daemon은 repair 후 build였기
-때문에 release 상태는 `LIVE_CHANNEL_UNVERIFIED`다. [redacted live evidence](evidence/d3-live-channel-acceptance.md)와
+D3 production code는 fake MCP/Orca/Slack 경계의 offline lifecycle matrix를 통과했다. 2026-10-01
+merged main release로 daemon과 session Adapter를 함께 실행한 2.1.286 plugin channel session에서 probe
+receipt, 실제 post-baseline Dispatch, 같은 Slack message update, duplicate receipt 무효화, daemon
+restart와 Adapter 재연결을 관찰했다(DL-071). [redacted live evidence](evidence/d3-live-channel-acceptance.md)와
 [수동 acceptance 절차](ops/channel-adapter-acceptance.md)를 함께 따른다.
+
+Claude Code는 channel 서버의 MCP instructions와 deferred tool 안내를 channel 이벤트로 시작된 턴에 붙이지
+않고, 다음 사람 지시나 도구 결과에 붙인다(2.1.285·2.1.286 관측, DL-070). 세션을 연 뒤 첫 지시나 도구
+호출 전에 도착한 이벤트에는 세션이 instructions도 receipt 도구도 없이 응답한다.
 
 - `source` 속성이 서버 이름으로 자동 설정된다.
 - 첫 턴 중 도착한 이벤트는 큐에 쌓였다가 다음 턴에 순서대로 그룹 처리된다.

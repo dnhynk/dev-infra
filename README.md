@@ -78,7 +78,7 @@ Bridge는 Agent가 아니라 관찰자다. worker↔coordinator 대화를 수집
 | `/init-orchestrate` 부팅과 컨텍스트 롤오버 | 구현됨. 일회용 Run에서 열화 감지 → handoff → successor 생성 → 인수까지 한 번 완주했다 |
 | `#pr-digest` PR 카드 | 구현됨. 실제 Slack 채널에 카드를 게시했고, 재관찰 시 새 메시지 없이 같은 카드를 갱신하는 것을 확인했다 |
 | review·CI·merge 추적, `#agent-runs` Run 카드, Gate 버튼·직접 입력 | 구현됨. 자동화 테스트로 검증했다. 실제 Slack에서 버튼으로 Gate 하나가 정확히 해결되는 것도 관찰했다 |
-| Slack 결정 후 열린 coordinator 세션 깨우기 (Channel Adapter) | **미검증.** 자동화 테스트는 통과했고 실제 세션에서도 동작을 관찰했지만, 그 관찰은 Adapter와 daemon이 서로 다른 빌드인 상태에서 이뤄졌다. 단일 빌드로 다시 확인하기 전까지 `LIVE_CHANNEL_UNVERIFIED`로 둔다 |
+| Slack 결정 후 열린 coordinator 세션 깨우기 (Channel Adapter) | 구현됨. merge된 main과 같은 빌드에서 daemon과 Adapter를 함께 실행해 실제 환경에서 수용 테스트를 통과했다(2026-10-01). Slack 결정이 coordinator를 깨우고 후속 worker가 재개된 뒤 같은 카드가 갱신됐다 |
 | Windows 로그인 시 자동 시작과 크래시 복구 | 구현됨. 실제 운영 설치에서 수용 테스트를 통과했다 |
 
 Channel Adapter는 Claude Code의 research preview 기능인 development channel(`--dangerously-load-development-channels`)에 의존한다. Claude Code 버전에 따라 동작이 바뀔 수 있다.
