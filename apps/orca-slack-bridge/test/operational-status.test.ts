@@ -3139,7 +3139,17 @@ describe('read-only operational status classification', () => {
     });
   });
 
-  it('ignores disabled observer rows while Gate and Channel jobs remain required', async () => {
+  it('treats a missing channel-delivery row as normal because the daemon never supervises that job', async () => {
+    // The daemon drives Channel delivery from its 5 s reconcile loop and never writes this job row.
+    const store = healthyStore({
+      jobNames: OPERATIONAL_JOB_NAMES.filter((job) => job !== 'channel-delivery'),
+    });
+    const report = await inspect({ snapshot: snapshotAndClose(store) });
+    expect(report).toMatchObject({ exitCode: 0, codes: ['status.healthy'] });
+    expect(report.jobs.find((job) => job.job === 'channel-delivery')?.state).toBe('absent');
+  });
+
+  it('ignores disabled observer rows while the Gate job remains required', async () => {
     const requiredJobs = ['gate-reconcile', 'channel-delivery'] as const;
     let store = healthyStore({ config: disabledConfig, jobNames: requiredJobs });
     let report = await inspect({
@@ -3180,7 +3190,7 @@ describe('read-only operational status classification', () => {
     expect(report).toMatchObject({ exitCode: 1, codes: expect.arrayContaining(['job.failed']) });
 
     rmSync(statePath, { force: true });
-    store = healthyStore({ config: disabledConfig, jobNames: ['gate-reconcile'] });
+    store = healthyStore({ config: disabledConfig, jobNames: ['channel-delivery'] });
     report = await inspect({
       config: disabledConfig, snapshot: snapshotAndClose(store, disabledConfig),
     });
