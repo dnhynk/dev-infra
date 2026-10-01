@@ -312,10 +312,12 @@ Windows process-exit recovery는 AtLogOn trigger의 duration 없는 PT1M repetit
 `IgnoreNew`가 이미 실행 중인 daemon과의 overlap을 막고, `RestartOnFailure` 3회/PT1M은 unmet start
 condition/action-start failure에만 남는다. disable이 shutdown보다 먼저이므로 stop fence 뒤 repetition은
 새 daemon work를 만들 수 없다. current-user `InteractiveToken` Task action은 absolute Windows
-PowerShell을 `-WindowStyle Hidden`으로 실행한다. 이 flag는 semantic fingerprint와 launcher 및
-`run-now`의 registered-action 검증에 포함되어, 앞선 production failure에서 관측된 console-window
-차이를 제거한다. `0xC000013A`의 원인이 실제 console-close였다는 인과는 직접 관측되지 않았으며,
-fixed release의 production control 전까지는 근거가 있는 추론으로 남긴다.
+PowerShell을 `-WindowStyle Hidden`으로 실행하고, 이 flag는 semantic fingerprint와 launcher 및
+`run-now`의 registered-action 검증에 포함된다. 이 flag는 콘솔을 없애지 않는다. 기본 터미널이 "Let
+Windows decide"인 host에서는 Windows Terminal이 콘솔을 띄우고 창을 최소화할 뿐이며, Windows Terminal을
+닫거나 다시 열면 그 콘솔에 붙은 프로세스는 console control event로 끝난다. 그래서 launcher는 다른 어떤
+작업보다 먼저 `FreeConsole`로 콘솔에서 떨어지고, 이후 콘솔 event를 받지 않는다(DL-072). launcher가 띄우는
+node process는 모두 `CreateNoWindow`로 자기 콘솔을 따로 가진다.
 
 ### O1 automation config contract (O1-1)
 
@@ -358,9 +360,13 @@ latest operational state의 권위는 v13 SQLite이고, 시간순 history는
 16 KiB를 넘기지 않는다. top-level field는 다음 allowlist뿐이다.
 
 `ts`, `level`, `service`, `schemaVersion`, `build`, `event`, `job`, `outcome`, `attempt`,
-`durationMs`, `nextRunAt`, `errorCode`, `retryable`, bounded numeric `counts`, `entityRef`
+`durationMs`, `nextRunAt`, `errorCode`, `retryable`, bounded numeric `counts`, `stopReason`, `entityRef`
 
-event/outcome/job/error/count key는 finite catalog이고 build identity는 logger construction에서, entity identity는
+`daemon.stopped`는 `stopReason`으로 정상 종료 이유를 남긴다: `parent_exit`(launcher가 사라져 stdin이 닫힘),
+`signal`(SIGINT/SIGTERM), `desired_state`(durable desired state가 `stopped`), `requested`(주입된 stop, test
+전용). 이 이유는 NDJSON history에만 있고 SQLite health row에는 없다. fatal 종료는 `daemon.stopped`를 남기지 않는다.
+
+event/outcome/job/error/count key/stop reason은 finite catalog이고 build identity는 logger construction에서, entity identity는
 concrete runtime sink 안에서 SHA-256으로 바뀐다. caller는 opaque raw-identity token이나 raw string만 넘길 수 있고
 이미 redacted됐다고 주장하는 `entityRef` input은 거부한다. persisted `entityRef`는 항상 digest 앞 12 lowercase
 hex다. Error, free-form detail, token/authorization/cookie/secret/password,

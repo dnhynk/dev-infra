@@ -12,6 +12,7 @@ import type {
 import {
   entityIdentity,
   type OperationalLogInput,
+  type OperationalStopReason,
   type OperationalTelemetrySink,
 } from './logger.js';
 
@@ -22,7 +23,11 @@ import {
 export interface DaemonOperationalHealthWriter {
   daemonStarted(input: DaemonStartInput): Promise<DaemonHealthRecord>;
   daemonHeartbeat(instanceId: string, at: string): Promise<DaemonHealthRecord | null>;
-  daemonCleanStopped(instanceId: string, at: string): Promise<DaemonHealthRecord | null>;
+  daemonCleanStopped(
+    instanceId: string,
+    at: string,
+    stopReason: OperationalStopReason,
+  ): Promise<DaemonHealthRecord | null>;
   jobStarted(
     job: DaemonJobName,
     at: string,
@@ -72,12 +77,16 @@ export class OperationalHealthTelemetry implements DaemonOperationalHealthWriter
     return record;
   }
 
-  async daemonCleanStopped(instanceId: string, at: string): Promise<DaemonHealthRecord | null> {
+  async daemonCleanStopped(
+    instanceId: string,
+    at: string,
+    stopReason: OperationalStopReason,
+  ): Promise<DaemonHealthRecord | null> {
     const record = this.store.recordDaemonCleanStop(instanceId, at);
     this.afterMutation();
     await this.event(record === null
       ? { level: 'warn', event: 'daemon.failed', outcome: 'rejected', errorCode: 'validation.failed' }
-      : { level: 'info', event: 'daemon.stopped', outcome: 'stopped' });
+      : { level: 'info', event: 'daemon.stopped', outcome: 'stopped', stopReason });
     return record;
   }
 

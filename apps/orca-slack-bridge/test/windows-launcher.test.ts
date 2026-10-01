@@ -34,6 +34,8 @@ const userScopeReads = [
 ] as const;
 const knownLocalAppDataRead =
   '[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)';
+const staticCodeWrite = '[Console]::Error.WriteLine($Code)';
+const consoleDetach = '[OrcaSlackBridge.NativeConsole]::FreeConsole()';
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -56,6 +58,8 @@ function createLauncherFixture(options: {
   readonly manifestMutation?: 'self-digest' | 'launcher-hash';
   /** The fixture daemon writes stderr lines and exits 1 right after passing the launch checks. */
   readonly daemonFailure?: boolean;
+  /** The static-code write throws, as a write to a console handle can once the launcher detached. */
+  readonly consoleWriteFailure?: boolean;
 } = {}) {
   const botValue = options.botValue ?? syntheticBot;
   const appValue = options.appValue ?? syntheticApp;
@@ -88,8 +92,13 @@ function createLauncherFixture(options: {
   expect(sourceLauncher.split('(Test-PrivateAcl $manifestParent $true)').length - 1).toBe(2);
   expect(sourceLauncher.split('(Test-PrivateAcl $SettingsPath $false)').length - 1).toBe(2);
   expect(sourceLauncher.split('Assert-TaskBinding $runtime $SettingsPath').length - 1).toBe(1);
+  expect(sourceLauncher.split(staticCodeWrite).length - 1).toBe(1);
   const protectedResult = options.protectedManifest === false ? '$false' : '$true';
   const instrumentedLauncher = sourceLauncher
+    .replace(
+      staticCodeWrite,
+      options.consoleWriteFailure === true ? "throw 'console write fixture'" : staticCodeWrite,
+    )
     .replace(
       userScopeReads[0],
       `$([IO.File]::AppendAllText((${psPath(tokenReadMarker)}), 'bot'); ${psString(botValue)})`,
@@ -243,6 +252,21 @@ describe('versioned Windows launcher', () => {
     expect(source).toContain('}, undefined, input.resolvedTriggerUserSid)');
   });
 
+  it('leaves the console before any verification and starts every child without a window', () => {
+    const source = launcherSource();
+    const detach = source.indexOf(consoleDetach);
+    expect(detach).toBeGreaterThan(
+      source.indexOf('[Environment]::SetEnvironmentVariable($buildIdentityName, $null'),
+    );
+    expect(detach).toBeLessThan(source.indexOf('Assert-ReleaseClosure'));
+    const children = source.split('[Diagnostics.ProcessStartInfo]::new()').slice(1);
+    expect(children.length).toBeGreaterThan(0);
+    for (const child of children) {
+      expect(child.indexOf('.Start()')).toBeGreaterThan(0);
+      expect(child.slice(0, child.indexOf('.Start()'))).toContain('.CreateNoWindow = $true');
+    }
+  });
+
   const driftCases = [
     ['transitive byte', (fixture: ReturnType<typeof createLauncherFixture>) => {
       writeFileSync(fixture.nestedPayload, 'drifted bytes\n');
@@ -299,6 +323,9 @@ describe('versioned Windows launcher', () => {
     expect(readFileSync(fixture.tokenReadMarker, 'utf8')).toBe('botappopenai');
     expect(readFileSync(fixture.daemonMarker, 'utf8')).toBe('launched');
     expect(`${result.stdout}${result.stderr}`).not.toContain(sentinel);
+    // A console host that closes cannot end a launcher that already left the console.
+    expect(readFileSync(join(fixture.logDirectory, 'daemon-stderr.log'), 'utf8'))
+      .toMatch(/ daemon started pid=\d+ console=detached\r?\n/u);
   }, 30_000);
 
   windowsIt('keeps every UTF-8 stderr line of a daemon that exits right after writing', () => {
@@ -329,6 +356,21 @@ describe('versioned Windows launcher', () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain(sentinel);
     expect(`${result.stdout}${result.stderr}`).not.toContain(syntheticApp);
   }, 30_000);
+
+  for (const [kind, options] of [
+    ['runtime drift', { manifestMutation: 'self-digest' }],
+    ['an absent User-scope token', { botValue: '   ' }],
+  ] as const) {
+    windowsIt(`still exits 2 on ${kind} when the static-code write throws`, () => {
+      const fixture = createLauncherFixture({ ...options, consoleWriteFailure: true });
+      const result = fixture.run();
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe('');
+      expect(existsSync(fixture.daemonMarker)).toBe(false);
+    }, 30_000);
+  }
 
   windowsIt('rejects a matching digest outside the current User known-folder release root', () => {
     const fixture = createLauncherFixture({ canonicalRoot: false });

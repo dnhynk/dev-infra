@@ -538,7 +538,7 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 
 ## 2026-08-28 · O1 Task supervisor hotfix
 
-### DL-058 · interactive Task의 PowerShell supervisor window를 hidden으로 고정한다
+### DL-058 · interactive Task의 PowerShell supervisor window를 hidden으로 고정한다 — 근거는 DL-072로 SUPERSEDED
 
 - exact merged-main production release에서 Task action PowerShell과 `CreateNoWindow` Node daemon 하나가
   시작된 뒤 약 2~4분에 PowerShell만 `0xC000013A`로 끝나 Node가 orphan으로 남았다. 같은 immutable
@@ -821,6 +821,40 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   flag 경로에만 적용된다.
 - 후속 Task는 Codex worker로 재개됐다(Orca 1.4.217). coordinator 지시문에는 channel 규칙이 없었다.
 - 근거는 [D3 live Channel acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다.
+
+## 2026-10-01 · launcher 콘솔 분리
+
+### DL-072 · launcher는 시작하자마자 콘솔에서 떨어진다
+
+- 원인: 2026-10-01 D3 live acceptance 중 daemon이 launcher의 `daemon exited` 줄 없이 두 번 멈췄고, 운영자는 두
+  번 모두 Windows Terminal을 닫거나 다시 열었다고 확인했다. 이 host의 기본 터미널은 "Let Windows decide"라
+  Task의 `powershell.exe -WindowStyle Hidden` 콘솔을 Windows Terminal이 띄우고, `-WindowStyle Hidden`은 창을
+  최소화할 뿐이다. Windows Terminal이 닫히면 그 콘솔에 붙은 launcher가 CTRL_CLOSE로 끝난다. `CreateNoWindow`와
+  redirected stdio로 시작된 daemon은 stdin EOF를 받아 `ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT=1` 계약대로 정상
+  종료했다.
+- 사용자 결정: launcher는 상속된 token을 지운 직후 다른 어떤 작업보다 먼저 `FreeConsole`로 콘솔에서 떨어진다.
+  떨어진 프로세스에는 콘솔 control event가 오지 않는다. 분리에 실패하면 붙은 채로 계속하고, 결과는
+  `daemon-stderr.log`의 `daemon started` 줄에 `console=detached|attached`로 남긴다. static failure는 stderr
+  쓰기가 실패해도 exit 2로 끝난다. `-WindowStyle Hidden`, Task XML, semantic fingerprint, launcher binding 검증은
+  바꾸지 않고 node 자식 process는 계속 `CreateNoWindow`로 시작한다.
+- stop-on-parent-exit는 유지한다. launcher가 어떻게 죽든 daemon을 고아로 남기지 않는 장치이고, 이번에도 daemon은
+  그 계약대로 멈췄다. 고친 대상은 launcher가 죽는 경로다.
+- daemon의 정상 종료 이유를 운영 로그 `daemon.stopped`의 `stopReason`(`parent_exit`, `signal`, `desired_state`,
+  `requested`)으로 남긴다. SQLite schema는 바꾸지 않는다. 이 필드가 없으면 정상 종료 줄만으로는 사람이 멈춘 것과
+  launcher가 죽어 따라 멈춘 것을 가릴 수 없다. 실패 catalog인 `errorCode`는 재사용하지 않는다.
+- DL-058이 `-WindowStyle Hidden`으로 console-close 경계를 닫았다고 본 근거는 이 결정이 대체한다. Windows
+  Terminal이 콘솔을 띄우는 host에서는 같은 종류의 console control 종료가 남아 있었다. flag 자체는 유지한다.
+- 확인 조건: 배포 뒤 Windows Terminal을 닫거나 다시 열어도 launcher와 daemon이 같은 pid로 살아 있고
+  `daemon-stderr.log`의 마지막 `daemon started` 줄이 `console=detached`여야 한다. hermetic test는 piped stdio와
+  숨은 콘솔에서 분리, stderr 전달, exit code 전달만 증명한다.
+- 기각: `conhost --headless`나 별도 wrapper로 action 감싸기. Task action이 System32 `powershell.exe`가 아니게 되어
+  strict Task XML parser, launcher binding 검증, `run-now` argv parser를 모두 바꿔야 한다.
+- 기각: `SetConsoleCtrlHandler`로 CTRL_CLOSE 받기. handler가 TRUE를 돌려줘도 시스템이 프로세스를 끝낸다
+  (Windows `HandlerRoutine` 문서). 종료를 막지 못한다.
+- 기각: stop-on-parent-exit 제거. Task가 멈추면 launcher만 끝나고 daemon이 Socket과 상태 DB를 쥔 고아로 남는
+  원래 문제가 돌아온다.
+- 기각: Task를 S4U로 실행. principal `InteractiveToken`은 strict Task XML parser와 launcher binding 검증이
+  고정하는 값이라, action wrapper와 같은 범위의 Task 계약을 바꿔야 한다.
 
 ## 2026-10-01 · Gate 카드 쓰기 fence와 재시도 안내
 

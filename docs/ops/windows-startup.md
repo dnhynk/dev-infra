@@ -8,9 +8,11 @@ registration trigger는 등록 순간 발화하므로 install만으로 daemon이
 겹침을 막는다. 별도의
 `RestartOnFailure` 3회/PT1M은 unmet start condition 또는 action-start failure용이며, 이미 시작된
 Exec의 exit code를 process crash recovery로 해석하지 않는다. uninstall은 repetition보다 먼저 exact
-owned task를 disable한 뒤 shutdown fence를 진행한다. interactive PowerShell action은 console-close
-boundary를 노출하지 않도록 `-WindowStyle Hidden`을 사용하며, 이 값은 Task semantic fingerprint와
-launcher/`run-now` binding 검증에 포함된다.
+owned task를 disable한 뒤 shutdown fence를 진행한다. interactive PowerShell action은 `-WindowStyle Hidden`을
+사용하며, 이 값은 Task semantic fingerprint와 launcher/`run-now` binding 검증에 포함된다. 이 flag는 콘솔을
+없애지 않는다. 기본 터미널이 "Let Windows decide"이면 Windows Terminal이 launcher의 콘솔을 최소화한 창으로
+띄운다. 그래서 launcher는 다른 어떤 작업보다 먼저 콘솔에서 떨어진다(`FreeConsole`). 그 뒤로는 Windows
+Terminal을 닫거나 다시 열어도 launcher에 콘솔 event가 가지 않는다.
 
 O1-7 상태와 redacted disposable-task cleanup 증거는
 [O1 operational acceptance evidence](../evidence/o1-operational-acceptance.md)를 따른다. exact merged-main
@@ -77,11 +79,16 @@ known-folder `%LOCALAPPDATA%` 아래 canonical release root인지 확인하고, 
 reparse point, hard link, tree 변화 및 release digest를 다시 검증한다. 이어서 실제 고정 Task export의
 전체 closed semantics와 marker fingerprint가 protected manifest와 일치하는지 확인한 뒤에만 token을 읽는다. token은
 Windows User scope에서 정확히 한 번씩 다시 읽어 daemon child 환경에만 넣고, build identity는
-release digest로 고정한다. token 누락이나 runtime/release drift는 값 없이 static error로 종료한다.
+release digest로 고정한다. token 누락이나 runtime/release drift는 값 없이 static error로 종료한다. Task
+실행에서는 launcher가 콘솔에서 떨어진 뒤라 stderr의 static code가 남는 곳이 없고, Task 실행 결과의 exit
+code 2로만 보인다.
 
 daemon child의 stderr는 운영 log directory의 `daemon-stderr.log`에 UTF-8 바이트 그대로 붙는다. 실행마다
-`daemon started pid=…`와 `daemon exited code=…` 줄이 그 사이의 stderr를 감싸고, 파일이 4MiB를 넘으면 다음
-실행이 비우고 시작한다. daemon이 운영 로그를 만들기 전에 죽으면 원인은 이 파일에만 남는다.
+`daemon started pid=… console=…`와 `daemon exited code=…` 줄이 그 사이의 stderr를 감싸고, 파일이 4MiB를 넘으면 다음
+실행이 비우고 시작한다. daemon이 운영 로그를 만들기 전에 죽으면 원인은 이 파일에만 남는다. `console=detached`는
+launcher가 콘솔에서 떨어졌다는 뜻이다. `console=attached`면 분리에 실패한 것이고, 콘솔 창이 닫힐 때 launcher도
+끝날 수 있다. launcher가 daemon보다 먼저 끝나면 `daemon exited` 줄이 없고, 운영 로그에는 `stopReason`이
+`parent_exit`인 `daemon.stopped`가 남는다.
 
 설치 preflight의 Orca readiness probe는 trusted known-folder API로 얻어 canonicalize한 `APPDATA`와
 `LOCALAPPDATA`만 기존의 최소 Windows system 환경에 추가해 `orca status --json`을 실행한다. exit,
