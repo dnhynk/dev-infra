@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { SummaryFacts } from './contract.js';
+import { SUMMARY_CONTRACT_REVISION, type SummaryFacts } from './contract.js';
 
 /**
  * 사실 지문.
@@ -10,6 +10,9 @@ import type { SummaryFacts } from './contract.js';
 export function factsFingerprint(facts: SummaryFacts): string {
   // 키 순서에 의존하지 않도록 명시적으로 직렬화한다.
   const canonical = JSON.stringify([
+    // 요약 계약이 바뀌면 같은 사실에서 다른 요약이 나온다. 이것이 없으면 이미 요약한 PR은
+    // 사실이 다시 움직일 때까지 옛 계약의 요약을 그대로 들고 있는다.
+    SUMMARY_CONTRACT_REVISION,
     facts.taskPurpose,
     facts.workerDone,
     facts.prTitle,

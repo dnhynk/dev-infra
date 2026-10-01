@@ -495,8 +495,10 @@ describe('O1-3 repository discovery reconciliation', () => {
       const before = store.readEffectiveDiscoverySnapshot();
       const bytes = storeBytes();
       let writes = 0;
-      const malformed = envelope([repoRow('orca-known', 'acme/known')]) as Record<string, unknown>;
-      malformed['unexpected'] = true;
+      // A row without the id discovery reads is a whole-pass schema drift (DL-066).
+      const malformed = envelope([
+        { ...repoRow('orca-known', 'acme/known'), id: undefined } as unknown as RepoRow,
+      ]);
       const result = await runRepositoryDiscoveryPass({
         orca: new FakeOrca(mode === 'schema' ? malformed : new Error('private query marker')),
         github: new FakeGithub(() => new Error('not called')),
@@ -1035,8 +1037,10 @@ describe('O1-3 repository discovery reconciliation', () => {
       [repoRow('orca-known', 'acme/known')], bridgeConfig,
       new FakeGithub(() => ({ id: 109, nameWithOwner: 'acme/known' })),
     );
-    const malformed = envelope([repoRow('orca-known', 'acme/known')]) as Record<string, unknown>;
-    malformed['unexpected'] = true;
+    // A row without the id discovery reads is a whole-pass schema drift (DL-066).
+    const malformed = envelope([
+        { ...repoRow('orca-known', 'acme/known'), id: undefined } as unknown as RepoRow,
+      ]);
     const failed = await runRepositoryDiscoveryPass({
       orca: new FakeOrca(malformed),
       github: new FakeGithub(() => new Error('not called')),

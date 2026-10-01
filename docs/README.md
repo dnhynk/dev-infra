@@ -1,7 +1,7 @@
 # dev-infra 문서 인덱스
 
-상태: **AB(`/init-orchestrate`+rollover) 구현 완료 · C1~D3·O1 구현 완료 · O1-7 production acceptance PASS · D3는 `LIVE_CHANNEL_UNVERIFIED` 유지**
-기준일: **2026-08-28**
+상태: **AB Claude 경로 완료 · Codex `$init-orchestrate`/rollover/Gate wake hermetic 구현·Windows Bridge 배포·Astra worker 수용 완료 · C1~D3·O1 구현 완료 · O1-7 production acceptance PASS · Claude D3는 `LIVE_CHANNEL_UNVERIFIED` 유지 · Codex Slack Gate wake·rollover live acceptance 완료**
+기준일: **2026-09-08**
 
 이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
 
@@ -19,10 +19,11 @@
 10. [미결정 사항](open-decisions.md)
 11. [검증된 플랫폼 역량과 제약](platform-capabilities.md)
 12. [Slack App 준비 절차](ops/slack-app-setup.md)
-13. [Channel Adapter 운영·live acceptance](ops/channel-adapter-acceptance.md)
-14. [Windows current-user 자동 시작 운영](ops/windows-startup.md)
-15. [요구사항 추적표](traceability.md)
-16. [Phase 0/D3 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
+13. [Claude Channel Adapter 운영·live acceptance](ops/channel-adapter-acceptance.md)
+14. [Codex coordinator 설치·acceptance](ops/codex-coordinator-setup.md)
+15. [Windows current-user 자동 시작 운영](ops/windows-startup.md)
+16. [요구사항 추적표](traceability.md)
+17. [Phase 0/D3 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
 
 ## 문서 권위와 표기
 
@@ -81,3 +82,16 @@ authority repair 전 build에서 시작됐고 daemon만 repair 후 build로 바�
 못했다. 따라서 상태는 `LIVE_CHANNEL_UNVERIFIED`이며 redacted 관찰과 잔여 조건은
 [D3 live acceptance evidence](evidence/d3-live-channel-acceptance.md)에 있다. O1의 hermetic/Windows
 검증과 merged-main 배포 잔여 조건은 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 있다.
+
+2026-09-07부터 Codex coordinator는 `plugins/orca-orchestration/`의 `$init-orchestrate` 스킬과 Stop
+hook을 사용한다. worker 계열은 coordinator와 무관하게 작업 종류로 정한다. 논리 추론·창의성은 Claude,
+코드 작업·디버깅·리서치는 Codex이고, model과 effort는 고정하지 않고 dispatch 시점의 런타임 카탈로그에서
+고른다(DL-065). Slack Gate는 기존 Claude Channel을 먼저 시도하고 후보가 없을 때 exact Codex Run 마커와
+Orca terminal route를 대조한 뒤 `terminal send --text ... --enter`로 wake-only identity를 보낸다. plugin
+설치, 새 thread의 skill discovery, Windows Stop hook 실행, 이 경로의 타입/단위 검증은 완료했다.
+2026-09-08에는 새 Astra `xhigh`
+worker의 requested/effective receipt, 실제 응답과 release, 수정한 Windows Bridge 배포를 확인했다.
+새 TUI의 Stop hook은 설치 2개·활성 2개로 관찰됐다. 사용자가 승인한 throwaway Run에서 stale generation
+무전송, 실제 Slack Gate 응답 뒤 wake와 Task 재개, 설치된 Stop hook이 지시한 1회 rollover(Run
+generation 1→2)까지 관찰했다. 절차는 [Codex 운영 절차](ops/codex-coordinator-setup.md), 실측 기록은
+[Codex coordinator acceptance evidence](evidence/codex-coordinator-acceptance.md)에 있다.

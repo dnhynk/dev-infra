@@ -79,6 +79,10 @@ function Set-PrivateAcl([string]$target, [bool]$directory) {
   $item = if ($directory) { [IO.DirectoryInfo]::new($target) } else { [IO.FileInfo]::new($target) }
   if (-not $item.Exists) { throw 'path absent' }
   if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse point' }
+  # 이미 맞으면 다시 쓰지 않는다. 디렉터리에 상속 ACL을 쓰면 Windows가 그 아래 모든 파일에
+  # 전파하는데, 이 root 아래에는 릴리스가 쌓인다. 실측에서 릴리스 21개 · 파일 125,229개가
+  # 되자 전파가 10초 제한을 넘겨 배포가 통째로 막혔다. 사실은 ACL이 이미 정확했다.
+  if (Test-PrivateAcl $target $directory) { return }
   $sections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner
   $acl = $item.GetAccessControl($sections)
   $acl.SetAccessRuleProtection($true, $false)

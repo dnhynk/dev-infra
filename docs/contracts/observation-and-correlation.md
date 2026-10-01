@@ -147,8 +147,7 @@ D1의 연결은 다음 권위 경계를 따른다.
      worker.resource.worktreeId           = <id>::<path>
         ↓
   ↔ Orca Run row
-      ├─ coordinator_handle
-      ├─ coordinator_pane_key
+      ├─ coordinator_handle ─ terminal show ─ pane (tabId:leafId)
       └─ consumer_generation
 ```
 
@@ -163,10 +162,11 @@ Run을 등록된 repository에 잇는 열쇠는 설정의 `orcaRepositoryIds`다
 id 형식이나 발급이 바뀌었을 때 카드가 조용히 비는 대신 그 사실이 드러나야 한다(OD-078, OD-072).
 
 Run/coordinator identity는 Orca Run row가 권위다. `run-list`가 반환하는 `coordinator_handle`·
-`coordinator_pane_key`·`consumer_generation`을 사용하고, coordinator 세션의 `ORCA_TERMINAL_HANDLE`·
-`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID` 같은 환경변수는 보조 단서로만 쓴다. `run-use` 인수는 두 coordinator
-필드를 인수한 터미널 값으로 바꾸고 `consumer_generation`을 올리므로 handle은 재시작·인수를 거쳐 유지되지
-않는다. binding 하나의 live/stale은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
+`consumer_generation`을 사용하고, row에 없는 coordinator pane은 그 handle의 `terminal show`에서 읽는다.
+coordinator 세션의 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID` 같은 환경변수는 보조
+단서로만 쓰고, 깨우기 전에는 Adapter나 marker가 보고한 pane이 그 live pane과 같은지 대조한다(DL-066).
+`run-use` 인수는 coordinator handle을 인수한 터미널 값으로 바꾸고 `consumer_generation`을 올리므로 handle은
+재시작·인수를 거쳐 유지되지 않는다. binding 하나의 live/stale은 현재 `consumer_generation`을 기준으로 구분한다(OD-020).
 
 **Run 수준 rollup은 `live`와 `unknown` 둘뿐이다.** `stale`은 binding 하나에만 쓴다. "관측된 binding이 전부
 낮은 세대다"는 Run이 버려졌다는 근거가 되지 못한다 — `run-use` 인수 직후 새 coordinator가 기존 ready task만
@@ -181,12 +181,12 @@ worker도 포함하므로 liveness 증거가 아니다. 이 Run에서 worktree i
 
 ### O1 repository discovery 입력 계약
 
-O1 discovery는 설치된 `orca repo list --json`의 success envelope key를 정확히 `id`, `ok`, `result`,
-`_meta`, result key를 정확히 `repos`로 읽는다. repository row는 설치 버전에서 관측한 `repoIcon` 포함
-14-key 형태 또는 그 key만 생략한 13-key 형태의 explicit union과 각 type을 exact 검증하며
-`gitRemoteIdentity`는 `null` 또는 `canonicalKey`, `remoteName`, `remoteUrl` string 세 필드의 exact
-object다. 존재하는 `repoIcon`은 null/object, `hookSettings`는 object까지만 검사하고 내부 raw field를
-export하지 않는다. envelope/result/row schema drift는 pass 전체 실패다.
+O1 discovery는 `orca repo list --json`에서 읽는 필드만 검사한다(DL-066). envelope의 `ok`는 boolean,
+`result.repos`는 배열이어야 한다. repository row는 string `id`와 `gitRemoteIdentity`를 읽는다.
+`gitRemoteIdentity`는 `null`이거나 string `canonicalKey`·`remoteUrl`을 가진 object다. 그 밖의 envelope·row·
+remote 필드는 없거나 새로 생겨도 무시하고 export하지 않는다. Orca는 사용자가 repository 설정을 바꿀 때 row에
+optional 필드를 더한다(§플랫폼 검증 2.2). 읽는 필드가 없거나 type이 다르면 schema drift이고 pass 전체
+실패다.
 
 정상 row의 remote URL은 위 독립 GitHub normalizer를 거친다. 계산한 key와 Orca `canonicalKey`가 다르면
 그 row는 `canonical_conflict`로 봉쇄하며 어느 쪽도 binding으로 추측하지 않는다. remote가 없거나 지원하지

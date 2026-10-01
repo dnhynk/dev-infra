@@ -45,6 +45,16 @@ function pipePath(label: string): string {
     : join(tmpdir(), `orca-cli-channel-${id}.sock`);
 }
 
+/** Orca 1.4.216 names the coordinator pane only through `terminal show` (DL-066). */
+function terminalShow(args: readonly string[]): string | null {
+  if (args[0] !== 'terminal' || args[1] !== 'show') return null;
+  const [tabId, leafId] = ENV_VALUES['ORCA_PANE_KEY']!.split(':');
+  return JSON.stringify({ id: 'fake', ok: true, result: { terminal: {
+    handle: ENV_VALUES['ORCA_TERMINAL_HANDLE'], tabId, leafId, worktreePath: 'C:/REDACTED/worktree', connected: true,
+    writable: true,
+  } } });
+}
+
 const EMPTY_ORCA: OrcaRunner = {
   run: (args) => args.join(' ') === 'orchestration run-list --json'
     ? Promise.resolve(JSON.stringify({ id: 'fake', ok: true, result: { runs: [] } }))
@@ -52,7 +62,9 @@ const EMPTY_ORCA: OrcaRunner = {
 };
 
 const BOUND_ORCA: OrcaRunner = {
-  run: (args) => args.join(' ') === 'orchestration run-list --json'
+  run: (args) => terminalShow(args) !== null
+    ? Promise.resolve(terminalShow(args)!)
+    : args.join(' ') === 'orchestration run-list --json'
     ? Promise.resolve(JSON.stringify({
         id: 'fake',
         ok: true,
@@ -61,7 +73,6 @@ const BOUND_ORCA: OrcaRunner = {
             id: BOUND_RUN_ID,
             objective: 'stdio output lifecycle test',
             coordinator_handle: ENV_VALUES['ORCA_TERMINAL_HANDLE'],
-            coordinator_pane_key: ENV_VALUES['ORCA_PANE_KEY'],
             consumer_generation: 1,
             legacy: false,
             created_at: '2026-08-26T00:00:00.000Z',
@@ -211,7 +222,7 @@ describe('channel-adapter production CLI wiring', () => {
         teamId: 'T0TEAM',
         apiAppId: 'A0APP',
         ownerUserIds: ['U0OWNER'],
-        channels: { prDigest: 'C0PRDIGEST', agentRuns: 'C0AGENTRUNS' },
+        channels: { prDigest: 'C0PRDIGEST', agentRuns: 'C0AGENTRUNS' , decisions: 'C0AGENTRUNS' },
       },
       projects: [],
     }));

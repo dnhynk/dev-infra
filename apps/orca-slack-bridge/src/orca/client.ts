@@ -67,6 +67,7 @@ export class OrcaCli implements OrcaRunner {
   async run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
     const { stdout } = await execFileAsync(this.bin, [...args], {
       encoding: 'utf8',
+      windowsHide: true,
       maxBuffer: 32 * 1024 * 1024,
       env: orcaServiceEnvironment(process.env),
       ...(this.timeoutMs === undefined ? {} : { timeout: this.timeoutMs }),
@@ -564,12 +565,11 @@ export async function readStrictResumeTasks(
     options,
   );
   if (!isRecord(result)) throw new TypeError('resume task-list result가 object가 아니다');
-  exactObjectKeys(result, ['runId', 'tasks', 'count', 'legacyReadOnly'], 'resume task-list result');
+  requireObjectKeys(result, ['runId', 'tasks', 'count'], 'resume task-list result');
   if (
     result['runId'] !== runId ||
     !Array.isArray(result['tasks']) ||
-    result['count'] !== result['tasks'].length ||
-    typeof result['legacyReadOnly'] !== 'boolean'
+    result['count'] !== result['tasks'].length
   ) {
     throw new TypeError('resume task-list result correlation/count가 어긋난다');
   }
@@ -643,14 +643,16 @@ export type ExactGateIdentity = {
   readonly options: readonly string[];
 };
 
-function exactObjectKeys(
+/**
+ * Orca adds and drops optional output fields between releases (DL-066). A reader names only the
+ * fields it uses: any other key is ignored, and a missing named field fails closed.
+ */
+function requireObjectKeys(
   value: Record<string, unknown>,
-  expected: readonly string[],
+  required: readonly string[],
   at: string,
 ): void {
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((key, i) => key !== wanted[i])) {
+  if (required.some((key) => !Object.hasOwn(value, key))) {
     throw new TypeError(`${at}의 structured output shape가 어긋난다`);
   }
 }
@@ -667,24 +669,11 @@ export async function readExactRunCoordinatorHandle(
     options,
   );
   if (!isRecord(result)) throw new TypeError('run-show result가 object가 아니다');
-  exactObjectKeys(result, ['run'], 'run-show result');
+  requireObjectKeys(result, ['run'], 'run-show result');
   const run = result['run'];
   if (!isRecord(run)) throw new TypeError('run-show run이 object가 아니다');
-  exactObjectKeys(
-    run,
-    [
-      'id',
-      'objective',
-      'home_database',
-      'coordinator_handle',
-      'coordinator_pane_key',
-      'consumer_generation',
-      'legacy',
-      'created_at',
-      'updated_at',
-    ],
-    'run-show run',
-  );
+  // Orca 1.4.216 dropped home_database and coordinator_pane_key; only these two are read.
+  requireObjectKeys(run, ['id', 'coordinator_handle'], 'run-show run');
   if (run['id'] !== runId) throw new TypeError('run-show run id가 요청과 어긋난다');
   const handle = run['coordinator_handle'];
   if (typeof handle !== 'string' || handle.trim() === '') {
@@ -695,7 +684,7 @@ export async function readExactRunCoordinatorHandle(
 
 function strictGateSnapshot(raw: unknown, identity: ExactGateIdentity, at: string): GateSnapshot {
   if (!isRecord(raw)) throw new TypeError(`${at}이(가) object가 아니다`);
-  exactObjectKeys(
+  requireObjectKeys(
     raw,
     ['id', 'run_id', 'task_id', 'question', 'options', 'status', 'resolution', 'created_at', 'resolved_at'],
     at,
@@ -764,7 +753,7 @@ export async function readExactGate(
     options,
   );
   if (!isRecord(result)) throw new TypeError('gate-list result가 object가 아니다');
-  exactObjectKeys(result, ['runId', 'gates', 'count'], 'gate-list result');
+  requireObjectKeys(result, ['runId', 'gates', 'count'], 'gate-list result');
   if (result['runId'] !== identity.runId || !Array.isArray(result['gates'])) {
     throw new TypeError('gate-list result의 runId/gates가 어긋난다');
   }
@@ -806,10 +795,10 @@ export async function resolveExactGate(
     throw new Error('Orca gate-resolve failed');
   }
   if (!isRecord(result)) throw new TypeError('gate-resolve result가 object가 아니다');
-  exactObjectKeys(result, ['gate', 'mutation'], 'gate-resolve result');
+  requireObjectKeys(result, ['gate', 'mutation'], 'gate-resolve result');
   const mutation = result['mutation'];
   if (!isRecord(mutation)) throw new TypeError('gate-resolve mutation이 object가 아니다');
-  exactObjectKeys(mutation, ['requestId', 'replayed'], 'gate-resolve mutation');
+  requireObjectKeys(mutation, ['requestId', 'replayed'], 'gate-resolve mutation');
   if (mutation['requestId'] !== retryRequestId || typeof mutation['replayed'] !== 'boolean') {
     throw new TypeError('gate-resolve mutation requestId/replayed가 어긋난다');
   }
@@ -853,15 +842,71 @@ export type OrcaWorker = {
  * **liveness 근거로 쓰지 않는다**(docs/contracts §5). 여기서 쓰는 것은 attempt 수와
  * repository 후보 두 가지뿐이다.
  */
+/** Upper bound on followed `worker-list` pages; Orca returns at most 100 rows per page. */
+const MAX_WORKER_LIST_PAGES = 1_000;
+
+function workerPageTotal(page: unknown): number | null {
+  return isRecord(page) && Number.isSafeInteger(page['total']) ? page['total'] as number : null;
+}
+
+function runWideWorkerTotals(result: Record<string, unknown>): string {
+  const counts = result['counts'];
+  return JSON.stringify([
+    workerPageTotal(result['page']),
+    isRecord(counts) ? Object.keys(counts).sort().map((key) => [key, counts[key]]) : counts,
+  ]);
+}
+
+/**
+ * Read every `worker-list` page of one Run. Orca 1.4.216 pages the rows while `counts` and
+ * `page.total` describe the whole Run, so a reader that stops at the first page sees an
+ * incomplete Run. Output without `page` is a single complete listing.
+ */
+async function readWorkerListPages(
+  runner: OrcaRunner,
+  runId: string,
+  options?: OrcaRunOptions,
+): Promise<{
+  readonly result: Record<string, unknown>;
+  readonly rows: readonly unknown[];
+  /** False when pages disagreed on the Run-wide totals or did not add up to `page.total`. */
+  readonly pagesConsistent: boolean;
+}> {
+  const base = ['orchestration', 'worker-list', '--run', runId];
+  const first = await call<unknown>(runner, [...base, '--json'], options);
+  if (!isRecord(first)) throw new TypeError('worker-list result가 object가 아니다');
+  const rows: unknown[] = Array.isArray(first['workers']) ? [...first['workers']] : [];
+  if (!Object.hasOwn(first, 'page')) return { result: first, rows, pagesConsistent: true };
+  const totals = runWideWorkerTotals(first);
+  let consistent = true;
+  let page = first['page'];
+  for (let read = 1; isRecord(page) && page['hasMore'] === true; read += 1) {
+    const cursor = page['nextCursor'];
+    if (typeof cursor !== 'string' || cursor === '' || read >= MAX_WORKER_LIST_PAGES) {
+      consistent = false;
+      break;
+    }
+    const next = await call<unknown>(runner, [...base, '--cursor', cursor, '--json'], options);
+    if (!isRecord(next) || !Array.isArray(next['workers'])) {
+      consistent = false;
+      break;
+    }
+    if (runWideWorkerTotals(next) !== totals) consistent = false;
+    rows.push(...next['workers']);
+    page = next['page'];
+  }
+  if (!isRecord(page) || page['hasMore'] !== false || workerPageTotal(first['page']) !== rows.length) {
+    consistent = false;
+  }
+  return { result: first, rows, pagesConsistent: consistent };
+}
+
 export async function listWorkerPage(
   runner: OrcaRunner,
   runId: string,
 ): Promise<{ workers: OrcaWorker[]; repositoryEvidenceComplete: boolean }> {
-  const r = await call<{ workers?: unknown; count?: unknown; counts?: unknown }>(runner, [
-    'orchestration', 'worker-list', '--run', runId, '--json',
-  ]);
-  const hasWorkerArray = Array.isArray(r.workers);
-  const workerRows: unknown[] = hasWorkerArray ? r.workers as unknown[] : [];
+  const { result: r, rows: workerRows, pagesConsistent } = await readWorkerListPages(runner, runId);
+  const hasWorkerArray = Array.isArray(r['workers']);
   const workers = workerRows.map((row) => {
     const o = row as Record<string, unknown>;
     const resource = isRecord(o['resource']) ? o['resource'] : {};
@@ -877,16 +922,17 @@ export async function listWorkerPage(
   });
   let countMatches = false;
   if ('count' in r) {
-    countMatches = typeof r.count === 'number' && Number.isSafeInteger(r.count) &&
-      r.count >= 0 && r.count === workers.length;
+    countMatches = typeof r['count'] === 'number' && Number.isSafeInteger(r['count']) &&
+      r['count'] >= 0 && r['count'] === workers.length;
   }
   if ('counts' in r) {
-    if (!isRecord(r.counts)) {
+    const counts = r['counts'];
+    if (!isRecord(counts)) {
       countMatches = false;
     } else {
       let total = 0;
       let bucketCountsValid = true;
-      for (const value of Object.values(r.counts)) {
+      for (const value of Object.values(counts)) {
         if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
           bucketCountsValid = false;
           break;
@@ -901,7 +947,10 @@ export async function listWorkerPage(
       countMatches = 'count' in r ? countMatches && bucketsMatch : bucketsMatch;
     }
   }
-  return { workers, repositoryEvidenceComplete: hasWorkerArray && countMatches };
+  return {
+    workers,
+    repositoryEvidenceComplete: hasWorkerArray && countMatches && pagesConsistent,
+  };
 }
 
 export async function listWorkers(runner: OrcaRunner, runId: string): Promise<OrcaWorker[]> {
@@ -921,15 +970,13 @@ export async function readStrictResumeWorkers(
   runId: string,
   options?: OrcaRunOptions,
 ): Promise<readonly StrictResumeWorker[]> {
-  const result = await call<unknown>(
-    runner,
-    ['orchestration', 'worker-list', '--run', runId, '--json'],
-    options,
-  );
-  if (!isRecord(result)) throw new TypeError('resume worker-list result가 object가 아니다');
-  exactObjectKeys(result, ['workers', 'counts'], 'resume worker-list result');
+  const { result, rows, pagesConsistent } = await readWorkerListPages(runner, runId, options);
+  requireObjectKeys(result, ['workers', 'counts'], 'resume worker-list result');
   if (!Array.isArray(result['workers']) || !isRecord(result['counts'])) {
     throw new TypeError('resume worker-list workers/counts shape가 어긋난다');
+  }
+  if (!pagesConsistent) {
+    throw new TypeError('resume worker-list page들이 Run 전체 합계와 어긋난다');
   }
   let countedWorkers = 0;
   for (const [bucket, value] of Object.entries(result['counts'])) {
@@ -941,11 +988,11 @@ export async function readStrictResumeWorkers(
       throw new TypeError('resume worker-list.counts 합계가 safe integer가 아니다');
     }
   }
-  if (countedWorkers !== result['workers'].length) {
+  if (countedWorkers !== rows.length) {
     throw new TypeError('resume worker-list workers/counts 합계가 어긋난다');
   }
   const seen = new Set<string>();
-  return result['workers'].map((raw, index) => {
+  return rows.map((raw, index) => {
     if (!isRecord(raw)) throw new TypeError(`resume worker-list.workers[${index}]가 object가 아니다`);
     const dispatchId = strictBoundedString(
       raw['dispatchId'],
@@ -990,7 +1037,7 @@ export async function readStrictResumeTaskDispatch(
     options,
   );
   if (!isRecord(result)) throw new TypeError('resume dispatch-show result가 object가 아니다');
-  exactObjectKeys(result, ['dispatch'], 'resume dispatch-show result');
+  requireObjectKeys(result, ['dispatch'], 'resume dispatch-show result');
   const row = result['dispatch'];
   if (!isRecord(row)) throw new TypeError('resume dispatch-show.dispatch가 object가 아니다');
   const dispatchId = strictBoundedString(row['id'], 'resume dispatch-show.dispatch.id');
@@ -1316,8 +1363,9 @@ function readWorkerDonePayload(
 export async function listWorkerDone(
   runner: OrcaRunner,
   limit = INBOX_LIMIT,
+  handle?: string,
 ): Promise<WorkerDoneInbox> {
-  return workerDoneFrom(await readInbox(runner, limit));
+  return workerDoneFrom(await readInbox(runner, limit, handle));
 }
 
 /**
@@ -1334,9 +1382,25 @@ export type OrcaInbox = {
   readonly limit: number;
 };
 
-export async function readInbox(runner: OrcaRunner, limit = INBOX_LIMIT): Promise<OrcaInbox> {
+export async function readInbox(
+  runner: OrcaRunner,
+  limit = INBOX_LIMIT,
+  handle?: string,
+): Promise<OrcaInbox> {
+  /*
+   * `handle`은 수신자다. `inbox`에 `--run`은 없지만 `--terminal`이 수신자로 거르고, 실측에서
+   * `worker_done` 563행 전부가 `run:<run_id>`로 배달돼 있었다(불일치 0). 그러므로 Run 키를
+   * 수신자로 넘기면 그 Run의 `worker_done`을 하나도 잃지 않고 좁힐 수 있다.
+   *
+   * 좁히는 이유는 포화다. 전역 inbox는 모든 Run과 heartbeat까지 한 배열로 오므로 상한에 닿고,
+   * 그 순간 부재를 증명할 수 없어 digest가 통째로 멈춘다. 실측(2026-09-04)에서 전역 6,220행
+   * 중 heartbeat가 4,736행이었고 가장 큰 Run도 3,785행이었다. 상한을 올리는 것은 `maxBuffer`
+   * 32MB라는 다음 벽으로 옮기는 것일 뿐이고, Run 단위로 나누면 포화 판정도 Run 안에 갇힌다.
+   */
   const r = await call<{ messages?: unknown[] }>(runner, [
-    'orchestration', 'inbox', '--limit', String(limit), '--json',
+    'orchestration', 'inbox',
+    ...(handle === undefined ? [] : ['--terminal', handle]),
+    '--limit', String(limit), '--json',
   ]);
   const rows = (r.messages ?? []).map((row) => row as Record<string, unknown>);
   // 포화 판정은 걸러낸 결과가 아니라 **반환된 전체 행 수**로 한다.

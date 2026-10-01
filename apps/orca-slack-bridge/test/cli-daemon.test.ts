@@ -40,6 +40,10 @@ import type {
   OperationalStatusSnapshotLease,
   OperationalStatusSnapshotLeaseStore,
 } from '../src/operational/status-capability.js';
+import {
+  fingerprintOperationalBuild,
+  fingerprintOperationalConfig,
+} from '../src/operational/status.js';
 
 const GATE_ID = 'gate_daemon';
 const RUN_ID = 'run_daemon';
@@ -52,7 +56,7 @@ const AT = '2026-08-24T10:00:00.000Z';
 const CONFIG: BridgeConfig = {
   slack: {
     teamId: 'T0TEAM', apiAppId: 'A0APP', ownerUserIds: ['U0OWNER'],
-    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL },
+    channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL , decisions: CHANNEL },
   },
   projects: [],
   correlationKeys: DEFAULT_CORRELATION_KEYS,
@@ -121,6 +125,7 @@ afterEach(() => {
 function seed(): void {
   const store = new SqliteDigestStore(statePath);
   store.insertGateMetadata({
+    source: 'registered',
     gateKey: GATE, runKey: runKey(RUN_ID), taskKey: taskKey(TASK_ID),
     dispatchKey: dispatchKey('ctx_daemon'), askMessageId: 'msg_daemon',
     questionThreadId: 'thread_daemon',
@@ -551,6 +556,96 @@ describe('daemon production wiring', () => {
     reopened.close();
   });
 
+  it('does not revive routing from the previous config after the first pass under a new config fails', async () => {
+    // A daemon under CONFIG discovered and bound one Orca repository.
+    const previousAt = new Date(Date.now() - 60_000).toISOString();
+    const seeded = new SqliteDigestStore(statePath);
+    seeded.replaceDiscoverySnapshot({
+      passOutcome: 'succeeded', routingMode: 'reconcile',
+      repositories: [{
+        canonicalKey: 'github.com/acme/widget', nameWithOwner: 'acme/widget',
+        githubRepositoryId: 101, projectKey: 'auto:github.com/acme/widget',
+        projectOrigin: 'auto', evidence: 'verified',
+      }],
+      bindings: [{
+        orcaRepositoryId: 'orca-widget', canonicalKey: 'github.com/acme/widget',
+        projectKey: 'auto:github.com/acme/widget', origin: 'discovered', evidence: 'verified',
+      }],
+      issues: [], at: previousAt,
+    });
+    seeded.recordDaemonStart({
+      instanceId: 'previous-daemon',
+      buildFingerprint: fingerprintOperationalBuild('development'),
+      configFingerprint: fingerprintOperationalConfig(ENABLED_CONFIG),
+      at: previousAt,
+    });
+    seeded.close();
+
+    // Any config change gives a new operational config fingerprint.
+    const changed = {
+      ...ENABLED_CONFIG,
+      automation: {
+        ...ENABLED_CONFIG.automation,
+        prDigest: { ...ENABLED_CONFIG.automation.prDigest, prLimit: 1 },
+      },
+    };
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const start = (orca: OrcaRunner): Promise<number> => runDaemonCommand(parsed, changed, {
+      channelServer: new FakeChannelServer([]),
+      orca,
+      slack: new ObserverSlack([]),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-config-transition-test',
+    });
+
+    // The first pass under the new config dies before it proves any routing.
+    expect(await start(new ObserverOrca([], { discoverySchema: true }))).toBe(1);
+    let reopened = new SqliteDigestStore(statePath);
+    const firstFailure = reopened.findDaemonJobOutcome('repository-discovery')?.errorCode;
+    reopened.close();
+
+    // The restart runs the same new config, which the health row now records. Routing written
+    // under the previous config must still not come back as last-known-good.
+    expect(await start(new ObserverOrca([]))).toBe(0);
+    reopened = new SqliteDigestStore(statePath);
+    expect(reopened.findDaemonJobOutcome('repository-discovery')?.state).toBe('succeeded');
+    expect(reopened.readEffectiveDiscoverySnapshot().bindings).toEqual([]);
+    reopened.close();
+    // With no stale routing left to guard, the failure keeps its own cause.
+    expect(firstFailure).toBe('discovery.schema_drift');
+  });
+
+  it('announces a fatal observer drift once per cause across the restart loop', async () => {
+    const logDir = join(dir, 'logs');
+    const parsed = parseArgs(['daemon', '--state', statePath, '--log-dir', logDir]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const slack = new ObserverSlack([]);
+    const start = (): Promise<number> => runDaemonCommand(parsed, ENABLED_CONFIG, {
+      channelServer: new FakeChannelServer([]),
+      orca: new ObserverOrca([], { discoverySchema: true }),
+      slack,
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-fatal-alert-test',
+    });
+
+    // The Scheduled Task restarts the daemon every minute; the owner hears about the cause once.
+    expect(await start()).toBe(1);
+    expect(await start()).toBe(1);
+    const notices = slack.posts.filter((post) => post.text.includes('discovery.schema_drift'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ channel: CHANNEL });
+    expect(notices[0]!.text).toContain('<@U0OWNER>');
+  });
+
   it('treats a discovery store mutation failure as fatal before Socket ingress', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
@@ -714,12 +809,65 @@ describe('daemon production wiring', () => {
         repositories: ['owner/alpha'], checkpoint: 1,
       });
       expect(fairDigestCycle(effective, 1)).toMatchObject({
-        repositories: ['owner/beta'], checkpoint: 0,
+        repositories: ['owner/beta'], checkpoint: 2,
       });
     } finally {
       localeCompare.mockRestore();
     }
   });
+
+  it.each(['succeeded', 'failed'] as const)(
+    'persists %s digest cycles across rotation, empty discovery, and repository shrink',
+    (status) => {
+      const store = new SqliteDigestStore(statePath);
+      const at = (seconds: number): string => new Date(Date.parse(AT) + seconds * 1_000).toISOString();
+      try {
+        const seedClaim = store.startDaemonJob('pr-digest', at(0));
+        if (seedClaim === null) throw new Error('initial digest claim failed');
+        expect(store.completeDaemonJobSuccess({
+          claim: seedClaim, at: at(1), nextRunAt: at(2), durationMs: 1_000, checkpoint: 10,
+        })).not.toBeNull();
+        const selected: (readonly string[])[] = [];
+        for (const [index, names] of [
+          ['alpha', 'beta'], ['alpha', 'beta'], [], ['alpha'],
+        ].entries()) {
+          const effective: EffectiveBridgeConfig = {
+            base: {
+              ...ENABLED_CONFIG,
+              automation: {
+                ...ENABLED_CONFIG.automation,
+                prDigest: { ...ENABLED_CONFIG.automation.prDigest, prLimit: 1, globalPrBudget: 1 },
+              },
+            },
+            configFingerprint: 'f'.repeat(64), revision: 1, bindings: [], diagnostics: [],
+            routing: { status: 'ready' },
+            projects: [{
+              key: 'project', name: 'project', origin: 'explicit', orcaRepositoryIds: [],
+              repositories: names.map((name) => ({
+                canonicalKey: `github.com/owner/${name}`, nameWithOwner: `owner/${name}`,
+              })),
+            }],
+          };
+          const claim = store.startDaemonJob('pr-digest', at(2 + index * 2));
+          if (claim === null) throw new Error('next digest claim failed');
+          const cycle = fairDigestCycle(effective, store.findDaemonJobOutcome('pr-digest')!.checkpoint);
+          selected.push(cycle.repositories);
+          const completion = {
+            claim, at: at(3 + index * 2), durationMs: 1_000, checkpoint: cycle.checkpoint,
+          };
+          const result = status === 'succeeded'
+            ? store.completeDaemonJobSuccess({ ...completion, nextRunAt: at(4 + index * 2) })
+            : store.completeDaemonJobFailure({ ...completion, errorCode: 'digest.timeout' });
+          expect(result, `cycle ${index} must preserve the durable checkpoint contract`).not.toBeNull();
+          expect(result?.state).toBe(status);
+        }
+        expect(selected).toEqual([['owner/alpha'], ['owner/beta'], [], ['owner/alpha']]);
+        expect(store.findDaemonJobOutcome('pr-digest')?.checkpoint).toBe(13);
+      } finally {
+        store.close();
+      }
+    },
+  );
 
   it('keeps the legacy reconciliation cadence independent while startup discovery is pending', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
@@ -1022,7 +1170,11 @@ describe('daemon production wiring', () => {
         statePath,
         'a'.repeat(64),
       )).toBeNull();
+      // 어느 조건으로 죽었는지까지 남긴다. 셋 다 exit 1로 합류하므로 이 줄이 없으면 store
+      // 닫기 실패인지, observer drain timeout인지, 운영 fatal인지 구분할 수단이 없다.
       expect(diagnostics).toEqual([
+        'daemon.stop_flags store_uncertain=true observer_drain_timeout=false'
+        + ' fatal_operational=false stop_reason=requested\n',
         'daemon이 strict startup 또는 Gate reconciliation에 실패했다\n',
       ]);
       expect(diagnostics.join('')).not.toContain(privateDetail);
@@ -1033,12 +1185,48 @@ describe('daemon production wiring', () => {
     }
   });
 
+  it('retries a snapshot lease that a read-only status holds briefly at startup', async () => {
+    // install --run-now polls status every second while the daemon starts; each poll holds the
+    // snapshot lease for a moment, and the daemon must not die on the first contended attempt.
+    const parsed = parseArgs(['daemon', '--state', statePath]);
+    if (parsed.kind !== 'run') throw new Error('daemon args failed');
+    const leases = new MemorySnapshotLeaseStore();
+    let attempts = 0;
+    let opened = false;
+    const code = await runDaemonCommand(parsed, ENABLED_CONFIG, {
+      statusSnapshotLeaseStore: {
+        tryAcquireSnapshotLease: async () => {
+          attempts += 1;
+          return attempts <= 2 ? null : await leases.tryAcquireSnapshotLease();
+        },
+      },
+      snapshotLeaseWaitMs: 5_000,
+      openStore: (path) => {
+        opened = true;
+        return new SqliteDigestStore(path);
+      },
+      channelServer: new FakeChannelServer([]),
+      orca: new ObserverOrca([]),
+      slack: new ObserverSlack([]),
+      connectionFactory: () => ({
+        start: () => Promise.resolve({ appId: 'A0APP' }),
+        close: () => Promise.resolve(),
+      }),
+      waitForStop: () => Promise.resolve(),
+      installationSeed: 'daemon-lease-retry-test',
+    });
+    expect(attempts).toBe(3);
+    expect(opened).toBe(true);
+    expect(code).toBe(0);
+  });
+
   it('fails bounded lease contention before opening a writable store', async () => {
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
     let opened = false;
     const code = await runDaemonCommand(parsed, CONFIG, {
       statusSnapshotLeaseStore: { tryAcquireSnapshotLease: async () => null },
+      snapshotLeaseWaitMs: 300,
       openStore: (path) => {
         opened = true;
         return new SqliteDigestStore(path);

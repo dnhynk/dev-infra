@@ -2,11 +2,13 @@ import { randomUUID } from 'node:crypto';
 
 import type { GateKey } from '../identity/keys.js';
 import {
+  readExactGate,
   readExactResumeDispatch,
   readStrictResumeTaskDispatch,
   readStrictResumeTasks,
   readStrictResumeWorkers,
   type OrcaRunner,
+  type ExactGateIdentity,
   type StrictResumeTask,
 } from '../orca/client.js';
 import type { GateStore } from '../store/schema.js';
@@ -20,6 +22,11 @@ import type {
 
 const RESUME_RUNNING = new Set(['dispatched', 'completed']);
 export const DEFAULT_RESUME_OBSERVATION_BACKOFF_MS = 30_000;
+
+/** deriveGateMetadata reserves this identity for a Gate without a worker ask/Dispatch. */
+function derivedSourceGateId(dispatchId: string): string | null {
+  return /^derived-(gate_[A-Za-z0-9_-]+)$/.exec(dispatchId)?.[1] ?? null;
+}
 
 function record(value: unknown, at: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -108,7 +115,10 @@ export function normalizeGateResumeSnapshot(value: unknown, at = 'resume snapsho
     };
   }).sort((a, b) => a.taskId.localeCompare(b.taskId));
   const source = candidates.find((candidate) => candidate.taskId === sourceTaskId);
-  if (source === undefined || !source.dispatches.some((row) => row.dispatchId === sourceDispatchId)) {
+  const derivedGateId = derivedSourceGateId(sourceDispatchId);
+  if (source === undefined || (derivedGateId === null
+    ? !source.dispatches.some((row) => row.dispatchId === sourceDispatchId)
+    : dispatchIds.has(sourceDispatchId))) {
     throw new TypeError(`${at}의 source Task/Dispatch correlation이 어긋난다`);
   }
   return { schemaVersion: 1, sourceTaskId, sourceDispatchId, candidates };
@@ -171,10 +181,25 @@ function stableCandidateTaskCut(tasks: readonly StrictResumeTask[]): string {
  */
 export async function readGateResumeSnapshot(
   runner: OrcaRunner,
-  identity: { readonly runId: string; readonly taskId: string; readonly dispatchId: string },
+  identity: {
+    readonly runId: string;
+    readonly taskId: string;
+    readonly dispatchId: string;
+    readonly sourceGate?: ExactGateIdentity;
+  },
   signal?: AbortSignal,
 ): Promise<GateResumeSnapshot> {
   const options = signal === undefined ? undefined : { signal };
+  const derivedGateId = derivedSourceGateId(identity.dispatchId);
+  if (derivedGateId !== null) {
+    const gate = identity.sourceGate;
+    if (gate === undefined || gate.gateId !== derivedGateId ||
+      gate.runId !== identity.runId || gate.taskId !== identity.taskId) {
+      throw new TypeError('resume derived source Gate identity가 어긋난다');
+    }
+    // A synthetic sidecar key is never worker evidence. Verify the exact real Gate instead.
+    await readExactGate(runner, gate, options);
+  }
   const beforeTasks = candidateTasks(
     await readStrictResumeTasks(runner, identity.runId, options),
     identity.taskId,
@@ -217,11 +242,11 @@ export async function readGateResumeSnapshot(
     }
   }
   const sourceWorkers = workers.filter((worker) => worker.dispatchId === identity.dispatchId);
-  if (
+  if (derivedGateId !== null ? sourceWorkers.length !== 0 : (
     sourceWorkers.length !== 1 ||
     sourceWorkers[0]?.taskId !== identity.taskId ||
     sourceWorkers[0]?.runId !== identity.runId
-  ) {
+  )) {
     throw new TypeError('resume source Dispatch correlation이 어긋난다');
   }
   const candidates = tasks.map((task) => {
@@ -388,6 +413,23 @@ export class GateResumeEngine {
     this.#batchLimit = batchLimit;
   }
 
+  #readSnapshot(delivery: GateChannelDelivery, signal?: AbortSignal): Promise<GateResumeSnapshot> {
+    const derivedGateId = derivedSourceGateId(delivery.sourceDispatchId);
+    const preRead = derivedGateId === null
+      ? undefined
+      : this.#store.findGateResolution(delivery.gateKey)?.preRead ?? undefined;
+    if (derivedGateId !== null && (preRead === undefined ||
+      derivedGateId !== delivery.gateKey.slice('gate:'.length))) {
+      throw new TypeError('resume derived source에 exact D2 Gate evidence가 없다');
+    }
+    return readGateResumeSnapshot(this.#orca, {
+      runId: delivery.runKey.slice('run:'.length),
+      taskId: delivery.taskKey.slice('task:'.length),
+      dispatchId: delivery.sourceDispatchId,
+      ...(preRead === undefined ? {} : { sourceGate: preRead }),
+    }, signal);
+  }
+
   async ensureBaseline(
     delivery: GateChannelDelivery,
     owner: string,
@@ -399,11 +441,7 @@ export class GateResumeEngine {
     if (delivery.resumeBaselineState === 'recorded') {
       return this.#store.findGateResumeObservation(delivery.gateKey) === null ? null : delivery;
     }
-    const baseline = await readGateResumeSnapshot(this.#orca, {
-      runId: delivery.runKey.slice('run:'.length),
-      taskId: delivery.taskKey.slice('task:'.length),
-      dispatchId: delivery.sourceDispatchId,
-    }, signal);
+    const baseline = await this.#readSnapshot(delivery, signal);
     if (isAborted(signal)) return null;
     return this.#store.recordGateResumeBaseline(
       delivery.gateKey,
@@ -460,11 +498,7 @@ export class GateResumeEngine {
       if (delivery === null || delivery.resumeBaselineState !== 'recorded') return;
       let latest: GateResumeSnapshot;
       try {
-        latest = await readGateResumeSnapshot(this.#orca, {
-          runId: delivery.runKey.slice('run:'.length),
-          taskId: delivery.taskKey.slice('task:'.length),
-          dispatchId: delivery.sourceDispatchId,
-        }, signal);
+        latest = await this.#readSnapshot(delivery, signal);
         if (isAborted(signal)) return;
       } catch {
         if (isAborted(signal)) return;

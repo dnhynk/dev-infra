@@ -34,6 +34,10 @@ import {
 } from '../src/store/schema.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import type { OrcaRunner } from '../src/orca/client.js';
+import {
+  downgradeGateMetadataToV13,
+  dropTerminalPromptTables,
+} from './fixtures/schema-downgrade.js';
 
 const GATE = gateKey('gate_resume_store');
 const RUN = runKey('run_resume_store');
@@ -321,12 +325,13 @@ const baseline: GateResumeSnapshot = normalizeGateResumeSnapshot({
 });
 const sourceFact = baseline.candidates.find((candidate) => candidate.taskId === TASK.slice('task:'.length))!;
 
-function resolveD2(store: SqliteDigestStore): void {
+function resolveD2(store: SqliteDigestStore, source: 'registered' | 'derived' = 'registered'): void {
   store.insertGateMetadata({
     gateKey: GATE,
     runKey: RUN,
     taskKey: TASK,
-    dispatchKey: dispatchKey(DISPATCH),
+    dispatchKey: dispatchKey(source === 'derived' ? `derived-${pending.gateId}` : DISPATCH),
+    source,
     askMessageId: 'msg_resume_store',
     questionThreadId: 'thread_resume_store',
     options: [
@@ -461,6 +466,8 @@ function downgradeDeliveryDatabaseToV11(): string {
     `INSERT INTO gate_channel_delivery (${legacyColumns.join(', ')})
      VALUES (${legacyColumns.map(() => '?').join(', ')})`,
   ).run(...legacyColumns.map((column) => legacyRow[column] as never));
+  dropTerminalPromptTables(raw);
+  downgradeGateMetadataToV13(raw);
   raw.prepare('UPDATE schema_version SET version = 11 WHERE id = 1').run();
   raw.exec('BEGIN');
   raw.exec("ALTER TABLE gate_channel_delivery ADD COLUMN resume_baseline_state TEXT NOT NULL DEFAULT 'unavailable' CHECK (resume_baseline_state IN ('unavailable','required','recorded'))");
@@ -473,6 +480,61 @@ function downgradeDeliveryDatabaseToV11(): string {
 }
 
 describe('v12 durable resume evidence and existing-card projection', () => {
+  it('baselines a coordinator Gate before its first worker and observes the real Dispatch after restart', async () => {
+    let nowMs = Date.parse(SEED_AT);
+    const now = () => new Date(nowMs);
+    let started = false;
+    const gateOrca = new MutableResumeOrca();
+    const orca: OrcaRunner = {
+      run(args) {
+        const runId = pending.runId;
+        const taskId = pending.taskId;
+        const status = started ? 'dispatched' : 'pending';
+        if (args[1] === 'task-list') return Promise.resolve(ok({
+          runId, legacyReadOnly: false, count: 1,
+          tasks: [{ id: taskId, run_id: runId, status, deps: '[]',
+            dispatch_id: started ? 'ctx_first' : null }],
+        }));
+        if (args[1] === 'worker-list') return Promise.resolve(ok({
+          counts: started ? { active: 1 } : {},
+          workers: started ? [{ dispatchId: 'ctx_first', taskId, runId, dispatchStatus: status }] : [],
+        }));
+        if (args[1] === 'dispatch-show') return Promise.resolve(ok({ dispatch: {
+          id: 'ctx_first', task_id: taskId, run_id: runId, status,
+        } }));
+        return gateOrca.run(args);
+      },
+    };
+    let store = new SqliteDigestStore(path, { monotonicNow: () => nowMs });
+    try {
+      resolveD2(store, 'derived');
+      const transport = new BaselineCheckingTransport(store);
+      const delivery = new GateChannelDeliveryEngine({ store, orca, transport, now });
+      await delivery.reconcile();
+      expect(transport.calls).toHaveLength(1);
+      expect(store.findGateResumeObservation(GATE)?.baseline).toEqual({
+        schemaVersion: 1, sourceTaskId: pending.taskId,
+        sourceDispatchId: `derived-${pending.gateId}`,
+        candidates: [{ taskId: pending.taskId, status: 'pending', currentDispatchId: null, dispatches: [] }],
+      });
+      delivery.recordReceipted({
+        gateId: pending.gateId, runId: pending.runId,
+        consumerGeneration: 1, connectionEpoch: 'epoch_resume',
+      });
+      store.close();
+      store = new SqliteDigestStore(path, { monotonicNow: () => nowMs });
+      started = true;
+      nowMs += 60_000;
+      await new GateResumeEngine({ store, orca, now }).reconcile();
+      expect(store.findGateResumeObservation(GATE)?.evidence).toMatchObject({
+        kind: 'new_dispatch', taskId: pending.taskId, dispatchId: 'ctx_first',
+      });
+      expect(gateOrca.calls.filter((call) => call === 'gate-list')).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
   it('commits the strict baseline before send, then observes an actual new Dispatch after restart', async () => {
     let nowMs = Date.parse(SEED_AT);
     const now = () => new Date(nowMs);
@@ -1233,7 +1295,7 @@ describe('v12 durable resume evidence and existing-card projection', () => {
 
     const nowAt = '2026-08-24T11:00:00.000Z';
     store = new SqliteDigestStore(path);
-    expect(SCHEMA_VERSION).toBe(13);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(store.findGateChannelDelivery(GATE)).toMatchObject({
       resumeBaselineState: 'unavailable',
       state: legacyState,

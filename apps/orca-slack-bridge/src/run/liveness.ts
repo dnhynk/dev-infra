@@ -41,9 +41,9 @@ export function classifyBinding(run: OrcaRun, binding: RunBindingFacts): Binding
   if (binding.generation < current) return 'stale';
   // Run row보다 높은 세대는 설명할 수 없다. 앞선 것을 live로 부르지 않는다.
   if (binding.generation > current) return 'unknown';
-  const handleMatches =
-    binding.handle === run.coordinatorHandle && binding.paneKey === run.coordinatorPaneKey;
-  return handleMatches ? 'live' : 'unknown';
+  // Orca 1.4.216 Run rows name the coordinator terminal but no longer its pane (DL-066), so the
+  // current owner is the handle at the current generation. The Task's pane stays observed only.
+  return binding.handle === run.coordinatorHandle ? 'live' : 'unknown';
 }
 
 /** binding 하나를 map key로 접는다. 세 축이 모두 같아야 같은 binding이다. */

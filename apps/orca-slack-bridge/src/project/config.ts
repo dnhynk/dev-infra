@@ -42,6 +42,16 @@ export type AutomationConfig = {
     readonly intervalSeconds: number;
     readonly timeoutSeconds: number;
   };
+  /**
+   * 막힌 agent 터미널의 대화형 프롬프트를 읽고, 확정된 답을 보낸다.
+   *
+   * 무인 운용에서 멈춤은 대부분 터미널 프롬프트로 나타난다. 이 주기가 곧 "사람이 막힌 것을
+   * 알게 되기까지의 시간"이라 Gate 재조정보다 짧게 둔다.
+   */
+  readonly terminalPrompt: {
+    readonly intervalSeconds: number;
+    readonly timeoutSeconds: number;
+  };
   readonly prDigest: {
     readonly intervalSeconds: number;
     readonly timeoutSeconds: number;
@@ -78,6 +88,9 @@ export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = Object.freeze({
   // 60s so a stuck decision converges well inside the owner's attention span; the engine's own
   // 20s reconcile deadline bounds one pass.
   gateReconcile: Object.freeze({ intervalSeconds: 60, timeoutSeconds: 30 }),
+  // 30s. 이 값이 사람이 막힘을 알게 되기까지의 지연이다. 한 pass는 터미널 수만큼의 read이고
+  // 실측에서 16대가 있었으므로 이 주기에서 비용이 문제 되지 않는다.
+  terminalPrompt: Object.freeze({ intervalSeconds: 30, timeoutSeconds: 120 }),
   prDigest: Object.freeze({
     intervalSeconds: 900,
     timeoutSeconds: 300,
@@ -118,6 +131,16 @@ export type SlackConfig = {
   readonly channels: {
     readonly prDigest: string;
     readonly agentRuns: string;
+    /**
+     * 사람이 답해야 하는 카드만 가는 채널.
+     *
+     * `agentRuns`와 나누는 이유는 Slack이 메시지를 게시 순서로 고정하기 때문이다. 상태 카드는
+     * 제자리에서 갱신되므로 아래로 내려오지 않고, 답할 카드가 그 사이에 섞이면 둘 다 스크롤로
+     * 찾아야 한다. 이 채널은 **맨 아래가 항상 지금 할 일**이 되도록 답할 카드만 받는다.
+     *
+     * 없으면 `agentRuns`를 쓴다. 채널을 만들지 않은 설치에서 기능이 사라지지 않게 한다.
+     */
+    readonly decisions: string;
   };
 };
 
@@ -234,6 +257,7 @@ function parseAutomation(value: unknown): AutomationConfig {
       'repositoryDiscovery',
       'runObserver',
       'gateReconcile',
+      'terminalPrompt',
       'prDigest',
       'github',
       'scheduler',
@@ -253,6 +277,7 @@ function parseAutomation(value: unknown): AutomationConfig {
   ]);
   const runObserver = section(value, 'runObserver', ['intervalSeconds', 'timeoutSeconds']);
   const gateReconcile = section(value, 'gateReconcile', ['intervalSeconds', 'timeoutSeconds']);
+  const terminalPrompt = section(value, 'terminalPrompt', ['intervalSeconds', 'timeoutSeconds']);
   const prDigest = section(value, 'prDigest', [
     'intervalSeconds',
     'timeoutSeconds',
@@ -334,6 +359,22 @@ function parseAutomation(value: unknown): AutomationConfig {
         DEFAULT_AUTOMATION_CONFIG.gateReconcile.timeoutSeconds,
         'automation.gateReconcile.timeoutSeconds',
         10,
+        300,
+      ),
+    },
+    terminalPrompt: {
+      intervalSeconds: boundedNumber(
+        terminalPrompt['intervalSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.terminalPrompt.intervalSeconds,
+        'automation.terminalPrompt.intervalSeconds',
+        10,
+        900,
+      ),
+      timeoutSeconds: boundedNumber(
+        terminalPrompt['timeoutSeconds'],
+        DEFAULT_AUTOMATION_CONFIG.terminalPrompt.timeoutSeconds,
+        'automation.terminalPrompt.timeoutSeconds',
+        15,
         300,
       ),
     },
@@ -487,6 +528,14 @@ function parseSlack(raw: unknown): SlackConfig | null {
     }
     return v;
   };
+  const optionalChannel = (key: string): string | null => {
+    const v = ch[key];
+    if (v === undefined) return null;
+    if (typeof v !== 'string' || !/^[CG]/.test(v)) {
+      throw new TypeError(`slack.channels.${key}가 채널 ID가 아니다. 이름이 아니라 ID를 쓴다`);
+    }
+    return v;
+  };
   const apiAppId = raw['apiAppId'];
   if (apiAppId !== undefined && (typeof apiAppId !== 'string' || !apiAppId.startsWith('A'))) {
     throw new TypeError('slack.apiAppId가 A로 시작하는 App ID가 아니다');
@@ -495,7 +544,12 @@ function parseSlack(raw: unknown): SlackConfig | null {
     teamId: id('teamId', 'T'),
     ...(typeof apiAppId === 'string' ? { apiAppId } : {}),
     ownerUserIds,
-    channels: { prDigest: channel('prDigest'), agentRuns: channel('agentRuns') },
+    channels: {
+      prDigest: channel('prDigest'),
+      agentRuns: channel('agentRuns'),
+      // 설정하지 않으면 지금까지와 같은 자리로 간다.
+      decisions: optionalChannel('decisions') ?? channel('agentRuns'),
+    },
   };
 }
 

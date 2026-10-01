@@ -121,7 +121,7 @@ function xml(value: WindowsTaskDefinition): string {
   const e = escapeTaskXmlTextForTest;
   return `<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
 <RegistrationInfo><Description>${e(value.description)}</Description></RegistrationInfo>
-<Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger></Triggers>
+<Triggers><LogonTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled><UserId>${e(value.trigger.userId)}</UserId></LogonTrigger><RegistrationTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled></RegistrationTrigger></Triggers>
 <Principals><Principal id="Author"><UserId>${e(value.principal.userId)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>${String(value.enabled).toLowerCase()}</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
 <Actions Context="Author"><Exec><Command>${e(value.action.execute)}</Command><Arguments>${e(value.action.arguments)}</Arguments><WorkingDirectory>${e(value.action.workingDirectory)}</WorkingDirectory></Exec></Actions>
@@ -514,10 +514,13 @@ describe('Windows current-user lifecycle', () => {
     staleRunner.definition = taskDefinition();
     staleRunner.state = 'Running';
     const staleScheduler = new CurrentUserWindowsTaskScheduler(staleRunner);
+    let staleNow = 0;
     await expect(runManagedTaskNow(2, {
       platform: 'win32', scheduler: staleScheduler,
       manifestStore: new FakeManifestStore().seed(),
       verifyRelease: () => true,
+      nowMilliseconds: () => staleNow,
+      sleep: async (milliseconds) => { staleNow += milliseconds; },
       inspectHealth: async () => ({ scheduler: await staleScheduler.inspect(), report: report({ heartbeatAgeSeconds: 91 }) }),
     })).rejects.toThrow('windows.run_now.running_stale');
     expect(staleRunner.operations).not.toContain('start');
@@ -543,6 +546,31 @@ describe('Windows current-user lifecycle', () => {
       },
     })).toEqual({ action: 'started' });
     expect(runner.operations.filter((operation) => operation === 'start')).toHaveLength(1);
+  });
+
+  it('waits for a task the registration trigger already started instead of calling it stale', async () => {
+    // install registers the task with a registration trigger, so it is running before run-now looks.
+    const runner = new FakePowerShellRunner();
+    runner.definition = taskDefinition();
+    runner.state = 'Running';
+    const scheduler = new CurrentUserWindowsTaskScheduler(runner);
+    let now = 0;
+    let observations = 0;
+    expect(await runManagedTaskNow(2, {
+      platform: 'win32', scheduler,
+      manifestStore: new FakeManifestStore().seed(),
+      verifyRelease: () => true,
+      nowMilliseconds: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+      inspectHealth: async () => {
+        observations += 1;
+        return {
+          scheduler: await scheduler.inspect(),
+          report: observations >= 3 ? report() : report({ heartbeatAgeSeconds: null }),
+        };
+      },
+    })).toEqual({ action: 'awaited-running' });
+    expect(runner.operations).not.toContain('start');
   });
 
   it('run-now is a no-op when the exact installed release is already healthy', async () => {

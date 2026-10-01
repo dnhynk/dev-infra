@@ -10,7 +10,7 @@
 
 | 도구 | 버전 | 비고 |
 |---|---|---|
-| Orca | `1.4.187` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready |
+| Orca | `1.4.216` | `C:\Users\<user>\AppData\Local\Programs\orca\resources\bin\orca.exe`, runtime ready. 2026-09-30 확인. 앱이 스스로 업데이트되며 출력 형식 변화는 §2.2 |
 | Claude Code | `2.1.246` | `C:\Users\<user>\.local\bin\claude.exe`. Channels 계약은 `2.1.238`에서 실측했고 D3 production code는 `2.1.243` target surface에 고정돼 있다. research preview이므로 D3 재수용 전에 이 버전에서 다시 검증한다 |
 | codex-cli | `0.149.0` | `C:\Users\<user>\AppData\Local\Programs\OpenAI\Codex\bin\codex` |
 | gh | `2.98.0` | |
@@ -50,6 +50,16 @@ worker-read, worker-release, worker-retain, worker-show, worker-start, worker-st
 
 `effectsApplied`로 실패 시 mutation 발생 여부를 판정한다.
 
+출력 필드는 버전마다 더해지고 빠진다. version-matched guide는 "Clients and remote servers update
+independently. Treat unknown optional fields as absent."라고 요구한다. Bridge의 Orca 출력 파서는 읽는
+필드만 존재·타입·의미를 검사하고 나머지는 무시한다(DL-066). Orca 1.4.216(2026-09-30)에서 관측한 변화:
+
+- `repo list` row: external-worktree 안내를 닫은 repository에 `externalWorktreeInboxBaselinePaths`(string
+  배열)와 `externalWorktreeVisibilityPromptDismissedAt`(epoch ms)가 생긴다.
+- `status`: `result.runtime.connectionState`가 추가됐다.
+- `run-list`/`run-show` row: `coordinator_pane_key`와 `home_database`가 빠졌다(§2.3).
+- `worker-list`: 한 번에 최대 100행을 돌려주는 페이지가 생겼다(§2.6).
+
 mutation 응답은 다음을 포함한다.
 
 ```json
@@ -66,9 +76,7 @@ mutation 응답은 다음을 포함한다.
 {
   "id": "run_a48566be983b",
   "objective": "...",
-  "home_database": "this_database",
   "coordinator_handle": "term_720b6c26-eb04-4a16-ab79-b226ac50c04f",
-  "coordinator_pane_key": "f39db44b-...:8c71884b-...",
   "consumer_generation": 1,
   "legacy": 0,
   "created_at": "2026-08-21T14:32:45Z",
@@ -76,7 +84,9 @@ mutation 응답은 다음을 포함한다.
 }
 ```
 
-`coordinator_handle`과 `coordinator_pane_key`는 `run-create` 시 자동으로 채워진다. row에 repository/worktree identity는 없다.
+`coordinator_handle`은 `run-create` 시 자동으로 채워진다. Orca 1.4.216부터 row에 `coordinator_pane_key`가
+없으므로 coordinator의 pane은 `terminal show --terminal <coordinator_handle>`의 `tabId:leafId`로 확인한다.
+row에 repository/worktree identity는 없다.
 
 Orca Run은 durable namespace이자 coordinator inbox이며, 플랫폼이 repository-bound entity라고 보장하지 않는다. Run↔Repository는 Bridge 정책으로 정의한다.
 
@@ -182,6 +192,11 @@ orca orchestration send --type worker_done --subject "<status>" --body "<3문장
 
 `worker-list --terminal-state` 값: `active`, `reclaimable`, `retained`, `release_pending`, `release_unknown`, `released`. terminal 상태는 process accounting이며 Task status와 별개다. 완료된 Task도 live terminal을 소유할 수 있으므로 liveness 판정에 Task status를 대신 쓰면 안 된다.
 
+Orca 1.4.216의 `worker-list`는 한 호출에 최대 100행(최신 순)을 돌려주고 `page.hasMore`·`page.nextCursor`로
+다음 페이지를 알린다. 다음 페이지는 `--cursor <page.nextCursor>`로 읽는다. `counts`와 `page.total`은 페이지가
+아니라 Run 전체 기준이다(2026-09-30 실측: 313 worker Run에서 모든 페이지가 같은 `counts`·`total`). 그래서
+전체 목록과 `counts`를 대조하려면 모든 페이지를 읽어야 한다.
+
 global `worker-list`는 unbound context에서도 성공하며 일부 row의 `runId + resource.worktreeId`로 Run↔worktree 후보를 얻을 수 있다. historical/released worker도 포함되므로 liveness 증거가 아니고, worker가 없는 Run에는 적용되지 않는다.
 
 `worker-read --source auto|transcript|terminal`. `auto`는 증명 가능한 경우 hook-reported transcript를, 아니면 labeled terminal 출력을 반환한다. released worker도 읽을 수 있다. cursor는 특정 source에 고정되며 Orca가 `source_changed`를 보고하면 새로 읽어야 한다.
@@ -206,15 +221,15 @@ ORCA_AGENT_HOOK_PORT = 51594
 | 환경변수 | 대응 필드 |
 |---|---|
 | `ORCA_TERMINAL_HANDLE` | Run의 `coordinator_handle` |
-| `ORCA_PANE_KEY` | Run의 `coordinator_pane_key`, Task의 `created_by_pane_key` |
+| `ORCA_PANE_KEY` | coordinator 터미널의 `terminal show` `tabId:leafId`, Task의 `created_by_pane_key` |
 | `ORCA_WORKTREE_ID` | Task `created_by_process_incarnation`의 접두부 |
 
 연결 사슬:
 
 ```text
-Orca Run.coordinator_handle / coordinator_pane_key
-   ↕ 동일 값
-coordinator 세션의 ORCA_TERMINAL_HANDLE / ORCA_PANE_KEY
+Orca Run.coordinator_handle ─ terminal show ─ tabId:leafId
+   ↕ 동일 값                                   ↕ 동일 값
+coordinator 세션의 ORCA_TERMINAL_HANDLE        ORCA_PANE_KEY
    ↓
 ORCA_WORKTREE_ID = <workspaceUuid>::<로컬 경로>
    ↓ Git remote
@@ -251,25 +266,16 @@ orca orchestration worker-start --task <task_id>
 
 `--model`은 Orca가 검증하지 않는 opaque provider id다. 유효 값은 각 provider CLI가 정한다.
 
-**Claude**: `--model` alias `opus`, `sonnet`, `fable`, `haiku` 또는 풀네임. `--effort` `low`, `medium`, `high`, `xhigh`, `max`. `ultra`는 없다.
+**Claude**: `claude --help`의 `--model` 설명이 alias와 풀네임을 받는다고 밝힌다. alias는 해당 계열의 최신
+model로 풀린다(2026-09-30 도움말 예: `fable`, `opus`, `sonnet`). `--effort` 단계도 같은 도움말에
+있다(2026-09-30: `low`, `medium`, `high`, `xhigh`, `max`). `ultra`는 없다.
 
-**Codex** (models_cache 기준. 설명은 벤더 원문):
-
-| slug | 벤더 설명 | 기본 effort | 지원 effort | ctx | tier |
-|---|---|---|---|---|---|
-| `gpt-5.6-sol` | Latest frontier agentic coding model | low | low, medium, high, xhigh, max, **ultra** | 272k | fast |
-| `gpt-5.6-terra` | Balanced agentic coding model for everyday work | medium | low, medium, high, xhigh, max, **ultra** | 272k | fast |
-| `gpt-5.6-luna` | Fast and affordable agentic coding model | medium | low, medium, high, xhigh, max | 272k | fast |
-| `gpt-5.5` | Frontier model for complex coding, **research**, and real-world work | medium | low, medium, high, xhigh | 272k | fast |
-| `gpt-5.3-codex-spark` | Ultra-fast coding model (1.5k tok/s, 동기 협업용) | high | low, medium, high, xhigh | **128k** | 없음 |
-| `gpt-5.4` | **deprecated** → `gpt-5.6-terra`로 이전 | medium | low, medium, high, xhigh | 272k | fast |
-| `gpt-5.4-mini` | **deprecated** → `gpt-5.6-luna`로 이전 | medium | low, medium, high, xhigh | 272k | 없음 |
-
-`gpt-5.4`와 `gpt-5.4-mini`는 models_cache에 `upgrade` 필드와 `retirement_at`이 설정된 은퇴 예정 모델이다. 새 배치 정책에 쓰지 않는다.
-
-`gpt-5.6` 계열은 `tool_mode`가 `code_mode_only`이고 `gpt-5.5`는 제한이 없다. **벤더 설명에서 "research"를 명시한 모델은 `gpt-5.5`가 유일하다.**
-
-`visibility: hide`인 모델 두 개가 더 있다. `gpt-reserve`(luna와 동일 설명)와 `codex-auto-review`("Automatic approval review model for Codex", 272k, effort max까지 지원)다. 모델 선택 UI에 노출되지 않지만 `--model`이 opaque passthrough이므로 지정 자체는 가능할 수 있다. PR 리뷰 전용 모델 후보이나 **동작 미검증이다.**
+**Codex**: `codex debug models`가 설치된 CLI가 쓰는 model 카탈로그를 JSON으로 출력한다. model마다
+`slug`, `display_name`, `description`, `visibility`(`list`는 선택 UI에 노출, `hide`는 노출하지 않음),
+`priority`(카탈로그 정렬 순서), `default_reasoning_level`, `supported_reasoning_levels`,
+`context_window`, `tool_mode`, `service_tiers` 등이 있다. 목록은 CLI 버전과 계정에 따라 바뀐다.
+2026-09-07 표에 없던 `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`가 2026-09-30 카탈로그에 올라왔으므로
+문서에 model 목록을 고정하지 않는다.
 
 effort 단계의 벤더 정의:
 
@@ -282,18 +288,22 @@ effort 단계의 벤더 정의:
 | `max` | Maximum reasoning depth for the hardest problems |
 | `ultra` | Maximum reasoning **with automatic task delegation** |
 
-`ultra`("Maximum reasoning with automatic task delegation")는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만 있다.
+`ultra` 지원 여부는 model마다 `supported_reasoning_levels`에 있다.
 
-`service_tiers`는 상위 모델 모두 `{"id": "priority", "name": "Fast", "1.5x speed, increased usage"}` 하나이고 `additional_speed_tiers`는 `["fast"]`다.
+`--model` 없이 dispatch된 codex worker는 effective `CODEX_HOME/config.toml`의 `model`과
+`model_reasoning_effort`를 쓴다.
 
-`~/.codex/config.toml`의 전역 기본값은 `model = "gpt-5.6-sol"`, `model_reasoning_effort = "xhigh"`다. `--model` 없이 dispatch된 codex worker는 이 값을 쓴다.
-
-사용자 표기 `sol high fast`는 서로 다른 세 축이다: model `gpt-5.6-sol` + effort `high` + service tier `priority`. **`worker-start`에 service tier 인자가 없으므로 tier는 이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나 `worker_done` 권위를 잃는다.
+model, effort, service tier는 서로 다른 축이다. **`worker-start`에 service tier 인자가 없으므로 tier는
+이 경로로 지정할 수 없다.** argv를 직접 구성하는 우회 경로는 supervised worker lifecycle을 벗어나
+`worker_done` 권위를 잃는다.
 
 ### 2.9 Wake-up 표면
 
 - Orca terminal 입력과 orchestration inbox는 서로 다른 표면이다.
 - `terminal send`는 live terminal에 직접 입력한다.
+- `terminal send --text ... --enter`로 입력을 제출한다. `--interrupt`도 존재하지만 실제 Codex
+  0.153.4 유휴 TUI를 종료시킨다. Codex wake에는 쓰지 않는다. acceptance는 실제 model 처리나 Gate
+  effect를 뜻하지 않는다.
 - `orchestration send`는 durable inbox/worker relay다.
 - Orca에 Claude Channel을 관리하는 전용 명령은 없다.
 
@@ -303,7 +313,7 @@ effort 단계의 벤더 정의:
 
 ```text
 terminal create --worktree <selector> --title <name> --command <text> --focus --json
-terminal send   --terminal <handle> --text <text> --enter --interrupt
+terminal send   --terminal <handle> --text <text> --enter
 terminal wait   --terminal <handle> --for exit|tui-idle --timeout-ms <n>
 terminal read   --terminal <handle> --screen | --cursor <n> --limit <n>
 ```
@@ -329,8 +339,9 @@ throwaway Run `run_ebd0bb4592d2`으로 승계를 완주하며 확인한 사실�
 - **인수 명령은 `run-use --id <run_id>`이며 `--takeover-legacy`가 아니다.** 후자는 플랫폼이 자동
   채택한 legacy Run 전용이고 일반 Run(`legacy: 0`)에는 `invalid_argument`로 거부된다.
   `"Legacy takeover is only available for the automatically adopted Run."`
-- 인수에 성공하면 Run row의 `coordinator_handle`·`coordinator_pane_key`가 새 터미널 값으로 바뀌고
-  **`consumer_generation`이 1 증가한다.** 이전 coordinator가 자신이 밀려났음을 판정할 수 있는 값이다.
+- 인수에 성공하면 Run row의 `coordinator_handle`이 새 터미널 값으로 바뀌고 **`consumer_generation`이 1
+  증가한다.** 이전 coordinator가 자신이 밀려났음을 판정할 수 있는 값이다. 새 터미널의 pane은
+  `terminal show`로 확인한다(§2.3).
 
 > ⚠️ **`--text`가 `/`로 시작하면 셸이 경로로 치환할 수 있다.** Git Bash에서 호출했을 때
 > `/init-orchestrate --resume <run>`이 터미널에 `C:/Program Files/Git/init-orchestrate --resume <run>`으로
@@ -596,6 +607,7 @@ PR body에도 `## Task`(`T-ID`, ticket 경로)/`## Why`/`## What` 규약이 있�
 | 전제조건 | 실패 모드 | 확인 |
 |---|---|---|
 | skill 설치 대상에 `claude-code` 포함 | 공유 디렉터리에만 설치되어 Claude Code가 skill을 못 봄 (§3.1) | `ls ~/.claude/skills` |
+| `orca-orchestration` Codex plugin 설치·hook 신뢰 | Codex가 `$init-orchestrate`를 못 보거나 Stop hook을 건너뜀 (§8) | `codex plugin list --json`, 새 thread의 `/hooks` |
 | git 커밋 identity | `~/.gitconfig` 부재로 worker가 커밋·PR을 만들 수 없음 | `git var GIT_AUTHOR_IDENT` |
 | `NVM_HOME`·`NVM_SYMLINK` 정의 | 사용자 PATH 항목이 두 변수 참조로 되어 있어 미정의면 빈 문자열로 확장되고 `node`·`npm`·`npx`가 전부 사라짐 | `node -v` |
 | nvm 활성 버전 26.x | 24.19.0이 활성일 수 있다. OD-001과 `node:sqlite` 근거가 26.x 기준 | `nvm list` |
@@ -632,3 +644,69 @@ PATH 레지스트리 값 타입이 `ExpandString`이므로 두 변수를 정의�
 이 두 항목은 검증 완료로 보지 않는다. 다만 OD-020이 위험을 명시적으로 감수하고 D1 진행을 결정했으므로
 §7.1의 구현 완료 차단 조건에는 포함하지 않는다. Orca 플랫폼 동작이 바뀌면 live/stale 판정이 깨지므로
 재검증해야 한다.
+
+## 8. Codex
+
+검증 기준일은 2026-09-08이고 로컬 CLI는 `codex-cli 0.153.4`다. 제품 동작은 버전 의존이므로
+[Codex skills](https://learn.chatgpt.com/docs/build-skills)와
+[Codex hooks](https://learn.chatgpt.com/docs/hooks)를 권위 자료로 쓴다. model 목록은 런타임
+카탈로그(§2.8)에서 읽는다.
+
+### 8.1 Skill과 plugin discovery
+
+- Codex는 repository 상위 경로의 `.agents/skills`와 user-level `$HOME/.agents/skills`를 읽고 symlink도
+  따른다. 이 repository는 배포와 Stop hook을 한 단위로 만들기 위해
+  `plugins/orca-orchestration/` plugin을 원본으로 둔다.
+- plugin은 기본 위치 `hooks/hooks.json`을 자동 발견한다. hook command에는 설치 root인
+  `PLUGIN_ROOT`와 writable data root인 `PLUGIN_DATA`가 주입된다.
+- Windows 전용 command override의 JSON key는 `commandWindows`다. plugin 설치/enable만으로 hook이
+  신뢰되지는 않으며 현재 정의를 새 thread에서 검토·신뢰하기 전까지 건너뛴다.
+- skill 호출은 `$init-orchestrate`; Claude용 `/init-orchestrate`를 그대로 복사한 slash command가 아니다.
+
+### 8.2 Session, transcript, Stop hook
+
+- 현재 Orca-managed Codex terminal에는 `CODEX_SESSION_ID`와 `CODEX_THREAD_ID`가 있고 같은 session
+  identity를 가리킨다. Run marker는 전자를 우선한다.
+- Stop payload는 최소 `session_id`, `transcript_path`, `cwd`, `stop_hook_active`,
+  `last_assistant_message`를 제공한다. `decision:block`과 `reason`을 반환하면 현재 turn을 계속한다.
+- 실제 JSONL의 현재-context 관측점은 `type=event_msg`, `payload.type=token_count`,
+  `info.last_token_usage`와 `info.model_context_window`다. `info.total_token_usage`는 thread 누적이므로
+  rollover 점유량으로 쓰지 않는다.
+- Codex monitor는 마지막 valid `last_token_usage.total_tokens`를 사용하고 transcript window를 marker
+  fallback보다 우선한다. 기본 reserve는 window 12%, 최소 64k/최대 128k이며 marker가 exact 값을
+  override할 수 있다. recursive Stop은 `stop_hook_active`로 pass-through하고 한 session 지시는 3회로
+  제한한다.
+
+### 8.3 Model과 effort
+
+- model 가용성은 계정과 runtime마다 다르다. 같은 host에서 이전 Orca 계정의 `codex exec -m gpt-6-astra`는
+  ChatGPT account 미지원 400 `invalid_request`를 반환했지만, 같은 날 후속 runtime-home 세션은 같은
+  model로 응답했다. 한 계정의 결과를 다른 계정에 일반화하지 않는다.
+- 현재 가용 model과 effort 단계는 dispatch 시점에 [§2.8](#28-agent-배치-표면)의 런타임 표면에서 읽는다.
+- `worker-start --model/--effort` 결과는 `launch.effective`가 권위다.
+- 관측한 5.6 `ultra`는 nested delegation 성격이 있었다. 다른 model의 `ultra`는 확인하지 않았으므로
+  worker에는 쓰지 않는다. Task DAG fan-out은 coordinator가 소유한다.
+- 2026-09-08 새 supervised worker `ctx_918167ae7527`에서 requested/effective `gpt-6-astra` / `xhigh`
+  일치, 실제 도구 실행과 성공 보고, release를 확인했다. 이전 계정의 availability 실패와 구분한다.
+
+### 8.4 Existing-session wake surface
+
+- Orca `terminal show --json`은 handle, worktree path, `tabId`, `leafId`, connected/writable을 제공하고
+  `terminal send`는 `--interrupt`를 지원한다.
+- `send.accepted=true`는 Orca가 입력을 수락했다는 application receipt일 뿐, 모델이
+  읽었거나 Gate effect를 만들었다는 증거가 아니다.
+- Bridge는 marker와 current Run의 terminal/pane/generation, `terminal show` route를 전후 대조하고
+  wake-only Run/Gate identity만 보낸다. exact Gate reread로 effect를 관찰한 뒤에만 consumed로 바꾼다.
+- plugin은 local marketplace에 설치했고 새 disposable thread에서 `$init-orchestrate` discovery와 Windows
+  Stop hook 두 개의 완료를 확인했다. 이 probe는 trust bypass였으므로 persistent interactive trust를
+  대신하지 않는다.
+- 2026-09-08 새 interactive TUI의 `/hooks`에서 Stop hook 설치 2개·활성 2개를 관찰했다. 같은 날
+  실제 Slack→Codex coordinator wake·Task 재개와 설치된 Stop hook의 1회 context rollover를 관찰했다
+  ([실측 기록](evidence/codex-coordinator-acceptance.md#d-2026-09-08-gate-wakerollover-완료)).
+- custom `codex --model ...`의 제한된 도구 셸은 bare/absolute Orca CLI 실행에 모두 실패했다.
+  sandbox 밖 guide 실행 확인창에는 `terminal send`도 `agent_prompt_blocked`를 반환했다.
+  실행 경로 지정만으로 해결됐다고 보지 않으며, 상세 관찰은
+  [Codex acceptance evidence](evidence/codex-coordinator-acceptance.md#c-2026-09-08-승인-후-live-검증)에 있다.
+- 실제 유휴 coordinator에 `--interrupt`를 보낸 첫 wake는 Codex를 종료시켰다. 해당 delivery는
+  queue receipt와 Gate effect를 관찰했지만 Task 재개 evidence는 없었다. Codex transport는 중단
+  신호 없이 `--text ... --enter`를 쓰도록 수정했다. active-turn steering을 검증한 것으로 확대하지 않는다.

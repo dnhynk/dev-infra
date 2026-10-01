@@ -38,6 +38,9 @@ jobs:
       # lockfile과 package.json이 어긋나면 여기서 실패한다.
       - run: pnpm install --frozen-lockfile
 
+      - name: Codex orchestration hook and marker tests
+        run: node --test plugins/orca-orchestration/test/rollover-monitor.test.mjs
+
       - name: O1-7 hermetic operational acceptance
         run: pnpm acceptance:o1-7
 

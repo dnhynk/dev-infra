@@ -62,7 +62,7 @@ const hello = (appId = 'A01BRIDGE') => Promise.resolve({ appId });
 describe('Socket hello와 명시적 preflight', () => {
   it('apiAppId는 optional이고 설정되면 App ID 형식이어야 한다', () => {
     const base = { projects: [{ name: 'p', repositories: ['o/r'] }] };
-    const slack = { teamId: 'T01', ownerUserIds: ['U01'], channels: { prDigest: 'C01', agentRuns: 'C02' } };
+    const slack = { teamId: 'T01', ownerUserIds: ['U01'], channels: { prDigest: 'C01', agentRuns: 'C02' , decisions: 'C02' } };
     expect(parseConfig({ ...base, slack }).slack?.apiAppId).toBeUndefined();
     expect(parseConfig({ ...base, slack: { ...slack, apiAppId: 'A01' } }).slack?.apiAppId).toBe('A01');
     expect(() => parseConfig({ ...base, slack: { ...slack, apiAppId: 'T01' } })).toThrow(/A로 시작/);
@@ -193,7 +193,7 @@ describe('Socket hello와 명시적 preflight', () => {
     vi.useFakeTimers();
     const config: SlackConfig = {
       teamId: 'T01TEAM', ownerUserIds: ['U01OWNER'],
-      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' , decisions: 'C01RUN' },
     };
     const connection = new FakeConnection(() => deferred<SocketHello>().promise);
     let result: Awaited<ReturnType<typeof verifySocketPreflight>> | undefined;
@@ -217,7 +217,7 @@ describe('Socket hello와 명시적 preflight', () => {
     vi.useFakeTimers();
     const config: SlackConfig = {
       teamId: 'T01TEAM', ownerUserIds: ['U01OWNER'],
-      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' , decisions: 'C01RUN' },
     };
     const connection = new FakeConnection(
       () => hello(),
@@ -248,7 +248,7 @@ describe('Socket hello와 명시적 preflight', () => {
     vi.useFakeTimers();
     const config: SlackConfig = {
       teamId: 'T01TEAM', ownerUserIds: ['U01OWNER'],
-      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' , decisions: 'C01RUN' },
     };
     const connection = new FakeConnection(
       () => hello(),
@@ -740,7 +740,7 @@ describe('backoff와 redaction', () => {
   it('preflight error에 token, URL, App ID, envelope, payload가 없다', async () => {
     const config: SlackConfig = {
       teamId: 'T01TEAM', apiAppId: 'A01EXPECTED', ownerUserIds: ['U01OWNER'],
-      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' },
+      channels: { prDigest: 'C01PR', agentRuns: 'C01RUN' , decisions: 'C01RUN' },
     };
     const raw = 'wss://secret.invalid envelope_id=ESECRET payload=RAWSECRET';
     const connection = new FakeConnection(() => Promise.reject(new Error(raw)));

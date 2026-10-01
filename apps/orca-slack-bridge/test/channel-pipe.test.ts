@@ -11,7 +11,10 @@ import {
   type ChannelAdapterIdentity,
   type ChannelNotificationWriter,
 } from '../src/channel/adapter.js';
-import { ChannelPipeServer } from '../src/channel/pipe-server.js';
+import {
+  ChannelPipeServer,
+  DEFAULT_PROBE_DELAYS_MS,
+} from '../src/channel/pipe-server.js';
 import {
   CHANNEL_PROTOCOL_VERSION,
   ChannelNdjsonDecoder,
@@ -29,6 +32,18 @@ const RUN_ID = 'run_channel';
 const TERMINAL = 'term_22222222-2222-4222-8222-222222222222';
 const PANE = '33333333-3333-4333-8333-333333333333:44444444-4444-4444-8444-444444444444';
 
+/** Orca 1.4.216 names the coordinator pane only through `terminal show` (DL-066). */
+function terminalShow(args: readonly string[], panes: ReadonlyMap<string, string>): string | null {
+  if (args[0] !== 'terminal' || args[1] !== 'show') return null;
+  const handle = args[args.indexOf('--terminal') + 1] ?? '';
+  const pane = panes.get(handle);
+  if (pane === undefined) return JSON.stringify({ id: 'fake', ok: false, error: { code: 'not_found' } });
+  const [tabId, leafId] = pane.split(':');
+  return JSON.stringify({ id: 'fake', ok: true, result: { terminal: {
+    handle, tabId, leafId, worktreePath: 'C:/REDACTED/worktree', connected: true, writable: true,
+  } } });
+}
+
 class FakeOrca implements OrcaRunner {
   generation = 1;
   duplicateRun = false;
@@ -39,6 +54,8 @@ class FakeOrca implements OrcaRunner {
   completions = 0;
 
   run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
+    const shown = terminalShow(args, new Map([[TERMINAL, PANE]]));
+    if (shown !== null) return Promise.resolve(shown);
     this.calls += 1;
     if (this.fail) return Promise.reject(new Error('raw private Orca failure'));
     if (args.join(' ') !== 'orchestration run-list --json') {
@@ -48,7 +65,6 @@ class FakeOrca implements OrcaRunner {
       id: RUN_ID,
       objective: 'channel test',
       coordinator_handle: TERMINAL,
-      coordinator_pane_key: PANE,
       consumer_generation: this.generation,
       legacy: false,
       created_at: '2026-08-25T00:00:00.000Z',
@@ -95,6 +111,8 @@ class HeldRouteOrca implements OrcaRunner {
   readonly held: HeldRouteRead[] = [];
 
   run(args: readonly string[], options: OrcaRunOptions = {}): Promise<string> {
+    const shown = terminalShow(args, new Map([[TERMINAL, PANE]]));
+    if (shown !== null) return Promise.resolve(shown);
     this.calls += 1;
     if (args.join(' ') !== 'orchestration run-list --json') {
       return Promise.reject(new Error('unexpected fake command'));
@@ -108,7 +126,6 @@ class HeldRouteOrca implements OrcaRunner {
           id: RUN_ID,
           objective: 'channel test',
           coordinator_handle: TERMINAL,
-          coordinator_pane_key: PANE,
           consumer_generation: generation,
           legacy: false,
           created_at: '2026-08-25T00:00:00.000Z',
@@ -168,6 +185,9 @@ class GlobalAdmissionOrca implements OrcaRunner {
   constructor(readonly bindings: readonly GlobalRouteBinding[]) {}
 
   run(args: readonly string[], _options: OrcaRunOptions = {}): Promise<string> {
+    const shown = terminalShow(args, new Map(this.bindings.map((binding) =>
+      [binding.identity.terminalHandle, binding.identity.paneKey] as const)));
+    if (shown !== null) return Promise.resolve(shown);
     this.calls += 1;
     if (args.join(' ') !== 'orchestration run-list --json') {
       return Promise.reject(new Error('unexpected global-admission command'));
@@ -180,7 +200,6 @@ class GlobalAdmissionOrca implements OrcaRunner {
           id: binding.runId,
           objective: 'global admission test',
           coordinator_handle: binding.identity.terminalHandle,
-          coordinator_pane_key: binding.identity.paneKey,
           consumer_generation: 1,
           legacy: false,
           created_at: '2026-08-25T00:00:00.000Z',
@@ -388,6 +407,24 @@ afterEach(async () => {
 });
 
 describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
+  it('검증되지 않은 연결의 정상 상태 probe 주기가 짧지 않다', () => {
+    /*
+     * probe는 세션 화면에 보이는 줄을 하나 남긴다. adapter의 중복 제거가 전송 중 집합만 보므로
+     * 같은 probe gate id라도 매번 다시 알림으로 나간다. 그래서 이 주기가 곧 "검증되지 않은
+     * 연결이 사람 화면에 줄을 쌓는 속도"다.
+     *
+     * 30초였을 때 실제로 코디네이터가 띄운 선택 프롬프트가 쌓인 probe 줄에 밀려 화면 밖으로
+     * 나갔다. 그 상태는 드물지 않다 — 프롬프트 앞에 멈춘 세션은 도구를 호출할 수 없어 receipt를
+     * 보내지 못하고, 즉 사람이 답을 기다리는 순간이 바로 연결이 검증되지 않는 순간이다.
+     *
+     * 앞쪽 값들은 정상 연결을 빠르게 검증하므로 짧아도 된다. 고정되는 마지막 값만 길어야 한다.
+     */
+    const steadyState = DEFAULT_PROBE_DELAYS_MS[DEFAULT_PROBE_DELAYS_MS.length - 1]!;
+    expect(steadyState).toBeGreaterThanOrEqual(300_000);
+    // 완전히 멈추지는 않는다. 세션이 나중에 풀렸을 때 복구되어야 한다.
+    expect(Number.isFinite(steadyState)).toBe(true);
+  });
+
   it('works daemon-first and verifies only the exact receipt callback', async () => {
     const path = pipePath('daemon-first');
     const daemon = server(path);
@@ -2235,6 +2272,30 @@ describe('daemon named pipe + reconnecting Adapter vertical seam', () => {
       {
         ...identity(),
         terminalHandle: 'term_99999999-9999-4999-8999-999999999999',
+      },
+    );
+    client.start();
+    await waitFor(() => daemon.listConnections()[0]?.verified === true);
+
+    expect(await daemon.evaluateProductionRoute(RUN_ID)).toEqual({
+      kind: 'pending',
+      code: 'no_candidate',
+    });
+    expect(daemon.getResourceSnapshot().productionGateWrites).toBe(0);
+  });
+
+  it('keeps the route pending when the Adapter pane is not the live pane of the Run terminal', async () => {
+    // Orca 1.4.216 Run rows carry no pane; terminal show must still prove the Adapter's pane.
+    const path = pipePath('wrong-pane');
+    const daemon = server(path);
+    await daemon.start();
+    let client!: ChannelAdapterClient;
+    client = adapter(
+      path,
+      { notifyGate: async (gateId) => { await client.reportReceipt(gateId); } },
+      {
+        ...identity(),
+        paneKey: '99999999-9999-4999-8999-999999999999:88888888-8888-4888-8888-888888888888',
       },
     );
     client.start();

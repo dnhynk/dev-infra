@@ -1,0 +1,4 @@
+interface:
+  display_name: "Init Orchestrate"
+  short_description: "Boot or resume an Orca coordinator in Codex"
+  default_prompt: "Use $init-orchestrate to boot or resume this Orca orchestration run."

@@ -303,6 +303,10 @@ B
 버튼 label은 짧게 유지한다. 사람이 읽는 question/options 요약과 별도로 안정적 option ID·설명·recommendation·impact를
 Bridge sidecar에 저장해 Gate ID와 연결하고, action은 이 metadata로 판정한다(OD-050).
 
+sidecar를 등록하지 않은 Gate에도 버튼은 나온다. 이때 카드에는 Orca `options` label과 버튼만 있고
+설명·권장안·영향 절이 없으며, 각주가 상세를 등록하지 않았다고 밝힌다(OD-083). `options`를 읽지 못한
+Gate만 버튼 없는 카드로 남는다.
+
 ### 3.4 자유형 결정 modal
 
 `[직접 입력]`은 해당 Gate에 연결된 modal을 연다.

@@ -5,7 +5,7 @@ import { parseConfig } from '../src/project/config.js';
 const slack = {
   teamId: 'T01ABCDEF',
   ownerUserIds: ['U01OWNER'],
-  channels: { prDigest: 'C01PRD', agentRuns: 'C01RUNS' },
+  channels: { prDigest: 'C01PRD', agentRuns: 'C01RUNS' , decisions: 'C01RUNS' },
 };
 const base = { slack, projects: [{ name: 'p', repositories: ['o/r'] }] };
 
@@ -40,7 +40,7 @@ describe('설정 파싱', () => {
 
   it('채널 이름을 ID 대신 넣으면 거부한다', () => {
     expect(() =>
-      parseConfig({ ...base, slack: { ...slack, channels: { prDigest: '#pr-digest', agentRuns: 'C1' } } }),
+      parseConfig({ ...base, slack: { ...slack, channels: { prDigest: '#pr-digest', agentRuns: 'C1' , decisions: 'C1' } } }),
     ).toThrow(/채널 ID가 아니다/);
   });
 

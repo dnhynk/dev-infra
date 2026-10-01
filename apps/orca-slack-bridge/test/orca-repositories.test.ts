@@ -92,6 +92,28 @@ describe('parseOrcaRepositoryList', () => {
     }]);
   });
 
+  it.each([true, false])('accepts the installed unset setup-method row (repoIcon=%s)', (withIcon) => {
+    // Orca 1.4.188 omits the unset setup preference on a newly added git repository.
+    const value = withIcon ? row() : rowWithoutRepoIcon();
+    delete value['projectHostSetupMethod'];
+    const got = parseOrcaRepositoryList(envelope([row(), value]));
+    expect(got.rows).toHaveLength(2);
+    expect(got.rows.every((item) => item.status === 'valid')).toBe(true);
+    expect(got.diagnostics).toEqual([]);
+  });
+
+  it('accepts the Orca 1.4.216 row that records external worktree inbox state', () => {
+    // Orca 1.4.216 adds both keys once the external-worktree prompt is dismissed. Discovery reads
+    // neither, so they must not fail the pass (DL-066).
+    const value = row({
+      externalWorktreeInboxBaselinePaths: ['C:/REDACTED/a', 'C:/REDACTED/b'],
+      externalWorktreeVisibilityPromptDismissedAt: 1_700_000_100_000,
+    });
+    const got = parseOrcaRepositoryList(envelope([row(), value]));
+    expect(got.rows.map((item) => item.status)).toEqual(['valid', 'valid']);
+    expect(got.diagnostics).toEqual([]);
+  });
+
   it('represents null remote as a row-local no_remote diagnostic', () => {
     const got = parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: null, repoIcon: null })]));
     expect(got.rows[0]).toMatchObject({ status: 'no_remote', rowIndex: 0 });
@@ -185,101 +207,89 @@ describe('parseOrcaRepositoryList', () => {
     });
   });
 
-  it.each(['id', 'ok', 'result', '_meta'])('rejects a missing envelope key: %s', (key) => {
+  it.each([
+    ['ok', 'ORCA_REPOSITORY_ENVELOPE_INVALID'],
+    ['result', 'ORCA_REPOSITORY_RESULT_INVALID'],
+  ] as const)('rejects a missing envelope key discovery reads: %s', (key, code) => {
     const value = clone(envelope());
     delete value[key];
-    expect(contractCode(() => parseOrcaRepositoryList(value))).toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
+    expect(contractCode(() => parseOrcaRepositoryList(value))).toBe(code);
   });
 
-  it('rejects extra envelope/result/meta keys and missing result.repos', () => {
-    expect(contractCode(() => parseOrcaRepositoryList({ ...envelope(), extra: true })))
+  it('ignores envelope, result, and meta keys discovery does not read (DL-066)', () => {
+    const value = clone(envelope());
+    delete value['id'];
+    delete value['_meta'];
+    value['extra'] = true;
+    (value['result'] as Record<string, unknown>)['extra'] = true;
+    expect(parseOrcaRepositoryList(value).rows).toHaveLength(1);
+  });
+
+  it('rejects a mistyped ok flag or repos list', () => {
+    expect(contractCode(() => parseOrcaRepositoryList({ ...envelope(), ok: 'true' })))
       .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
-    const extraResult = clone(envelope());
-    (extraResult['result'] as Record<string, unknown>)['extra'] = true;
-    expect(contractCode(() => parseOrcaRepositoryList(extraResult)))
-      .toBe('ORCA_REPOSITORY_RESULT_INVALID');
     const missingRepos = clone(envelope());
     delete (missingRepos['result'] as Record<string, unknown>)['repos'];
     expect(contractCode(() => parseOrcaRepositoryList(missingRepos)))
       .toBe('ORCA_REPOSITORY_RESULT_INVALID');
-    const extraMeta = clone(envelope());
-    (extraMeta['_meta'] as Record<string, unknown>)['extra'] = true;
-    expect(contractCode(() => parseOrcaRepositoryList(extraMeta)))
-      .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
-    expect(contractCode(() => parseOrcaRepositoryList({ ...envelope(), id: 1 })))
-      .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
-    expect(contractCode(() => parseOrcaRepositoryList({ ...envelope(), ok: 'true' })))
-      .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
     const wrongRepos = clone(envelope());
     (wrongRepos['result'] as Record<string, unknown>)['repos'] = {};
     expect(contractCode(() => parseOrcaRepositoryList(wrongRepos)))
       .toBe('ORCA_REPOSITORY_RESULT_INVALID');
-    const wrongRuntime = clone(envelope());
-    (wrongRuntime['_meta'] as Record<string, unknown>)['runtimeId'] = null;
-    expect(contractCode(() => parseOrcaRepositoryList(wrongRuntime)))
-      .toBe('ORCA_REPOSITORY_ENVELOPE_INVALID');
   });
 
-  const rowKeys = Object.keys(row()).filter((key) => key !== 'repoIcon');
-  it.each(rowKeys)('rejects a missing top-level row key: %s', (key) => {
+  it.each(['id', 'gitRemoteIdentity'])('rejects a row missing a field discovery reads: %s', (key) => {
     const value = row();
     delete value[key];
     expect(contractCode(() => parseOrcaRepositoryList(envelope([value]))))
       .toBe('ORCA_REPOSITORY_ROW_INVALID');
   });
 
-  it('rejects an extra top-level row key', () => {
-    expect(contractCode(() => parseOrcaRepositoryList(envelope([{ ...row(), extra: true }]))))
-      .toBe('ORCA_REPOSITORY_ROW_INVALID');
-  });
-
-  it('rejects every other missing or extra key in the repoIcon-omitted row variant', () => {
-    for (const key of Object.keys(rowWithoutRepoIcon())) {
-      const value = rowWithoutRepoIcon();
-      delete value[key];
-      expect(contractCode(() => parseOrcaRepositoryList(envelope([value]))))
-        .toBe('ORCA_REPOSITORY_ROW_INVALID');
-    }
-    expect(contractCode(() => parseOrcaRepositoryList(envelope([{
-      ...rowWithoutRepoIcon(),
-      unexpected: true,
-    }])))).toBe('ORCA_REPOSITORY_ROW_INVALID');
-  });
-
-  const wrongTypes: readonly [string, unknown][] = [
-    ['id', 1], ['path', null], ['displayName', false], ['badgeColor', 1], ['addedAt', 1.5],
-    ['kind', null], ['externalWorktreeVisibilityLegacy', 0], ['gitUsername', []],
-    ['repoIcon', 'icon'], ['upstream', {}], ['gitRemoteIdentity', []],
-    ['projectHostSetupMethod', false], ['hookSettings', null], ['externalWorktreeVisibility', 1],
-  ];
-  it.each(wrongTypes)('rejects wrong top-level row type: %s', (key, value) => {
+  it.each([
+    ['id', 1], ['gitRemoteIdentity', []], ['gitRemoteIdentity', 'origin'],
+  ] as const)('rejects a mistyped row field discovery reads: %s', (key, value) => {
     expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ [key]: value })]))))
       .toBe('ORCA_REPOSITORY_ROW_INVALID');
-    if (key !== 'repoIcon') {
-      expect(contractCode(() => parseOrcaRepositoryList(envelope([
-        rowWithoutRepoIcon({ [key]: value }),
-      ])))).toBe('ORCA_REPOSITORY_ROW_INVALID');
-    }
   });
 
-  it('requires the exact three remote identity fields and string types', () => {
-    const missing = { canonicalKey: 'github.com/example/project', remoteName: 'origin' };
-    expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: missing })]))))
-      .toBe('ORCA_REPOSITORY_ROW_INVALID');
-    const extra = { ...missing, remoteUrl: 'https://github.com/example/project', extra: true };
-    expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: extra })]))))
-      .toBe('ORCA_REPOSITORY_ROW_INVALID');
-    const wrong = { ...missing, remoteUrl: 1 };
-    expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: wrong })]))))
-      .toBe('ORCA_REPOSITORY_ROW_INVALID');
+  const unreadRowKeys = Object.keys(row()).filter((key) => key !== 'id' && key !== 'gitRemoteIdentity');
+  it.each(unreadRowKeys)('ignores a missing or changed row field discovery does not read: %s', (key) => {
+    const missing = row();
+    delete missing[key];
+    expect(parseOrcaRepositoryList(envelope([missing])).rows[0]).toMatchObject({ status: 'valid' });
+    expect(parseOrcaRepositoryList(envelope([row({ [key]: { changed: true } })])).rows[0])
+      .toMatchObject({ status: 'valid' });
+  });
+
+  it('ignores unknown row keys', () => {
+    expect(parseOrcaRepositoryList(envelope([{ ...row(), extra: true }])).rows[0])
+      .toMatchObject({ status: 'valid' });
+  });
+
+  it('requires string canonicalKey and remoteUrl and ignores other remote fields', () => {
+    const remote = {
+      canonicalKey: 'github.com/example/project',
+      remoteUrl: 'https://github.com/Example/Project.git',
+    };
+    expect(parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: { ...remote, extra: true } })]))
+      .rows[0]).toMatchObject({ status: 'valid' });
+    for (const key of ['canonicalKey', 'remoteUrl']) {
+      const missing: Record<string, unknown> = { ...remote };
+      delete missing[key];
+      expect(contractCode(() => parseOrcaRepositoryList(envelope([row({ gitRemoteIdentity: missing })]))))
+        .toBe('ORCA_REPOSITORY_ROW_INVALID');
+      expect(contractCode(() => parseOrcaRepositoryList(envelope([
+        row({ gitRemoteIdentity: { ...remote, [key]: 1 } }),
+      ])))).toBe('ORCA_REPOSITORY_ROW_INVALID');
+    }
   });
 
   it('uses static redacted errors for JSON and schema failures', () => {
     const sentinel = 'PRIVATE-PATH-URL-ID-SENTINEL';
     for (const action of [
       () => parseOrcaRepositoryListJson(`{${sentinel}`),
-      () => parseOrcaRepositoryList({ ...envelope(), [sentinel]: sentinel }),
-      () => parseOrcaRepositoryList(envelope([{ ...row(), path: 1, displayName: sentinel }])),
+      () => parseOrcaRepositoryList({ ...envelope(), ok: sentinel }),
+      () => parseOrcaRepositoryList(envelope([{ ...row(), id: 1, displayName: sentinel }])),
     ]) {
       try {
         action();

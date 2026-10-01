@@ -74,7 +74,7 @@ import type { GateDirectInputStore } from '../gate/direct-input-types.js';
  */
 
 /** 현재 스키마 버전. `MIGRATIONS.length + 1`과 반드시 같다. */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 16;
 
 /** durable store 경로를 덮어쓰는 환경변수. */
 export const STATE_PATH_VAR = 'ORCA_SLACK_BRIDGE_STATE';
@@ -298,7 +298,21 @@ CREATE TABLE run_collection_message (
  * Coordinator가 등록한 ask↔Gate mapping과 option metadata. Orca 원문을 복제해 대체하지 않고,
  * Gate ID에 없는 안정적 option identity/recommendation/impact만 보존한다(DL-040).
  */
-const GATE_METADATA_TABLE = `
+/**
+ * v14가 붙인 한 컬럼. 등록하지 않은 Gate도 Slack에서 누를 수 있게 하려면 관측이 파생 행을
+ * 남겨야 하고, 그 행을 등록된 행과 구분할 자리가 필요하다. 기존 행은 전부 `gate-register`가
+ * 쓴 것이므로 기본값이 그대로 맞다.
+ *
+ * `recommendation_option_id`/`recommendation_reason`/`impact`는 파생 행에서 의미가 없지만
+ * NOT NULL로 남는다. NOT NULL을 nullable로 바꾸는 것은 파괴적 변경이라 MIGRATIONS가 다루지
+ * 않는다. 파생 행은 그 자리를 빈 문자열로 두고, 읽는 쪽(sqlite.ts의 toGateMetadata)이
+ * source를 보고 null로 노출한다.
+ */
+const GATE_METADATA_SOURCE_COLUMN =
+  "source TEXT NOT NULL DEFAULT 'registered' CHECK (source IN ('registered','derived'))";
+
+/** v14 이전에 배포된 정확한 table DDL. 여기 있는 파일은 이 문자열로 만들어졌다. */
+const GATE_METADATA_V13_TABLE = `
 CREATE TABLE gate_metadata (
   gate_key                 TEXT PRIMARY KEY,
   run_key                  TEXT NOT NULL,
@@ -312,6 +326,16 @@ CREATE TABLE gate_metadata (
   impact                    TEXT NOT NULL,
   registered_at             TEXT NOT NULL
 )`;
+
+/**
+ * `ALTER TABLE ... ADD COLUMN`이 v13 DDL에 남기는 정확한 결과. 손으로 옮겨 적으면 새로 만든
+ * 파일과 올린 파일의 persisted DDL이 갈라져 `validateCurrentGateStore`가 둘 중 하나를 거부한다.
+ * 그래서 새 shape을 옛 shape에서 파생시켜 두 경로가 구조적으로 같아지게 한다.
+ */
+const GATE_METADATA_TABLE = GATE_METADATA_V13_TABLE.replace(
+  /\n\)$/,
+  `\n, ${GATE_METADATA_SOURCE_COLUMN})`,
+);
 
 /** 같은 Run의 metadata를 Gate key 순서로 읽는 production projector용 index. */
 const GATE_METADATA_RUN_INDEX = `
@@ -699,10 +723,27 @@ CREATE TABLE daemon_health (
           AND updated_at >= clean_stopped_at))
 )`;
 
+/**
+ * v16이 이 표를 다시 만든 이유.
+ *
+ * `job_name`의 CHECK에 새 job 이름을 넣으려면 CHECK를 바꿔야 하고, CHECK 변경은 컬럼 추가로
+ * 되지 않는다. MIGRATIONS는 덧붙이기만 다루므로 OD-043이 "파괴적 변경이 필요해지면 그때 정한다"로
+ * 비워 둔 자리다. 여기서 정한다: **이 표는 다시 만든다.**
+ *
+ * 이 표가 담는 것은 job 스케줄 상태(시도 수, backoff, checkpoint)뿐이고 전부 다시 만들어진다.
+ * 잃어도 되는 것을 위해 새 job을 관측 불가로 남기는 것이 더 나쁜 거래다. 행은 그대로 옮기므로
+ * 실제로는 잃는 것도 없다.
+ *
+ * 표를 다시 만들 때 `ALTER TABLE ... RENAME TO`로 **새 이름을 만들지 않는다.** SQLite가 rename
+ * 시 저장된 DDL의 표 이름을 따옴표로 다시 쓰기 때문에, 그렇게 만든 파일은 새로 만든 파일과
+ * DDL 문자열이 달라지고 `validateCurrentOperationalStore`가 둘 중 하나를 거부한다. 옛 표를
+ * 옆으로 밀고, 새 표를 정확한 DDL로 만들고, 옮기고, 옛 표를 지운다.
+ */
 const DAEMON_JOB_OUTCOME_TABLE = `
 CREATE TABLE daemon_job_outcome (
   job_name             TEXT PRIMARY KEY CHECK (job_name IN
-    ('repository-discovery','run-observer','pr-digest','gate-reconcile','channel-delivery')),
+    ('repository-discovery','run-observer','pr-digest','gate-reconcile','channel-delivery',
+     'terminal-prompt')),
   revision             INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 9007199254740991),
   state                TEXT NOT NULL CHECK (state IN ('running','succeeded','failed','backoff')),
   attempt              INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 9007199254740991),
@@ -736,9 +777,105 @@ CREATE TABLE daemon_job_outcome (
   )
 )`;
 
+
+/** v16 이전에 배포된 정확한 table DDL. 그 이전 파일이 이 문자열로 만들어졌다. */
+const DAEMON_JOB_OUTCOME_V15_TABLE = DAEMON_JOB_OUTCOME_TABLE.replace(
+  "'channel-delivery',\n     'terminal-prompt')),",
+  "'channel-delivery')),",
+);
+
 const DAEMON_JOB_OUTCOME_STATE_INDEX = `
 CREATE INDEX daemon_job_outcome_state
   ON daemon_job_outcome (state, next_run_at, job_name)`;
+
+/**
+ * 살아 있는 agent 터미널 하나에서 관측한 대화형 선택 프롬프트와 그 답변 진행.
+ *
+ * Gate와 다른 표다. Gate는 coordinator가 만들기로 **결정한** 것이고, 이것은 agent가 화면에
+ * 띄워 **막혀 있는** 것이다. 무인 운용에서 멈춤은 대부분 후자로 나타나는데 지금까지 그 자리는
+ * badge 한 줄이었다.
+ *
+ * `fingerprint`가 이 표의 안전장치다. 답을 보내기 직전에 화면을 다시 읽어 이 값과 대조하고,
+ * 다르면 보내지 않는다. 그 사이 프롬프트가 바뀌었으면 같은 답이 다른 질문에 들어가기 때문이다.
+ */
+const TERMINAL_PROMPT_TABLE = `
+CREATE TABLE terminal_prompt (
+  -- Orca가 발급한 terminal handle.
+  terminal_handle    TEXT NOT NULL,
+  run_key            TEXT NOT NULL,
+  -- coordinator인지 worker인지. 카드의 문구가 갈리고, coordinator는 Run당 하나뿐이다.
+  role               TEXT NOT NULL CHECK (role IN ('coordinator','worker')),
+  -- worker 프롬프트일 때의 Dispatch. coordinator는 NULL이다.
+  dispatch_key       TEXT,
+  -- 프롬프트 영역만의 지문. 화면 전체가 아니다.
+  fingerprint        TEXT NOT NULL CHECK (length(fingerprint) = 32),
+  -- 관측한 질문/선택지 스냅샷. 카드는 이것으로 그린다.
+  prompt_json        TEXT NOT NULL,
+  channel_id         TEXT,
+  thread_ts          TEXT,
+  message_ts         TEXT,
+  render_fingerprint TEXT,
+  state              TEXT NOT NULL
+    CHECK (state IN ('open','claimed','answered','failed','gone')),
+  -- 사용자가 고른 선택지 번호. claimed 이후에만 있다.
+  claimed_option     INTEGER CHECK (claimed_option IS NULL OR claimed_option BETWEEN 1 AND 25),
+  claimed_by         TEXT,
+  claimed_at         TEXT,
+  settled_at         TEXT,
+  last_error_code    TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 80),
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  -- claim은 선택지와 주체를 함께 남긴다. 셋 중 하나만 있는 행은 어느 답을 누가 골랐는지 모른다.
+  CHECK ((claimed_option IS NULL AND claimed_by IS NULL AND claimed_at IS NULL)
+      OR (claimed_option IS NOT NULL AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL)),
+  CHECK (state <> 'claimed' OR claimed_option IS NOT NULL),
+  CHECK (state NOT IN ('answered','failed') OR settled_at IS NOT NULL),
+  -- 카드 매핑은 셋이 함께 있거나 함께 없다. 일부만 있으면 어디를 갱신할지 알 수 없다.
+  CHECK ((channel_id IS NULL AND thread_ts IS NULL AND message_ts IS NULL)
+      OR (channel_id IS NOT NULL AND thread_ts IS NOT NULL AND message_ts IS NOT NULL)),
+  -- 지문이 다르면 다른 질문이다. 같은 터미널이라도 행과 카드가 따로여야 지나간 질문의 카드가
+  -- 새 질문으로 바뀌지 않는다.
+  PRIMARY KEY (terminal_handle, fingerprint)
+)`;
+
+/**
+ * 한 터미널에 답할 수 있는 프롬프트는 한 번에 하나다.
+ *
+ * 부분 index인 것이 요점이다. 지나간 프롬프트 행은 남되 활성 행과 경쟁하지 않는다.
+ */
+const TERMINAL_PROMPT_ACTIVE_INDEX = `
+CREATE UNIQUE INDEX terminal_prompt_active
+  ON terminal_prompt (terminal_handle) WHERE state IN ('open','claimed')`;
+
+/** Run 단위로 프롬프트를 읽는 카드 렌더용 index. */
+const TERMINAL_PROMPT_RUN_INDEX = `
+CREATE INDEX terminal_prompt_run ON terminal_prompt (run_key, terminal_handle)`;
+
+/** 처리할 프롬프트를 고르는 daemon용 index. */
+const TERMINAL_PROMPT_STATE_INDEX = `
+CREATE INDEX terminal_prompt_state ON terminal_prompt (state, updated_at)`;
+
+/**
+ * 답변 시도 한 번의 결과. 살아 있는 세션에 입력을 쓴 사실은 지워지지 않아야 한다.
+ *
+ * `outcome`이 `refused`인 행이 이 기능이 제대로 작동한다는 증거다 — 화면이 바뀌었을 때 보내지
+ * 않았다는 뜻이기 때문이다.
+ */
+const TERMINAL_PROMPT_ATTEMPT_TABLE = `
+CREATE TABLE terminal_prompt_attempt (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  terminal_handle  TEXT NOT NULL,
+  fingerprint      TEXT NOT NULL,
+  option_index     INTEGER NOT NULL,
+  outcome          TEXT NOT NULL
+    CHECK (outcome IN ('sent','refused','failed')),
+  reason           TEXT CHECK (reason IS NULL OR length(reason) BETWEEN 1 AND 80),
+  at               TEXT NOT NULL
+)`;
+
+const TERMINAL_PROMPT_ATTEMPT_INDEX = `
+CREATE INDEX terminal_prompt_attempt_handle
+  ON terminal_prompt_attempt (terminal_handle, id)`;
 
 const SLACK_ROOT_INTENT_TABLE = `
 CREATE TABLE slack_root_intent (
@@ -807,7 +944,7 @@ export const OPERATIONAL_V13_SCHEMA_OBJECTS: Readonly<Record<string, string>> = 
 
 /** Exact code-owned v8 objects. Startup compares normalized sqlite_master SQL fail-closed. */
 export const GATE_V8_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
-  gate_metadata: GATE_METADATA_TABLE,
+  gate_metadata: GATE_METADATA_V13_TABLE,
   gate_metadata_run_key: GATE_METADATA_RUN_INDEX,
   gate_message: GATE_MESSAGE_TABLE,
   gate_message_slack_identity: GATE_MESSAGE_INDEX,
@@ -846,6 +983,12 @@ export const GATE_V12_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
   gate_channel_delivery: GATE_CHANNEL_DELIVERY_TABLE,
   gate_resume_observation: GATE_RESUME_OBSERVATION_TABLE,
   gate_resume_observation_due: GATE_RESUME_OBSERVATION_DUE_INDEX,
+};
+
+/** v14 adds only the derived/registered sidecar distinction; 다른 Gate 의미는 그대로다. */
+export const GATE_V14_SCHEMA_OBJECTS: Readonly<Record<string, string>> = {
+  // Override the deployed v13 table in the merged current-object map after ALTER ADD COLUMN.
+  gate_metadata: GATE_METADATA_TABLE,
 };
 
 /**
@@ -932,6 +1075,12 @@ ${DAEMON_JOB_OUTCOME_STATE_INDEX};
 ${SLACK_ROOT_INTENT_TABLE};
 ${SLACK_ROOT_INTENT_STATE_INDEX};
 ${SLACK_ROOT_INTENT_SLACK_INDEX};
+${TERMINAL_PROMPT_TABLE};
+${TERMINAL_PROMPT_ACTIVE_INDEX};
+${TERMINAL_PROMPT_RUN_INDEX};
+${TERMINAL_PROMPT_STATE_INDEX};
+${TERMINAL_PROMPT_ATTEMPT_TABLE};
+${TERMINAL_PROMPT_ATTEMPT_INDEX};
 `;
 
 /**
@@ -977,7 +1126,7 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
   [RUN_COLLECTION_MESSAGE_TABLE],
   // v6 → v7: sidecar producer와 정적 Gate thread consumer가 즉시 쓰는 두 표만 붙인다(D2-A).
   // 기존 PR/Run/collection 행은 건드리지 않고, 과거 Gate metadata나 Slack reply를 추측해 채우지 않는다.
-  [GATE_METADATA_TABLE, GATE_METADATA_RUN_INDEX, GATE_MESSAGE_TABLE, GATE_MESSAGE_INDEX],
+  [GATE_METADATA_V13_TABLE, GATE_METADATA_RUN_INDEX, GATE_MESSAGE_TABLE, GATE_MESSAGE_INDEX],
   // v7 → v8: one immutable Gate-local winner, exact observations, bounded append-only evidence,
   // and replayable D2 card/notification projection. No existing row is inferred or rewritten.
   [
@@ -1021,11 +1170,42 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     REPOSITORY_DISCOVERY_ISSUE_TABLE,
     REPOSITORY_DISCOVERY_ISSUE_ACTIVE_INDEX,
     DAEMON_HEALTH_TABLE,
-    DAEMON_JOB_OUTCOME_TABLE,
+    DAEMON_JOB_OUTCOME_V15_TABLE,
     DAEMON_JOB_OUTCOME_STATE_INDEX,
     SLACK_ROOT_INTENT_TABLE,
     SLACK_ROOT_INTENT_STATE_INDEX,
     SLACK_ROOT_INTENT_SLACK_INDEX,
+  ],
+  // v13 → v14: sidecar를 등록하지 않은 Gate도 Slack에서 누를 수 있도록, 관측이 Orca
+  // options만으로 채운 파생 행을 구분한다. 기존 행은 모두 `gate-register`가 쓴 것이므로
+  // 기본값 'registered'가 그대로 맞다.
+  [`ALTER TABLE gate_metadata ADD COLUMN ${GATE_METADATA_SOURCE_COLUMN}`],
+  // v14 → v15: agent 터미널의 대화형 프롬프트를 durable하게 관측하고 답한다. 표 추가뿐이라
+  // 기존 행은 그대로 남는다.
+  [
+    TERMINAL_PROMPT_TABLE,
+    TERMINAL_PROMPT_ACTIVE_INDEX,
+    TERMINAL_PROMPT_RUN_INDEX,
+    TERMINAL_PROMPT_STATE_INDEX,
+    TERMINAL_PROMPT_ATTEMPT_TABLE,
+    TERMINAL_PROMPT_ATTEMPT_INDEX,
+  ],
+  // v15 → v16: `daemon_job_outcome.job_name`의 CHECK에 새 job 이름을 넣는다.
+  //
+  // **이 단계가 v15와 따로인 이유.** v15는 이미 배포된 파일에 적용됐다. 적용이 끝난 단계에
+  // 문장을 더하면 그 파일은 새 문장을 영영 받지 못하고, 코드가 기대하는 shape과 갈라진 채로
+  // 남는다. 실제로 그렇게 만들어 배포가 한 번 막혔다. 덧붙이기는 배열의 **모양**이 아니라
+  // **효과**에 대한 규칙이다.
+  //
+  // CHECK 변경은 표를 다시 만드는 일이라 덧붙이기가 아니다. OD-043이 "파괴적 변경이 필요해지면
+  // 그때 정한다"로 비워 둔 자리이고, 여기서 정한다: 이 표는 다시 만든다. 담는 것이 job 스케줄
+  // 상태뿐이고 행은 그대로 옮기므로 잃는 것이 없다.
+  [
+    'ALTER TABLE daemon_job_outcome RENAME TO daemon_job_outcome_pre_v16',
+    DAEMON_JOB_OUTCOME_TABLE,
+    'INSERT INTO daemon_job_outcome SELECT * FROM daemon_job_outcome_pre_v16',
+    'DROP TABLE daemon_job_outcome_pre_v16',
+    DAEMON_JOB_OUTCOME_STATE_INDEX,
   ],
 ];
 
@@ -1371,6 +1551,13 @@ export interface GateStore
    * transaction before any action controls are exposed.
    */
   insertGateMessage(message: NewGateMessage, observation?: GateLocalObservation): void;
+  /**
+   * Slack에서 사라진 Gate 카드의 매핑을 버린다. 지운 것이 있으면 true다.
+   *
+   * 사람이 카드를 지우면 우리가 든 ts는 가리킬 곳이 없다. 그 매핑을 두면 매 관측마다
+   * `chat.update`가 `message_not_found`로 던지고, 카드 한 장이 관측 pass 전체를 멈춘다.
+   */
+  forgetGateMessage(gateKey: GateKey): boolean;
   /** Settle an ordinary write fence and atomically record the exact observation it projected. */
   updateGateObservation(
     gateKey: GateKey,

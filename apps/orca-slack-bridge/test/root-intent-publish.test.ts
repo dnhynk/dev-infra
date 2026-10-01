@@ -9,7 +9,7 @@ import {
   type SlackRootIntentHooks,
 } from '../src/slack/root-intent.js';
 import { SlackApiError, type PostedMessage, type SlackPoster } from '../src/slack/post.js';
-import { SqliteDigestStore } from '../src/store/sqlite.js';
+import { OperationalStoreError, SqliteDigestStore } from '../src/store/sqlite.js';
 import type { SlackRootEntity, SlackRootPostedMapping } from '../src/store/operational-types.js';
 
 let dir: string;
@@ -97,6 +97,40 @@ async function restartAndRetry(slack: FakeSlack, clock: Clock): Promise<void> {
 }
 
 describe('at-most-once Slack root intent', () => {
+  it.each(['sending', 'uncertain', 'posted'] as const)(
+    'keeps a changed card blocked after an attempt becomes %s', async (state) => {
+      const clock = new Clock();
+      const slack = new FakeSlack();
+      const store = new SqliteDigestStore(path);
+      try {
+        if (state === 'sending') {
+          await expect(attempt(store, slack, clock, {
+            afterClaim: () => { throw new SlackRootSimulatedCrash('before_send'); },
+          })).rejects.toBeInstanceOf(SlackRootSimulatedCrash);
+        } else {
+          slack.failTransport = state === 'uncertain';
+          await attempt(store, slack, clock);
+        }
+        const before = store.findSlackRootIntent(PR);
+        const attempts = slack.attempts;
+        slack.failTransport = false;
+        const changed = (channel: string) => postSlackRootAtMostOnce({
+          store, entity: PR, mapping: PR_MAPPING, channel, renderFingerprint: 'render.changed',
+          message: { text: 'changed facts', blocks: [] }, slack, now: clock.now,
+          runtime: { instanceId: 'instance-b' },
+        });
+        await expect(changed('C1')).resolves.toMatchObject({ kind: 'blocked', state });
+        expect(slack.attempts).toBe(attempts);
+        expect(store.findSlackRootIntent(PR)).toEqual(before);
+        await expect(changed('C2')).rejects.toBeInstanceOf(OperationalStoreError);
+        expect(slack.attempts).toBe(attempts);
+        expect(store.findSlackRootIntent(PR)).toEqual(before);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   for (const [stage, hooks, expectedAttempts] of [
     ['before send', { afterClaim: () => { throw new SlackRootSimulatedCrash('before_send'); } }, 0],
     ['after response', {

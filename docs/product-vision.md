@@ -29,7 +29,11 @@
 ```text
 /orchestration
 /init-orchestrate 데모까지만 구현
+$init-orchestrate 데모까지만 구현
 ```
+
+Claude coordinator는 slash form, Codex coordinator는 dollar skill form을 쓴다. 둘은 같은 Run/PR/Gate
+계약을 공유하고 provider별 session/rollover adapter만 다르다.
 
 ### B. 수동 컨텍스트 승계
 
@@ -95,7 +99,9 @@ LLM은 Slack 레이아웃, 버튼, action, 링크를 임의 생성하지 않는�
 
 ### 결정 저장과 wake-up을 분리한다
 
-Slack 결정은 먼저 Orca Gate에 기록한다. durable 상태를 남긴 뒤 Channel notification으로 coordinator를 깨운다. Channel은 source of truth가 아니라 초인종이다.
+Slack 결정은 먼저 Orca Gate에 기록한다. durable 상태를 남긴 뒤 provider별 notification으로
+coordinator를 깨운다. Claude는 Channel Adapter, Codex는 exact Run marker로 검증한 Orca terminal
+입력을 쓴다. 어느 notification도 source of truth가 아니라 초인종이다.
 
 ### blocker는 의존하는 branch만 막는다
 

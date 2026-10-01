@@ -51,7 +51,7 @@ Slack button/modal
   → Orca에서 Gate 최신 상태 확인
   → Orca gate-resolve
   → durable delivery record
-  → Channel wake-up 시도
+  → provider별 coordinator wake-up 시도
   → coordinator가 Orca Gate를 다시 읽음
   → dependent task 재개
 ```
@@ -152,6 +152,12 @@ LLM structured output은 다음 네 필드뿐이다.
 }
 ```
 
+위 예시가 요구 문체다. 요약은 **번역이지 발췌가 아니다.** 내부 용어와 약어를 그대로 옮기거나 파일
+경로·함수명·테이블명을 나열하면 실패다. 읽는 사람은 코드도 저장소도 보고 있지 않으므로, 어디를
+고쳤는지가 아니라 무엇이 전과 다르게 동작하는지를 써야 한다. 이 문체 요구는 `SYSTEM_PROMPT`가
+강제하고, 요구가 바뀌면 `SUMMARY_CONTRACT_REVISION`을 올린다. 그 값은 `factsFingerprint`에 들어가므로
+이미 요약한 PR도 새 계약으로 한 번 다시 요약된다. 이것이 없으면 프롬프트를 고쳐도 옛 요약이 남는다.
+
 `status`는 관찰한 PR·Orca 사실에서 코드가 파생하고, `risk`는 `reviewer_result.findings[].severity`를 코드가 집계해 파생한다. 모델에 두 판정을 맡기지 않는다. provider는 OpenAI API, 기본 모델은 설정으로 교체 가능한 `gpt-5.6-luna`, 출력 언어는 한국어다. 출력은 strict JSON Schema로 검증하며 검증 실패는 한 번 재시도하고, 재시도도 실패하면 요약 없이 사실만 담은 축소 카드를 만들고 "요약 실패"를 표시한다(OD-034~037, DL-026~027).
 
 Renderer는 다음을 보장해야 한다.
@@ -229,6 +235,34 @@ Orca Gate의 `question`과 `options`에는 사람이 읽는 짧은 요약만 둔
 recommendation, impact는 Bridge sidecar에 저장하고 Gate ID로 연결한다. button·modal의 기계 판정은 이
 metadata를 사용하며 question/options 자유 텍스트를 parsing하지 않는다(OD-050).
 
+### 6.2b 막힌 터미널
+
+무인 운용에서 멈춤은 대부분 Gate가 아니라 **agent 터미널의 대화형 프롬프트**로 나타난다. Gate는
+coordinator가 만들기로 결정한 것이라 자발성에 기대고, 그 자발성이 깨지면 멈춤이 어디에도 나타나지
+않는다. 그래서 Bridge는 살아 있는 터미널의 화면을 직접 읽는다(OD-084).
+
+대상은 Run의 `coordinator_handle`과 dispatched worker의 `agent_terminal_handle`이다. coordinator는
+Dispatch가 아니라 `worker-show`의 `agentWait`에 잡히지 않으므로, 이 경로가 없으면 coordinator의
+멈춤은 관측 표면 어디에도 없다.
+
+카드의 버튼은 `orca terminal send`로 답한다. 순서가 안전성 전부다.
+
+1. 화면을 다시 읽어 지문을 대조한다. 다르면 보내지 않는다.
+2. 커서를 목표까지 옮긴다. 이동은 선택이 아니라 되돌릴 수 있다.
+3. 다시 읽어 커서가 목표에 있는지 확인한다. 아니면 멈춘다.
+4. 확인된 뒤에만 Enter를 보낸다.
+
+지문은 프롬프트 영역만 쓰고 커서 표시는 뺀다. 화면 아래 로그는 프롬프트와 무관하게 움직이고,
+커서는 이 절차 자신이 옮기기 때문이다. 화면 모양이 어긋나면 카드를 만들지 않고 기존 badge 경로로
+남는다. 자유 입력으로 들어가는 선택지는 버튼으로 만들지 않는다 — Slack에서 그 상태를 끝낼 수 없어
+더 나쁜 막힘이 된다.
+
+sidecar가 등록되지 않은 Gate는 관측이 Orca `options`만으로 파생 행을 만들어 durable하게 남긴다
+(`source='derived'`). 파생 행의 option ID는 label에서 결정되고 resolution은 label 그대로이며
+설명·recommendation·impact는 없다. 카드는 그만큼 얇지만 누를 수 있다. 나중에 들어온 `gate-register`가
+파생 행을 대체한다. `options`를 읽지 못했거나 label이 75자 상한을 넘으면 파생하지 않고, 그 Gate는
+누를 수 없는 카드로 남는다(OD-083).
+
 ask를 사람용 Gate로 승격할 때 Bridge는 `{askMessageId, questionThreadId, dispatchId, taskId, gateId}`를
 durable하게 저장하고 이를 권위 correlation으로 쓴다. Gate question은 표시용이며 correlation source가 아니다(OD-019).
 
@@ -241,7 +275,7 @@ Gate가 해결되면 thread에서 다음을 구분해 보여준다.
 - coordinator 통지 상태
 - 실제 Orca 상태로 관찰된 후속 작업 재개
 
-Channel transport write만 성공했다고 “작업 재개”로 표시하지 않는다.
+notification transport write/queue만 성공했다고 “작업 재개”로 표시하지 않는다.
 
 카드에는 degraded 상태를 항상 표시한다. Channel pending·미해결 Gate·correlation 실패처럼 owner 개입 없이는
 진행되지 않는 상태만 thread에 알리고, summarizer 실패·source stale처럼 자가 복구되는 상태는 badge만
@@ -271,14 +305,17 @@ exponential backoff을 적용하고 reconnect 단절 구간의 event replay는 �
 6. Orca의 공식 `gate-resolve` interface로 resolution을 기록한다.
 7. Gate별 직렬화, 같은 논리 요청의 retry request ID 재사용과 `mutation.replayed` 처리, resolve 전후 재조회로
    결과를 확정하고 durable outbox와 reconcile한다. Orca 내부 transaction 원자성은 가정하지 않는다.
-8. 기존 coordinator에 Channel notification을 시도한다.
+8. 기존 coordinator에 notification을 시도한다. Claude Channel exact candidate를 우선하고, 후보가
+   없을 때만 opt-in된 Codex Run marker의 exact terminal route로 fallback한다.
 9. coordinator는 Orca Gate source of truth를 다시 읽고 후속 orchestration을 진행한다.
 
-Slack payload를 바로 Claude prompt로 보내거나 Slack을 결정 저장소로 사용하지 않는다.
+Slack payload를 바로 coordinator prompt로 보내거나 Slack을 결정 저장소로 사용하지 않는다.
 
 직접 입력 action은 예외적인 fast path를 가진다. sender/action을 빠르게 검증하고 button payload의 `trigger_id`가 만료되기 전에 ACK와 `views.open`을 3초 안에 끝낸다. 비-owner에게 modal을 열지 않는다. modal submission의 로컬 형식·필수값 오류는 3초 안에 input `block_id`별 `response_action=errors`로 ACK해 modal을 유지한다. 유효한 제출은 ACK한 뒤 원격 Orca 작업을 비동기로 수행한다(OD-071).
 
-## 8. Channel Adapter
+## 8. Coordinator notification adapters
+
+### 8.1 Claude Channel Adapter
 
 Channel은 새 Web session이나 새 clone을 만드는 수단이 아니라 이미 열린 기존 로컬 coordinator 세션에 외부 이벤트를 push하는 수단이다.
 
@@ -334,6 +371,43 @@ actual Claude Code 2.1.243 opt-in과 실제 Task resume 경로는 2026-08-26 사
 관찰됐다. 다만 session Adapter와 authority-repaired daemon이 하나의 exact build가 아니었으므로
 release 상태는 `LIVE_CHANNEL_UNVERIFIED`다. 구체 ID를 제거한 근거와 잔여 조건은
 [D3 live Channel acceptance evidence](../evidence/d3-live-channel-acceptance.md)에 있다.
+
+### 8.2 Codex terminal wake route
+
+Codex에는 이 시스템이 의존할 수 있는 Claude Channels-equivalent inbound Adapter가 없다. Codex
+coordinator는 `$init-orchestrate`가 원자적으로 기록한
+`~/.codex/orchestration/runs/<run_id>.json` marker로 notification을 opt-in하고, daemon은 기존
+Orca-managed terminal의 입력 surface를 사용한다.
+
+라우팅 순서는 다음과 같다.
+
+1. 기존 Claude Channel route를 먼저 판정한다. 정확한 결과가 `pending/no_candidate`일 때만 Codex를 본다.
+2. marker schema/provider/run ID를 strict parse하고 크기를 제한한다.
+3. current Run row의 coordinator handle/pane/consumer generation과 marker를 exact 대조한다.
+4. `terminal show`의 handle, `tabId:leafId`, worktree path, `connected`, `writable`을 다시 대조한다.
+5. `[orca-gate-wakeup v1 run_id=... gate_id=...]`와 “결정을 추론하지 말고 exact Gate를 재조회하라”는
+   고정 문구만 `terminal send --text ... --enter`로 queue한다. resolution text는 싣지 않는다.
+   `--interrupt`는 유휴 Codex TUI를 종료시키므로 사용하지 않는다.
+6. queue 수락 뒤 marker, terminal route, current Run을 다시 읽어 replacement, movement, takeover가
+   없었는지 확인한다.
+7. `send.accepted=true`를 `application_queued` application receipt로 durable하게 기록하되, normal
+   exact Gate reread에서 coordinator effect를 관찰하기 전에는 `consumed`로 바꾸지 않는다.
+
+marker 부재는 정상적인 no-candidate다. malformed marker, route mismatch, stale generation,
+ambiguous Run, terminal write failure는 fail closed하며 다른 route로 우회하지 않는다. 이 receipt는
+Codex가 prompt를 해석했다는 증거도, dependent Task를 재개했다는 증거도 아니다. 실제 재개 표시는 기존
+Orca Task/Dispatch 관측으로만 한다.
+
+coordinator가 직접 만든 Gate에는 원래 worker Dispatch가 없다. 이때 sidecar의
+`derived-<gate_id>`는 Gate correlation용 예약값이며 worker fact가 아니다. Bridge는 저장된 D2
+pre-read와 현재 exact Gate의 Run·Task·선택지를 대조한 뒤, 해당 Task와 의존 Task의 기준 관찰을
+전송 전에 저장한다. 이후 실제 새 Dispatch 또는 검증된 상태 전이만 작업 재개 근거로 삼는다.
+예약값을 실제 worker로 돌려주는 응답과 Gate 누락·중복·identity 불일치는 거부한다. 등록된 worker
+Gate의 기존 source Dispatch 검증과 과거 `unavailable` baseline의 소급 관찰 금지는 유지한다.
+
+이 경로는 `CodexTerminalDeliveryTransport`와 delivery state regression으로 hermetic 검증했다. 실제
+Codex coordinator, plugin hook trust, Slack action을 함께 쓰는 live acceptance는 2026-09-08에
+통과했다([실측 기록](../evidence/codex-coordinator-acceptance.md)).
 
 ## 9. Durability와 멱등성
 

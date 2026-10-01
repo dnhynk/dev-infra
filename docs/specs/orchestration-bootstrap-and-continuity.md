@@ -1,6 +1,6 @@
 # Orchestration Bootstrap & Continuity 스펙
 
-상태: **구현 완료 · A와 B를 `skills/init-orchestrate/SKILL.md`와 `tools/rollover-monitor/`로 구현했고 throwaway Run에서 감지→handoff→successor 생성→인수를 완주했다**  
+상태: **Claude 경로 구현/live 완주 · Codex 경로를 `plugins/orca-orchestration/`에 구현하고 marker/Stop hook/Gate wake를 hermetic 검증함 · Astra live worker 수용 완료 · Slack Gate wake·rollover live acceptance 완료**
 해결 대상: **A + B**  
 관련 문서: [제품 비전](../product-vision.md), [작업 규약](../process/working-agreement.md), [미결정 사항](../open-decisions.md)
 
@@ -16,9 +16,12 @@
 ```text
 /orchestration
 /init-orchestrate 데모까지만 구현
+$init-orchestrate 데모까지만 구현
 ```
 
-`/init-orchestrate` 뒤의 문자열은 해당 Run의 추가 범위·우선순위·종료 지점이다. 기존 확정 스펙이나 작업 규약과 충돌할 때 어느 쪽이 우선하는지는 조용히 추론하지 않는다.
+Claude Code는 `/init-orchestrate`, Codex는 `$init-orchestrate`를 사용한다. 뒤의 문자열은 해당 Run의
+추가 범위·우선순위·종료 지점이다. 기존 확정 스펙이나 작업 규약과 충돌할 때 어느 쪽이 우선하는지는
+조용히 추론하지 않는다.
 
 ## 2. 기능 경계
 
@@ -59,7 +62,8 @@ Bridge 관련 기능은 별도 스펙을 따르되, PR metadata와 Gate 생성 �
 
 1. 사용자가 `/orchestration`과 `/init-orchestrate <추가 지시>`를 실행한다.
 2. 기능은 현재 repository, 적용할 작업 규약, authoritative spec, 기존 Run과 handoff의 존재 여부를 확인한다.
-3. Channel Adapter 기능이 설치된 환경에서는 현재 Run/session binding과 session별 channel opt-in을 확인한다.
+3. 현재 provider의 notification binding을 확인한다. Claude는 session별 Channel opt-in, Codex는 exact
+   Run marker와 terminal/pane/generation binding을 확인한다.
 4. 신규 Run이라면 coordinator는 다음을 제시한다.
    - 이해한 목적과 범위
    - 명시적 제외 범위
@@ -79,7 +83,8 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 3. Orca Run/Task/Dispatch/Worker/Gate, Git worktree, GitHub PR/review/CI의 live 상태를 다시 조회한다.
 4. resolved됐지만 coordinator 처리 여부가 확인되지 않은 Gate와 pending Channel delivery를 다시 조회한다.
 5. handoff snapshot과 live 상태의 차이를 식별한다.
-6. Channel Adapter 기능이 설치된 환경에서는 successor session의 adapter binding과 session opt-in 상태를 확인한다.
+6. successor provider의 notification binding을 확인한다. Claude는 Adapter/probe receipt, Codex는 새
+   session identity로 원자 교체한 Run marker와 exact terminal route가 근거다.
 7. 기존 합의 범위 안의 안전한 연속 작업은 반복 승인을 요구하지 않는다.
 8. spec 충돌, handoff 모호성, coordinator 권한 중복, 민감한 신규 판단만 사용자에게 올린다.
 9. 기존 worker·worktree·PR을 재사용하고 같은 Task를 중복 dispatch하거나 같은 PR을 중복 merge하지 않는다.
@@ -113,23 +118,36 @@ successor는 `HANDOFF.md`만 읽고 바로 mutation을 시작하지 않는다.
 
 ### 4.2 Agent 배치 정책
 
-coordinator는 Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·model·effort를 선택한다. 모든 worker를 같은 기본 agent로 배치하지 않는다.
+coordinator provider와 무관하게 작업 종류가 worker 계열(`--agent`)을 정한다. 논리 추론과 창의성이
+핵심인 작업(아키텍처·계약 설계, 어려운 구현, 조용한-실패 위험 리뷰, 추론이 필요한 문서, 실패 뒤
+escalation)은 `claude`, 코드 작업·디버깅·리서치·일반 PR 리뷰·사실 정리형 문서는 `codex`다. 정책 표는
+Claude용 [`/init-orchestrate` 스킬](../../skills/init-orchestrate/SKILL.md)과 Codex plugin의
+[worker routing](../../plugins/orca-orchestration/skills/init-orchestrate/references/worker-routing.md)에
+같은 내용으로 둔다. 이 repository는 별도 override를 두지 않는다.
 
-**정책 표의 원본은 [`/init-orchestrate` 스킬](../../skills/init-orchestrate/SKILL.md)에 있다.** 스킬은 `~/.claude/skills/`에 전역 1부로 설치되어 모든 repository의 coordinator에 적용되므로, 작업 종류 분류처럼 repository와 무관한 정책은 그쪽이 원본이다. 이 repository는 스킬의 기본 배치를 그대로 쓰며 override하지 않는다.
-
-배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 유효 값과 제약은 [플랫폼 검증 §2.8](../platform-capabilities.md#28-agent-배치-표면)을 따른다.
+배치는 `worker-start`의 `--agent`, `--model`, `--effort`로 표현한다. 표면과 제약은 [플랫폼 검증 §2.8](../platform-capabilities.md#28-agent-배치-표면)을 따른다.
 
 배치 근거:
 
-- 깊은 추론·기본 구현·디버깅에 Claude 우선, 단순 반복에 `gpt-5.6-luna` `medium`, PR 리뷰에 `xhigh`, 문서 작업에 Codex 우선은 **사용자 판단**이다.
-- 병렬 리서치의 `ultra`는 벤더가 이 단계를 "Maximum reasoning with **automatic task delegation**"으로 정의하므로 대응한다.
-- 단순 반복의 `gpt-5.6-luna`는 벤더 설명이 "Fast and affordable agentic coding model"이다.
-- 사실 정리형 문서의 `gpt-5.6-terra`는 벤더 설명이 "Balanced agentic coding model for everyday work"로, 판단이 적은 정리 작업에 대응한다.
-- 리뷰 지적 반영 수정이 원 Dispatch 배치를 따르는 것은 [Coordinator 운영 계약](#4-coordinator-운영-계약)의 "수정 요청은 가능한 한 원 worker에게 돌린다"를 따른 결과다.
-- 실패·저확신 escalation에 `claude` `fable` `max`를 쓰는 것은 **사용자 판단**이다. 같은 배치로 다시 돌리면 같은 결론에 다시 도달하므로 계열을 바꾼다. 이 배치가 원 배치보다 나은 결과를 낸다는 실측은 없다.
+- 계열 배정과 model/effort를 고정하지 않는 것은 2026-09-30 **사용자 판단**이다(DL-065). provider가
+  모델을 자주 내놓아 고정 표가 금방 낡는다.
+- model과 effort는 dispatch 시점의 런타임에서 후보를 읽어 고른다. Claude는 `claude --help`의
+  `--model` alias와 `--effort` 단계, Codex는 `codex debug models` 카탈로그의 `visibility=list` 모델과
+  그 모델의 `supported_reasoning_levels`다. 같은 결과를 낼 수 있는 가장 낮은 설정을 고르고, 되돌리기
+  비싼 결정·정확성 논증·silent-risk review·escalation에만 계열에서 가장 강한 추론 설정을 쓴다.
+- 후보를 확인할 수 없으면 `--model`/`--effort`를 생략해 사용자가 설정한 agent 기본값을 상속한다.
+  Orca guide도 사용자가 지명하지 않은 model은 생략하라고 한다. 요청 model이 거부되면 같은 계열의 다음
+  후보로 새로 배치하고, 계열을 조용히 바꾸지 않는다.
+- worker에 `ultra`를 쓰지 않는다. nested delegation을 유발할 수 있고 Task DAG의 fan-out은
+  coordinator가 소유하기 때문이다.
+- 리뷰 지적 반영 수정이 원 Dispatch 계열을 따르는 것은 [Coordinator 운영 계약](#4-coordinator-운영-계약)의 "수정 요청은 가능한 한 원 worker에게 돌린다"를 따른 결과다.
+- 실패·저확신 escalation은 fresh `claude` context에 이전 가설과 반증 근거를 넘겨
+  counter-hypothesis를 요구한다. 같은 terminal/context를 재사용하지 않는다.
 - escalation 트리거에 관측 가능한 저확신 신호 목록을 붙인 것은 무인 coordinator가 주관으로 판정할 수 없기 때문이다. 신호 없이 escalate를 허용하면 11행이 가장 비싼 기본 배치가 된다.
 
-`codex-auto-review`("Automatic approval review model for Codex")는 PR 리뷰의 대안 후보이나 모델 선택 UI에 노출되지 않고 동작을 검증하지 않았다. 검증 전에는 채택하지 않는다.
+`launch.requested`가 아니라 `launch.effective`가 적용 근거다. 고른 model·effort와 이유는 Task에 남긴다.
+Codex coordinator는 사용자가 띄운 model/effort로 동작하고, successor는 marker에 기록된 effective 값을
+이어받는다.
 
 ## 5. Worker와 PR 관찰 계약
 
@@ -246,9 +264,14 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 
 감지 주체와 threshold는 확정됐다(OD-014, DL-017).
 
-- 감지 주체는 모델의 자기 판단이 아니라 **외부 monitor**다. `tools/rollover-monitor/`가 Claude Code
-  Stop hook으로 동작하며, 활성 coordinator Run 마커가 있는 세션에서만 transcript 꼬리의
-  `message.usage`를 읽어 남은 컨텍스트를 판정한다.
+- 감지 주체는 모델의 자기 판단이 아니라 **외부 monitor**다. Claude는
+  `tools/rollover-monitor/`, Codex는 plugin에 포함된
+  `scripts/rollover-monitor.mjs`를 Stop hook으로 사용한다. 둘 다 명시적으로 opt-in한 현재
+  coordinator marker가 있을 때만 동작한다.
+- Claude monitor는 마지막 assistant `message.usage`, Codex monitor는 마지막 `event_msg`의
+  `payload.type=token_count`와 `last_token_usage`를 읽는다. Codex의 누적 `total_token_usage`는 현재
+  context 점유량이 아니므로 쓰지 않고, transcript가 주는 `model_context_window`를 marker fallback보다
+  우선한다.
 - 임계값 미만이면 `{"decision":"block"}`으로 사전 승인된 롤오버 절차를 지시한다.
 - 자동 rollover 승인은 **Run 시작 시 1회**다. `/init-orchestrate` 시점에 합의하면 이후 열화마다 묻지
   않는다. 매 rollover 승인은 "작업실에 없어도 계속 돈다"는 B의 목표와 충돌한다.
@@ -256,8 +279,8 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
   권위를 주장할 수 없고, 모델이 이를 prompt injection으로 판단해 거부하는 것을 실측했다
   ([플랫폼 검증 §3.6](../platform-capabilities.md#36-hook-기반-세션-제어와-컨텍스트-측정)).
 - successor 세션 생성은 `terminal create`, 인수는 `run-use --id <run_id>`, 제출 확인은 `--screen`
-  대조다. `send --text`가 `/`로 시작하면 셸이 경로로 치환할 수 있고 `accepted`/`bytesWritten`은 그
-  손상을 알리지 않으므로 `--screen` 대조가 유일한 탐지 수단이다.
+  대조다. Claude는 `/init-orchestrate`, Codex는 `$init-orchestrate`를 주입한다. `accepted`만으로 TUI
+  제출 완료를 주장하지 않는다.
 
 ## 9. Source of truth
 
@@ -265,7 +288,7 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 |---|---|
 | 제품 요구사항과 작업 규약 | 확정 spec, `AGENTS.md` |
 | orchestration 상태 | Orca live Run/Task/Worker/Gate |
-| Run/coordinator identity | `run-list` Run row의 `coordinator_handle`·`coordinator_pane_key`·`consumer_generation`; 환경변수는 보조 단서 |
+| Run/coordinator identity | `run-list` Run row의 `coordinator_handle`·`consumer_generation`과 그 handle의 `terminal show` pane; 환경변수는 보조 단서 |
 | 코드·worktree 상태 | Git working tree/worktree |
 | PR·CI·merge 상태 | GitHub 원본 |
 | reviewer verdict | correlated Orca Task의 `task.result`에 기록된 `reviewer_result` |
@@ -302,6 +325,8 @@ secret과 불필요한 장문 transcript는 handoff에 복사하지 않는다. r
 - successor 시작 실패, 알림 유실, 프로세스 재시작 뒤에도 handoff가 남고 안전하게 재시도할 수 있다.
 - 별도 D3 Run에서 Adapter를 설치한 뒤에는 daemon의 end-to-end probe로 successor session의 opt-in을 확인하고,
   `gate_id`만 받은 coordinator가 Orca를 다시 읽는지 확인한다(OD-053, OD-058).
+- Codex 경로는 successor marker의 session/terminal/pane/generation 교체, Stop hook trigger, wake-only
+  입력, exact Gate re-read→consume를 함께 검증한다.
 - 실제 자동 전환까지 검증되지 않았다면 B 해결 완료를 선언하지 않는다.
 
 모든 수용 테스트는 실행 명령과 출력을 남긴다. 실행하지 않은 테스트는 미검증으로 기록한다.

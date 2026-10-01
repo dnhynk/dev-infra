@@ -5,41 +5,8 @@ import type {
   RepositoryDiscoverySnapshot,
 } from './types.js';
 
-const ENVELOPE_KEYS = ['_meta', 'id', 'ok', 'result'] as const;
-const RESULT_KEYS = ['repos'] as const;
-const META_KEYS = ['runtimeId'] as const;
-const ROW_KEYS_WITH_REPO_ICON = [
-  'addedAt',
-  'badgeColor',
-  'displayName',
-  'externalWorktreeVisibility',
-  'externalWorktreeVisibilityLegacy',
-  'gitRemoteIdentity',
-  'gitUsername',
-  'hookSettings',
-  'id',
-  'kind',
-  'path',
-  'projectHostSetupMethod',
-  'repoIcon',
-  'upstream',
-] as const;
-const ROW_KEYS_WITHOUT_REPO_ICON = [
-  'addedAt',
-  'badgeColor',
-  'displayName',
-  'externalWorktreeVisibility',
-  'externalWorktreeVisibilityLegacy',
-  'gitRemoteIdentity',
-  'gitUsername',
-  'hookSettings',
-  'id',
-  'kind',
-  'path',
-  'projectHostSetupMethod',
-  'upstream',
-] as const;
-const REMOTE_KEYS = ['canonicalKey', 'remoteName', 'remoteUrl'] as const;
+/** The remote identity fields discovery reads. Other remote fields are ignored (DL-066). */
+const REMOTE_KEYS = ['canonicalKey', 'remoteUrl'] as const;
 
 export type OrcaRepositoryContractErrorCode =
   | 'ORCA_REPOSITORY_JSON_INVALID'
@@ -68,11 +35,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
-  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
-}
-
 function fail(code: OrcaRepositoryContractErrorCode): never {
   throw new OrcaRepositoryContractError(code);
 }
@@ -81,40 +43,17 @@ function requireString(row: Record<string, unknown>, key: string): void {
   if (typeof row[key] !== 'string') fail('ORCA_REPOSITORY_ROW_INVALID');
 }
 
+/**
+ * Discovery reads only `id` and `gitRemoteIdentity` (DL-066). Orca adds optional row fields as the
+ * user changes repository settings (dismissing the external-worktree prompt adds two), so every
+ * other key is ignored. A read field that is missing or mistyped still fails the whole pass.
+ */
 function validateRowShape(value: unknown): Record<string, unknown> {
-  if (
-    !isRecord(value) ||
-    (!hasExactKeys(value, ROW_KEYS_WITH_REPO_ICON) &&
-      !hasExactKeys(value, ROW_KEYS_WITHOUT_REPO_ICON))
-  ) {
-    fail('ORCA_REPOSITORY_ROW_INVALID');
-  }
-  for (const key of [
-    'id',
-    'path',
-    'displayName',
-    'badgeColor',
-    'kind',
-    'gitUsername',
-    'projectHostSetupMethod',
-    'externalWorktreeVisibility',
-  ]) {
-    requireString(value, key);
-  }
-  if (!Number.isSafeInteger(value['addedAt'])) fail('ORCA_REPOSITORY_ROW_INVALID');
-  if (typeof value['externalWorktreeVisibilityLegacy'] !== 'boolean') {
-    fail('ORCA_REPOSITORY_ROW_INVALID');
-  }
-  if (value['upstream'] !== null) fail('ORCA_REPOSITORY_ROW_INVALID');
-  if ('repoIcon' in value && value['repoIcon'] !== null && !isRecord(value['repoIcon'])) {
-    fail('ORCA_REPOSITORY_ROW_INVALID');
-  }
-  if (!isRecord(value['hookSettings'])) fail('ORCA_REPOSITORY_ROW_INVALID');
+  if (!isRecord(value)) fail('ORCA_REPOSITORY_ROW_INVALID');
+  requireString(value, 'id');
   const remote = value['gitRemoteIdentity'];
   if (remote !== null) {
-    if (!isRecord(remote) || !hasExactKeys(remote, REMOTE_KEYS)) {
-      fail('ORCA_REPOSITORY_ROW_INVALID');
-    }
+    if (!isRecord(remote)) fail('ORCA_REPOSITORY_ROW_INVALID');
     for (const key of REMOTE_KEYS) requireString(remote, key);
   }
   return value;
@@ -179,21 +118,10 @@ function parseRow(value: unknown, rowIndex: number): RepositoryDiscoveryRow {
 }
 
 export function parseOrcaRepositoryList(raw: unknown): RepositoryDiscoverySnapshot {
-  if (!isRecord(raw) || !hasExactKeys(raw, ENVELOPE_KEYS)) {
-    fail('ORCA_REPOSITORY_ENVELOPE_INVALID');
-  }
-  if (typeof raw['id'] !== 'string' || typeof raw['ok'] !== 'boolean') {
-    fail('ORCA_REPOSITORY_ENVELOPE_INVALID');
-  }
+  if (!isRecord(raw) || typeof raw['ok'] !== 'boolean') fail('ORCA_REPOSITORY_ENVELOPE_INVALID');
   if (raw['ok'] !== true) fail('ORCA_REPOSITORY_COMMAND_FAILED');
-  const meta = raw['_meta'];
-  if (!isRecord(meta) || !hasExactKeys(meta, META_KEYS) || typeof meta['runtimeId'] !== 'string') {
-    fail('ORCA_REPOSITORY_ENVELOPE_INVALID');
-  }
   const result = raw['result'];
-  if (!isRecord(result) || !hasExactKeys(result, RESULT_KEYS) || !Array.isArray(result['repos'])) {
-    fail('ORCA_REPOSITORY_RESULT_INVALID');
-  }
+  if (!isRecord(result) || !Array.isArray(result['repos'])) fail('ORCA_REPOSITORY_RESULT_INVALID');
   const rows = result['repos'].map(parseRow);
   return {
     rows,

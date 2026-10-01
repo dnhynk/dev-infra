@@ -40,6 +40,10 @@ import {
   parseWindowsRuntimeManifest,
   serializeWindowsRuntimeManifest,
 } from '../src/windows/runtime-manifest.js';
+import {
+  downgradeGateMetadataToV13,
+  dropTerminalPromptTables,
+} from './fixtures/schema-downgrade.js';
 
 let root: string;
 let releaseSequence: number;
@@ -212,6 +216,8 @@ function downgradeToV12(path: string): void {
     DROP TABLE orca_repository_binding;
     DROP TABLE repository_registry;
   `);
+  dropTerminalPromptTables(db);
+  downgradeGateMetadataToV13(db);
   db.prepare('UPDATE schema_version SET version = 12 WHERE id = 1').run();
   db.close();
 }
@@ -226,7 +232,7 @@ function schemaVersion(path: string): number {
 }
 
 describe('prebuilt Windows deployment preflight', () => {
-  it('accepts only the closed ready Orca status shape', () => {
+  it('accepts a ready Orca status and rejects any missing or non-ready fact', () => {
     const ready = {
       id: 'request-id',
       ok: true,
@@ -243,11 +249,41 @@ describe('prebuilt Windows deployment preflight', () => {
       _meta: { runtimeId: 'runtime-id' },
     };
     expect(parseOrcaReadinessOutput(JSON.stringify(ready))).toBe(true);
-    expect(parseOrcaReadinessOutput(JSON.stringify({
-      ...ready, result: { ...ready.result, graph: { state: 'loading' } },
-    }))).toBe(false);
-    expect(parseOrcaReadinessOutput(JSON.stringify({ ...ready, extra: true }))).toBe(false);
+    // Fields the readiness check does not read are ignored (DL-066).
+    expect(parseOrcaReadinessOutput(JSON.stringify({ ...ready, extra: true }))).toBe(true);
+    for (const broken of [
+      { ...ready, ok: false },
+      { ...ready, result: { ...ready.result, graph: { state: 'loading' } } },
+      { ...ready, result: { ...ready.result, target: { kind: 'remote' } } },
+      { ...ready, result: { ...ready.result, app: { ...ready.result.app, running: false } } },
+      { ...ready, result: { ...ready.result, app: { ...ready.result.app, pid: 0 } } },
+      { ...ready, result: { ...ready.result, runtime: { ...ready.result.runtime, reachable: false } } },
+      { ...ready, result: { ...ready.result, runtime: { ...ready.result.runtime, state: 'starting' } } },
+      { ...ready, _meta: { runtimeId: 'other-runtime' } },
+    ]) {
+      expect(parseOrcaReadinessOutput(JSON.stringify(broken))).toBe(false);
+    }
     expect(parseOrcaReadinessOutput('{')).toBe(false);
+  });
+
+  it('accepts the Orca 1.4.216 ready status that also reports runtime.connectionState', () => {
+    const ready = {
+      id: 'request-id',
+      ok: true,
+      result: {
+        target: { kind: 'local' },
+        app: { running: true, pid: 1234, desktopWindowStatus: 'available' },
+        runtime: {
+          state: 'ready', reachable: true, connectionState: 'connected', runtimeId: 'runtime-id',
+          appVersion: '1.4.216',
+          remoteUpdateSupport: { installMode: 'interactive', automatic: true, reason: 'available' },
+          capabilities: ['runtime.status.compat.v1'],
+        },
+        graph: { state: 'ready' },
+      },
+      _meta: { runtimeId: 'runtime-id' },
+    };
+    expect(parseOrcaReadinessOutput(JSON.stringify(ready))).toBe(true);
   });
 
   it('probes the canonical Orca executable and fails closed when it is not ready', async () => {
@@ -502,7 +538,7 @@ describe('prebuilt Windows deployment preflight', () => {
   });
 
   // node:sqlite backup is one libuv work item and can wait behind unrelated parallel test workers.
-  it('checkpoints and verifies a timestamped backup outside the release before first v13 migration', async () => {
+  it('checkpoints and verifies a timestamped backup outside the release before first v16 migration', async () => {
     const fixture = createRelease();
     const deployment = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     downgradeToV12(fixture.pathAccess.toNativePath(deployment.paths.statePath));
@@ -520,7 +556,7 @@ describe('prebuilt Windows deployment preflight', () => {
       expect(prepared.backupPath).not.toBeNull();
       expect(prepared.backupPath?.startsWith(deployment.paths.appRoot)).toBe(false);
       expect(schemaVersion(fixture.pathAccess.toNativePath(prepared.backupPath!))).toBe(12);
-      expect(schemaVersion(fixture.pathAccess.toNativePath(deployment.paths.statePath))).toBe(13);
+      expect(schemaVersion(fixture.pathAccess.toNativePath(deployment.paths.statePath))).toBe(16);
       expect(order).toEqual(['backup', 'migrate-12']);
     } finally {
       await prepared.release();
@@ -539,7 +575,7 @@ describe('prebuilt Windows deployment preflight', () => {
     expect(existsSync(fixture.pathAccess.toNativePath(deployment.paths.statePath))).toBe(false);
   });
 
-  it('creates v13 only when the state path is truly absent', async () => {
+  it('creates v16 only when the state path is truly absent', async () => {
     const fixture = createRelease();
     const deployment = await validateWindowsDeployment(fixture.input, validationOptions(fixture));
     const nativeStatePath = fixture.pathAccess.toNativePath(deployment.paths.statePath);
@@ -552,7 +588,7 @@ describe('prebuilt Windows deployment preflight', () => {
     });
     try {
       expect(prepared.backupPath).toBeNull();
-      expect(schemaVersion(nativeStatePath)).toBe(13);
+      expect(schemaVersion(nativeStatePath)).toBe(16);
     } finally {
       await prepared.release();
     }

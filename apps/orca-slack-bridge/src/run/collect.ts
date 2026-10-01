@@ -25,9 +25,10 @@ import {
 import { isEffectiveBridgeConfig } from '../discovery/effective-config.js';
 import { redactedEntityRef } from '../discovery/redaction.js';
 import type { EffectiveBridgeConfig } from '../discovery/types.js';
+import { deriveGateMetadata } from '../gate/derive.js';
 import { projectGateDecisions } from '../gate/project.js';
 import type { GateMetadata } from '../gate/types.js';
-import { runKey } from '../identity/keys.js';
+import { gateKey, runKey } from '../identity/keys.js';
 import type { GateStore } from '../store/schema.js';
 import { OperationalStoreError } from '../store/sqlite.js';
 import { aggregateBlockers, aggregateDispatches, aggregateTasks } from './aggregate.js';
@@ -154,10 +155,31 @@ function byId<T>(pick: (row: T) => string): (a: T, b: T) => number {
   };
 }
 
+/**
+ * sidecar가 없는 Gate만 골라 축소된 행을 만든다. 이미 등록된 Gate는 건드리지 않으므로
+ * 등록된 설명·권장안·영향이 파생 값으로 덮이지 않는다.
+ */
+function derivePendingGateMetadata(
+  gates: readonly OrcaGate[],
+  stored: readonly GateMetadata[],
+  at: string,
+): readonly GateMetadata[] {
+  if (gates.length === 0) return [];
+  const known = new Set(stored.map((row) => row.gateKey));
+  const rows: GateMetadata[] = [];
+  for (const gate of gates) {
+    if (known.has(gateKey(gate.id))) continue;
+    const row = deriveGateMetadata(gate, at);
+    if (row !== null) rows.push(row);
+  }
+  return rows;
+}
+
 async function readRunSources(
   orca: OrcaRunner,
   run: OrcaRun,
   gateStore: GateStore | undefined,
+  at: string,
 ): Promise<RunSources> {
   // legacy Run은 읽기 전용 placeholder다. Task/Gate 조회를 시도하지 않는다(snapshot.ts와 같다).
   if (run.legacy) {
@@ -200,6 +222,24 @@ async function readRunSources(
   if (gateStore !== undefined) {
     try {
       gateMetadata = gateStore.listGateMetadata(runKey(run.id));
+      // sidecar를 등록하지 않은 Gate는 버튼 없는 카드로 떠서 Slack에서 해결할 수 없다.
+      // 관측이 Orca options만으로 축소된 행을 만들어 durable하게 남긴다. 버튼 클릭 검증
+      // (`claimGateResolution`)이 durable metadata를 요구하므로 렌더 시점 합성으로는 부족하다.
+      const derived = derivePendingGateMetadata(gates, gateMetadata, at);
+      if (derived.length > 0) {
+        for (const row of derived) {
+          try {
+            gateStore.insertGateMetadata(row);
+          } catch (e) {
+            if (e instanceof OperationalStoreError) throw e;
+            degraded.push({
+              kind: 'query_failed',
+              detail: `gate_metadata 파생 기록 실패: ${message(e)}`,
+            });
+          }
+        }
+        gateMetadata = gateStore.listGateMetadata(runKey(run.id));
+      }
     } catch (e) {
       if (e instanceof OperationalStoreError) throw e;
       degraded.push({
@@ -577,7 +617,7 @@ export async function collectRunFacts(
   for (const run of runs) {
     const projected = projectRun(
       run,
-      await readRunSources(orca, run, options.gateStore),
+      await readRunSources(orca, run, options.gateStore, observedAt.toISOString()),
       askInbox,
       config,
     );

@@ -163,6 +163,9 @@ function context(lines: readonly string[]): SlackBlock {
   };
 }
 
+/** 결정에 쓰는 절과 그 뒤의 운영 사실을 눈으로 가른다. */
+const DIVIDER: SlackBlock = { type: 'divider' };
+
 /**
  * 여러 줄을 그대로 유지하는 작은 글씨 블록.
  *
@@ -292,6 +295,13 @@ export type RunCardInput = {
    */
   readonly pullRequests: readonly RunPullRequestRecord[];
   readonly collection: RunCollectionContext;
+  /**
+   * 지금 사람의 답을 기다리는 터미널 수.
+   *
+   * 프롬프트 자체는 이 Run 스레드의 별도 카드로 간다. 여기에는 수만 둔다 — Run 카드를 훑는
+   * 사람이 "이 Run은 사람이 필요하다"를 스레드를 열지 않고 알아야 하기 때문이다.
+   */
+  readonly waitingPrompts?: number;
 };
 
 /**
@@ -346,15 +356,19 @@ function entryLine(e: BlockerEntry): string {
  * **수를 더하지 않는다.** 각 badge의 `count`를 그대로 적고 무리 합계도 전체 합계도 만들지
  * 않는다(OD-067).
  */
-function badgeLines(badges: readonly BlockerBadge[], sources: readonly BlockerSource[]): string[] {
+function badgeLines(
+  badges: readonly BlockerBadge[],
+  sources: readonly BlockerSource[],
+  entryCap = ENTRY_CAP,
+): string[] {
   const lines: string[] = [];
   for (const source of sources) {
     const badge = badges.find((b) => b.source === source);
     if (badge === undefined) continue;
     lines.push(`• ${BLOCKER_LABEL[source]} ${badge.count}`);
-    for (const e of badge.entries.slice(0, ENTRY_CAP)) lines.push(entryLine(e));
-    if (badge.entries.length > ENTRY_CAP) {
-      lines.push(`    ↳ 외 ${badge.entries.length - ENTRY_CAP}건은 카드에 싣지 않았다`);
+    for (const e of badge.entries.slice(0, entryCap)) lines.push(entryLine(e));
+    if (badge.entries.length > entryCap) {
+      lines.push(`    ↳ 외 ${badge.entries.length - entryCap}건은 카드에 싣지 않았다`);
     }
   }
   return lines;
@@ -364,10 +378,7 @@ function badgeLines(badges: readonly BlockerBadge[], sources: readonly BlockerSo
 function bindingLine(b: ObservedBinding): string {
   const { emoji, label } = LIVENESS[b.liveness];
   const handle = b.binding.handle ?? '(handle 없음)';
-  return (
-    `• ${emoji} ${label} · generation ${b.binding.generation} · ${esc(handle)}` +
-    ` · 이 binding이 만든 Task ${b.tasks}`
-  );
+  return `${emoji} ${label} gen ${b.binding.generation} ${esc(handle)} · Task ${b.tasks}`;
 }
 
 /**
@@ -458,6 +469,9 @@ function referenceLines(label: string, refs: readonly string[]): string[] {
   const ordered = [...new Set(refs)].sort();
   const visible = ordered.slice(0, STRUCTURED_REF_CAP);
   const omitted = ordered.length - visible.length;
+  // 참조가 없으면 줄을 만들지 않는다. "참조 0건"은 사실을 더하지 않으면서 미등록 Run마다
+  // 한 줄씩 차지했다.
+  if (ordered.length === 0) return [];
   const summary = `    ↳ ${label} ${ordered.length}건` +
     (omitted === 0 ? '' : ` · ${omitted}건은 싣지 않았다`);
   if (visible.length === 0) return [summary];
@@ -561,25 +575,44 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
   blocks.push(section(`${live.emoji} *${escapedObjective}*`));
   blocks.push(context([escapedIdentity, esc(id.runId), `${live.emoji} ${live.label}`]));
 
+  /*
+   * 사람이 필요한 것을 맨 위에 둔다.
+   *
+   * 이 카드를 이동 중에 훑는 사람이 찾는 것은 단 하나 — "내가 지금 해야 할 일이 있나"다. 그
+   * 답이 운영 사실 여러 절 아래에 있으면 카드를 끝까지 읽어야 알 수 있고, 그러면 읽지 않는다.
+   * 아래 절들의 사실은 하나도 지우지 않고 순서와 무게만 바꾼다.
+   */
+  const waiting = input.waitingPrompts ?? 0;
+  const current = badgeLines(run.blockers.badges, CURRENT_SOURCES);
+  const needsPerson = waiting > 0 || current.length > 0;
+  if (needsPerson) {
+    const lines: string[] = [];
+    if (waiting > 0) {
+      lines.push(`• 터미널 ${waiting}대가 답을 기다린다 — 이 스레드의 카드에서 고르면 된다`);
+    }
+    lines.push(...current);
+    blocks.push(labelled('사람이 필요하다', lines));
+  }
+
+  blocks.push(DIVIDER);
+
   // Run identity 절. 판정과 그 판정이 선 근거를 같은 자리에 둔다.
-  const identityLines = [
-    `Run ID ${esc(id.runId)}`,
-    `소유자 binding ${live.emoji} ${live.label} — ${live.detail}`,
-  ];
+  const identityLines = [`${live.emoji} ${live.label} — ${live.detail}`];
   if (id.legacy) {
     identityLines.push('legacy Run이다. Task·Gate·Dispatch를 조회하지 않았다');
   }
   identityLines.push(
     id.current === null
       ? 'Run row의 현재 소유자를 읽지 못했다 (consumer_generation 읽기 실패)'
-      : `Run row의 현재 소유자 generation ${id.current.generation} · ` +
+      : `현재 소유자 generation ${id.current.generation} · ` +
           `${esc(id.current.handle ?? '(handle 없음)')}`,
   );
-  if (id.observed.length === 0) {
-    identityLines.push('관측된 binding 없음 (binding을 읽은 Task가 없다)');
-  } else {
-    identityLines.push(...id.observed.map(bindingLine));
-  }
+  // binding 계보는 한 줄로 접는다. 항목마다 줄을 쓰면 소유권 추적이 카드의 절반을 차지한다.
+  identityLines.push(
+    id.observed.length === 0
+      ? '관측된 binding 없음 (binding을 읽은 Task가 없다)'
+      : id.observed.map(bindingLine).join('  ·  '),
+  );
   // binding 계보는 소유권을 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다.
   // liveness 판정 자체는 위 헤더 줄에 이미 라벨로 나와 있고, 여기에는 그 판정의 근거가 남는다.
   blocks.push(contextLines(['*Run identity*', ...identityLines]));
@@ -590,13 +623,13 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    * 분모(`task-list.count`)와 상태별 수를 **각각 다른 줄에** 적는다. 한 줄에 `a / b`로 붙이면
    * 그 표기가 분수로 읽히고, 그것이 이 결정이 금지한 것이다. 나눗셈도 퍼센트도 없다.
    */
-  const taskLines = [`task-list.count ${run.tasks.total}`];
-  if (run.tasks.byStatus.length === 0) {
-    taskLines.push('관측된 Task 상태 없음');
-  } else {
-    taskLines.push(...run.tasks.byStatus.map((s) => `${esc(s.status)} ${s.count}`));
-  }
-  blocks.push(labelled('진행', taskLines));
+  const taskLines = [
+    run.tasks.byStatus.length === 0
+      ? '관측된 Task 상태 없음'
+      : run.tasks.byStatus.map((s) => `${esc(s.status)} ${s.count}`).join('  ·  '),
+    // OD-069. 분모는 상태별 수와 **다른 줄**에 둔다. 한 줄에 붙이면 분수로 읽힌다.
+    `task-list.count ${run.tasks.total}`,
+  ];
 
   /*
    * Dispatch attempts 절(OD-069).
@@ -604,30 +637,44 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    * **Task 절과 다른 block이다.** retry Dispatch는 같은 Task를 다시 dispatch하므로 이 수를 Task
    * 수에 더하면 같은 작업을 여러 번 센다. 두 절을 붙이면 읽는 사람이 그 덧셈을 한다.
    */
-  const dispatchLines = [`attempts ${run.dispatches.total}`];
+  const dispatchLines: string[] = [];
   if (run.dispatches.byStatus.length > 0) {
-    dispatchLines.push(...run.dispatches.byStatus.map((s) => `${esc(s.status)} ${s.count}`));
+    dispatchLines.push(run.dispatches.byStatus.map((s) => `${esc(s.status)} ${s.count}`).join('  ·  '));
   }
-  dispatchLines.push(`재시도가 있었던 Task ${run.dispatches.retriedTasks}`);
+  dispatchLines.push(
+    `attempts ${run.dispatches.total}  ·  재시도가 있었던 Task ${run.dispatches.retriedTasks}`,
+  );
   // OD-069. 두 수를 더해 읽는 것을 막는 유일한 문구다.
   dispatchLines.push('_retry는 Task 수를 늘리지 않는다_');
+  // Task와 Dispatch를 한 절에 두되 라벨과 줄을 나눈다. 두 수를 더해 읽는 것은 같은 라벨 아래
+  // 이어 적을 때 생기는 오독이고, 절을 나누는 것만으로는 카드만 길어졌다.
+  // **두 절을 한 block에 합치지 않는다**(OD-069). retry Dispatch는 같은 Task를 다시 dispatch하므로
+  // 두 수가 붙어 있으면 읽는 사람이 그것을 더한다. 줄 수는 줄이되 이 경계는 그대로 둔다.
+  blocks.push(labelled('진행', taskLines));
   // 작은 글씨로 둔다. 진행 절과 시각적으로도 다른 무게가 되어야 두 수를 더해 읽지 않는다.
   blocks.push(contextLines(['*Dispatch attempts*', ...dispatchLines]));
 
-  // PR 절. 재료는 store에 있는 것뿐이고 그 경계를 같은 자리에서 밝힌다.
-  const prLines =
-    pullRequests.length === 0 ? ['store에 기록된 PR 없음'] : pullRequests.map(pullRequestLine);
-  // 목록의 경계를 밝힌다. 없으면 "이 Run이 만든 PR 전부"로 읽힌다.
-  prLines.push('_correlation에 성공한 PR만_');
-  blocks.push(labelled('PR', prLines));
+  // PR 절. 재료는 store에 있는 것뿐이고 그 경계를 같은 자리에서 밝힌다. 없을 때 절을 통째로
+  // 그리면 두 줄로 "없다"만 말하게 되므로 그때는 작은 글씨 한 줄로 내린다.
+  if (pullRequests.length === 0) {
+    // "PR 없음"이 아니라 "store에 기록된 PR 없음"이다. 앞의 문구는 이 Run이 PR을 만들지 않았다는
+    // 뜻으로 읽히는데 카드가 아는 것은 store에 기록이 없다는 사실뿐이다.
+    blocks.push(context(['*PR* store에 기록된 PR 없음', 'correlation에 성공한 PR만']));
+  } else {
+    blocks.push(labelled('PR', [...pullRequests.map(pullRequestLine), '_correlation에 성공한 PR만_']));
+  }
 
   /*
    * blocker 절(OD-067).
    *
    * 원천별 badge를 시제별로 세 무리로 나눈다. **고유 총합을 만들지 않는다.**
+   *
+   * 현재 시제는 위 "사람이 필요하다"로 올라갔다. 거기 없을 때만 여기서 "없음"을 밝힌다 —
+   * 0건과 관측 불가를 구분하는 것이 이 절의 목적이라 조건부로 지우지 않는다.
    */
-  const current = badgeLines(run.blockers.badges, CURRENT_SOURCES);
-  blocks.push(labelled('blocker · 현재 상태', current.length === 0 ? ['관측된 원천 없음'] : current));
+  if (!needsPerson) {
+    blocks.push(contextLines(['*blocker · 현재 상태*', '관측된 원천 없음']));
+  }
 
   const windowed = badgeLines(run.blockers.badges, WINDOWED_SOURCES);
   if (windowed.length > 0) {
@@ -635,29 +682,32 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
       // 라벨이 이미 "관찰 창 안에서만 판정"이라고 말하므로 같은 말을 문단으로 반복하지 않는다.
       // 다만 inbox가 실제로 포화됐을 때는 이 수를 확정으로 읽으면 안 된다는 사실이 추가되므로
       // **그때만** 한 줄 덧붙인다. 늘 붙이면 해당되지 않는 카드에서도 사실이 밀려난다.
-      labelled('blocker · 관찰 창 안에서만 판정', run.degraded.some(
+      contextLines(['*blocker · 관찰 창 안에서만 판정*', ...(run.degraded.some(
         (d) => d.kind === 'inbox_saturated',
-      ) ? [...windowed, '_inbox_saturated — 확정으로 읽지 않는다_'] : windowed),
+      ) ? [...windowed, '_inbox_saturated — 확정으로 읽지 않는다_'] : windowed)]),
     );
   }
 
-  const history = badgeLines(run.blockers.badges, HISTORY_SOURCES);
+  // 지나간 일이다. 원천당 한 건만 보이고 나머지는 수로 남긴다. 실측에서 escalation 6과
+  // failed Dispatch 33이 각각 다섯 줄씩 펼쳐져, 카드가 현재 상태보다 이력으로 채워졌다.
+  // OD-067이 요구하는 것은 원천별 badge와 연결 ID이고, 한 건이면 그 요구를 만족한다.
+  const history = badgeLines(run.blockers.badges, HISTORY_SOURCES, 1);
   if (history.length > 0) {
     blocks.push(
       // 라벨의 "(현재 blocker가 아니다)"가 이미 오독을 막는다.
-      labelled('blocker · 누적 이력 (현재 blocker가 아니다)', history),
+      contextLines(['*blocker · 누적 이력 (현재 blocker가 아니다)*', ...history]),
     );
   }
 
   // 0건 badge로 그리지 않는다. 0건과 관측 불가는 다르다.
   if (run.blockers.notObservable.length > 0) {
     blocks.push(
-      labelled(
-        'blocker · 이 관측 표면에서 만들 수 없음',
-        run.blockers.notObservable.map(
+      contextLines([
+        '*blocker · 이 관측 표면에서 만들 수 없음*',
+        ...run.blockers.notObservable.map(
           (n) => `• ${esc(n.source)} — ${esc(cut(n.reason, DETAIL_CAP))}`,
         ),
-      ),
+      ]),
     );
   }
 
@@ -667,19 +717,31 @@ export function renderRunCard(input: RunCardInput): RenderedCard {
    * 이 Run의 degraded와 관찰 전체의 degraded를 나눠 적는다. 합치면 어느 것이 이 Run에 귀속되는
    * 사실인지 잃는다.
    */
-  const degradedLines: string[] = ['이 Run'];
-  degradedLines.push(...(run.degraded.length === 0 ? ['• 없음'] : run.degraded.map(degradedLine)));
-  degradedLines.push('관찰 전체');
+  // 두 범위를 합치지 않는 것이 요구다. 비었을 때 범위 이름과 같은 줄에 적는 것은 그 요구를
+  // 해치지 않고 줄만 줄인다(OD-072).
+  const degradedLines: string[] = ['*degraded*'];
+  degradedLines.push(run.degraded.length === 0 ? '이 Run · 없음' : '이 Run');
+  if (run.degraded.length > 0) degradedLines.push(...run.degraded.map(degradedLine));
+  // 관찰 전체 degraded는 모든 Run 카드에 같은 내용으로 실린다. 종류와 수만 남기고 상세는
+  // 컬렉션 카드에 둔다 — 카드마다 같은 문장을 펼치면 그 Run의 사실이 밀려난다.
   degradedLines.push(
-    ...(collection.degraded.length === 0 ? ['• 없음'] : collection.degraded.map(degradedLine)),
+    collection.degraded.length === 0
+      ? '관찰 전체 · 없음'
+      : `관찰 전체 · ${collection.degraded.length}건 · ` +
+        `${[...new Set(collection.degraded.map((d) => d.kind))].map((k) => `[${esc(k)}]`).join(' ')}`,
   );
-  blocks.push(labelled('degraded', degradedLines));
+  // 운영자가 추적할 때 필요한 사실이지 Run을 훑을 때 먼저 볼 것이 아니다. 지우지 않고 내린다.
+  blocks.push(contextLines(degradedLines));
 
   /*
    * 미등록 Run 절(OD-078). **0이어도 그린다.**
    *
    * 이 수가 오르는 것이 "등록 열쇠가 어긋나 Run이 조용히 사라진다"를 관측 가능하게 만드는
    * 유일한 장치다. 절을 조건부로 만들면 그 장치가 조건부가 된다.
+   *
+   * **수로 접지 않는다.** 조회 실패·빈 Run·등록 없음은 서로 다른 사건이고, 카드가 그 셋을 같은
+   * 모양으로 그리면 렌더 지문도 같아진다. 지문이 같으면 게시 경계가 갱신을 건너뛰므로 그
+   * 구분은 Slack에 아예 도달하지 않는다. 부피는 아래 참조 줄에서 줄인다.
    */
   blocks.push(...labelledSections('등록되지 않은 Run', unregisteredLines(collection.unregistered)));
 

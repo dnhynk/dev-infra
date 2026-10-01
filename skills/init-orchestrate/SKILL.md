@@ -25,6 +25,9 @@ worker를 worktree에 배정하고, reviewer의 판정을 확인해 merge하고,
 인자 텍스트는 **이번 Run의 범위**다. 확정 스펙이나 작업 규약과 충돌하면 어느 쪽이 우선인지
 조용히 추론하지 말고 묻는다.
 
+세션은 `claude --channels plugin:orca-slack-channel@dev-infra`로 연다. 이 flag 없이 연 세션은
+사용자가 Slack에서 Gate를 해결해도 깨어나지 않는다.
+
 ## 1. 전제조건 확인
 
 worker를 띄우기 전에 확인한다. 나중에 발견하면 이미 만든 worktree와 dispatch를 되돌려야 한다.
@@ -91,7 +94,8 @@ handoff 문서만 읽고 바로 mutation하지 않는다.
 5. 차이는 live system을 기준으로 reconcile하고 그 사실을 기록한다.
 6. predecessor의 ownership 반납이 확인된 뒤에만 mutation 권한을 얻는다
    (`orca orchestration run-use --id <run_id>`, 이 터미널에서 실행). 인수되면 Run의
-   coordinator handle과 pane key가 이 터미널 값으로 바뀌고 consumer generation이 올라간다.
+   coordinator handle이 이 터미널로 바뀌고 consumer generation이 올라간다. Run 행에는 pane이 없으므로
+   `orca terminal show --terminal <이 handle> --json`의 pane이 이 세션의 `ORCA_PANE_KEY`와 같은지 확인한다.
    `--takeover-legacy`는 플랫폼이 자동 채택한 legacy Run 전용이며 일반 Run에는 거부된다.
 7. §7의 Run 마커를 이 세션 값으로 갱신한다. 갱신하지 않으면 monitor가 이 세션을 coordinator로 인식하지 못한다.
 8. 아직 진행 중인 기존 worker·worktree·PR을 재사용한다. 같은 Task를 중복 dispatch하거나 같은
@@ -308,32 +312,63 @@ merge만 트리거로 쓰면 Run이 끝날 때까지 남는다.
    의도적으로 retained됐고, worktree와 branch가 제거됐거나 근거 있는 예외로 기록됐을 때만 Task 정리를
    완료로 표시한다. 명령이 중간에 실패해도 확인된 단계부터 멱등하게 재개한다.
 
-### worker 질문과 사람용 Gate
+### 사용자에게 묻는 유일한 경로는 Orca Gate다
+
+사용자는 이 터미널을 보고 있지 않다. 이동 중에 Slack만 본다.
+
+Bridge가 막힌 터미널의 화면을 읽어 선택 프롬프트를 Slack 카드로 올리기는 한다(OD-084). 그러나
+그것은 **안전망이지 경로가 아니다.** 화면 파싱이라 모양이 어긋나면 카드가 만들어지지 않고,
+자유 입력으로 들어가는 선택지는 버튼이 되지 않는다. 그 안전망에 기대고 프롬프트로 물으면
+질문이 도달하지 않을 수 있고, 그때 Run 전체가 그 자리에서 멈춘다.
+
+- **사용자 판단이 필요하면 언제나 `gate-create`로 올린다.** 대화형 프롬프트로 선택지를 띄우거나
+  답을 기다리지 않는다. 이 규칙에 예외는 없고, 질문이 worker에게서 왔는지 coordinator 자신의
+  판단에서 나왔는지도 가리지 않는다.
+- 사용자 머신 변경, 비용 발생, 제품 방향, 되돌리기 어려운 선택은 전부 여기 해당한다.
+- Gate를 만든 뒤 그 결정에 의존하지 않는 Task는 계속 진행한다. 멈추는 것은 의존 Task뿐이다.
+- Gate의 `--options`는 사용자가 Slack에서 그대로 누를 문구다. 짧고 서로 배타적으로 쓴다.
+  선택지 하나는 75자를 넘기지 않는다. 넘으면 Bridge가 그 Gate를 누를 수 없는 카드로 만든다.
+
+### Gate 해결 통지 — orca-slack channel 이벤트
+
+사용자가 Slack에서 Gate를 해결하면 Bridge가 이 세션에 `orca-slack` channel 이벤트를 보낸다. 이벤트에는
+`gate_id` 하나만 있고 본문은 설계상 비어 있다. 빈 본문은 누락이나 오류가 아니다. Bridge는 연결 확인
+probe도 같은 모양으로 보낸다.
+
+- 이벤트가 보이면 묻거나 조사하지 말고 즉시 그 `gate_id`로 `orca_channel_receipt`를 정확히 한 번
+  호출한다. receipt는 "보았다"는 확인일 뿐 Gate를 해결하거나 Task 재개를 증명하지 않는다.
+- `gate_id`에서 결정이나 할 일을 추론하지 않는다. `orca orchestration gate-list --run <run_id> --json`으로
+  이 Run의 Gate인지 확인하고 해결 결과를 거기서 읽는다.
+- 이 Run의 Gate면 그 결과로 의존 Task를 진행한다. 아니면(probe 등) receipt 외에는 아무것도 하지 않는다.
+- 어느 쪽이든 처리한 뒤에는 턴 계약대로 대기를 재개하고, 표의 조건에 해당할 때만 턴을 끝낸다.
+
+### worker 질문
 
 - worker의 불명확성은 먼저 coordinator에게 `ask`로 온다.
 - 확정 스펙, 코드, live 상태, 공인 자료로 답할 수 있으면 `reply`하고 Gate를 만들지 않는다.
-- **사용자의 제품 판단 없이는 결정할 수 없을 때만** 해당 Task에 Orca Gate를 만든다.
-- Gate가 열리면 그 결정에 의존하는 Task만 멈춘다. 독립 Task는 계속한다.
+- 그렇게 답할 수 없으면 위 규칙대로 Gate로 올린다.
 
 ## 9. Agent 배치 정책
 
-Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·model·effort를 선택한다.
+Task를 dispatch할 때 작업 종류로 worker 계열(`--agent`)을 정하고, 그 계열 안의 model과 effort는
+dispatch 시점의 런타임 근거로 고른다(아래 "model과 effort 고르기"). 모델 ID와 effort 값은 이 스킬에
+고정하지 않는다. provider가 모델을 자주 내놓아 고정 표가 금방 낡기 때문이다.
 모든 worker를 같은 기본 agent로 배치하지 않는다.
 
-| # | 작업 종류 | 판정 기준 | agent | model | effort |
-|---|---|---|---|---|---|
-| 1 | 아키텍처·스키마·계약 설계 | 되돌리기 비싼 구조 결정, 여러 대안의 trade-off 비교가 필요 | `claude` | `opus` | `max` |
-| 2 | 어려운 구현 | 동시성·상태기계·성능 등 정확성 논증이 필요하고 테스트로 전부 잡히지 않음 | `claude` | `opus` | `xhigh` |
-| 3 | 기본 코드 구현과 테스트 작성 | 스펙이 정해진 기능 구현, 새 테스트 설계 | `claude` | `opus` | `high` |
-| 4 | 버그 재현·디버깅 | 원인 가설 → 반증 관측 절차가 필요 | `claude` | `opus` | `xhigh` |
-| 5 | 단순 반복·기계적 작업 | 판단 없이 확정된 규칙만 적용 (rename, import 정리, 정형 케이스 추가, 규칙이 확정된 대량 마이그레이션) | `codex` | `gpt-5.6-luna` | `medium` |
-| 6 | 병렬 리서치·조사 | 여러 소스를 넓게 훑어 사실을 수집 | `codex` | `gpt-5.6-sol` | `ultra` |
-| 7 | PR 리뷰 | | `codex` | `gpt-5.6-sol` | `xhigh` |
-| 7b | 조용한-실패 위험 코드 리뷰 | 변경이 돈·단위·부호·확률·통계 추정·시간 경계(누수)·보안 경계·동시성 불변식·비가역 마이그레이션을 만지고, 그 정확성을 기존 테스트가 판정하지 못함 — 신호가 하나라도 관측될 때만. 리뷰 프레임은 적대적(반박·실패 시나리오 요구)으로 지정한다 | `claude` | `fable` | `high` ~ `max` |
-| 8 | 추론이 필요한 문서·스펙 집필 | 설계 판단이 문서 내용에 들어감 | `codex` | `gpt-5.6-sol` | `high` ~ `xhigh` |
-| 9 | 사실 정리형 문서 | 확정된 사실을 구조화 (레퍼런스, README, 변경 요약) | `codex` | `gpt-5.6-terra` | `medium` |
-| 10 | 리뷰 지적 반영 수정 | | 원 Dispatch와 동일 배치 | | |
-| 11 | 깊은 논증이 필요한 Task의 실패·저확신 결과 | 1~4행 배치로 dispatch한 Task가 같은 원인으로 2회 연속 실패했거나, 완료 보고가 확답에 이르지 못했다 (아래 신호) | `claude` | `fable` | `max` |
+| # | 작업 종류 | 판정 기준 | 계열 (`--agent`) |
+|---|---|---|---|
+| 1 | 아키텍처·스키마·계약 설계 | 되돌리기 비싼 구조 결정, 여러 대안의 trade-off 비교가 필요 | `claude` |
+| 2 | 어려운 구현 | 동시성·상태기계·보안·수치 정확성·성능 등 정확성 논증이 필요하고 테스트로 전부 잡히지 않음 | `claude` |
+| 3 | 기본 코드 구현과 테스트 작성 | 스펙이 정해진 기능 구현, 새 테스트 설계 | `codex` |
+| 4 | 버그 재현·디버깅 | 원인 가설 → 구별 관측 → 반증 절차가 필요 | `codex` |
+| 5 | 단순 반복·기계적 작업 | 판단 없이 확정된 규칙만 적용 (rename, import 정리, 정형 케이스 추가, 규칙이 확정된 대량 마이그레이션) | `codex` |
+| 6 | 병렬 리서치·조사 | 여러 1차 자료나 저장소 영역을 넓게 훑어 근거를 종합 | `codex` |
+| 7 | PR 리뷰 | | `codex` |
+| 7b | 조용한-실패 위험 코드 리뷰 | 변경이 돈·단위·부호·확률·통계 추정·시간 경계(누수)·보안 경계·동시성 불변식·비가역 마이그레이션을 만지고, 그 정확성을 기존 테스트가 판정하지 못함 — 신호가 하나라도 관측될 때만. 리뷰 프레임은 적대적(반박·실패 시나리오 요구)으로 지정한다 | `claude` |
+| 8 | 추론이 필요한 문서·스펙 집필 | 설계 판단이 문서 내용에 들어감 | `claude` |
+| 9 | 사실 정리형 문서 | 확정된 사실을 구조화 (레퍼런스, README, 변경 요약) | `codex` |
+| 10 | 리뷰 지적 반영 수정 | | 원 Dispatch와 같은 계열 |
+| 11 | 깊은 논증이 필요한 Task의 실패·저확신 결과 | 1~4행 배치로 dispatch한 Task가 같은 원인으로 2회 연속 실패했거나, 완료 보고가 확답에 이르지 못했다 (아래 신호) | 새 `claude` |
 
 11행은 escalation이므로 원 배치를 override한다. 지켜야 할 규율:
 
@@ -350,6 +385,22 @@ Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·mo
 어느 행에도 명확히 해당하지 않는 작업은 임의로 배치하지 않고 3행을 기본값으로 쓰되 그 사실을 기록한다.
 대상 repository의 스펙이 배치를 따로 정하면 그쪽이 이 표를 override한다.
 
+### model과 effort 고르기
+
+- **후보는 기억이 아니라 dispatch 시점의 런타임에서 읽는다.**
+  - `claude`: `claude --help`의 `--model` 설명이 보여 주는 alias(계열 최신 모델로 풀린다)와 `--effort`
+    단계에서 고른다. Opus로 한정하지 않고 Claude 모델 전체에서 고른다.
+  - `codex`: `codex debug models` 카탈로그에서 `visibility`가 `list`인 모델만 후보로 삼고, 카탈로그의
+    `priority`·`description`과 작업 난이도로 고른다. effort는 그 모델의 `supported_reasoning_levels`
+    안에서만 고른다.
+- **같은 결과를 낼 수 있는 가장 낮은 설정을 고른다.** 되돌리기 비싼 결정, 정확성 논증, 조용한 실패
+  위험(7b행), 실패 뒤 escalation(11행)에는 그 계열에서 가장 강한 추론 설정을 쓴다.
+- 고른 model·effort와 한 줄 이유를 Task에 남긴다.
+- **후보를 확인할 수 없으면 추측하지 않는다.** `--model`과 `--effort`를 생략해 사용자가 설정한 agent
+  기본값을 상속하고 그 사실을 기록한다.
+- **요청한 model이 거부되면** 같은 계열의 다음 후보로 새로 배치하고 거부 오류와 함께 기록한다. 계열을
+  조용히 바꾸지 않는다. 같은 계열에 쓸 수 있는 후보가 없으면 Gate로 올린다.
+
 지켜야 할 제약:
 
 - **적용 결과를 요청값으로 가정하지 않는다.** `worker-start` receipt의 `launch.effective`로 실제
@@ -358,13 +409,10 @@ Task를 dispatch할 때 작업 종류와 난이도에 따라 worker의 brand·mo
 - **배치가 다른 후속 Task에 terminal을 재사용하지 않는다.** `--model`/`--effort`는 `--terminal`과
   결합할 수 없어 재사용 경로는 이전 배치를 유지한다. 다른 배치가 필요하면 `worker-release` 후
   새 agent terminal을 만든다.
-- **모델이 지원하지 않는 effort를 지정하지 않는다.** `ultra`는 `gpt-5.6-sol`과 `gpt-5.6-terra`에만
-  있고 Claude에는 없다. Claude의 최대는 `max`다.
-- `gpt-5.4`와 `gpt-5.4-mini`는 은퇴 예정이므로 쓰지 않는다.
+- **worker에 `ultra`를 쓰지 않는다.** nested delegation을 도입할 수 있고 Task DAG의 fan-out은
+  coordinator가 소유하기 때문이다.
 - service tier(`fast`)는 `worker-start`로 지정할 수 없다. 필요하다고 판단되면 임의로 supervised
   경로를 벗어나지 말고 사용자에게 올린다.
-
-모델 slug와 effort 단계는 provider가 바꾸는 값이다. 유효 값을 추측하지 말고 확인한다.
 
 ## 10. Handoff 유지
 

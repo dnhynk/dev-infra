@@ -177,6 +177,19 @@ function New-DesiredTaskDefinition([object]$d) {
   $trigger.Enabled = $true
   $trigger.Repetition.Interval = 'PT1M'
   $trigger.Repetition.StopAtDurationEnd = $false
+  # 등록 시점에 발화하는 트리거(7). 이것이 watchdog다.
+  #
+  # logon 트리거의 반복은 logon이 발화해야 켜진다. install이 task를 재등록해도 logon은 이미
+  # 지난 사건이라 발화하지 않으므로 반복이 armed되지 않는다. 실측에서 NextRunTime이 비어 있었고,
+  # daemon이 죽은 뒤 이틀 동안 아무도 다시 띄우지 않았다 — RestartCount 3회를 소진한 뒤로는
+  # 다음 logon까지 브리지가 정지 상태였다.
+  #
+  # 등록 트리거는 install 순간 발화하고 그때부터 반복이 돈다. MultipleInstances=IgnoreNew이므로
+  # 살아 있는 daemon이 있으면 매 tick은 그냥 무시된다.
+  $watchdog = $definition.Triggers.Create(7)
+  $watchdog.Enabled = $true
+  $watchdog.Repetition.Interval = 'PT1M'
+  $watchdog.Repetition.StopAtDurationEnd = $false
   $definition.Settings.Enabled = [bool]$d.enabled
   $definition.Settings.StartWhenAvailable = $true
   $definition.Settings.MultipleInstances = 2
@@ -755,8 +768,10 @@ export function parseWindowsTaskXml(
   const actions = childElements(actionsElement);
   if (principals === null || principals.length !== 1 || principals[0]?.localName !== 'Principal' ||
       !exactAttributes(principals[0], { id: 'Author' }) ||
-      triggers === null || triggers.length !== 1 || triggers[0]?.localName !== 'LogonTrigger' ||
-      !exactAttributes(triggers[0]) ||
+      triggers === null || triggers.length !== 2 ||
+      triggers[0]?.localName !== 'LogonTrigger' ||
+      triggers[1]?.localName !== 'RegistrationTrigger' ||
+      !exactAttributes(triggers[0]) || !exactAttributes(triggers[1]) ||
       actions === null || actions.length !== 1 || actions[0]?.localName !== 'Exec' ||
       !exactAttributes(actionsElement, { Context: 'Author' }) || !exactAttributes(actions[0])) return null;
   const principal = exactChildren(
@@ -769,6 +784,12 @@ export function parseWindowsTaskXml(
     ['UserId', 'Repetition'],
     ['Enabled'],
   );
+  // 등록 트리거에는 UserId가 없다. 반복만 우리가 정한 값인지 본다.
+  const watchdogTrigger = exactChildren(
+    triggers[1],
+    ['Repetition'],
+    ['Enabled'],
+  );
   const settings = exactChildren(rootChildren.get('Settings')!, [
     'MultipleInstancesPolicy', 'DisallowStartIfOnBatteries', 'StopIfGoingOnBatteries',
     'StartWhenAvailable', 'IdleSettings', 'ExecutionTimeLimit', 'RestartOnFailure',
@@ -777,9 +798,15 @@ export function parseWindowsTaskXml(
     'Hidden', 'RunOnlyIfIdle', 'WakeToRun', 'Priority',
   ]);
   const exec = exactChildren(actions[0], ['Command', 'Arguments', 'WorkingDirectory']);
-  if (principal === null || logonTrigger === null || settings === null || exec === null) return null;
+  if (principal === null || logonTrigger === null || watchdogTrigger === null ||
+      settings === null || exec === null) return null;
   const repetition = exactChildren(
     logonTrigger.get('Repetition')!,
+    ['Interval'],
+    ['StopAtDurationEnd'],
+  );
+  const watchdogRepetition = exactChildren(
+    watchdogTrigger.get('Repetition')!,
     ['Interval'],
     ['StopAtDurationEnd'],
   );
@@ -787,8 +814,9 @@ export function parseWindowsTaskXml(
     'Duration', 'WaitTimeout', 'StopOnIdleEnd', 'RestartOnIdle',
   ]);
   const restart = exactChildren(settings.get('RestartOnFailure')!, ['Interval', 'Count']);
-  if (repetition === null || idle === null || restart === null ||
+  if (repetition === null || watchdogRepetition === null || idle === null || restart === null ||
       !exactAttributes(logonTrigger.get('Repetition')!) ||
+      !exactAttributes(watchdogTrigger.get('Repetition')!) ||
       !exactAttributes(settings.get('IdleSettings')!) ||
       !exactAttributes(settings.get('RestartOnFailure')!)) return null;
   const description = childText(registration, 'Description');
@@ -813,6 +841,10 @@ export function parseWindowsTaskXml(
       childText(repetition, 'Interval') !== WINDOWS_TASK_REPETITION_INTERVAL ||
       (repetition.has('StopAtDurationEnd') &&
        childBoolean(repetition, 'StopAtDurationEnd') !== false) ||
+      (watchdogTrigger.has('Enabled') && childBoolean(watchdogTrigger, 'Enabled') !== true) ||
+      childText(watchdogRepetition, 'Interval') !== WINDOWS_TASK_REPETITION_INTERVAL ||
+      (watchdogRepetition.has('StopAtDurationEnd') &&
+       childBoolean(watchdogRepetition, 'StopAtDurationEnd') !== false) ||
       childText(settings, 'MultipleInstancesPolicy') !== 'IgnoreNew' ||
       childBoolean(settings, 'DisallowStartIfOnBatteries') !== false ||
       childBoolean(settings, 'StopIfGoingOnBatteries') !== false ||

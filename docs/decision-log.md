@@ -132,7 +132,7 @@
 
 ## 2026-08-22 · Agent 배치
 
-### DL-019 · 작업 종류별 agent 배치를 동적으로 한다
+### DL-019 · 작업 종류별 agent 배치를 동적으로 한다 — worker brand/model 표는 DL-064로 SUPERSEDED
 
 - coordinator는 모든 worker를 같은 기본 agent로 배치하지 않는다. 작업 종류와 난이도에 따라 brand·model·effort를 선택한다.
 - 정책 표는 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다. 각 작업 종류에 대해 agent·model·effort를 지정한다.
@@ -140,6 +140,8 @@
 - 적용 여부는 요청값이 아니라 receipt의 `launch.effective`로 검증한다.
 - 배치가 다른 후속 Task에는 terminal을 재사용하지 않는다. `--model`/`--effort`가 `--terminal`과 결합 불가하기 때문이다.
 - 상세 정책은 [Agent 배치 정책](specs/orchestration-bootstrap-and-continuity.md#42-agent-배치-정책)에 둔다.
+- 동적 분류, `launch.effective` 검증, terminal 재사용 제약은 유지한다. 당시의 Claude/혼합 worker
+  model 선택과 `ultra` 사용만 DL-064가 대체한다.
 
 ## 2026-08-22 · S0 설계 방향
 
@@ -669,3 +671,129 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
 - read-only aggregate의 `job.absent`, `registry.rejected`, `work.pending`는 별도 D3
   `LIVE_CHANNEL_UNVERIFIED`와 기존 backlog를 숨기지 않는 진단이다. schema/config/build/task mismatch,
   stale heartbeat 또는 O1 background job failure가 아니므로 이 별도 상태가 O1 PASS를 취소하지 않는다.
+
+## 2026-09-07 · Codex coordinator와 GPT worker 전환
+
+### DL-064 · Codex를 first-class coordinator로 추가하고 worker 배치를 GPT 계열로 통일한다 — worker 배치와 coordinator model 기본값은 DL-065로 SUPERSEDED
+
+- Claude coordinator와 historical Channel acceptance는 호환용으로 유지한다. Codex에는 Claude Markdown을
+  그대로 복제하지 않고, plugin-native `$init-orchestrate`, progressive references, marker helper, Stop
+  hook으로 별도 패키징한다.
+- coordinator 기본은 `gpt-6-astra` `xhigh`다. `max`는 architecture/contract, hard silent-risk review,
+  두 번 실패한 escalation처럼 경계가 좁고 정확성 비용이 큰 worker Task에만 쓴다.
+- worker는 모두 `codex`/GPT 계열이다. 최고 lane은 `gpt-6-astra`; 표준 구현/리뷰는
+  `gpt-5.6-sol`, 기계적 작업은 `gpt-5.6-luna`, 폭넓은 사실 조사와 사실형 문서는
+  `gpt-5.6-terra`를 쓴다. 기존 DL-019의 동적 분류와 receipt 검증은 유지하지만 혼합 brand/model 표와
+  worker `ultra`는 이 결정이 대체한다.
+- 요청값은 적용 근거가 아니다. `worker-start` receipt의 `launch.effective`를 확인한다. 현재 host에서
+  `codex exec -m gpt-6-astra`는 ChatGPT account 미지원 400 `invalid_request`를 반환했다. 이 exact
+  availability 오류에는 `gpt-5.6-sol` `max` compatibility 배치를 쓰고 `astra_unavailable` 근거를
+  남기며, Astra로 표시하지 않는다. 다른 unavailable/mismatch/provider 오류는 Orca Gate로 올린다.
+- Codex Run은 `~/.codex/orchestration/runs/<run_id>.json` marker로 session/terminal/pane/generation/worktree를
+  opt-in한다. Stop hook은 Codex transcript의 마지막 `token_count.last_token_usage`와
+  `model_context_window`로 reserve를 계산하며 thread 누적 total을 쓰지 않는다.
+- Slack Gate notification은 authenticated Claude Channel exact route를 먼저 쓴다. 그 결과가
+  `pending/no_candidate`일 때만 Codex marker와 current Run/terminal route를 전후 대조해 wake-only
+  Run/Gate identity를 `terminal send --interrupt`로 queue한다. queue acceptance는 application receipt일
+  뿐이며 exact Gate effect 재조회 뒤에만 consumed로 바꾼다.
+- plugin/marker/monitor와 Codex route의 hermetic tests, local marketplace 설치, 새 disposable thread의
+  skill discovery와 Windows Stop hook 실행은 완료했다. persistent interactive hook trust, Astra-enabled
+  account launch, Slack action과 rollover의 live end-to-end는 별도 acceptance residual이다.
+- 같은 날 후속 runtime-home 세션에서 `gpt-6-astra` / `max` 응답을 확인했다. 위 400은 이전 Orca
+  계정의 관측이며 host 전체의 금지가 아니다. fallback은 현재 계정에서 새로 관측한 exact 오류에만
+  적용한다. 기존 Astra 세션 응답과 새 supervised worker receipt는 별도로 검증한다.
+- 2026-09-08 live 검증에서 위 `--interrupt` 방식은 유휴 Codex 0.153.4 TUI를 종료시켰다. 이 관측으로
+  Codex wake 방식만 `terminal send --text ... --enter`로 정정한다. queue receipt, exact route 전후
+  검증, Gate effect와 실제 Task 재개 evidence의 구분은 유지한다.
+- Codex coordinator, marker, Stop hook, Gate wake 결정은 유지한다. worker를 GPT 계열로 통일한 표,
+  고정 model/effort, Astra compatibility fallback, coordinator 기본 model은 DL-065가 대체한다.
+
+## 2026-09-30 · worker 계열 배치와 런타임 model 선택
+
+### DL-065 · worker 계열은 작업 종류로 정하고 model/effort는 dispatch 시점 런타임에서 고른다
+
+- 사용자 결정: 논리 추론과 창의성이 핵심인 작업은 Claude, 코드 작업·디버깅·리서치는 Codex 계열에
+  배치한다. model과 effort는 스킬에 고정하지 않는다. provider가 model을 자주 내놓아 고정 표가 금방
+  낡기 때문이다.
+- `claude`: 아키텍처·스키마·계약 설계, 어려운 구현, silent-risk adversarial review, 추론이 필요한
+  문서·스펙, 실패·저확신 escalation. `codex`: 기본 구현·테스트, 버그 재현·디버깅, 기계적 작업, 리서치,
+  일반 PR 리뷰, 사실 정리형 문서. 리뷰 지적 반영은 원 Dispatch 계열을 따른다.
+- Claude 쪽은 Opus로 한정하지 않고 Claude model 전체에서 고른다(사용자 결정).
+- 후보는 dispatch 시점 런타임에서 읽는다. Claude는 `claude --help`의 `--model` alias와 `--effort` 단계,
+  Codex는 `codex debug models`의 `visibility=list` model과 각 model의 `supported_reasoning_levels`다.
+  같은 결과를 낼 수 있는 가장 낮은 설정을 고르고, 되돌리기 비싼 결정·정확성 논증·silent-risk
+  review·escalation에만 계열에서 가장 강한 추론 설정을 쓴다. 고른 값과 이유를 Task에 남긴다.
+- 후보를 확인할 수 없으면 `--model`/`--effort`를 생략해 사용자가 설정한 agent 기본값을 상속한다. 요청
+  model이 거부되면 같은 계열의 다음 후보로 새로 배치하고 계열을 조용히 바꾸지 않는다. 후보가 없으면
+  Gate로 올린다.
+- Codex coordinator는 사용자가 띄운 model/effort로 동작하고 successor는 marker의 effective 값을
+  이어받는다.
+- 유지: DL-019의 동적 분류, `launch.effective` 검증, 배치가 다른 Task의 terminal 재사용 금지, worker
+  `ultra` 금지, service tier 임의 지정 금지.
+- 기각: model ID와 effort를 표에 고정하는 방식(DL-064). 2026-09-07 표에 없던 `gpt-6.1-sol`,
+  `gpt-6-sol`, `gpt-6-luna`가 2026-09-30 `codex debug models` 카탈로그에 올라와 표의 lane이 낡았다.
+
+## 2026-09-30 · Orca 1.4.216 호환과 치명 종료 알림
+
+### DL-066 · Orca 출력은 읽는 필드만 검사하고 coordinator pane은 terminal show로 증명한다
+
+- 사용자 결정: Bridge가 읽는 Orca 출력 필드는 존재·type·의미를 검사하고 그 밖의 필드는 무시한다. 읽는
+  필드가 없거나 type이 다르면 계속 fail closed한다. version-matched Orca guide도 "Treat unknown optional
+  fields as absent"를 요구한다.
+- 대상은 Orca CLI 출력 파서다: `repo list`, 설치 preflight의 `status` readiness, `run-show`, strict
+  `task-list`·`gate-list`·`gate-resolve`·`worker-list`·`dispatch-show`. Bridge가 정의한 계약(channel pipe
+  protocol, gate-register JSON, 저장된 resume snapshot, Codex marker)은 exact 검사를 유지한다.
+- Orca 1.4.216 Run row에는 `coordinator_pane_key`가 없다. Claude Channel binding은 coordinator handle과
+  generation으로 만들고, 전달 직전 그 handle의 `terminal show` pane이 Adapter hello의 pane과 같아야 한다
+  (사용자 결정). Codex wake는 Run row의 handle·generation을 marker와 대조하고 pane은 기존 terminal route
+  검사로 증명한다. Run 카드의 binding liveness는 표시용 판정이므로 Run row의 handle·generation으로만
+  판정하고 Task에 기록된 pane은 관측값으로만 보여 준다.
+- `worker-list`는 모든 페이지를 읽는다. 페이지마다 Run 전체 기준 `counts`·`page.total`이 같고 합친 row 수가
+  total과 같아야 한다. 어긋나면 strict 재개 판정은 실패로 두고 다음 주기에 재시도하며, Run 관찰은 증거
+  불완전으로 둔다.
+- 결과로 `run-show`의 모르는 필드도 더는 거부하지 않는다. 이전에는 "unexpected authority field"로
+  `gate-resolve` 전에 막았다. authority는 계속 exact Run id와 `coordinator_handle`에서 온다.
+- 기각: 관측한 필드만 exact 목록에 추가하는 방식(2026-09-08 `projectHostSetupMethod` 수정). 2026-09-10
+  사용자가 한 repository의 external-worktree 안내를 닫자 row에 optional 필드 2개가 생겼고, exact 검사가
+  discovery pass 전체를 실패시켜 daemon이 17일 동안 1분마다 재시작·종료를 반복했다.
+- 기각: Claude 경로의 pane 대조 제거. 사용자가 `terminal show` 대조 유지를 택했다.
+
+### DL-067 · daemon 치명 종료는 원인별로 하루 한 번 Slack에 알린다
+
+- 사용자 결정: daemon이 0이 아닌 코드로 끝나면 decisions 채널에 소유자 멘션과 원인 코드 한 줄을
+  게시한다. 원인 코드는 observer fatal 원인(예: `discovery.schema_drift`)이 있으면 그것을 쓴다.
+- 같은 원인은 24시간 안에 다시 알리지 않는다. 기록은 운영 로그 디렉터리의 `fatal-alert.json`에 두고 state
+  DB schema는 바꾸지 않는다. Slack API 거부는 게시되지 않았다는 증거이므로 기록하지 않고 다음 기동이
+  재시도한다. timeout과 알 수 없는 실패는 게시됐을 수 있어 기록한다.
+- 알림은 최대 10초 best-effort이며 종료 코드와 종료를 바꾸지 않는다. payload와 오류 본문은 싣지 않는다.
+- 한계: Slack poster를 만들기 전의 실패와 launcher 단계 실패(token 누락, release drift)는 알리지 못한다.
+
+## 2026-09-30 · Channel 이벤트 receipt 규칙
+
+### DL-068 · coordinator는 channel 이벤트를 묻지 않고 즉시 receipt한다
+
+- 사용자 결정: Channel MCP instructions와 Claude `/init-orchestrate` skill이 둘 다 이 규칙을 명시한다.
+  빈 본문은 설계이고, receipt는 판단이 필요 없는 가시성 확인이므로 사용자에게 묻지 않고 즉시 1회
+  호출한다. 그 뒤 coordinate 중인 Run의 Gate면 Orca에서 다시 읽고, 아니면(probe 등) 아무것도 하지 않는다.
+- 근거: Claude Code 2.1.285 + Opus 5.5 세션은 기존 instructions("call once")만으로는 빈 probe 3개에
+  receipt를 부르지 않았다. 대신 본문이 전달 중 빠졌다고 추정하고 사용자에게 세 번 물었다. T5
+  prototype에서는 instructions만으로 매 event에 receipt tool을 불렀지만 당시 model과 문안은 달랐다.
+- `gate_id`를 untrusted로 다루고 거기서 질문·결정·소유자·행동을 추론하지 않는 규칙은 그대로다.
+- skill은 `--channels` 기동 여부를 부팅 조건으로 검사하지 않는다. 세션은 자기 channel opt-in을 알 수
+  없고(T5), instructions는 flag가 없어도 보인다. 기동 방법은 skill 호출 형태에 운영 안내로 둔다.
+
+## 2026-09-30 · config 변경과 routing LKG
+
+### DL-069 · config가 바뀐 기동은 새 fingerprint를 기록하기 전에 routing을 비운다
+
+- 사용자 결정: daemon은 health의 config fingerprint가 현재 config와 다르면 새 fingerprint를 기록하기 전에
+  `orca_repository_binding`과 `repository_registry`를 비운다. issue 이력은 replace 경로처럼 남긴다. 그래서
+  남은 routing 행은 언제나 health가 기록한 config에서 만든 것이다.
+- 근거: 기동 시 LKG 증거는 `daemon_health.config_fingerprint` 하나다. daemon은 이 값을 discovery 성공과
+  무관하게 기동 직후 기록한다. 그래서 새 config의 첫 pass가 실패하면, 같은 config로 다시 기동한 daemon이
+  옛 config의 routing을 검증된 LKG로 읽었다. 회귀 테스트가 수정 전 코드에서 옛 binding이 되살아나는 것을
+  재현했다.
+- 결과: config 변경 직후 첫 pass가 실패하면 `config_drift`가 아니라 원래 원인 코드로 보고되고, 치명 여부도
+  그 원인을 따른다. 예를 들어 확인 deadline 초과는 재시도한다. 비워 둔 routing은 첫 성공 pass가 다시 만든다.
+- 기각: routing 세대의 fingerprint를 그 세대를 쓴 transaction에 durable하게 기록하는 방식. 가장 정확하지만
+  state schema v17 migration이 필요하다.

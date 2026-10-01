@@ -91,6 +91,8 @@
 | OD-080 | 등록 Run이 0인 구간에서도 미등록 사실이 도달할 게시 표면 | D1 전 | DECIDED |
 | OD-081 | custom channel plugin을 세션 확인 없이 켜는 배포 경로 | D3 재수용 전 | DECIDED |
 | OD-082 | daemon digest가 summarizer를 부를지 | O1 운영 전 | DECIDED |
+| OD-083 | sidecar 없는 Gate를 Slack에서 해결할 수 있는지 | D3 운영 전 | DECIDED |
+| OD-084 | 막힌 agent 터미널의 대화형 프롬프트를 Slack에서 답할 수 있는지 | 무인 운용 전 | DECIDED |
 
 ## Gate와 Channel
 
@@ -281,6 +283,11 @@ ID: OD-010
           실제 부팅 동작은 첫 Run에서 검증한다.
 결정일: 2026-08-22
 ```
+
+2026-09-07 보완: 이 결정은 Claude 진입점의 역사적 계약으로 유지한다. DL-064는 Codex 진입점을
+repository marketplace의 `orca-orchestration` plugin과 `$init-orchestrate` skill로 별도 추가했다. Codex의
+skill discovery, Stop hook, Windows command, 설치/trust 수명주기가 Claude와 달라 Markdown 파일을 단순
+복제하지 않는다.
 
 ```text
 ID: OD-012
@@ -1354,6 +1361,72 @@ ID: OD-082
 영향 문서/파일: apps/orca-slack-bridge/src/cli.ts, docs/architecture/orca-slack-bridge.md
 검증 방법: 운영 daemon이 새 요약을 생성하고, 사실이 그대로인 다음 주기에는 provider를 부르지 않는 것을
       `digest` 보고의 재사용 표시로 확인한다.
+결정일: 2026-08-29
+```
+
+```text
+ID: OD-083
+상태: DECIDED
+결정: sidecar가 등록되지 않은 Gate는 관측이 Orca `options`만으로 파생 metadata 행을 만들어
+      durable하게 남긴다. 파생 행은 `gate_metadata.source='derived'`로 구분하고, option ID는
+      label에서 결정하며 resolution은 label 그대로다. 설명·recommendation·impact는 없다.
+      나중에 도착한 `gate-register`가 파생 행을 대체한다.
+근거:
+  - 제품 목적이 "사용자가 이동 중에 Slack만으로 blocking 결정을 해결한다"다. `gate-create`만 하고
+    등록을 빠뜨리면 카드에 선택지 버튼도 직접 입력 버튼도 없어(`render.ts`의 `actionable`/
+    `directActionable`) 그 Gate는 Slack에서 해결할 수 없다. coordinator가 한 번 빠뜨리는 것으로
+    무인 루프가 멈추는 실패 모드를 남기지 않는다.
+  - 버튼만 그리는 것으로는 부족하다. 클릭 검증(`claimGateResolution`)이 durable metadata 행과
+    `metadataState='matched'`를 요구하므로, 렌더 시점 합성은 눌렀을 때 `sidecar_not_matched`로
+    거부된다. 그래서 행을 실제로 남긴다.
+  - Orca에는 Gate를 수정하는 명령이 없어 label이 불변이다. 그래서 label에서 정한 option ID가
+    같은 Gate를 다시 관측해도 같다.
+  - OD-050은 그대로다. sidecar가 있으면 그것이 권위이고, 파생은 등록을 빠뜨렸을 때의 대체물이다.
+    등록이 파생을 대체하는 방향만 있고 반대는 없다.
+한계: `options`를 읽지 못했거나 label이 등록 문서와 같은 75자 상한을 넘으면 파생하지 않는다.
+      자르면 Orca에 쓰는 resolution이 사용자가 고른 원문과 달라지기 때문이다. 그 Gate는 지금처럼
+      누를 수 없는 카드로 남는다.
+영향 문서/파일: apps/orca-slack-bridge/src/gate/derive.ts, src/gate/project.ts, src/gate/render.ts,
+      src/gate/register.ts, src/run/collect.ts, src/store/schema.ts(v14), src/store/sqlite.ts
+검증 방법: sidecar 없는 Gate가 버튼 있는 카드로 뜨고, 그 버튼으로 Orca Gate가 resolved 되는 것을
+      관측한다. 이어서 같은 Gate에 `gate-register`를 하면 설명과 권장안이 붙은 카드로 바뀐다.
+결정일: 2026-08-29
+```
+
+```text
+ID: OD-084
+상태: DECIDED
+결정: 살아 있는 agent 터미널의 화면을 읽어 대화형 선택 프롬프트를 카드로 올리고, 버튼으로
+      `orca terminal send`를 통해 답한다. 대상은 Run의 `coordinator_handle`과 dispatched
+      worker의 `agent_terminal_handle`이다.
+근거:
+  - 무인 운용에서 멈춤은 대부분 터미널 프롬프트로 나타난다. Gate는 coordinator가 만들기로
+    **결정한** 것이라 자발성에 기대고, 그 자발성이 깨지면 아무 데도 나타나지 않는다. 실제로
+    2026-08-29에 Academic coordinator가 SQLCipher 설치 결정을 터미널 프롬프트로 띄웠고 Slack에
+    아무것도 오지 않았다.
+  - 기존 관측은 `worker-show`의 `agentWait` 하나였고 그것은 `{source, reason}` 두 문자열이다.
+    무엇을 묻는지도, 답할 방법도 없었다. 게다가 coordinator는 Dispatch가 아니라 그 조회에
+    잡히지 않아, 가장 비싼 멈춤이 유일하게 보이지 않는 멈춤이었다.
+  - Orca가 필요한 표면을 이미 갖고 있다: `terminal read --screen`, `terminal send`,
+    `terminal wait --for tui-idle`.
+측정(2026-08-29, 실제 막힌 coordinator 터미널과 probe 터미널):
+  - `terminal read --screen`이 질문 전문·선택지·설명·`Enter to select` 안내를 그대로 준다.
+  - 프롬프트가 열려 있는 동안 화면은 3회 읽기(9초)에 걸쳐 바이트 단위로 동일하다.
+  - `terminal send --text`가 raw byte를 전달한다: `"2"`→`[50]`, ESC `[B`→`[27,91,66]`,
+    `--enter`→`[13]`. escape sequence가 통과하므로 방향키로 옮기고 Enter로 확정할 수 있다.
+안전장치: 지문 대조 → 커서 이동 → 이동 확인 → Enter 순서로만 커밋한다. 지문은 프롬프트 영역만
+      쓰고 커서 표시는 뺀다(화면 아래 로그는 무관하게 움직이고, 커서는 우리가 옮기기 때문).
+      Enter 앞의 모든 단계는 관측 가능하고 되돌릴 수 있다. 어긋나면 보내지 않는 쪽으로 닫는다.
+한계:
+  - 화면 파싱이다. `❯ <n>.` 구조는 Claude Code의 UI이지 계약이 아니다. 모양이 어긋나면 카드를
+    만들지 않고 지금까지의 badge 경로로 남는다.
+  - 자유 입력으로 들어가는 선택지("Type something.", "Chat about this")는 버튼으로 만들지
+    않는다. Slack에서 그 상태를 끝낼 수 없어 더 나쁜 막힘이 된다. 목록에는 싣고 표시만 한다.
+    자유형 답변을 Slack에서 받는 것은 아직 없다.
+영향 문서/파일: apps/orca-slack-bridge/src/terminal/*, src/cli.ts, src/store/schema.ts(v15)
+검증 방법: 막힌 coordinator 터미널이 `#agent-runs`의 그 Run 스레드에 버튼 카드로 뜨고, 버튼을
+      누르면 터미널의 선택이 실제로 바뀌는 것을 관측한다. 화면이 바뀐 뒤 누른 클릭은
+      `terminal_prompt_attempt`에 `refused`로 남는다.
 결정일: 2026-08-29
 ```
 

@@ -84,6 +84,7 @@ function resolveCanonicalD2(store: SqliteDigestStore): void {
     runKey: RUN,
     taskKey: input.task,
     dispatchKey: dispatchKey(input.dispatchId),
+    source: 'registered',
     askMessageId: `msg_${input.gateId}`,
     questionThreadId: `thread_${input.gateId}`,
     options: [

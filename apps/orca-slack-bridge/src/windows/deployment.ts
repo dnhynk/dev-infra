@@ -128,56 +128,35 @@ export class SpawnExecutableVersionProbe implements ExecutableVersionProbe {
   }
 }
 
-function exactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
-  return JSON.stringify(actual) === JSON.stringify([...expected].sort());
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** Closed parser for the supported `orca status --json` readiness document. */
+/**
+ * Reads the `orca status --json` facts that prove a ready local Orca. Other fields are ignored
+ * (DL-066): Orca 1.4.216 added `runtime.connectionState`, and the earlier closed shape refused
+ * every later install for it.
+ */
 export function parseOrcaReadinessOutput(raw: string): boolean {
   let value: unknown;
   try { value = JSON.parse(raw) as unknown; } catch { return false; }
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const top = value as Record<string, unknown>;
-  if (!exactObjectKeys(top, ['id', 'ok', 'result', '_meta']) ||
-      typeof top['id'] !== 'string' || top['id'].length === 0 || top['ok'] !== true ||
-      top['result'] === null || typeof top['result'] !== 'object' || Array.isArray(top['result']) ||
-      top['_meta'] === null || typeof top['_meta'] !== 'object' || Array.isArray(top['_meta'])) return false;
-  const result = top['result'] as Record<string, unknown>;
-  const meta = top['_meta'] as Record<string, unknown>;
-  if (!exactObjectKeys(result, ['target', 'app', 'runtime', 'graph']) ||
-      !exactObjectKeys(meta, ['runtimeId'])) return false;
+  if (!isPlainRecord(value) || value['ok'] !== true) return false;
+  const result = value['result'];
+  const meta = value['_meta'];
+  if (!isPlainRecord(result) || !isPlainRecord(meta)) return false;
   const target = result['target'];
   const app = result['app'];
   const runtime = result['runtime'];
   const graph = result['graph'];
-  if (target === null || typeof target !== 'object' || Array.isArray(target) ||
-      app === null || typeof app !== 'object' || Array.isArray(app) ||
-      runtime === null || typeof runtime !== 'object' || Array.isArray(runtime) ||
-      graph === null || typeof graph !== 'object' || Array.isArray(graph)) return false;
-  const targetRecord = target as Record<string, unknown>;
-  const appRecord = app as Record<string, unknown>;
-  const runtimeRecord = runtime as Record<string, unknown>;
-  const graphRecord = graph as Record<string, unknown>;
-  if (!exactObjectKeys(targetRecord, ['kind']) || targetRecord['kind'] !== 'local' ||
-      !exactObjectKeys(appRecord, ['running', 'pid', 'desktopWindowStatus']) ||
-      appRecord['running'] !== true || appRecord['desktopWindowStatus'] !== 'available' ||
-      typeof appRecord['pid'] !== 'number' || !Number.isSafeInteger(appRecord['pid']) ||
-      appRecord['pid'] <= 0 ||
-      !exactObjectKeys(runtimeRecord, [
-        'state', 'reachable', 'runtimeId', 'appVersion', 'remoteUpdateSupport', 'capabilities',
-      ]) || runtimeRecord['state'] !== 'ready' || runtimeRecord['reachable'] !== true ||
-      typeof runtimeRecord['runtimeId'] !== 'string' || runtimeRecord['runtimeId'].length === 0 ||
-      typeof runtimeRecord['appVersion'] !== 'string' || runtimeRecord['appVersion'].length === 0 ||
-      !Array.isArray(runtimeRecord['capabilities']) ||
-      !exactObjectKeys(graphRecord, ['state']) || graphRecord['state'] !== 'ready' ||
-      meta['runtimeId'] !== runtimeRecord['runtimeId']) return false;
-  const update = runtimeRecord['remoteUpdateSupport'];
-  return update !== null && typeof update === 'object' && !Array.isArray(update) &&
-    exactObjectKeys(update as Record<string, unknown>, ['installMode', 'automatic', 'reason']) &&
-    typeof (update as Record<string, unknown>)['installMode'] === 'string' &&
-    typeof (update as Record<string, unknown>)['automatic'] === 'boolean' &&
-    typeof (update as Record<string, unknown>)['reason'] === 'string';
+  if (!isPlainRecord(target) || !isPlainRecord(app) || !isPlainRecord(runtime) ||
+      !isPlainRecord(graph)) return false;
+  return target['kind'] === 'local' &&
+    app['running'] === true && app['desktopWindowStatus'] === 'available' &&
+    typeof app['pid'] === 'number' && Number.isSafeInteger(app['pid']) && app['pid'] > 0 &&
+    runtime['state'] === 'ready' && runtime['reachable'] === true &&
+    typeof runtime['runtimeId'] === 'string' && runtime['runtimeId'].length > 0 &&
+    graph['state'] === 'ready' &&
+    meta['runtimeId'] === runtime['runtimeId'];
 }
 
 export class SpawnOrcaReadinessProbe implements OrcaReadinessProbe {

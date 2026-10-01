@@ -1,0 +1,21 @@
+{
+  "name": "orca-orchestration",
+  "version": "0.1.0+codex.20260907171927",
+  "description": "Boot and operate an Orca coordinator from Codex, including Claude/Codex worker routing, continuity, and Slack Gate wake-up.",
+  "author": {
+    "name": "dnhynk"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Orca Orchestration",
+    "shortDescription": "Run Orca coordination from Codex.",
+    "longDescription": "Boot or resume a Codex-owned Orca Run, dispatch Claude and Codex workers with runtime-chosen models and risk-adjusted reasoning effort, preserve handoffs, and monitor coordinator context for safe rollover.",
+    "developerName": "dnhynk",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": "Use $init-orchestrate to boot or resume the Orca coordinator for this repository."
+  }
+}

@@ -669,11 +669,66 @@ try {
   }
   $start.EnvironmentVariables[$buildIdentityName] = [string]$runtime.releaseDigest
 
+  # daemon은 이 launcher가 살아 있는 동안만 산다.
+  #
+  # Task Scheduler가 task를 멈추면 launcher만 종료되고 daemon은 고아로 남는다. 실측에서 task가
+  # Ready인데 daemon이 Slack Socket과 상태 DB를 계속 쥐고 있었고, 그 위에 배포가 진행됐다.
+  #
+  # stdin을 파이프로 넘긴다. launcher가 어떤 방식으로 죽든 OS가 쓰기 끝을 닫고, daemon은 그
+  # EOF를 정상 종료 신호로 읽는다. 여기서 아무것도 쓰지 않는다 — 파이프의 존재 자체가 신호다.
+  $start.EnvironmentVariables['ORCA_SLACK_BRIDGE_STOP_ON_PARENT_EXIT'] = '1'
+  $start.RedirectStandardInput = $true
+
+  # daemon이 죽은 순간의 흔적을 남긴다.
+  #
+  # 지금까지 daemon이 사라져도 stderr가 어디에도 수집되지 않았다. Task로 뜬 프로세스에는 콘솔이
+  # 없어 그대로 버려진다. 그래서 두 번의 죽음 모두 운영 로그에 성공한 job이 마지막 줄이었고,
+  # 원인을 볼 수단이 없었다. 여기서 파일로 받는다.
+  #
+  # 비동기로 읽는다. 동기로 읽으면 파이프 버퍼가 차는 순간 daemon이 쓰기에서 막힌다 — 계측이
+  # 대상을 멈추게 하는 것이 가장 나쁜 종류다.
+  #
+  # PowerShell event(-Action)로 받지 않고 .NET이 바이트를 그대로 파일에 복사한다. event action은
+  # launcher가 WaitForExit에서 막혀 있는 동안 실행되지 않고, 종료 직후 구독을 해제하면 남은 줄이
+  # 버려졌다 — 죽기 직전에 쓴, 원인을 말하는 줄이 가장 자주 사라졌다. 콘솔 코드페이지로 해석하지
+  # 않으므로 daemon의 UTF-8 한국어도 깨지지 않는다. 버퍼 없이 열어 launcher가 끊겨도 쓴 만큼 남는다.
+  $stderrPath = [IO.Path]::Combine([string]$runtime.logDirectory, 'daemon-stderr.log')
+  $stderrLog = $null
+  try {
+    $stderrLog = [IO.FileStream]::new(
+      $stderrPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+    # 무한히 커지지 않게 상한을 둔다. 넘으면 새로 시작한다 — 최근 것이 원인에 가깝다.
+    if ($stderrLog.Length -gt 4194304) { $stderrLog.SetLength(0) }
+    $null = $stderrLog.Seek(0, [IO.SeekOrigin]::End)
+  } catch { $stderrLog = $null }
+  $start.RedirectStandardError = $null -ne $stderrLog
+  $writeStderrLine = {
+    param([string]$text)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+      ('{0:o} {1}' -f (Get-Date).ToUniversalTime(), $text) + [Environment]::NewLine)
+    $stderrLog.Write($bytes, 0, $bytes.Length)
+  }
+
   $daemon = [Diagnostics.Process]::new()
   $daemon.StartInfo = $start
   if (-not $daemon.Start()) { throw 'daemon start' }
+  $stderrCopy = $null
+  if ($null -ne $stderrLog) {
+    try {
+      & $writeStderrLine ('daemon started pid={0}' -f $daemon.Id)
+      $stderrCopy = $daemon.StandardError.BaseStream.CopyToAsync($stderrLog)
+    } catch { $stderrCopy = $null }
+  }
   $daemon.WaitForExit()
   $exitCode = $daemon.ExitCode
+  if ($null -ne $stderrLog) {
+    try {
+      # 종료 줄보다 먼저 daemon이 쓴 바이트가 모두 들어가게 한다.
+      if ($null -ne $stderrCopy) { $null = $stderrCopy.Wait(5000) }
+      & $writeStderrLine ('daemon exited code={0}' -f $exitCode)
+      $stderrLog.Dispose()
+    } catch { }
+  }
   $daemon.Dispose()
   exit $exitCode
 } catch {

@@ -1,6 +1,6 @@
 # `orca-slack-bridge` 시스템 구조
 
-상태: **Draft · C1~D3와 O1 구현 완료 · O1-7 production acceptance PASS · D3 exact-build 재수용 대기**
+상태: **Draft · C1~D3와 O1 구현 완료 · O1-7 production acceptance PASS · Claude D3 exact-build 재수용 대기 · Codex wake hermetic 검증 완료/live 대기**
 
 이 문서는 [Bridge umbrella 스펙](../specs/orca-slack-bridge.md)의 책임 경계와 장애 경계를 정의한다. C1 구현 stack은 TypeScript on Node.js 26.x, pnpm workspaces, `node:sqlite`로 확정됐고 후속 slice의 세부 구조는 열린 결정으로 남긴다.
 
@@ -23,15 +23,16 @@
 │                          ├→ summarizer           │
 │                          ├→ Slack renderer       │
 │                          └→ durable store        │
-└──────────────────┬───────────────────────────────┘
-                   │ named pipe / pending events
-                   ▼
-┌──────────────────────────────────────────────────┐
-│ Claude Channel Adapter                           │
-│ resolved Gate → 열린 coordinator session에 push │
-└──────────────────┬───────────────────────────────┘
-                   ▼
-          기존 coordinator session
+└──────────────┬───────────────────────┬───────────┘
+               │ named pipe            │ exact marker + Orca input
+               ▼                       ▼
+┌───────────────────────────┐  ┌───────────────────────────┐
+│ Claude Channel Adapter    │  │ Codex terminal wake route │
+│ MCP notification/receipt  │  │ wake-only identity/queue  │
+└──────────────┬────────────┘  └──────────────┬────────────┘
+               └───────────────┬───────────────┘
+                               ▼
+                    기존 coordinator session
 ```
 
 Slack은 daemon과 `@slack/socket-mode` WebSocket으로 연결한다. 공개 inbound HTTP endpoint는 운영하지 않는다.
@@ -43,13 +44,15 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
 ### Discovery
 
 - D1에서는 설정 파일에 수동 등록한 repository와 그 Run 후보만 찾는다.
-- Run identity는 `run-list` row의 `coordinator_handle`·`coordinator_pane_key`·`consumer_generation`을
-  권위로 읽고, live/stale은 `consumer_generation`으로 구분한다(OD-020).
+- Run identity는 `run-list` row의 `coordinator_handle`·`consumer_generation`을 권위로 읽고, live/stale은
+  `consumer_generation`으로 구분한다(OD-020). coordinator의 pane은 row에 없으므로 그 handle의
+  `terminal show` pane으로 확인한다(DL-066).
 - coordinator 세션의 `ORCA_TERMINAL_HANDLE`·`ORCA_PANE_KEY`·`ORCA_WORKTREE_ID`는 보조 단서로만 쓴다.
 - global worker list의 Run↔worktree 정보는 repository 후보 복구에 사용할 수 있지만 historical/released worker를 liveness로 사용하지 않는다.
-- O1-1은 `orca repo list --json` success envelope/result와 관측된 14-key repository row를 strict parse하는
-  read-only adapter를 추가한다. whole-envelope 또는 row schema drift는 pass 전체 실패이며 raw path/URL/
-  payload를 오류에 복사하지 않는다. durable last-good registry 적용은 O1-2/O1-3 범위다.
+- O1-1은 `orca repo list --json`에서 discovery가 읽는 필드(`ok`, `result.repos`, row `id`·
+  `gitRemoteIdentity`)만 검사하는 read-only adapter를 추가한다. 그 밖의 필드는 무시한다(DL-066). 읽는
+  필드의 schema drift는 pass 전체 실패이며 raw path/URL/payload를 오류에 복사하지 않는다. durable
+  last-good registry 적용은 O1-2/O1-3 범위다.
 - O1-1 GitHub normalizer는 HTTPS, SCP-like `git@github.com`, `ssh://git@github.com` 세 syntax만 받고
   host/owner/repository case와 한 `.git` suffix를 canonicalize한다. Orca `canonicalKey`는 독립 계산값과
   exact 일치할 때만 evidence이며 mismatch는 row-local `canonical_conflict`다.
@@ -61,7 +64,7 @@ URL은 연결 직전에 발급하고 hello App ID를 확인하며 warning/refres
   canonical GitHub identity, canonical remote당 exact Orca ID N개, blocked conflict를 나타내는 immutable
   effective-config 타입까지만 제공하고 route나 durable registry를 만들지 않는다.
 
-`run-use` 인수 뒤 coordinator handle·pane key는 새 터미널 값으로 바뀌고 generation이 올라가므로, 최초 handle을
+`run-use` 인수 뒤 coordinator handle은 새 터미널 값으로 바뀌고 generation이 올라가므로, 최초 handle을
 Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설정(OD-068)을 따르며, 관측된
 `<uuid>::<path>` worktree id 형식은 안정성이 보장된 계약으로 파싱하지 않는다.
 
@@ -137,14 +140,29 @@ Run 수명 동안 고정하지 않는다. repository 연결은 수동 등록 설
 - transport write와 application receipt를 구분하고, reply tool 왕복으로 receipt를 daemon에 돌려준다. 이 경로를 유일하다고 규정하지 않는다(OD-054, OD-059).
 - coordinator는 `gate_id`로 Orca를 다시 읽고 이미 효과가 반영됐으면 no-op으로 처리한다(OD-057).
 
+### Codex Terminal Wake Router
+
+- Claude Channel에서 exact candidate가 `no_candidate`일 때만 fallback한다. `unverified`, ambiguous,
+  stale generation, write failure를 Codex 경로로 우회하지 않는다.
+- `~/.codex/orchestration/runs/<run_id>.json` marker가 `provider=codex`로 opt-in한 Run만 후보로 본다.
+- marker의 session/terminal/pane/generation/worktree를 current `run-list` row와
+  `terminal show`의 connected/writable route에 exact 대조한다. 입력 수락 뒤 marker, terminal,
+  Run을 다시 읽어 replacement/movement/takeover race도 가능한 범위에서 닫는다.
+- `terminal send --text ... --enter`에는 `[orca-gate-wakeup v1 run_id=... gate_id=...]` identity와 재조회 지시만
+  보낸다. Slack resolution 본문은 prompt에 싣지 않는다.
+- Orca의 `send.accepted=true`는 `application_queued` receipt일 뿐이다. durable delivery는
+  `receipted`로 남고 exact Gate effect를 다시 읽은 뒤에만 `consumed`가 된다.
+
 ## 3. 프로세스 경계
 
-목표 최종형은 두 프로세스다.
+목표 최종형은 daemon과 provider별 wake surface다. Claude 경로는 두 프로세스이고 Codex 경로는
+daemon이 기존 Orca-managed terminal에 직접 입력하므로 session subprocess가 없다.
 
 | 프로세스 | 수명 | 책임 |
 |---|---|---|
 | daemon | PC에서 상시 실행 | Slack, Orca/GitHub 관찰, DB, Slack projection |
 | Channel Adapter | coordinator 세션별 subprocess | pending Gate ID push, reply tool application receipt 반환 |
+| Codex coordinator | 기존 Orca terminal의 interactive process | wake-only 입력 수신, exact Gate 재조회, 후속 orchestration |
 
 D3 구현은 별도 Run에서 완료됐고, daemon과 session Adapter는 실제 process/pipe 경계로 분리된다.
 development flag의 매 기동 확인은 사람이 수행하며 allowlist plugin 등재는 포함하지 않는다(OD-056).
@@ -165,7 +183,7 @@ Slack action ACK 또는 modal open fast path
   → Orca Gate open 재확인
   → Orca gate-resolve
   → durable outbox에 pending 기록
-  → Channel delivery attempt
+  → provider notification attempt (Claude Channel 우선, exact Codex marker fallback)
   → coordinator가 Orca Gate 재조회
   → 후속 Orca 상태 관찰
   → Slack에 실제 재개 표시
@@ -198,7 +216,8 @@ OPEN_IN_ORCA
 ```
 
 - `TRANSPORT_WRITE_ATTEMPTED`는 전달을 증명하지 않고 application receipt만 전달 신호다(OD-054).
-- `RECEIPTED`는 reply tool 왕복으로 관측하며 재시도 backoff만 늦춘다(OD-059, OD-066).
+- `RECEIPTED`는 Claude reply tool 왕복 또는 exact route 검증 뒤 Orca가 수락한 Codex 입력으로
+  관측하며 재시도 backoff만 늦춘다. 둘 다 coordinator effect 증거는 아니다(OD-059, OD-066, DL-064).
 - Orca 효과는 대상 Gate의 `pending`→`resolved` 전이고, 이를 관찰한 뒤 `CONSUMED`로 바꾼다(OD-055).
 - `RECEIPTED`에서 멈춘 event는 재조회 대상으로 남고 `CONSUMED`에서만 재조회를 억제한다(OD-066).
 - coordinator는 항상 Orca 상태를 다시 읽어 중복을 no-op으로 만들며 별도 dedup 저장소를 두지 않는다(OD-057).
@@ -431,7 +450,9 @@ scan 뒤 yield 전에 모든 handle을 닫으므로 Windows rotation을 막지 �
 
 daemon startup은 writable v13 store와 fixed Channel pipe를 먼저 소유하고 D2 Gate·D3 Channel recovery를
 끝낸다. 호환되는 config fingerprint의 LKG routing만 읽은 뒤 같은 observer lane에서 bounded repository
-discovery를 즉시 수행하고, 그 pass가 끝난 뒤 Slack Socket을 연다. Socket open 직후 Run observer를 due로
+discovery를 즉시 수행하고, 그 pass가 끝난 뒤 Slack Socket을 연다. config fingerprint가 health 기록과 다르면
+새 fingerprint를 기록하기 전에 routing 두 표를 비우므로, 남은 routing 행은 언제나 health가 기록한 config에서
+만든 것이다(DL-069). Socket open 직후 Run observer를 due로
 만들고 PR digest의 첫 due는 60초 뒤다. 이후 discovery/Run/digest는 각각 300/120/900초 completion-based
 schedule, 30/90/300초 deadline, installation-seeded deterministic jitter와 30초 시작 exponential backoff를
 쓴다. 세 job은 due bit만 coalesce하는 round-robin lane 하나를 공유해 backlog나 observer 간 overlap을 만들지
@@ -456,7 +477,9 @@ fingerprint skip/update와 thread dedupe는 그대로이며 Gate thread reply는
 
 observer의 GitHub/Orca/discovery outage는 job-local failure/backoff라 Socket과 Gate plane을 죽이지 않는다.
 반대로 store/schema/config invariant, fixed-pipe ownership, operational status mutation, fatal logger failure는
-daemon-fatal이다. shutdown은 새 ingress와 timers를 먼저 막고 observer/child AbortController를 취소한 뒤
+daemon-fatal이다. startup은 store를 열기 전에 status snapshot lease를 잡는다. daemon이 아직 응답하지 않는 동안
+read-only `status`(예: install `--run-now`의 1초 간격 확인)가 이 lease를 잠깐 쥐므로 최대 10초 재시도하고,
+그동안 계속 쥐여 있을 때만 실패한다. shutdown은 새 ingress와 timers를 먼저 막고 observer/child AbortController를 취소한 뒤
 accepted work를 bounded drain하며, timeout이면 nonzero다. clean shutdown만 daemon clean-stop을 기록하고
 Socket, pipe, status owner, log, store, snapshot lease 순으로 소유권을 놓는다. `desired_state=stopped`도 같은
 graceful 경로를 사용한다.

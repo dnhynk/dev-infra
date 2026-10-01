@@ -2,8 +2,10 @@
 
 상태: **O1 canonical operator workflow · production accepted**
 
-Managed Task의 AtLogOn trigger는 duration 없는 PT1M repetition을 가진다. daemon process가 종료되면
-다음 repetition이 다시 실행하고, 이미 실행 중이면 `IgnoreNew`가 겹침을 막는다. 별도의
+Managed Task의 AtLogOn trigger와 registration trigger는 둘 다 duration 없는 PT1M repetition을 가진다.
+registration trigger는 등록 순간 발화하므로 install만으로 daemon이 뜨고 logon을 기다리지 않고 repetition이
+시작된다. daemon process가 종료되면 다음 repetition이 다시 실행하고, 이미 실행 중이면 `IgnoreNew`가
+겹침을 막는다. 별도의
 `RestartOnFailure` 3회/PT1M은 unmet start condition 또는 action-start failure용이며, 이미 시작된
 Exec의 exit code를 process crash recovery로 해석하지 않는다. uninstall은 repetition보다 먼저 exact
 owned task를 disable한 뒤 shutdown fence를 진행한다. interactive PowerShell action은 console-close
@@ -60,8 +62,10 @@ $node = '<versioned Node 26 node.exe 절대경로>'
   --log-dir '<운영 log directory 절대경로>'
 ```
 
-plain install은 task를 시작하지 않는다. 즉시 확인하려면 같은 install에 `--run-now`를 추가하거나
-나중에 staged CLI의 `run-now --wait-seconds 90`을 사용한다. install은 현재 SID의 root Scheduled
+install은 registration trigger로 task를 바로 시작한다. 같은 install의 `--run-now`나 나중의 staged CLI
+`run-now --wait-seconds 90`은 그 release의 새 heartbeat가 올 때까지 기다려 확인한다. 이미 실행 중인
+task는 다시 시작하거나 종료하지 않고 기다리며(`action=awaited-running`), 대기 안에 heartbeat가 오지
+않을 때만 `windows.run_now.running_stale`로 끝낸다. install은 현재 SID의 root Scheduled
 Task를 COM validate-only로 먼저 검증하고, protected runtime manifest와 task를 CAS/rollback으로
 갱신한다. task action에는 절대 System32 Windows PowerShell, 고정된 hidden/noninteractive flags,
 versioned launcher, protected manifest 경로만 들어간다. Task XML은 schema `1.2`부터 host COM
@@ -75,9 +79,15 @@ reparse point, hard link, tree 변화 및 release digest를 다시 검증한다.
 Windows User scope에서 정확히 한 번씩 다시 읽어 daemon child 환경에만 넣고, build identity는
 release digest로 고정한다. token 누락이나 runtime/release drift는 값 없이 static error로 종료한다.
 
+daemon child의 stderr는 운영 log directory의 `daemon-stderr.log`에 UTF-8 바이트 그대로 붙는다. 실행마다
+`daemon started pid=…`와 `daemon exited code=…` 줄이 그 사이의 stderr를 감싸고, 파일이 4MiB를 넘으면 다음
+실행이 비우고 시작한다. daemon이 운영 로그를 만들기 전에 죽으면 원인은 이 파일에만 남는다.
+
 설치 preflight의 Orca readiness probe는 trusted known-folder API로 얻어 canonicalize한 `APPDATA`와
 `LOCALAPPDATA`만 기존의 최소 Windows system 환경에 추가해 `orca status --json`을 실행한다. exit,
-bounded timeout 및 closed ready shape 중 하나라도 맞지 않으면 설치를 시작하지 않는다.
+bounded timeout, ready 사실(`ok`, local target, 실행 중인 app과 사용 가능한 desktop window, ready·reachable
+runtime과 일치하는 `runtimeId`, ready graph) 중 하나라도 맞지 않으면 설치를 시작하지 않는다. 그 밖의 status
+필드는 무시한다(DL-066).
 
 ## 재설치와 제거
 

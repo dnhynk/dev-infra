@@ -6,6 +6,7 @@ import {
   readGateResumeSnapshot,
 } from '../src/channel/resume.js';
 import {
+  listWorkerPage,
   readExactResumeDispatch,
   readStrictResumeWorkers,
   type OrcaRunner,
@@ -62,6 +63,31 @@ class ResumeOrca implements OrcaRunner {
   }
 }
 
+/** Orca 1.4.216 worker-list: at most one page per call, `counts` and `page.total` cover the whole Run. */
+class PagedWorkerOrca implements OrcaRunner {
+  readonly calls: string[][] = [];
+
+  constructor(
+    readonly pages: readonly (readonly Record<string, unknown>[])[],
+    readonly totals: readonly number[] = pages.map(() => pages.flat().length),
+  ) {}
+
+  run(args: readonly string[]): Promise<string> {
+    this.calls.push([...args]);
+    if (args[1] !== 'worker-list') return Promise.reject(new Error(`unexpected ${args.join(' ')}`));
+    const at = args.indexOf('--cursor');
+    const index = at === -1 ? 0 : Number(args[at + 1]!.slice('cursor-'.length));
+    const hasMore = index + 1 < this.pages.length;
+    const total = this.totals[index]!;
+    return Promise.resolve(ok({
+      counts: { released: total },
+      page: { limit: 100, total, hasMore, nextCursor: hasMore ? `cursor-${index + 1}` : null },
+      scope: { run: RUN, source: 'flag' },
+      workers: this.pages[index],
+    }));
+  }
+}
+
 function task(
   id: string,
   status: string,
@@ -114,7 +140,82 @@ const baseline = snapshot([
 ]);
 const sourceFact = baseline.candidates.find((candidate) => candidate.taskId === SOURCE_TASK)!;
 
+const coordinatorGate = {
+  gateId: 'gate_coordinator', runId: RUN, taskId: SOURCE_TASK, options: ['continue', 'stop'],
+};
+const coordinatorIdentity = {
+  runId: RUN, taskId: SOURCE_TASK, dispatchId: `derived-${coordinatorGate.gateId}`,
+  sourceGate: coordinatorGate,
+};
+const coordinatorGateRow = {
+  id: coordinatorGate.gateId, run_id: RUN, task_id: SOURCE_TASK,
+  question: 'Continue?', options: JSON.stringify(coordinatorGate.options), status: 'pending',
+  resolution: null, created_at: '2026-09-07T17:43:00.000Z', resolved_at: null,
+};
+
 describe('strict normalized Task/Dispatch resume evidence', () => {
+  it.each([
+    ['missing', []],
+    ['duplicate', [coordinatorGateRow, coordinatorGateRow]],
+    ['wrong Run', [{ ...coordinatorGateRow, run_id: 'run_other' }]],
+    ['wrong Task', [{ ...coordinatorGateRow, task_id: 'task_other' }]],
+    ['changed options', [{ ...coordinatorGateRow, options: '["unexpected"]' }]],
+    ['invalid status', [{ ...coordinatorGateRow, status: 'unknown' }]],
+  ])('rejects a derived source with %s Gate evidence before reading workers', async (_label, gates) => {
+    const calls: string[] = [];
+    const runner: OrcaRunner = {
+      run(args) {
+        calls.push(args[1]!);
+        return Promise.resolve(ok({ runId: RUN, count: gates.length, gates }));
+      },
+    };
+    await expect(readGateResumeSnapshot(runner, coordinatorIdentity)).rejects.toThrow(/gate|options|status/i);
+    expect(calls).toEqual(['gate-list']);
+  });
+
+  it('requires exact D2 Gate identity and never admits a synthetic Dispatch as worker evidence', async () => {
+    const workers = new ResumeOrca(
+      [task(SOURCE_TASK, 'pending', [], null)],
+      [worker(coordinatorIdentity.dispatchId, SOURCE_TASK, 'completed')],
+    );
+    const runner: OrcaRunner = {
+      run(args) {
+        return args[1] === 'gate-list'
+          ? Promise.resolve(ok({ runId: RUN, count: 1, gates: [coordinatorGateRow] }))
+          : workers.run(args);
+      },
+    };
+    const { sourceGate: _gate, ...missingGate } = coordinatorIdentity;
+    await expect(readGateResumeSnapshot(runner, missingGate)).rejects.toThrow(/source Gate identity/);
+    await expect(readGateResumeSnapshot(runner, {
+      ...coordinatorIdentity, sourceGate: { ...coordinatorGate, gateId: 'gate_other' },
+    })).rejects.toThrow(/source Gate identity/);
+    await expect(readGateResumeSnapshot(runner, coordinatorIdentity)).rejects.toThrow(/source Dispatch/);
+    expect(() => normalizeGateResumeSnapshot({
+      schemaVersion: 1, sourceTaskId: SOURCE_TASK, sourceDispatchId: coordinatorIdentity.dispatchId,
+      candidates: [{ ...sourceFact, currentDispatchId: null,
+        dispatches: [{ dispatchId: coordinatorIdentity.dispatchId, status: 'completed' }] }],
+    })).toThrow(/correlation/);
+  });
+
+  it('forwards cancellation to the exact derived Gate read without proceeding to Task/worker facts', async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const runner: OrcaRunner = {
+      run(args, options) {
+        calls.push(args[1]!);
+        expect(options?.signal).toBe(controller.signal);
+        return new Promise((_resolve, reject) => {
+          options!.signal!.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+        });
+      },
+    };
+    const reading = readGateResumeSnapshot(runner, coordinatorIdentity, controller.signal);
+    controller.abort();
+    await expect(reading).rejects.toThrow(/cancelled/);
+    expect(calls).toEqual(['gate-list']);
+  });
+
   it('uses actual Orca terminal-state count buckets as a complete worker denominator', async () => {
     const workers = [
       worker(SOURCE_DISPATCH, SOURCE_TASK, 'completed'),
@@ -143,6 +244,33 @@ describe('strict normalized Task/Dispatch resume evidence', () => {
       null,
       counts,
     ), RUN)).rejects.toThrow(/counts/);
+  });
+
+  it('reads every Orca 1.4.216 worker-list page before checking the run-wide counts', async () => {
+    const orca = new PagedWorkerOrca([
+      [worker('ctx_a', 'task_a', 'completed'), worker('ctx_b', 'task_b', 'completed')],
+      [worker('ctx_c', 'task_c', 'dispatched')],
+    ]);
+    await expect(readStrictResumeWorkers(orca, RUN)).resolves.toHaveLength(3);
+    expect(orca.calls.map((args) => args.includes('--cursor'))).toEqual([false, true]);
+  });
+
+  it('lists every Orca 1.4.216 worker page so run evidence stays complete', async () => {
+    const orca = new PagedWorkerOrca([
+      [worker('ctx_a', 'task_a', 'completed'), worker('ctx_b', 'task_b', 'completed')],
+      [worker('ctx_c', 'task_c', 'dispatched')],
+    ]);
+    const page = await listWorkerPage(orca, RUN);
+    expect(page.workers.map((row) => row.dispatchId)).toEqual(['ctx_a', 'ctx_b', 'ctx_c']);
+    expect(page.repositoryEvidenceComplete).toBe(true);
+  });
+
+  it('fails closed when worker-list pages disagree on the run-wide total', async () => {
+    const orca = new PagedWorkerOrca([
+      [worker('ctx_a', 'task_a', 'completed')],
+      [worker('ctx_b', 'task_b', 'completed')],
+    ], [2, 3]);
+    await expect(readStrictResumeWorkers(orca, RUN)).rejects.toThrow(/page/);
   });
 
   it('freezes source plus transitive descendants deterministically and excludes unrelated work', async () => {
