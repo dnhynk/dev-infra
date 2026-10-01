@@ -537,6 +537,74 @@ ${err.stack ?? ''}`).not.toContain(TOKEN);
   });
 });
 
+/**
+ * 누른 사람에게만 보이는 안내. 재시도 정책은 `post`와 같고, 성공 응답은 `ts` 대신
+ * `message_ts`만 싣는다.
+ */
+describe('SlackWebApiPoster.ephemeral', () => {
+  const ephemeralInput = {
+    channel: 'C1',
+    user: 'U1',
+    text: '안내',
+    threadTs: '1700000000.000100',
+  };
+
+  it('chat.postEphemeral을 호출하고 user와 thread_ts를 보낸다', async () => {
+    const fake = new FakeFetch([{ body: { ok: true, message_ts: '1700000009.000009' } }]);
+    const result = await poster(fake).ephemeral(ephemeralInput);
+    expect(result).toEqual({ channel: 'C1', ts: '1700000009.000009' });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]!.url).toBe('https://slack.com/api/chat.postEphemeral');
+    expect(JSON.parse(String(fake.calls[0]!.init.body))).toEqual({
+      channel: 'C1',
+      user: 'U1',
+      text: '안내',
+      thread_ts: '1700000000.000100',
+    });
+  });
+
+  it('threadTs가 없으면 thread_ts를 싣지 않는다', async () => {
+    const fake = new FakeFetch([{ body: { ok: true, message_ts: '1700000009.000010' } }]);
+    await poster(fake).ephemeral({ channel: 'C1', user: 'U1', text: '안내' });
+    expect(JSON.parse(String(fake.calls[0]!.init.body))).toEqual({
+      channel: 'C1',
+      user: 'U1',
+      text: '안내',
+    });
+  });
+
+  it('성공 응답에 message_ts가 없으면 진행하지 않는다', async () => {
+    // chat.postMessage 모양의 응답이다. 이 method에서는 ts를 읽지 않는다.
+    const fake = new FakeFetch([{ body: { ok: true, channel: 'C1', ts: '1.1' } }]);
+    await expect(poster(fake).ephemeral(ephemeralInput)).rejects.toThrow('channel/ts가 없다');
+  });
+
+  it('게시 여부를 알 수 없는 실패를 재시도하지 않는다', async () => {
+    const ok = { body: { ok: true, message_ts: '9.9' } } as const;
+    for (const first of [
+      new Error('socket hang up'),
+      { body: { ok: false, error: 'internal_error' } },
+      { status: 503, body: {} },
+    ]) {
+      const fake = new FakeFetch([first, ok]);
+      await expect(poster(fake).ephemeral(ephemeralInput)).rejects.toThrow();
+      expect(fake.calls).toHaveLength(1);
+    }
+  });
+
+  it('토큰이 오류에 실리지 않는다', async () => {
+    const fake = new FakeFetch([
+      new Error(`connect ECONNREFUSED authorization=Bearer ${TOKEN}`),
+    ]);
+    const err = (await poster(fake, 0)
+      .ephemeral(ephemeralInput)
+      .catch((e: unknown) => e)) as Error;
+    expect(`${err.message}
+${err.stack ?? ''}`).not.toContain(TOKEN);
+    expect(err.message).toContain(maskToken(TOKEN));
+  });
+});
+
 describe('botToken', () => {
   it('ORCA_SLACK_BRIDGE_BOT_TOKEN만 읽는다', () => {
     expect(botToken({ [BOT_TOKEN_VAR]: TOKEN })).toBe(TOKEN);

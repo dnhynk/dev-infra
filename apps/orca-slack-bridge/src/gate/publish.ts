@@ -55,8 +55,19 @@ export type GatePublishOptions = {
   readonly placement?: 'thread' | 'channel';
   readonly now: () => Date;
   readonly slackTimeoutMs?: number;
-  /** Observer deadline/shutdown fence carried through first replies and later updates. */
+  /**
+   * 관측 job의 기한. 첫 게시와 D2 카드 투영에 싣는다.
+   *
+   * 쓰기 fence를 잡은 ordinary update에는 싣지 않는다. 이미 중단된 job은 fence를 잡기 전에 멈춘다.
+   */
   readonly signal?: AbortSignal;
+  /**
+   * daemon 종료. 쓰기 fence를 잡은 ordinary update는 이것과 `slackTimeoutMs`로만 멈춘다.
+   *
+   * job 기한으로 끊으면 Slack이 이미 적용한 갱신을 store에 기록하지 못하고, fence가 다음 pass까지
+   * 남아 그동안의 클릭이 전부 `card_mapping_not_matched`로 거부된다(DL-073).
+   */
+  readonly shutdownSignal?: AbortSignal;
   readonly fault?: (
     point:
       | 'after_gate_observation_reservation_before_confirmation'
@@ -295,6 +306,11 @@ export async function publishGateCard(
     throw new Error(`${gate.key}의 ordinary write observation generation이 없다`);
   }
   await options.fault?.('after_gate_observation_confirmation_before_write', gate.key);
+  // 이 검사와 fence 사이에는 await가 없다. 중단된 job이 fence를 잡으면 Slack을 부르지도 못한 채
+  // fence만 남긴다.
+  if (options.signal?.aborted) {
+    throw new Error(`${gate.key}의 ordinary write를 시작하기 전에 관측 job이 중단됐다`);
+  }
   if (!options.store.beginGateObservationWrite(
     gate.key,
     at,
@@ -340,7 +356,8 @@ export async function publishGateCard(
       ts: existing.messageTs,
       text: card.text,
       blocks: card.blocks,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      // fence를 잡은 갱신은 job 기한으로 끊지 않는다. daemon 종료와 `slackTimeoutMs`만 멈춘다.
+      ...(options.shutdownSignal === undefined ? {} : { signal: options.shutdownSignal }),
     }, options.slackTimeoutMs ?? DEFAULT_SLACK_UPDATE_TIMEOUT_MS);
   } catch (e) {
     options.store.abandonGateObservationWrite(gate.key);

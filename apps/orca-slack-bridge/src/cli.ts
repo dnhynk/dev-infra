@@ -34,8 +34,10 @@ import {
 } from './slack/socket.js';
 import { runDigest, formatReport } from './digest/digest.js';
 import {
+  SlackApiError,
   SlackWebApiPoster,
   botToken,
+  type EphemeralPoster,
   type SlackPoster,
   type ThreadPoster,
 } from './slack/post.js';
@@ -1479,6 +1481,9 @@ export async function runDaemonCommand(
     const threadPoster = typeof (slack as Partial<ThreadPoster>).reply === 'function'
       ? slack as SlackPoster & ThreadPoster
       : null;
+    const ephemeralPoster = typeof (slack as Partial<EphemeralPoster>).ephemeral === 'function'
+      ? slack as SlackPoster & EphemeralPoster
+      : null;
     const viewOpener = dependencies.viewOpener ?? (
       productionBotToken === null
         ? { open: () => Promise.reject(new Error('Slack modal opener is not injected')) }
@@ -1500,12 +1505,44 @@ export async function runDaemonCommand(
       const task = job().catch(() => undefined).finally(() => pending.delete(task));
       pending.add(task);
     };
+    /*
+     * 일시 거부한 Gate 클릭에 보내는 "다시 눌러 달라"는 안내(DL-073).
+     *
+     * 호출마다 5초로 묶고 종료 drain이 끊는다. 실패는 기록한 뒤 `schedule`이 삼키므로 클릭의 판정을
+     * 바꾸지 않는다. Slack이 ok:false로 답한 실패는 `slack.validation_failed`, 응답을 받지 못한
+     * 실패(시간 초과, 연결 실패, 5xx)는 `slack.transport_unknown`으로 남긴다.
+     */
+    const ephemeral: EphemeralPoster | null = ephemeralPoster === null ? null : {
+      ephemeral: async (input) => {
+        try {
+          const posted = await ephemeralPoster.ephemeral({
+            ...input,
+            signal: AbortSignal.any([acceptedWorkAbort.signal, AbortSignal.timeout(5_000)]),
+          });
+          void health?.event({
+            level: 'info', event: 'gate.action_notice', outcome: 'succeeded',
+          }).catch(() => { /* reporting never fences the notice */ });
+          return posted;
+        } catch (error) {
+          void health?.event({
+            level: 'warn',
+            event: 'gate.action_notice',
+            outcome: 'failed',
+            errorCode: error instanceof SlackApiError
+              ? 'slack.validation_failed'
+              : 'slack.transport_unknown',
+          }).catch(() => { /* reporting never fences the notice */ });
+          throw error;
+        }
+      },
+    };
     const handler = new GateActionHandler({
       config: config.slack,
       store,
       engine: daemonEngine,
       schedule,
       abortSignal: inboundAbort.signal,
+      ...(ephemeral === null ? {} : { ephemeral }),
     });
     const directHandler = new GateDirectInputHandler({
       config: config.slack,
@@ -1514,6 +1551,7 @@ export async function runDaemonCommand(
       engine: daemonEngine,
       schedule,
       abortSignal: inboundAbort.signal,
+      ...(ephemeral === null ? {} : { ephemeral }),
     });
     /**
      * 터미널 프롬프트 버튼.
@@ -1916,6 +1954,8 @@ export async function runDaemonCommand(
                 now: observerClock.wallNow,
                 rootIntent: rootRuntime(signal),
                 signal,
+                // 쓰기 fence를 잡은 Gate 카드 갱신은 job 기한이 아니라 daemon 종료로만 끊는다(DL-073).
+                shutdownSignal: reconciliationAbort.signal,
                 ...(dependencies.slackTimeoutMs === undefined
                   ? {}
                   : { slackTimeoutMs: dependencies.slackTimeoutMs }),

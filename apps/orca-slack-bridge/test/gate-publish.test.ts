@@ -15,7 +15,7 @@ import type {
   ThreadReplyInput,
   UpdateMessageInput,
 } from '../src/slack/post.js';
-import { SlackApiError } from '../src/slack/post.js';
+import { SlackApiError, SlackUpdateTimeoutError } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import { gateActionId, gateBlockId } from '../src/gate/actions.js';
@@ -317,6 +317,17 @@ function claimGate(
     retryRequestId,
     at,
   });
+}
+
+/** 첫 관측 pass로 카드를 게시하고 그 pass가 본 Gate를 돌려준다. */
+async function publishedGate(store: SqliteDigestStore, orca: MutableFakeOrca) {
+  const slack = new FakeSlack();
+  const initial = await runRunObserver(orca, {
+    config: CONFIG, channel: CHANNEL, store, slack, thread: slack, now: () => new Date(AT),
+  });
+  const gate = initial.facts.runs[0]?.gates.find((candidate) => candidate.gateId === GATE_ID);
+  if (gate === undefined) throw new Error('observed Gate missing');
+  return gate;
 }
 
 describe('collect → project → render → existing Run thread publish', () => {
@@ -2243,6 +2254,131 @@ describe('collect → project → render → existing Run thread publish', () =>
       expect(retry.updates.filter((update) => update.ts === FIRST_GATE_TS)).toHaveLength(1);
       expect(store.findGateLocalObservation(gate)?.mappingState).toBe('matched');
     } finally {
+      store.close();
+    }
+  });
+
+  it('a fenced update finishes after the job deadline fires and leaves the card claimable', async () => {
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const blocking = new BlockingGateSlack();
+    try {
+      const observedGate = await publishedGate(store, new MutableFakeOrca());
+      const gate = gateKey(GATE_ID);
+      const job = new AbortController();
+      const shutdown = new AbortController();
+      const publishing = publishGateCard(
+        {
+          store, slack: blocking, thread: blocking, channel: CHANNEL,
+          now: () => new Date('2026-08-24T08:00:00.000Z'),
+          signal: job.signal, shutdownSignal: shutdown.signal,
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        { ...observedGate, question: 'job deadline fired during the fenced update' },
+      );
+      await blocking.gateUpdateStarted;
+      // 2026-10-01: the observer deadline fired after Slack had the update, before the store write.
+      job.abort();
+      blocking.releaseGateUpdate();
+
+      await expect(publishing).resolves.toMatchObject({ action: 'update', messageTs: FIRST_GATE_TS });
+      expect(store.findGateLocalObservation(gate)?.mappingState).toBe('matched');
+      expect(claimGate(store, gate, '73737373-7373-4373-8373-737373737373').kind).toBe('claimed');
+    } finally {
+      blocking.releaseGateUpdate();
+      store.close();
+    }
+  });
+
+  it('daemon shutdown aborts a fenced update and keeps its durable owner for the next pass', async () => {
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const blocking = new BlockingGateSlack();
+    try {
+      const observedGate = await publishedGate(store, new MutableFakeOrca());
+      const gate = gateKey(GATE_ID);
+      const job = new AbortController();
+      const shutdown = new AbortController();
+      const publishing = publishGateCard(
+        {
+          store, slack: blocking, thread: blocking, channel: CHANNEL,
+          now: () => new Date('2026-08-24T08:00:00.000Z'),
+          signal: job.signal, shutdownSignal: shutdown.signal,
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        { ...observedGate, question: 'daemon stopped during the fenced update' },
+      );
+      await blocking.gateUpdateStarted;
+      shutdown.abort();
+      blocking.releaseGateUpdate();
+
+      await expect(publishing).rejects.toThrow(/aborted/);
+      expect(store.findGateLocalObservation(gate)?.mappingState).toBe('write_pending');
+      expect(claimGate(store, gate, '74747474-7474-4474-8474-747474747474'))
+        .toEqual({ kind: 'rejected', reason: 'card_mapping_not_matched' });
+    } finally {
+      blocking.releaseGateUpdate();
+      store.close();
+    }
+  });
+
+  it('a job that is already aborted takes no fence and leaves the card claimable', async () => {
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    try {
+      const observedGate = await publishedGate(store, new MutableFakeOrca());
+      const gate = gateKey(GATE_ID);
+      const job = new AbortController();
+      job.abort();
+      const slack = new FakeSlack();
+      await expect(publishGateCard(
+        {
+          store, slack, thread: slack, channel: CHANNEL,
+          now: () => new Date('2026-08-24T08:00:00.000Z'),
+          signal: job.signal, shutdownSignal: new AbortController().signal,
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        { ...observedGate, question: 'next Gate reached after the job deadline' },
+      )).rejects.toThrow();
+
+      expect(slack.updates).toEqual([]);
+      expect(store.findGateLocalObservation(gate)?.mappingState).toBe('matched');
+      expect(claimGate(store, gate, '75757575-7575-4575-8575-757575757575').kind).toBe('claimed');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a job abort does not end a never-settling fenced update before its Slack bound', async () => {
+    const store = new SqliteDigestStore(dbPath);
+    insertSidecar(store);
+    const blocking = new BlockingGateSlack();
+    try {
+      const observedGate = await publishedGate(store, new MutableFakeOrca());
+      const gate = gateKey(GATE_ID);
+      const job = new AbortController();
+      const began = Date.now();
+      const publishing = publishGateCard(
+        {
+          store, slack: blocking, thread: blocking, channel: CHANNEL,
+          now: () => new Date('2026-08-24T08:00:00.000Z'), slackTimeoutMs: 50,
+          signal: job.signal, shutdownSignal: new AbortController().signal,
+        },
+        runKey(RUN_ID),
+        RUN_ROOT_TS,
+        { ...observedGate, question: 'never-settling update after the job deadline' },
+      );
+      await blocking.gateUpdateStarted;
+      job.abort();
+
+      await expect(publishing).rejects.toBeInstanceOf(SlackUpdateTimeoutError);
+      expect(Date.now() - began).toBeLessThan(1_000);
+      expect(store.findGateLocalObservation(gate)?.mappingState).toBe('write_pending');
+    } finally {
+      blocking.releaseGateUpdate();
       store.close();
     }
   });

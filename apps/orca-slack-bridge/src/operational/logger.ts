@@ -57,6 +57,13 @@ export const OPERATIONAL_LOG_EVENTS = [
    * 처리 결과는 남기지 않는다 — 그건 gate audit과 `terminal.prompt_action`이 이미 남긴다.
    */
   'slack.ingress',
+  /*
+   * 일시 거부한 Gate 클릭에 "다시 눌러 달라"는 안내를 보낸 결과.
+   *
+   * 이것이 없으면 안내가 보이지 않았다는 보고에서 안내를 보내지 않은 것인지 Slack이 거절한 것인지
+   * 가릴 수 없다. 안내는 클릭의 판정이 아니므로 Gate audit에는 싣지 않는다.
+   */
+  'gate.action_notice',
   'logger.failed',
   'telemetry.rejected',
   'log.corrupt_line',

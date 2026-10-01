@@ -855,3 +855,31 @@ S0가 열어둔 것: durable store(OD-043)는 Slack message identity가 필요�
   원래 문제가 돌아온다.
 - 기각: Task를 S4U로 실행. principal `InteractiveToken`은 strict Task XML parser와 launcher binding 검증이
   고정하는 값이라, action wrapper와 같은 범위의 Task 계약을 바꿔야 한다.
+
+## 2026-10-01 · Gate 카드 쓰기 fence와 재시도 안내
+
+### DL-073 · 쓰기 fence가 걸린 Gate 카드 갱신은 job 기한으로 중단하지 않고 일시 거부는 사용자에게 알린다
+
+- 구조: Run observer는 Gate 카드를 `chat.update`하는 동안 store에 쓰기 fence를 건다(`write_pending`과 30초
+  lease의 `write_owner`). fence가 있는 동안의 클릭은 `card_mapping_not_matched`로 거부되고, 갱신 결과를
+  store에 기록하는 transaction이 fence를 푼다. 첫 게시도 버튼 없는 카드를 올린 뒤 이 경로로 버튼을 붙인다.
+- 사고: 2026-10-01 D3 live acceptance에서 run-observer의 90초 기한이 Slack이 버튼 갱신을 적용한 뒤, store에
+  기록하기 전에 발화했다. 예외 경로는 in-memory 표시만 지웠고 `write_owner`는 다음 pass까지 남았다. 그 사이의
+  클릭 네 번이 모두 거부됐는데 handler는 ACK만 했으므로 사용자는 아무 반응도 보지 못했다. 이미 중단된 job이
+  다음 Gate에 이르면 Slack을 부르지 않고 fence만 잡아 남기는 경로도 있었다.
+- 사용자 결정: fence를 잡은 갱신은 job 기한으로 끊지 않는다. daemon 종료와 Slack 갱신 상한만 멈춘다. 이미
+  중단된 job은 fence를 잡기 전에 멈춘다. 기한 뒤에 실행되는 store 완료(`updateGateObservation`)는 자기 fence를
+  검사하는 단일 `BEGIN IMMEDIATE` transaction이라 안전하다.
+- 상한: Slack 갱신 상한 15초는 lease 30초와 종료 시 observer drain 20초보다 짧다. observer lane은 기한 뒤 최대
+  약 15초 더 돌 수 있고, 그 pass는 그대로 timeout으로 기록된다. 종료·timeout·crash로 남은 fence는 다음 pass가
+  회수한다.
+- 사용자 결정: 다시 누르면 받아들여질 수 있는 일시 거부는 누른 사람에게 알린다. 쓰기 fence, 로컬 기한 초과,
+  `claim_sqlite_busy_*`, 승자를 기록한 뒤 늦은 ACK, 직접 입력의 `store_failed`가 그렇다. 버튼은 ACK가 성공한 뒤
+  `chat.postEphemeral`로 알리고, 직접 입력 제출은 `response_action=errors`로 알려 modal과 세션을 유지한다.
+  다시 눌러도 같은 거부(payload·신원 불일치, `unknown_message`, `missing_sidecar_or_observation`,
+  `sidecar_not_matched`, `stale_or_resolved`, `resolution_already_claimed`, `button_event_collision`,
+  `invalid_*`, modal 불일치, `lost`), 종료 중의 중단, ACK 실패에는 알리지 않는다.
+- 안내 결과는 운영 로그 `gate.action_notice`에만 남긴다. Gate audit 표는 클릭의 판정을 기록하는 곳이라 쓰지
+  않는다.
+- 기각: `response_url`로 안내하는 방식. 이 코드는 그 값을 secret으로 다루고 저장하지 않는다.
+- D3 Channel 경로(`src/channel/**`, plugin, Channel Adapter 명령)는 바꾸지 않았다.

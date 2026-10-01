@@ -313,6 +313,8 @@ Slack payload를 바로 coordinator prompt로 보내거나 Slack을 결정 저�
 
 직접 입력 action은 예외적인 fast path를 가진다. sender/action을 빠르게 검증하고 button payload의 `trigger_id`가 만료되기 전에 ACK와 `views.open`을 3초 안에 끝낸다. 비-owner에게 modal을 열지 않는다. modal submission의 로컬 형식·필수값 오류는 3초 안에 input `block_id`별 `response_action=errors`로 ACK해 modal을 유지한다. 유효한 제출은 ACK한 뒤 원격 Orca 작업을 비동기로 수행한다(OD-071).
 
+다시 누르면 받아들여질 수 있는 일시 거부는 누른 사람에게 알린다. 관측 job이 카드를 갱신하는 동안의 쓰기 fence(`card_mapping_not_matched`), 로컬 기한 초과, SQLite writer 경합, 승자를 기록한 뒤 늦은 ACK가 그렇다. 버튼 클릭은 ACK가 성공한 뒤 그 사람에게만 보이는 `chat.postEphemeral`로 같은 버튼을 다시 누르라고 안내한다. modal 제출은 input `block_id`에 `response_action=errors`로 ACK해 modal과 세션을 유지하므로 그대로 다시 제출할 수 있다. 다시 눌러도 결과가 같은 거부, 종료 중의 중단, ACK 실패에는 안내하지 않는다. `response_url`은 쓰지 않는다(DL-073).
+
 ## 8. Coordinator notification adapters
 
 ### 8.1 Claude Channel Adapter
