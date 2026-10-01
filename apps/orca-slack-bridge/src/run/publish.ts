@@ -156,6 +156,8 @@ export type RunPublishOptions = {
   readonly rootIntent?: SlackRootIntentRuntime;
   /** Observer deadline/shutdown fence carried through Run and Gate publication. */
   readonly signal?: AbortSignal;
+  /** daemon 종료. 쓰기 fence를 잡은 Gate 카드 갱신에만 싣는다(`GatePublishOptions.shutdownSignal`). */
+  readonly shutdownSignal?: AbortSignal;
 };
 
 /**
@@ -460,6 +462,9 @@ export async function publishRunCollection(
               : { placement: 'channel' as const }),
             now: options.now,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
+            ...(options.shutdownSignal === undefined
+              ? {}
+              : { shutdownSignal: options.shutdownSignal }),
             ...(options.slackTimeoutMs === undefined
               ? {}
               : { slackTimeoutMs: options.slackTimeoutMs }),
@@ -497,6 +502,8 @@ export type RunObserveOptions = {
   readonly rootIntent?: SlackRootIntentRuntime;
   /** Observer deadline/shutdown fence carried through Run and Gate publication. */
   readonly signal?: AbortSignal;
+  /** daemon 종료. 쓰기 fence를 잡은 Gate 카드 갱신에만 싣는다(`GatePublishOptions.shutdownSignal`). */
+  readonly shutdownSignal?: AbortSignal;
 };
 
 /**

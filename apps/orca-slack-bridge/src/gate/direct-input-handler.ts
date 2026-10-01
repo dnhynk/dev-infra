@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { GateKey } from '../identity/keys.js';
 import type { SlackConfig } from '../project/config.js';
+import type { EphemeralPoster } from '../slack/post.js';
 import {
   SlackViewOpenError,
   type SlackModalView,
@@ -8,6 +9,7 @@ import {
 } from '../slack/views.js';
 import type { GateStore } from '../store/schema.js';
 import type { SocketSlackEvent } from '../slack/socket.js';
+import { scheduleGateRetryNotice } from './action-handler.js';
 import type { GateResolutionEngine } from './resolve.js';
 import {
   isGateDirectActionId,
@@ -22,6 +24,8 @@ const SQLITE_BUSY_RETRY_MS = 10;
 const MAX_SQLITE_BUSY_RETRIES = 512;
 const RESOLUTION_CAP = 3_000;
 const INPUT_ERROR = '1~3000자의 유효한 결정 내용을 입력하세요.';
+/** 일시 실패한 제출. modal을 그대로 두고 세션도 `opened`로 남으므로 다시 제출할 수 있다. */
+const RETRY_ERROR = '이번 제출은 반영되지 않았습니다. 잠시 후 다시 결정을 눌러 주세요.';
 
 export type GateDirectInputOutcome =
   | 'modal_opened'
@@ -55,6 +59,8 @@ export type GateDirectInputHandlerOptions = {
   readonly schedule?: (job: () => Promise<void>) => void;
   readonly fault?: (point: GateDirectInputFault) => void | Promise<void>;
   readonly abortSignal?: AbortSignal;
+  /** 일시 거부한 버튼 클릭을 누른 사람에게 알리는 경계. 없으면 알리지 않는다. */
+  readonly ephemeral?: EphemeralPoster;
   readonly ingressDeadlineMs?: number;
   readonly localStoreDeadlineMs?: number;
   readonly sqliteBusyRetryMs?: number;
@@ -479,7 +485,7 @@ export class GateDirectInputHandler {
       !isGateCardChannel(this.options.config, button.channelId)
     ) return (await ack()) ? 'rejected' : 'ack_failed';
     if (this.options.abortSignal?.aborted || (budget.elapsed() ?? Infinity) >= this.localStoreDeadlineMs) {
-      return (await ack()) ? 'store_failed' : 'ack_failed';
+      return (await this.ackRetryableClick(ack, button)) ? 'store_failed' : 'ack_failed';
     }
     let prepared;
     try {
@@ -500,11 +506,18 @@ export class GateDirectInputHandler {
         }),
         budget,
       );
-      if (prepared === null) return (await ack()) ? 'store_failed' : 'ack_failed';
+      if (prepared === null) {
+        return (await this.ackRetryableClick(ack, button)) ? 'store_failed' : 'ack_failed';
+      }
     } catch {
       return (await ack()) ? 'store_failed' : 'ack_failed';
     }
-    if (prepared.kind === 'rejected') return (await ack()) ? 'rejected' : 'ack_failed';
+    if (prepared.kind === 'rejected') {
+      const acked = prepared.reason === 'card_mapping_not_matched'
+        ? await this.ackRetryableClick(ack, button)
+        : await ack();
+      return acked ? 'rejected' : 'ack_failed';
+    }
     // This injected boundary represents process death, so it intentionally sits outside the
     // recoverable store-error catch and leaves the prepared sidecar unACKed for Slack redelivery.
     await this.options.fault?.('after_modal_prepare_before_ack');
@@ -609,7 +622,7 @@ export class GateDirectInputHandler {
       })) ? 'rejected' : 'ack_failed';
     }
     if (this.options.abortSignal?.aborted || (budget.elapsed() ?? Infinity) >= this.localStoreDeadlineMs) {
-      return (await ack()) ? 'store_failed' : 'ack_failed';
+      return (await this.ackRetryableSubmission(ack, session)) ? 'store_failed' : 'ack_failed';
     }
     let claimed;
     try {
@@ -630,7 +643,9 @@ export class GateDirectInputHandler {
         }),
         budget,
       );
-      if (claimed === null) return (await ack()) ? 'store_failed' : 'ack_failed';
+      if (claimed === null) {
+        return (await this.ackRetryableSubmission(ack, session)) ? 'store_failed' : 'ack_failed';
+      }
     } catch {
       return (await ack()) ? 'store_failed' : 'ack_failed';
     }
@@ -639,7 +654,9 @@ export class GateDirectInputHandler {
       // exception, a real crash cannot send an ACK or mutate the ACK fence on its way down.
       await this.options.fault?.('after_submission_claim_before_ack');
     }
-    const acked = await ack();
+    const acked = claimed.kind === 'rejected' && claimed.reason === 'card_mapping_not_matched'
+      ? await this.ackRetryableSubmission(ack, session)
+      : await ack();
     if (!acked) {
       if (claimed.kind === 'claimed' || claimed.kind === 'duplicate') {
         await this.persistAck(claimed.intent, 'failed', budget);
@@ -658,6 +675,22 @@ export class GateDirectInputHandler {
       this.schedule(() => this.options.engine.resolveAndProject(gateKey));
     }
     return claimed.kind;
+  }
+
+  /** 일시 실패한 버튼 클릭을 ACK하고, 종료 중이 아니면 누른 사람에게 다시 누르라고 알린다. */
+  private async ackRetryableClick(ack: Ack, button: ParsedButton): Promise<boolean> {
+    const acked = await ack();
+    if (acked && !this.options.abortSignal?.aborted) {
+      scheduleGateRetryNotice(this.schedule, this.options.ephemeral, button);
+    }
+    return acked;
+  }
+
+  /** 일시 실패한 제출은 modal을 유지하고 다시 결정하라고 표시한다. 종료 중이면 그냥 ACK한다. */
+  private ackRetryableSubmission(ack: Ack, session: GateDirectModalSession): Promise<boolean> {
+    return this.options.abortSignal?.aborted
+      ? ack()
+      : ack({ response_action: 'errors', errors: { [session.inputBlockId]: RETRY_ERROR } });
   }
 
   private finishOpenFailure(session: GateDirectModalSession, code: string): void {

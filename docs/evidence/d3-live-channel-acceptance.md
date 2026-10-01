@@ -54,7 +54,7 @@ operator help.
 
 - The first four clicks were each audited as `card_mapping_not_matched`, and the operator saw no
   response. The Run observer had overrun its 90 s deadline after staging the card and still held
-  the card's write lease. The next observer pass released it. This D2 defect is tracked separately.
+  the card's write lease. The next observer pass released it. DL-073 fixes this D2 defect.
 - The daemon stopped twice without a launcher exit record, once before and once after the
   acceptance checks. The task repetition restarted it after 2 minutes and after 19 seconds. One
   click in the first window was not delivered. Both times the operator had closed or reopened

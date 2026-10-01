@@ -55,6 +55,17 @@ export type UpdateMessageInput = {
   readonly signal?: AbortSignal;
 };
 
+export type EphemeralMessageInput = {
+  readonly channel: string;
+  /** 안내를 볼 사람. 이 사람에게만 보인다. */
+  readonly user: string;
+  readonly text: string;
+  /** 카드가 thread 답글일 때만 싣는다. Slack 파라미터 `thread_ts`다. */
+  readonly threadTs?: string;
+  /** Cooperative cancellation for an at-most-once notice attempt. Never serialized to Slack. */
+  readonly signal?: AbortSignal;
+};
+
 /**
  * 게시 결과.
  *
@@ -256,6 +267,19 @@ export interface ThreadPoster {
 }
 
 /**
+ * 누른 사람에게만 보이는 안내(`chat.postEphemeral`). Gate 클릭이 일시적으로 거부됐을 때 다시
+ * 누르라고 알린다.
+ *
+ * **재시도 정책은 `post`와 같다.** 같은 요청임을 Slack이 알아볼 identity가 없으므로 게시 여부를 알 수
+ * 없는 실패를 다시 보내면 같은 안내가 두 번 보인다. 안내는 store에 기록하지 않는다.
+ *
+ * `response_url`로 대신하지 않는다. 이 코드는 그 값을 secret으로 다루고 저장하지 않는다.
+ */
+export interface EphemeralPoster {
+  ephemeral(input: EphemeralMessageInput): Promise<PostedMessage>;
+}
+
+/**
  * Slack이 `ok: false`로 준 실패.
  *
  * `error` 코드를 그대로 싣는다. 호출자가 `message_not_found`(메시지가 지워져 다시 연결해야
@@ -351,9 +375,10 @@ type Attempt =
  *
  * 함께 두는 근거는 재시도 규율이다. `reply`의 재시도 정책은 `post`와 같아야 하는데, 같은 `call`을
  * 같은 `retryDeliveryUnknown=false`로 부르면 그 규율이 **한 곳에만** 있다. 클래스를 나누면
- * `call`·`attempt`·`redact`와 토큰 마스킹이 복사되고, 복사본은 한쪽만 고쳐진다.
+ * `call`·`attempt`·`redact`와 토큰 마스킹이 복사되고, 복사본은 한쪽만 고쳐진다. `EphemeralPoster`도
+ * 같은 이유로 여기 있다.
  */
-export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
+export class SlackWebApiPoster implements SlackPoster, ThreadPoster, EphemeralPoster {
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetries: number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -409,6 +434,21 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
         text: input.text,
         blocks: input.blocks,
         ...(input.broadcast === true ? { reply_broadcast: true } : {}),
+      },
+      false,
+      input.signal,
+    );
+  }
+
+  /** 누른 사람에게만 보이는 안내. **재시도 정책이 `post`와 같다.** 근거는 `EphemeralPoster`에 있다. */
+  async ephemeral(input: EphemeralMessageInput): Promise<PostedMessage> {
+    return this.call(
+      'chat.postEphemeral',
+      {
+        channel: input.channel,
+        user: input.user,
+        text: input.text,
+        ...(input.threadTs === undefined ? {} : { thread_ts: input.threadTs }),
       },
       false,
       input.signal,
@@ -515,8 +555,10 @@ export class SlackWebApiPoster implements SlackPoster, ThreadPoster {
       throw new SlackApiError(method, code);
     }
 
-    const channel = o['channel'];
-    const ts = o['ts'];
+    // chat.postEphemeral은 channel 없이 message_ts만 돌려준다. 요청한 channel이 그 안내의 channel이다.
+    const ephemeral = method === 'chat.postEphemeral';
+    const channel = ephemeral ? body['channel'] : o['channel'];
+    const ts = ephemeral ? o['message_ts'] : o['ts'];
     if (typeof channel !== 'string' || channel === '' || typeof ts !== 'string' || ts === '') {
       // ok:true인데 identity가 없으면 store가 기록할 값이 없다. 빈 값으로 진행하지 않는다.
       throw new Error(`Slack ${method} 응답에 channel/ts가 없다`);

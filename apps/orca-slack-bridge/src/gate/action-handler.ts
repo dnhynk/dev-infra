@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { GateKey } from '../identity/keys.js';
 import type { SlackConfig } from '../project/config.js';
 import type { GateStore } from '../store/schema.js';
+import type { EphemeralPoster } from '../slack/post.js';
 import type { SocketSlackEvent } from '../slack/socket.js';
 import type { GateResolutionEngine } from './resolve.js';
 import type { GateResolutionIntent } from './resolution-types.js';
@@ -21,6 +22,8 @@ export type GateActionHandlerOptions = {
   readonly fault?: (point: GateActionFault) => void;
   /** Daemon shutdown aborts only local SQLITE_BUSY sleeps; the one Slack ACK is still attempted. */
   readonly abortSignal?: AbortSignal;
+  /** 일시 거부를 누른 사람에게 알리는 경계. 없으면 알리지 않는다(`scheduleGateRetryNotice`). */
+  readonly ephemeral?: EphemeralPoster;
   /** Test seams may shorten, but never extend, Slack's production three-second ingress budget. */
   readonly localCasDeadlineMs?: number;
   readonly slackAckDeadlineMs?: number;
@@ -235,6 +238,39 @@ function isGateCardChannel(config: SlackConfig, channelId: string): boolean {
   return channelId === config.channels.agentRuns || channelId === config.channels.decisions;
 }
 
+const GATE_RETRY_NOTICE =
+  '⏳ 이번 선택은 반영되지 않았습니다. 잠시 후 같은 버튼을 다시 눌러 주세요.';
+
+/**
+ * 일시적으로 거부한 클릭을 누른 사람에게 알린다. ACK가 성공한 뒤에만 부른다.
+ *
+ * 일시 거부는 같은 버튼을 다시 누르면 받아들여질 수 있는 거부다. 쓰기 fence가 걸린 카드
+ * (`card_mapping_not_matched`), 로컬 기한 초과, SQLite writer 경합, 승자를 기록한 뒤 늦은 ACK가 그렇다.
+ * 그 밖의 거부는 다시 눌러도 같으므로 알리지 않는다. 종료 중의 중단과 ACK 실패도 알리지 않는다.
+ *
+ * 안내는 클릭한 카드 자리에 놓는다. thread 답글 카드면 그 thread에, 최상위 카드면 채널에 놓는다.
+ */
+export function scheduleGateRetryNotice(
+  schedule: (job: () => Promise<void>) => void,
+  ephemeral: EphemeralPoster | undefined,
+  click: {
+    readonly channelId: string;
+    readonly ownerUserId: string;
+    readonly threadTs: string;
+    readonly messageTs: string;
+  },
+): void {
+  if (ephemeral === undefined) return;
+  schedule(async () => {
+    await ephemeral.ephemeral({
+      channel: click.channelId,
+      user: click.ownerUserId,
+      text: GATE_RETRY_NOTICE,
+      ...(click.threadTs === click.messageTs ? {} : { threadTs: click.threadTs }),
+    });
+  });
+}
+
 export class GateActionHandler {
   private readonly now: () => Date;
   private readonly monotonic: () => number;
@@ -369,6 +405,7 @@ export class GateActionHandler {
     if (elapsed >= this.localCasDeadlineMs) {
       const acked = await ack();
       this.audit(null, 'rejected', 'local_deadline_exceeded');
+      if (acked) scheduleGateRetryNotice(this.schedule, this.options.ephemeral, action);
       return acked ? 'rejected' : 'ack_failed';
     }
 
@@ -402,6 +439,10 @@ export class GateActionHandler {
           if (stopped !== null) {
             const acked = await ack();
             this.audit(null, 'store_failed', `claim_sqlite_busy_${stopped}`);
+            // `aborted`는 daemon 종료다. 알리지 않는다.
+            if (acked && stopped !== 'aborted') {
+              scheduleGateRetryNotice(this.schedule, this.options.ephemeral, action);
+            }
             return acked ? 'store_failed' : 'ack_failed';
           }
         }
@@ -441,6 +482,10 @@ export class GateActionHandler {
       }
       return 'ack_failed';
     }
+    if (claimed.kind === 'rejected' && claimed.reason === 'card_mapping_not_matched') {
+      // 관측 job이 이 카드를 갱신하는 중이다. 그 쓰기가 끝나면 같은 클릭이 받아들여진다.
+      scheduleGateRetryNotice(this.schedule, this.options.ephemeral, action);
+    }
     let afterAckElapsed: number | null = null;
     if (postCasElapsed !== null) {
       try {
@@ -469,6 +514,8 @@ export class GateActionHandler {
         if (persisted.intent === null) {
           this.audit(claimed.intent.gateKey, 'store_failed', persisted.reason);
         }
+        // 이 승자는 실행하지 않는다. 같은 버튼을 다시 누르면 duplicate로 이어서 실행된다.
+        scheduleGateRetryNotice(this.schedule, this.options.ephemeral, action);
       }
       return 'rejected';
     }

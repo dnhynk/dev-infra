@@ -160,6 +160,19 @@ describe('allowlist-only redacted operational logger', () => {
     expect(parseOperationalLogLine(rawLines()[1] as string)?.event).toBe('telemetry.rejected');
   });
 
+  it('accepts the Gate retry-notice event with or without a catalog failure code', async () => {
+    const logger = await OperationalNdjsonLogger.create({ logDir: dir, buildIdentity: 'build', clock: () => AT });
+    await logger.log({ level: 'info', event: 'gate.action_notice', outcome: 'succeeded' });
+    await logger.log({
+      level: 'warn', event: 'gate.action_notice', outcome: 'failed', errorCode: 'slack.transport_unknown',
+    });
+    await logger.close();
+    expect(rawLines().map((line) => parseOperationalLogLine(line))).toMatchObject([
+      { event: 'gate.action_notice', outcome: 'succeeded' },
+      { event: 'gate.action_notice', outcome: 'failed', errorCode: 'slack.transport_unknown' },
+    ]);
+  });
+
   it('flushes already accepted writes on close and rejects later writes without touching the file', async () => {
     const logger = await OperationalNdjsonLogger.create({ logDir: dir, buildIdentity: 'build', clock: () => AT });
     const accepted = Array.from({ length: 20 }, () =>

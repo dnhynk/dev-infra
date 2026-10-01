@@ -350,8 +350,14 @@ completed outbox may be skipped until another generation or forced reprojection.
 message-update CAS or distributed transaction to close this final stale-remote/storage crash gap.
 
 An ordinary Run observer holds a durable pre-Slack write fence while it updates the shared Gate
-card. A click during that short interval is still ACKed exactly once but is rejected fail-closed;
-the owner must click again after the observer settles. This is intentional because allowing the
-claim to race the ordinary update would let a stale fixed-action card overwrite the D2 status card.
+card. A click during that interval is still ACKed exactly once but is rejected fail-closed
+(`card_mapping_not_matched`). This is intentional because allowing the claim to race the ordinary
+update would let a stale fixed-action card overwrite the D2 status card. Once the fence is taken,
+the observer job deadline no longer cancels the update: only daemon shutdown or the 15-second Slack
+update bound stops it, and the local completion runs even after the deadline. A job that is
+already aborted does not take the fence. The fence therefore ends within the Slack bound, or at the
+next observer pass after a shutdown, timeout or crash. After a successful ACK the owner who clicked
+is told to press the same button again; a direct-input submission keeps its modal open with an
+inline error instead (DL-073).
 
 No live Slack or Orca product write was made while collecting this evidence.

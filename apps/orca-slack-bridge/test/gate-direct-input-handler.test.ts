@@ -23,6 +23,7 @@ import {
 } from '../src/gate/actions.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { SlackConfig } from '../src/project/config.js';
+import type { EphemeralMessageInput, EphemeralPoster } from '../src/slack/post.js';
 import type { SocketSlackEvent } from '../src/slack/socket.js';
 import type {
   OpenedSlackView,
@@ -50,6 +51,8 @@ const REQUEST_IDS = [
   '44444444-4444-4444-8444-444444444444',
 ];
 const INPUT_ERROR = '1~3000자의 유효한 결정 내용을 입력하세요.';
+const RETRY_NOTICE = '⏳ 이번 선택은 반영되지 않았습니다. 잠시 후 같은 버튼을 다시 눌러 주세요.';
+const RETRY_ERROR = '이번 제출은 반영되지 않았습니다. 잠시 후 다시 결정을 눌러 주세요.';
 
 const CONFIG: SlackConfig = {
   teamId: TEAM,
@@ -113,6 +116,27 @@ function seed(
     mappingState: over.mappingState ?? 'matched',
     observedAt: AT,
   });
+}
+
+/** 관측 job이 이 카드를 갱신하는 중이다. 돌려준 값으로 그 쓰기를 마칠 수 있다. */
+function fence(store: SqliteDigestStore) {
+  const saved = store.saveGateLocalObservation({
+    gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+    resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+  });
+  expect(store.beginGateObservationWrite(
+    GATE, AT, saved.observation, saved.revision, { channelId: CHANNEL, threadTs: THREAD_TS },
+  )).toBe(true);
+  return saved;
+}
+
+function recordingNotice(notices: EphemeralMessageInput[]): EphemeralPoster {
+  return {
+    ephemeral: async (input) => {
+      notices.push(input);
+      return { channel: input.channel, ts: '1787554900.000099' };
+    },
+  };
 }
 
 function buttonBody(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -1060,6 +1084,109 @@ describe('Gate direct-input Socket Mode boundary', () => {
       expect(directJobs.length + fixedJobs.length).toBe(1);
       for (const job of [...directJobs, ...fixedJobs]) await job();
       expect(engineCalls).toEqual([GATE]);
+      store.close();
+    }
+  });
+
+  it('a direct-input click on a fenced card opens nothing and is told once, after the ACK, to retry', async () => {
+    const store = new SqliteDigestStore(join(dir, 'fenced-button.db'));
+    seed(store);
+    fence(store);
+    const opener = new FakeOpener();
+    const order: string[] = [];
+    const jobs: Array<() => Promise<void>> = [];
+    const notices: EphemeralMessageInput[] = [];
+    expect(await directHandler(store, opener, [], jobs, {
+      ephemeral: recordingNotice(notices),
+      schedule: (job) => {
+        order.push('schedule');
+        jobs.push(job);
+      },
+    }).handle(event(buttonBody(), () => { order.push('ack'); }))).toBe('rejected');
+
+    expect(order).toEqual(['ack', 'schedule']);
+    expect(opener.calls).toEqual([]);
+    expect(store.findGateDirectModal(SESSION_ID)).toBeNull();
+    await jobs[0]!();
+    expect(notices).toEqual([{
+      channel: CHANNEL, user: OWNER, text: RETRY_NOTICE, threadTs: THREAD_TS,
+    }]);
+    store.close();
+  });
+
+  it('keeps the modal open on a fenced card and claims the resubmission after the write settles', async () => {
+    const store = new SqliteDigestStore(join(dir, 'fenced-submission.db'));
+    seed(store);
+    const opener = new FakeOpener();
+    const { handler, engineCalls, jobs } = await openModal(store, opener);
+    const write = fence(store);
+    const responses: unknown[] = [];
+    expect(await handler.handle(event(submissionBody('fence 뒤 결정'), (response) => {
+      responses.push(response);
+    }))).toBe('rejected');
+
+    expect(responses).toEqual([{
+      response_action: 'errors',
+      errors: { [gateDirectInputBlockId(GATE)]: RETRY_ERROR },
+    }]);
+    expect(store.findGateDirectModal(SESSION_ID)?.state).toBe('opened');
+    expect(store.findGateResolution(GATE)).toBeNull();
+    expect(jobs).toEqual([]);
+
+    // 관측 job이 카드 갱신을 마쳤다.
+    store.updateGateObservation(GATE, 'fp-settled', AT, write.observation, write.revision);
+    const resubmitted: unknown[] = [];
+    expect(await handler.handle(event(submissionBody('fence 뒤 결정'), (response) => {
+      resubmitted.push(response);
+    }))).toBe('claimed');
+    expect(resubmitted).toEqual([undefined]);
+    expect(store.findGateResolution(GATE)).toMatchObject({
+      optionResolution: 'fence 뒤 결정',
+      ackState: 'acked',
+    });
+    expect(jobs).toHaveLength(1);
+    await jobs[0]!();
+    expect(engineCalls).toEqual([GATE]);
+    store.close();
+  });
+
+  it('a local store deadline asks to retry, while a shutdown abort keeps the plain ACK', async () => {
+    for (const mode of ['deadline', 'shutdown'] as const) {
+      const store = new SqliteDigestStore(join(dir, `temporary-${mode}.db`));
+      seed(store);
+      const opener = new FakeOpener();
+      await openModal(store, opener);
+      let reads = 0;
+      const over: Partial<DirectOptions> = mode === 'deadline'
+        ? { monotonic: () => (reads++ === 0 ? 0 : 2_000) }
+        : { abortSignal: AbortSignal.abort() };
+      const jobs: Array<() => Promise<void>> = [];
+      const notices: EphemeralMessageInput[] = [];
+      const handler = directHandler(store, opener, [], jobs, {
+        ...over,
+        ephemeral: recordingNotice(notices),
+      });
+
+      const buttonAcks: unknown[] = [];
+      expect(await handler.handle(event(buttonBody(), (response) => {
+        buttonAcks.push(response);
+      })), mode).toBe('store_failed');
+      expect(buttonAcks, mode).toEqual([undefined]);
+      for (const job of jobs) await job();
+      expect(notices, mode).toEqual(mode === 'deadline'
+        ? [{ channel: CHANNEL, user: OWNER, text: RETRY_NOTICE, threadTs: THREAD_TS }]
+        : []);
+
+      reads = 0;
+      const submitAcks: unknown[] = [];
+      expect(await handler.handle(event(submissionBody('기한 뒤 결정'), (response) => {
+        submitAcks.push(response);
+      })), mode).toBe('store_failed');
+      expect(submitAcks, mode).toEqual([mode === 'deadline'
+        ? { response_action: 'errors', errors: { [gateDirectInputBlockId(GATE)]: RETRY_ERROR } }
+        : undefined]);
+      expect(store.findGateDirectModal(SESSION_ID)?.state, mode).toBe('opened');
+      expect(store.findGateResolution(GATE), mode).toBeNull();
       store.close();
     }
   });

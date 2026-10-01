@@ -8,6 +8,7 @@ import { gateActionId, gateBlockId } from '../src/gate/actions.js';
 import { GateResolutionEngine } from '../src/gate/resolve.js';
 import { dispatchKey, gateKey, runKey, taskKey } from '../src/identity/keys.js';
 import type { SlackConfig } from '../src/project/config.js';
+import type { EphemeralMessageInput, EphemeralPoster } from '../src/slack/post.js';
 import { SqliteDigestStore } from '../src/store/sqlite.js';
 
 const GATE = gateKey('gate_action');
@@ -30,6 +31,7 @@ const CONFIG: SlackConfig = {
   ownerUserIds: ['U0OWNER', 'U0SECOND'],
   channels: { prDigest: 'C0PRDIGEST', agentRuns: CHANNEL, decisions: DECISIONS },
 };
+const RETRY_NOTICE = '⏳ 이번 선택은 반영되지 않았습니다. 잠시 후 같은 버튼을 다시 눌러 주세요.';
 
 let dir: string;
 
@@ -64,6 +66,27 @@ function seed(store: SqliteDigestStore, over: {
     resolvedAt: status === 'resolved' ? AT : null,
     metadataState: over.metadataState ?? 'matched', mappingState: over.mappingState ?? 'matched', observedAt: AT,
   });
+}
+
+/** 관측 job이 이 카드를 갱신하는 중이다. 그동안의 클릭은 `card_mapping_not_matched`로 거부된다. */
+function fence(store: SqliteDigestStore, threadTs = THREAD_TS): void {
+  const saved = store.saveGateLocalObservation({
+    gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+    resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+  });
+  expect(store.beginGateObservationWrite(
+    GATE, AT, saved.observation, saved.revision, { channelId: CHANNEL, threadTs },
+  )).toBe(true);
+}
+
+function recordingNotice(order: string[], notices: EphemeralMessageInput[] = []): EphemeralPoster {
+  return {
+    ephemeral: async (input) => {
+      order.push('notice');
+      notices.push(input);
+      return { channel: input.channel, ts: '1787554900.000099' };
+    },
+  };
 }
 
 function body(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -830,6 +853,183 @@ describe('fixed-option Slack Gate action boundary', () => {
     expect(acks).toBe(1);
     expect(engineCalls).toEqual([]);
     expect(store.findGateResolution(GATE)).toBeNull();
+    store.close();
+  });
+
+  it('a click on a fenced card is rejected and told once, after the ACK, to retry', async () => {
+    for (const placement of ['thread', 'channel'] as const) {
+      const store = new SqliteDigestStore(join(dir, `fenced-${placement}.db`));
+      seed(store);
+      const raw = body();
+      if (placement === 'channel') {
+        // 최상위 카드는 자기 자신이 thread 루트다.
+        store.forgetGateMessage(GATE);
+        store.insertGateMessage({
+          gateKey: GATE, runKey: RUN, channelId: CHANNEL,
+          threadTs: MESSAGE_TS, messageTs: MESSAGE_TS, renderFingerprint: 'fp', at: AT,
+        }, {
+          gateKey: GATE, runKey: RUN, taskKey: TASK, status: 'pending', resolution: null,
+          resolvedAt: null, metadataState: 'matched', mappingState: 'matched', observedAt: AT,
+        });
+        delete (raw['message'] as Record<string, unknown>)['thread_ts'];
+      }
+      fence(store, placement === 'thread' ? THREAD_TS : MESSAGE_TS);
+      const order: string[] = [];
+      const notices: EphemeralMessageInput[] = [];
+      const engineCalls: string[] = [];
+      const outcome = await handler(store, engineCalls, {
+        ephemeral: recordingNotice(order, notices),
+      }).handle(event(raw, () => { order.push('ack'); }));
+
+      expect(outcome, placement).toBe('rejected');
+      expect(order, placement).toEqual(['ack', 'notice']);
+      expect(notices, placement).toEqual([{
+        channel: CHANNEL,
+        user: 'U0OWNER',
+        text: RETRY_NOTICE,
+        // 답글 카드의 안내만 그 thread에 놓는다.
+        ...(placement === 'thread' ? { threadTs: THREAD_TS } : {}),
+      }]);
+      expect(engineCalls, placement).toEqual([]);
+      expect(store.findGateResolution(GATE), placement).toBeNull();
+      store.close();
+    }
+  });
+
+  it('a local deadline, writer contention and a late ACK after the winner each notify once after the ACK', async () => {
+    const deadlineStore = new SqliteDigestStore(join(dir, 'notice-local-deadline.db'));
+    seed(deadlineStore);
+    let deadlineReads = 0;
+    const deadlineOrder: string[] = [];
+    expect(await handler(deadlineStore, [], {
+      monotonic: () => (deadlineReads++ === 0 ? 0 : 2_600),
+      ephemeral: recordingNotice(deadlineOrder),
+    }).handle(event(body(), () => { deadlineOrder.push('ack'); }))).toBe('rejected');
+    expect(deadlineOrder).toEqual(['ack', 'notice']);
+    deadlineStore.close();
+
+    const busyPath = join(dir, 'notice-busy-deadline.db');
+    const busyStore = new SqliteDigestStore(busyPath);
+    seed(busyStore);
+    const locker = new DatabaseSync(busyPath);
+    locker.exec('BEGIN IMMEDIATE');
+    const busyOrder: string[] = [];
+    expect(await handler(busyStore, [], {
+      localCasDeadlineMs: 40,
+      slackAckDeadlineMs: 200,
+      sqliteBusyRetryMs: 5,
+      monotonic: () => 0,
+      ephemeral: recordingNotice(busyOrder),
+    }).handle(event(body(), () => {
+      busyOrder.push('ack');
+      locker.exec('COMMIT');
+    }))).toBe('store_failed');
+    expect(busyOrder).toEqual(['ack', 'notice']);
+    locker.close();
+    busyStore.close();
+
+    const lateStore = new SqliteDigestStore(join(dir, 'notice-late-ack.db'));
+    seed(lateStore);
+    let lateReads = 0;
+    const lateOrder: string[] = [];
+    expect(await handler(lateStore, [], {
+      monotonic: () => {
+        lateReads += 1;
+        if (lateReads === 3) throw new Error('clock unavailable');
+        return lateReads === 1 ? 0 : 100;
+      },
+      ephemeral: recordingNotice(lateOrder),
+    }).handle(event(body(), () => { lateOrder.push('ack'); }))).toBe('rejected');
+    expect(lateOrder).toEqual(['ack', 'notice']);
+    // 같은 버튼을 다시 누르면 이 승자가 duplicate로 이어진다.
+    expect(lateStore.findGateResolution(GATE)?.ackState).toBe('failed');
+    lateStore.close();
+  });
+
+  it('final rejections, a lost click, a failed ACK and shutdown aborts send no notice', async () => {
+    const cases: readonly {
+      readonly name: string;
+      readonly prepare: (store: SqliteDigestStore) => void;
+      readonly raw?: Record<string, unknown>;
+      readonly ack?: () => void;
+      readonly over?: Partial<ConstructorParameters<typeof GateActionHandler>[0]>;
+      readonly outcome: string;
+    }[] = [
+      { name: 'stale', prepare: (store) => seed(store, { status: 'resolved' }), outcome: 'rejected' },
+      {
+        name: 'sidecar',
+        prepare: (store) => seed(store, { metadataState: 'mismatched' }),
+        outcome: 'rejected',
+      },
+      {
+        name: 'identity',
+        prepare: (store) => seed(store),
+        raw: body({ team: { id: 'TOTHER' } }),
+        outcome: 'rejected',
+      },
+      {
+        name: 'lost',
+        prepare: (store) => {
+          seed(store);
+          expect(store.claimGateResolution({
+            teamId: 'T0TEAM', ownerUserId: 'U0SECOND', apiAppId: 'A0APP', channelId: CHANNEL,
+            threadTs: THREAD_TS, messageTs: MESSAGE_TS, blockId: gateBlockId(GATE),
+            actionId: gateActionId(GATE, 'change'), actionValue: 'change',
+            retryRequestId: UUIDS[2]!, at: AT,
+          }).kind).toBe('claimed');
+        },
+        outcome: 'lost',
+      },
+      {
+        name: 'ack-failed',
+        prepare: (store) => { seed(store); fence(store); },
+        ack: () => { throw new Error('ack transport failed'); },
+        outcome: 'ack_failed',
+      },
+      {
+        name: 'shutdown',
+        prepare: (store) => { seed(store); fence(store); },
+        over: { abortSignal: AbortSignal.abort() },
+        outcome: 'store_failed',
+      },
+    ];
+    for (const testCase of cases) {
+      const store = new SqliteDigestStore(join(dir, `no-notice-${testCase.name}.db`));
+      testCase.prepare(store);
+      const order: string[] = [];
+      expect(await handler(store, [], {
+        ...testCase.over,
+        ephemeral: recordingNotice(order),
+      }).handle(event(testCase.raw ?? body(), () => {
+        order.push('ack');
+        testCase.ack?.();
+      })), testCase.name).toBe(testCase.outcome);
+      expect(order, testCase.name).toEqual(['ack']);
+      store.close();
+    }
+
+    // 종료가 writer 경합 대기를 끊은 클릭도 알리지 않는다.
+    const path = join(dir, 'no-notice-busy-shutdown.db');
+    const store = new SqliteDigestStore(path);
+    seed(store);
+    const locker = new DatabaseSync(path);
+    locker.exec('BEGIN IMMEDIATE');
+    const abort = new AbortController();
+    const abortTimer = setTimeout(() => abort.abort(), 20);
+    const order: string[] = [];
+    expect(await handler(store, [], {
+      abortSignal: abort.signal,
+      localCasDeadlineMs: 200,
+      slackAckDeadlineMs: 300,
+      sqliteBusyRetryMs: 10,
+      ephemeral: recordingNotice(order),
+    }).handle(event(body(), () => {
+      order.push('ack');
+      locker.exec('COMMIT');
+    }))).toBe('store_failed');
+    clearTimeout(abortTimer);
+    expect(order).toEqual(['ack']);
+    locker.close();
     store.close();
   });
 });
