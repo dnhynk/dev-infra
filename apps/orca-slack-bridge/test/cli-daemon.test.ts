@@ -581,10 +581,14 @@ describe('daemon production wiring', () => {
     });
     seeded.close();
 
-    const changed = parseConfig({
-      ...CONFIG,
-      slack: { ...CONFIG.slack, channels: { ...CONFIG.slack.channels, prDigest: 'C0PRDIGEST2' } },
-    });
+    // Any config change gives a new operational config fingerprint.
+    const changed = {
+      ...ENABLED_CONFIG,
+      automation: {
+        ...ENABLED_CONFIG.automation,
+        prDigest: { ...ENABLED_CONFIG.automation.prDigest, prLimit: 1 },
+      },
+    };
     const parsed = parseArgs(['daemon', '--state', statePath]);
     if (parsed.kind !== 'run') throw new Error('daemon args failed');
     const start = (orca: OrcaRunner): Promise<number> => runDaemonCommand(parsed, changed, {
