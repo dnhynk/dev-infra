@@ -99,7 +99,7 @@ Orca Run은 durable namespace이자 coordinator inbox이며, 플랫폼이 reposi
   "parent_id": null,
   "created_by_terminal_handle": "term_720b6c26-...",
   "created_by_pane_key": "f39db44b-...:8c71884b-...",
-  "created_by_process_incarnation": "ccb3c8ee-...::D:/dev-infra@@8c25bfec:f126ab2a-...",
+  "created_by_process_incarnation": "c0c0c0c0-...::D:/dev-infra@@8c25bfec:f126ab2a-...",
   "created_by_run_generation": 1,
   "task_title": "...", "display_name": "...", "spec": "...",
   "status": "ready", "deps": "[]", "result": null,
@@ -211,8 +211,8 @@ Orca가 실행한 Claude 세션에 identity가 환경변수로 주입된다.
 ORCA_TERMINAL_HANDLE = term_720b6c26-eb04-4a16-ab79-b226ac50c04f
 ORCA_PANE_KEY        = f39db44b-...:8c71884b-...
 ORCA_TAB_ID          = f39db44b-...
-ORCA_WORKTREE_ID     = ccb3c8ee-...::D:/dev-infra
-ORCA_WORKSPACE_ID    = ccb3c8ee-...::D:/dev-infra
+ORCA_WORKTREE_ID     = c0c0c0c0-...::D:/dev-infra
+ORCA_WORKSPACE_ID    = c0c0c0c0-...::D:/dev-infra
 ORCA_AGENT_HOOK_PORT = 51594
 ```
 
@@ -570,12 +570,12 @@ review의 "핵심 comment"와 `Merge Ready`는 API 단일 필드가 아니라 Br
 
 | repository | PR 수 | GitHub review | `reviewDecision` | CI check |
 |---|---|---|---|---|
-| `vertical-live` (public) | 31 | 전부 `COMMENTED` | null | 1 |
-| `ToneAndMove` | 36 | 0건 | null | 2 |
-| `toss_trade` | 49 | 0건 | null | 0 |
+| `repo-a` (public) | 31 | 전부 `COMMENTED` | null | 1 |
+| `repo-b` | 36 | 0건 | null | 2 |
+| `repo-c` | 49 | 0건 | null | 0 |
 | `PostFeel` | 22 | 0건 | null | 1 |
 
-**`reviewDecision`은 모든 repository에서 null이다.** `vertical-live`의 31개 PR에 `APPROVED`나 `CHANGES_REQUESTED`가 한 건도 없다. 원인은 구조적이다 — PR author와 review author가 같은 계정(`dnhynk`)이고 GitHub은 자기 PR을 스스로 approve할 수 없게 막는다. 단일 계정 workflow에서는 formal verdict가 원리적으로 불가능하다.
+**`reviewDecision`은 모든 repository에서 null이다.** `repo-a`의 31개 PR에 `APPROVED`나 `CHANGES_REQUESTED`가 한 건도 없다. 원인은 구조적이다 — PR author와 review author가 같은 계정(`dnhynk`)이고 GitHub은 자기 PR을 스스로 approve할 수 없게 막는다. 단일 계정 workflow에서는 formal verdict가 원리적으로 불가능하다.
 
 따라서 **GitHub만 관찰해서는 approve/changes-requested를 알 수 없다.** reviewer verdict의 durable source는 Orca다(DL-016).
 
@@ -583,7 +583,7 @@ check 개수는 repository마다 0~2개로 제각각이고 CI가 아예 없는 r
 
 #### review 본문 규약 (repo 국소)
 
-`vertical-live`의 review 본문 구조:
+`repo-a`의 review 본문 구조:
 
 ```text
 ## Verdict: request_changes        ← 또는 approve

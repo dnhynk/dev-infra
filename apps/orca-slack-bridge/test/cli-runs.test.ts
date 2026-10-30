@@ -43,7 +43,7 @@ afterEach(() => {
 const TOKEN = ['xoxb', 'FAKE', 'NOTAREALBOTTOKENVALUE'].join('-');
 const AGENT_RUNS = 'C0AGENTRUNS';
 const PR_DIGEST = 'C0PRDIGEST';
-const REPO_ID = 'ccb3c8ee-6d9e-42af-af36-9fdac6566fcc';
+const REPO_ID = 'c0c0c0c0-0000-4000-8000-000000000001';
 
 const CONFIG: BridgeConfig = {
   slack: {

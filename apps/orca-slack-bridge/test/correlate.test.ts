@@ -41,7 +41,7 @@ describe('metadata 파싱', () => {
 
 describe('correlation 판정', () => {
   it('metadata가 없으면 no_metadata', () => {
-    // 실측된 vertical-live PR body는 ## Task / ## Why / ## What 구조이고 orca id가 없다
+    // 실측된 다른 repository의 PR body는 ## Task / ## Why / ## What 구조이고 orca id가 없다
     const body = '## Task\n\n- T-ID: T8e\n\n## Why\n...';
     const r = resolveCorrelation(parseCorrelationMetadata(body, K), orca);
     expect(r).toEqual({ kind: 'uncorrelated', reason: 'no_metadata' });

@@ -215,10 +215,10 @@ ID: OD-003
 근거는 [플랫폼 검증 §5.3](platform-capabilities.md#53-대상-repository-실측).
 
 - **OD-028** (reviewer verdict의 durable source): 성격이 바뀌었다. 사용자 repository 4곳 전부에서 `reviewDecision`이 null이고, review가 존재하는 1곳도 전부 `COMMENTED`다. PR author와 review author가 같은 계정이라 GitHub이 self-approve를 막으므로 **현재 workflow에서는 formal verdict가 원리적으로 불가능하다.** "GitHub과 Orca 중 어디를 계약으로 삼을지"가 아니라 "workflow를 어떻게 바꿀지"의 문제이며, 이는 Bridge 단독 결정이 아니라 AB workstream(`/init-orchestrate`의 reviewer 계약)과 함께 정해야 한다.
-- **OD-033** (review 핵심 comment 선택 규칙): `vertical-live` 규약의 `## Findings` 아래 `[blocker]`/`[major]`/`[minor]` 태그가 추출 대상으로 직접 쓰인다. 다만 이 규약은 4개 repo 중 1곳에만 존재하므로 전역 계약으로 만들어야 의존할 수 있다.
+- **OD-033** (review 핵심 comment 선택 규칙): `repo-a` 규약의 `## Findings` 아래 `[blocker]`/`[major]`/`[minor]` 태그가 추출 대상으로 직접 쓰인다. 다만 이 규약은 4개 repo 중 1곳에만 존재하므로 전역 계약으로 만들어야 의존할 수 있다.
 - **OD-037** (risk 산정 근거): `[blocker]`/`[major]`/`[minor]` 개수를 집계하면 risk를 LLM 추정이 아니라 사실로 산정할 수 있다. 규약이 전역화되는 것이 전제다.
 - **OD-032** (required/optional check와 merge-ready 정책): repository별 check 개수가 0~2개로 제각각이고 CI가 아예 없는 repo도 있다. merge-ready 판정에 CI 통과를 무조건 전제할 수 없다.
-- **OD-021** (PR correlation metadata): `vertical-live` PR body에 `## Task`/`T-ID` 규약이 이미 있으나 Orca Run/Task/Dispatch ID는 없다. 새 metadata를 기존 규약과 공존시키는 형식을 정해야 한다.
+- **OD-021** (PR correlation metadata): `repo-a` PR body에 `## Task`/`T-ID` 규약이 이미 있으나 Orca Run/Task/Dispatch ID는 없다. 새 metadata를 기존 규약과 공존시키는 형식을 정해야 한다.
 
 ```text
 ID: OD-028
@@ -620,7 +620,7 @@ ID: OD-073
   - Windows에서 중첩 객체·배열·한글·백틱을 포함한 `reviewer_result`를 coordinator가 기록하고
     `task-list --json`으로 읽어 무손실 왕복을 확인했다.
   - GitHub `reviewDecision`이 모든 대상 repository에서 null이므로 Orca가 유일한 durable source다(DL-016).
-  - severity taxonomy는 `vertical-live` reviewer가 이미 쓰는 값을 그대로 쓴다.
+  - severity taxonomy는 `repo-a` reviewer가 이미 쓰는 값을 그대로 쓴다.
   - `reviewedHeadSha`는 현재 head와 같은지를 드러내는 사실이다. OD-031은 이 사실만 표시하고 이전
     approval의 유효·무효를 Bridge가 판정하지 않는 것으로 확정됐다.
 영향 문서/파일: contracts/observation-and-correlation.md §6, specs/orchestration-bootstrap-and-continuity.md §4
@@ -1563,7 +1563,7 @@ ID: OD-078
   - [관측] Run row(`run-list`)에는 repository 필드가 없다. Task의 `created_by_process_incarnation`과
     worker의 `resource.worktreeId`에 있는 `<id>::<path>`만이 관측 가능한 연결점이다.
   - [관측] 경로에서 `owner/name`을 얻을 수단이 Orca 조회 표면에 없다.
-  - [관측] `worker-list` 전체에서 repository id `ccb3c8ee-6d9e-42af-af36-9fdac6566fcc` 하나가
+  - [관측] `worker-list` 전체에서 repository id `c0c0c0c0-0000-4000-8000-000000000001` 하나가
     경로 59개를 덮었다. 앞부분은 worktree가 아니라 repository의 id다.
   - [관측] `orca worktree list --json`의 `repoId`가 같은 값이고 같은 행의 `path`와 나란히 있어
     사용자가 등록할 값을 한 번에 찾을 수 있다.

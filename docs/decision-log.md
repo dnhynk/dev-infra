@@ -175,7 +175,7 @@
 로드맵의 [Slice S0](roadmap.md#4-bridge-slice-s0--관찰상관관계-기반) 출구 조건을 다음 근거로 충족했다.
 
 - **같은 입력을 반복해도 같은 entity로 인식됨** — key를 관측 입력에서 결정적으로 파생시킨다. 실제 Orca·GitHub에 대해 snapshot을 두 번 실행했고 기존 9개 entity가 동일하게 재파생됐다. 두 실행 사이에 새로 생긴 Run 1건만 증가했다.
-- **누락된 correlation을 추측하지 않고 오류로 식별함** — `vertical-live` PR 5건이 모두 `uncorrelated:no_metadata`로 보고됐다. branch 이름과 제목에 단서가 있어도 확정하지 않는다.
+- **누락된 correlation을 추측하지 않고 오류로 식별함** — `repo-a` PR 5건이 모두 `uncorrelated:no_metadata`로 보고됐다. branch 이름과 제목에 단서가 있어도 확정하지 않는다.
 - **실제 sample schema가 문서와 fixture에 반영됨** — 테스트가 실측 응답 형태(`run_required` 오류 payload, gate `options` JSON 문자열, task `created_by_process_incarnation`, `statusCheckRollup`)를 그대로 쓴다.
 
 외부 write는 없다. `check`와 `--ack`는 클라이언트에 넣지 않았다.

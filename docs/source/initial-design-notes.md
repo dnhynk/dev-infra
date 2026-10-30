@@ -1566,7 +1566,7 @@ orca-slack-bridge  ← 추가
 
 예:
 
-🟢 toneandmove · PR #184
+🟢 sample-app · PR #184
 
 결제 중복 처리 방지
 
@@ -1576,7 +1576,7 @@ orca-slack-bridge  ← 추가
 
 다른 repo:
 
-🟠 letter · PR #52
+🟠 other-app · PR #52
 
 이메일 인증 개선
 
@@ -1586,7 +1586,7 @@ orca-slack-bridge  ← 추가
 
 Run도:
 
-🚧 letter · RUN-27 · 결정 필요
+🚧 other-app · RUN-27 · 결정 필요
 
 편지를 삭제한 뒤 수신자에게
 
@@ -1626,11 +1626,11 @@ Run도:
 
 그리고 각 메시지 상단에 repository를 표시한다.
 
-🟢 [toneandmove] PR #184
+🟢 [sample-app] PR #184
 
 ...
 
-🟠 [letter] PR #52
+🟠 [other-app] PR #52
 
 ...
 
@@ -1668,13 +1668,13 @@ Run도:
 
 #agent-runs
 
-🤖 [toneandmove] RUN-42
+🤖 [sample-app] RUN-42
 
 결제 시스템 리팩터링
 
     └─ thread
 
-🤖 [letter] RUN-18
+🤖 [other-app] RUN-18
 
 편지 전달 시스템 개선
 
@@ -1692,15 +1692,15 @@ PR도 마찬가지다.
 
 #pr-digest
 
-🟢 [toneandmove] PR #184
+🟢 [sample-app] PR #184
 
     └─ 중요 상태 변화
 
-🟠 [toneandmove] PR #185
+🟠 [sample-app] PR #185
 
     └─ 중요 상태 변화
 
-✅ [letter] PR #52
+✅ [other-app] PR #52
 
     └─ 중요 상태 변화
 
@@ -1712,13 +1712,13 @@ GitHub 앱을 Slack Workspace에 설치하고, 각 채널에서 원하는 reposi
 
 예를 들어 프로젝트별로 나누고 싶다면:
 
-#toneandmove-github
+#sample-app-github
 
-/github subscribe donghyun/toneandmove
+/github subscribe example-org/sample-app
 
-#letter-github
+#other-app-github
 
-/github subscribe donghyun/letter-service
+/github subscribe example-org/other-app
 
 처럼 하면 되고,
 
@@ -1768,14 +1768,14 @@ event.repo
 
 예:
 
-if (event.repo === "toneandmove") {
+if (event.repo === "sample-app") {
 
 ```text
   ...
 }
 ```
 
-if (event.repo === "letter") {
+if (event.repo === "other-app") {
 
 ```text
   ...
@@ -1830,7 +1830,7 @@ PR
 
 Project
 
-Tone & Move
+Sample App
 
 Run
 

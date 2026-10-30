@@ -13,8 +13,8 @@ describe('key 파생은 결정적이다', () => {
     expect(taskKey('task_cd1991c049a8')).toBe('task:task_cd1991c049a8');
     expect(dispatchKey('dispatch_123')).toBe('dispatch:dispatch_123');
     expect(gateKey('gate_ac624dad74b5')).toBe('gate:gate_ac624dad74b5');
-    // 실측: dnhynk/vertical-live PR #31
-    expect(pullRequestKey(1335912197, 31)).toBe('pr:1335912197#31');
+    // 다른 repository의 PR #31 (예시 id)
+    expect(pullRequestKey(1000000001, 31)).toBe('pr:1000000001#31');
   });
 
   it('서로 다른 entity 종류의 key는 겹치지 않는다', () => {
@@ -43,8 +43,8 @@ describe('repository 동등성은 이름을 보지 않는다', () => {
   });
 
   it('이름이 같아도 id가 다르면 다른 repository다 (fork)', () => {
-    const origin = repositoryIdentity(1335912197, 'dnhynk/vertical-live');
-    const fork = repositoryIdentity(999999999, 'dnhynk/vertical-live');
+    const origin = repositoryIdentity(1000000001, 'example-org/repo-a');
+    const fork = repositoryIdentity(999999999, 'example-org/repo-a');
     expect(sameRepository(origin, fork)).toBe(false);
     expect(origin.key).not.toBe(fork.key);
   });

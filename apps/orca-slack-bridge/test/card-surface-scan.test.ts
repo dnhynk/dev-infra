@@ -90,7 +90,7 @@ function runFacts(over: Partial<RunFacts> = {}): RunFacts {
     },
     project: 'dev-infra',
     repositories: ['dnhynk/dev-infra'],
-    observedRepositoryIds: ['ccb3c8ee-6d9e-42af-af36-9fdac6566fcc'],
+    observedRepositoryIds: ['c0c0c0c0-0000-4000-8000-000000000001'],
     tasks: { total: 3, byStatus: [{ status: 'completed', count: 2 }, { status: 'blocked', count: 1 }] },
     dispatches: {
       total: 5,
@@ -118,7 +118,7 @@ const UNREGISTERED: readonly UnregisteredRun[] = (
 ).map((kind, index) => ({
   runId: `run_${index}0a1b2c3d4e5`,
   runRef: HASH.slice(index, index + 12),
-  repositoryIds: ['ccb3c8ee-6d9e-42af-af36-9fdac6566fcc'],
+  repositoryIds: ['c0c0c0c0-0000-4000-8000-000000000001'],
   repositoryRefs: [HASH.slice(index + 1, index + 13)],
   degraded: [{
     kind,
