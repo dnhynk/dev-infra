@@ -89,10 +89,6 @@ Apart from the documentation index and six evidence records, the documents and t
 - [Coordinator boot and handover spec](docs/specs/orchestration-bootstrap-and-continuity.md)
 - [Records of live and offline checks](docs/evidence/)
 
-## Project context
-
-Specified, reviewed and verified by the author; implemented with Claude Code and Codex. Commits made through Claude Code carry Co-Authored-By trailers.
-
 ## License
 
 [MIT](LICENSE)
