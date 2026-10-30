@@ -70,7 +70,7 @@
 | 하드코딩 대신 설정/DB의 Project↔Repository mapping | 확정 방향, cardinality TBD | [Entity 계약](contracts/observation-and-correlation.md#1-entity-identity), [OD-027](open-decisions.md#orcagithub-관찰과-correlation) |
 | GitHub App workspace당 한 번 설치, 여러 repo 구독 | 공식 확인 | [GitHub Slack App](platform-capabilities.md#51-공식-slack-app) |
 | Orca Bridge Slack App 하나가 여러 채널 담당 | 목표 구조 | [다중 프로젝트 구조](specs/orca-slack-bridge.md#11-다중-프로젝트-정보-구조) |
-| C1에서 실제 빌드와 제한된 외부 write를 검증함 | 완료 | [문서 인덱스](README.md#현재-산출물-경계), [로드맵](roadmap.md#5-bridge-slice-c1--pr-digest-첫-수직-슬라이스) |
+| C1에서 실제 빌드와 제한된 외부 write를 검증함 | 완료 | [로드맵](roadmap.md#5-bridge-slice-c1--pr-digest-첫-수직-슬라이스) |
 | 실제 빌드에서는 대상 확정 후 Slack/GitHub/Orca 통합 write 허용 | 사용자 확정 | [DL-008](decision-log.md#dl-008--현재-세션-권한), [로드맵](roadmap.md#3-bridge-사전-size-gate) |
 | 나머지 Bridge 범위는 size 확인 후 분할 | 사용자 확정 | [로드맵](roadmap.md#3-bridge-사전-size-gate) |
 | 구체 기술·계약은 빌드 과정에서 확정 | 사용자 확정 | [미결정 장부](open-decisions.md) |

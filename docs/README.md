@@ -1,96 +1,87 @@
-# dev-infra 문서 인덱스
+# dev-infra documentation
 
-상태: **AB Claude 경로 완료 · Codex `$init-orchestrate`/rollover/Gate wake hermetic 구현·Windows Bridge 배포·Astra worker 수용 완료 · C1~D3·O1 구현 완료 · O1-7 production acceptance PASS · Claude D3 exact merged build live acceptance PASS · Codex Slack Gate wake·rollover live acceptance 완료**
-기준일: **2026-10-01**
+This folder holds the specs, design notes, operating procedures and test records for dev-infra. The documents are written in Korean, except six evidence records in English. Start with the [root README](../README.md) for what the project does and where it stands.
 
-이 디렉터리는 1인 개발자가 Orca IDE의 병렬 Agent orchestration을 더 적은 수동 개입으로 운영하기 위한 개인 Agentic Development Infrastructure의 현재 기준 문서다. C1 PR Digest의 구현·검증 결과와 후속 slice의 아직 열린 계약을 함께 보존한다.
+## Reading order
 
-## 문서 읽기 순서
-
-1. [작업 규약](process/working-agreement.md)
-2. [제품 비전과 전체 범위](product-vision.md)
-3. [`/init-orchestrate`와 컨텍스트 승계 스펙](specs/orchestration-bootstrap-and-continuity.md)
-4. [`orca-slack-bridge` umbrella 스펙](specs/orca-slack-bridge.md)
-5. [Bridge 시스템 구조](architecture/orca-slack-bridge.md)
-6. [관찰·상관관계 계약](contracts/observation-and-correlation.md)
-7. [Slack 메시지 UX](ux/slack-surfaces.md)
-8. [구현 로드맵](roadmap.md)
-9. [확정 결정 기록](decision-log.md)
-10. [미결정 사항](open-decisions.md)
-11. [검증된 플랫폼 역량과 제약](platform-capabilities.md)
-12. [Slack App 준비 절차](ops/slack-app-setup.md)
-13. [Claude Channel Adapter 운영·live acceptance](ops/channel-adapter-acceptance.md)
-14. [Codex coordinator 설치·acceptance](ops/codex-coordinator-setup.md)
-15. [Windows current-user 자동 시작 운영](ops/windows-startup.md)
-16. [요구사항 추적표](traceability.md)
-17. [Phase 0/D3 실측 증거](evidence/) — 한시적. Gate에서 canonical 문서로 흡수한 뒤 삭제한다
-
-## 문서 권위와 표기
-
-충돌 시 다음 순서로 해석한다.
-
-1. 사용자가 명시적으로 확정한 최신 결정
-2. 최신 사용자 결정을 시간순으로 옮긴 [확정 결정 기록](decision-log.md)
-3. 프로젝트에 적용되는 `AGENTS.md` 및 [작업 규약](process/working-agreement.md)
-4. 아래 주제별 canonical 문서
-5. 예시, 후보 기술, 향후 아이디어
-
-같은 주제의 결정이 바뀌면 최신 사용자 결정이 이전 기록을 대체한다. `decision-log.md`에는 새 결정을 추가하고 대체된 결정에 `SUPERSEDED`를 표시해야 한다.
-
-| 주제 | Canonical 문서 |
+| Document | What it covers |
 |---|---|
-| 사용자 확정 결정 | [확정 결정 기록](decision-log.md) |
-| 협업·변경·디버깅·검증 절차 | [작업 규약](process/working-agreement.md) |
-| 문제·제품 목표·설계 철학 | [제품 비전](product-vision.md) |
-| 기능 범위와 normative 행동 | [`/init-orchestrate` 스펙](specs/orchestration-bootstrap-and-continuity.md), [Bridge 스펙](specs/orca-slack-bridge.md) |
-| 컴포넌트·프로세스·장애 경계 | [Bridge 구조](architecture/orca-slack-bridge.md) |
-| entity·correlation·상태 의미 | [관찰·상관관계 계약](contracts/observation-and-correlation.md) |
-| Slack 정보 구조와 문구 예시 | [Slack UX](ux/slack-surfaces.md) |
-| 잠정 작업 순서와 size gate | [로드맵](roadmap.md) |
-| 아직 답하지 않은 선택 | [미결정 사항](open-decisions.md) |
-| 버전 의존 외부 사실 | [플랫폼 검증](platform-capabilities.md) |
+| [Working agreement](process/working-agreement.md) | How design, implementation, debugging and verification sessions run in this repo |
+| [Product vision](product-vision.md) | The manual steps the project removes and the design rules behind it |
+| [Coordinator boot and handover spec](specs/orchestration-bootstrap-and-continuity.md) | `/init-orchestrate`, Run markers, handoff files and rollover |
+| [Bridge spec](specs/orca-slack-bridge.md) | Required behavior of `orca-slack-bridge` |
+| [Bridge architecture](architecture/orca-slack-bridge.md) | Components, processes and failure boundaries |
+| [Observation and correlation contract](contracts/observation-and-correlation.md) | Entity identity, and how pull requests are linked to Runs and Tasks |
+| [Slack surfaces](ux/slack-surfaces.md) | Card layout and wording |
+| [Roadmap](roadmap.md) | Build order by stage |
+| [Decision log](decision-log.md) | The owner's decisions in date order. Replaced entries are marked SUPERSEDED |
+| [Open decisions](open-decisions.md) | Questions still open, and the answers to closed ones |
+| [Platform capabilities](platform-capabilities.md) | Measured behavior and limits of Orca, GitHub, Slack, Claude Code and Codex, with versions |
+| [Slack app setup](ops/slack-app-setup.md) | Creating the Slack app, tokens and channels |
+| [Claude Code channel adapter](ops/channel-adapter-acceptance.md) | Installing the adapter and the live acceptance procedure |
+| [Codex coordinator setup](ops/codex-coordinator-setup.md) | Installing the Codex plugin and its acceptance |
+| [Windows login start](ops/windows-startup.md) | Staging a release and installing the Scheduled Task |
+| [Traceability](traceability.md) | Where each original requirement is kept |
+| [Initial design notes](source/initial-design-notes.md) | The design discussion the specs were written from |
 
-[요구사항 추적표](traceability.md)는 감사용 색인이며 새로운 요구사항을 만들지 않는다.
+## When documents disagree
 
-`docs/evidence/`는 C2·D1·D2·D3의 미결정을 닫기 위해 수집한 실측 기록이며 normative source가 아니다. 사용자 결정 후 [플랫폼 검증](platform-capabilities.md)과 [미결정 사항](open-decisions.md)으로 흡수하고 디렉터리를 삭제한다.
+Read them in this order of authority:
 
-문서의 상태 표기는 다음 의미를 가진다.
+1. The owner's latest explicit decision.
+2. The [decision log](decision-log.md).
+3. The [working agreement](process/working-agreement.md) and any `AGENTS.md` that applies.
+4. The topic documents in the table above.
+5. Examples, candidate technologies and future ideas.
 
-- **Draft**: 문서 전체에 아직 TBD가 남아 있어 구현 계약이 완전히 닫히지 않았다는 뜻이다. Draft 안에서 `확정`으로 표시된 사용자 요구까지 임의로 바꿀 수 있다는 뜻은 아니다.
-- **확정**: 구현자가 임의로 바꾸거나 추측으로 대체하면 안 되는 요구사항
-- **TBD**: 빌드 과정에서 관측과 사용자 판단을 통해 구체화할 사항
-- **후속**: 최종 비전에는 포함되지만 현재 핵심 구현 이후에 다룰 사항
-- **검증 필요**: 외부 제품 버전이나 실제 통합 환경에서 다시 확인해야 하는 주장
-- **Open**: 미결정 장부에서 아직 사용자 결정이 없는 항목
-- **Draft audit**: 추적표가 현재 문서 snapshot을 감사한 결과이며 normative source가 아님
+A newer owner decision replaces an older one on the same topic. The decision log keeps both and marks the older entry SUPERSEDED. An implementer who meets an unanswered question records it in the open-decisions log, and the owner settles it during the build.
 
-예시 JSON, CLI, Slack 문구는 의도를 구체화하지만, 별도로 `확정 계약`이라고 표시되지 않은 한 필드명·명령 문법·문구 자체를 고정하지 않는다.
+Example JSON, CLI calls and Slack wording illustrate intent. They do not fix field names, command syntax or copy unless a document marks them as a fixed contract (확정 계약).
 
-## 현재 확정된 작업 순서
+## Status labels used in the documents
 
-- `/init-orchestrate`와 컨텍스트 열화·handoff lifecycle은 하나의 workstream으로 다룬다.
-- 나머지 `orca-slack-bridge` 범위는 실제 크기와 위험을 확인한 뒤 독립적으로 검증 가능한 슬라이스로 나눈다.
-- 구현 stack은 TypeScript on Node.js 26.x와 pnpm workspaces로 확정했으며 별도 monorepo 빌드 오케스트레이터는 두지 않는다. summarizer는 OpenAI API를 사용하고 기본 모델은 설정으로 교체 가능한 `gpt-5.6-luna`다.
-- 미정 사항은 구현자가 조용히 채우지 않고 [미결정 사항](open-decisions.md)에 기록해 빌드 과정에서 확정한다.
+| Label | Meaning |
+|---|---|
+| Draft | The document still has open items. Requirements marked 확정 inside it are still binding |
+| 확정 (fixed) | An implementer must not change or replace it by guesswork |
+| TBD | To be settled from observation and the owner's decision during the build |
+| 후속 (follow-up) | Part of the long-term plan, outside the current build |
+| 검증 필요 (needs verification) | Depends on an external product version or a live environment and must be rechecked |
+| Open | An open-decisions entry with no decision yet |
+| Draft audit | The traceability table's audit of the documents; not a source of requirements |
 
-## 현재 산출물 경계
+## Stage and entry codes
 
-이 문서 세트는 C1~D3 구현과 검증 결과, 후속 slice의 현재 계약을 함께 보존한다. D3의 daemon,
-durable delivery, Task-resume evidence, existing-card projection은 hermetic failure matrix를 통과했다.
-2026-10-01에는 merged main과 같은 release에서 daemon과 session Adapter를 함께 실행해 live acceptance도
-통과했다(DL-071). redacted 관찰은 [D3 live acceptance evidence](evidence/d3-live-channel-acceptance.md)에
-있다. O1의 hermetic/Windows
-검증과 merged-main 배포 잔여 조건은 [O1 operational acceptance evidence](evidence/o1-operational-acceptance.md)에 있다.
+The Korean documents refer to build stages and log entries by short codes.
 
-2026-09-07부터 Codex coordinator는 `plugins/orca-orchestration/`의 `$init-orchestrate` 스킬과 Stop
-hook을 사용한다. worker 계열은 coordinator와 무관하게 작업 종류로 정한다. 논리 추론·창의성은 Claude,
-코드 작업·디버깅·리서치는 Codex이고, model과 effort는 고정하지 않고 dispatch 시점의 런타임 카탈로그에서
-고른다(DL-065). Slack Gate는 기존 Claude Channel을 먼저 시도하고 후보가 없을 때 exact Codex Run 마커와
-Orca terminal route를 대조한 뒤 `terminal send --text ... --enter`로 wake-only identity를 보낸다. plugin
-설치, 새 thread의 skill discovery, Windows Stop hook 실행, 이 경로의 타입/단위 검증은 완료했다.
-2026-09-08에는 새 Astra `xhigh`
-worker의 requested/effective receipt, 실제 응답과 release, 수정한 Windows Bridge 배포를 확인했다.
-새 TUI의 Stop hook은 설치 2개·활성 2개로 관찰됐다. 사용자가 승인한 throwaway Run에서 stale generation
-무전송, 실제 Slack Gate 응답 뒤 wake와 Task 재개, 설치된 Stop hook이 지시한 1회 rollover(Run
-generation 1→2)까지 관찰했다. 절차는 [Codex 운영 절차](ops/codex-coordinator-setup.md), 실측 기록은
-[Codex coordinator acceptance evidence](evidence/codex-coordinator-acceptance.md)에 있다.
+| Code | Meaning |
+|---|---|
+| AB | Coordinator boot and context handover (`/init-orchestrate`, rollover monitor) |
+| S0 | Read-only observation of Orca and GitHub, and entity correlation |
+| C1, C2 | PR cards in `#pr-digest`; review, CI and merge tracking |
+| D1 | Run observer and Run cards in `#agent-runs` |
+| D2 | Gate cards, and writing Slack decisions to Orca |
+| D3 | Waking the coordinator after a decision (Claude Code channel adapter, Codex terminal route) |
+| O1 | Always-on operation: daemon, Windows login task, status and logs |
+| T1 to T5 | Platform probes run on 2026-08-23 before the build stages |
+| DL-nnn, OD-nnn | Entries in the decision log and the open-decisions log |
+
+## Evidence
+
+[`evidence/`](evidence/) holds dated records of live and offline checks. They support the specs but do not define behavior.
+
+| Record | Check | Date | Language |
+|---|---|---|---|
+| [t1-github-lifecycle](evidence/t1-github-lifecycle.md) | GitHub pull request lifecycle | 2026-08-23 | Korean |
+| [t2-orca-worker-done-retrieval](evidence/t2-orca-worker-done-retrieval.md) | Reading worker completion reports from Orca | 2026-08-23 | Korean |
+| [t3-orca-gate-and-aggregation](evidence/t3-orca-gate-and-aggregation.md) | Orca Gates and Run aggregation | 2026-08-23 | Korean |
+| [t4-slack-inbound](evidence/t4-slack-inbound.md) | Slack Socket Mode and interaction payloads | 2026-08-23 | Korean |
+| [t5-channel-adapter](evidence/t5-channel-adapter.md) | Claude Code channel behavior | 2026-08-23 | Korean |
+| [d2-c-gate-resolution](evidence/d2-c-gate-resolution.md) | Resolving a Gate from a fixed-option button | 2026-08-25 | English |
+| [d2-d-direct-input-modal](evidence/d2-d-direct-input-modal.md) | Resolving a Gate from the direct-input dialog | 2026-08-25 | Korean |
+| [d3-1-channel-transport](evidence/d3-1-channel-transport.md) | Local named-pipe transport to the adapter | 2026-08-25 | English |
+| [d3-2-durable-delivery](evidence/d3-2-durable-delivery.md) | Durable delivery of decisions to the coordinator | 2026-08-25 | English |
+| [d3-4-lifecycle-acceptance](evidence/d3-4-lifecycle-acceptance.md) | Offline failure matrix for the wake-up path | 2026-08-26 | English |
+| [o1-operational-acceptance](evidence/o1-operational-acceptance.md) | Windows login task and status checks | 2026-08-27 | English |
+| [codex-coordinator-acceptance](evidence/codex-coordinator-acceptance.md) | Codex coordinator wake-up and rollover, live | 2026-09-07 | Korean |
+| [d3-live-channel-acceptance](evidence/d3-live-channel-acceptance.md) | Slack decision wakes a Claude Code coordinator, live | 2026-10-01 | English |

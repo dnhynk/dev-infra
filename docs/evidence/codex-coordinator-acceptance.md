@@ -71,7 +71,7 @@ release root: C:\Users\<user>\AppData\Local\OrcaSlackBridge\releases\f3d24584080
 ```
 
 이 패키지는 현재 checkout의 기존 변경을 포함한 전체 Bridge build다. plugin은 §A의 Codex cache에
-별도로 설치되어 있다. 운영 교체는 [Windows 시작 절차](windows-startup.md)의 기존 daemon 종료,
+별도로 설치되어 있다. 운영 교체는 [Windows 시작 절차](../ops/windows-startup.md)의 기존 daemon 종료,
 staged CLI install, run-now와 status 검증 순서를 사용한다. 새 release root로 install하거나 live
 Slack Gate 메시지를 생성하는 명령은 아직 실행하지 않았다.
 
