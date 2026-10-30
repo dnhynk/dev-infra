@@ -91,7 +91,7 @@ describe('터미널 프롬프트 버튼 처리', () => {
       options: prompt.options,
       cursorIndex: prompt.cursorIndex,
     }, AT);
-    return renderTerminalPromptCard({ prompt: record, runLabel: 'Academic' });
+    return renderTerminalPromptCard({ prompt: record, runLabel: 'Run 하나' });
   }
 
   /** 카드에 실제로 실린 버튼을 그대로 눌러 본다. 손으로 만든 값이 아니다. */
