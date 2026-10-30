@@ -121,6 +121,8 @@ export class TerminalPromptActionHandler {
     const user = record(root['user']);
     const owner = user === null ? null : text(user['id'], 40);
     if (owner === null) return 'missing_user';
+    // 이 버튼은 살아 있는 agent 터미널에 입력을 넣는다. Gate 결정과 같은 owner allowlist를 요구한다.
+    if (!this.options.config.ownerUserIds.includes(owner)) return 'unauthorized_owner';
 
     const actions = root['actions'];
     if (!Array.isArray(actions) || actions.length !== 1) return 'ambiguous_actions';
