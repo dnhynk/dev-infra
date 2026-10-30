@@ -17,16 +17,16 @@
         "dnhynk/dev-infra"
       ],
       "orcaRepositoryIds": [
-        "ccb3c8ee-6d9e-42af-af36-9fdac6566fcc"
+        "c0c0c0c0-0000-4000-8000-000000000001"
       ]
     },
     {
-      "name": "Vertical Live",
+      "name": "Example App",
       "repositories": [
-        "dnhynk/vertical-live"
+        "example-org/example-app"
       ],
       "orcaRepositoryIds": [
-        "0409601c-4119-4b29-ae29-e814b8853e11"
+        "0a0a0a0a-0000-4000-8000-000000000002"
       ]
     }
   ],

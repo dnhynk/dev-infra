@@ -11,8 +11,8 @@ import {
 
 const valid = {
   projects: [
-    { name: 'Tone & Move', repositories: ['dnhynk/ToneAndMove'] },
-    { name: 'Vertical Live', repositories: ['dnhynk/vertical-live', 'dnhynk/vertical-live-infra'] },
+    { name: 'Sample App', repositories: ['example-org/SampleApp'] },
+    { name: 'Repo A', repositories: ['example-org/repo-a', 'example-org/repo-a-infra'] },
   ],
 };
 
@@ -20,7 +20,7 @@ describe('parseConfig', () => {
   it('유효한 설정을 읽는다', () => {
     const c = parseConfig(valid);
     expect(c.projects).toHaveLength(2);
-    expect(c.projects[0]?.repositories).toEqual(['dnhynk/toneandmove']);
+    expect(c.projects[0]?.repositories).toEqual(['example-org/sampleapp']);
     expect(c.correlationKeys).toEqual(DEFAULT_CORRELATION_KEYS);
     expect(c.automation).toEqual(DEFAULT_AUTOMATION_CONFIG);
   });
@@ -229,11 +229,11 @@ describe('automation config', () => {
 describe('projectForRepository', () => {
   const c = parseConfig(valid);
   it('등록된 repository의 Project를 찾는다', () => {
-    expect(projectForRepository(c, 'dnhynk/ToneAndMove')).toBe('Tone & Move');
-    expect(projectForRepository(c, 'DNHYNK/vertical-live')).toBe('Vertical Live');
+    expect(projectForRepository(c, 'example-org/SampleApp')).toBe('Sample App');
+    expect(projectForRepository(c, 'EXAMPLE-ORG/repo-a')).toBe('Repo A');
   });
   it('미등록이면 추측하지 않고 null', () => {
-    expect(projectForRepository(c, 'dnhynk/unknown')).toBeNull();
+    expect(projectForRepository(c, 'example-org/unknown')).toBeNull();
   });
 });
 

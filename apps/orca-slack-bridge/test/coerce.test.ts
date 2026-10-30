@@ -95,11 +95,11 @@ describe('parseOrcaTimestamp', () => {
 
 describe('worktree 경로 추출', () => {
   it('ORCA_WORKTREE_ID에서 경로를 꺼낸다', () => {
-    expect(worktreePathFromId('ccb3c8ee-6d9e-42af-af36-9fdac6566fcc::D:/dev-infra')).toBe('D:/dev-infra');
+    expect(worktreePathFromId('c0c0c0c0-0000-4000-8000-000000000001::D:/dev-infra')).toBe('D:/dev-infra');
   });
 
   it('task의 process incarnation에서 경로만 꺼낸다', () => {
-    const inc = 'ccb3c8ee-6d9e-42af-af36-9fdac6566fcc::D:/dev-infra@@8c25bfec:f126ab2a-77e6-46b6-a862-3dd75ec962bd';
+    const inc = 'c0c0c0c0-0000-4000-8000-000000000001::D:/dev-infra@@8c25bfec:f126ab2a-77e6-46b6-a862-3dd75ec962bd';
     expect(worktreePathFromIncarnation(inc)).toBe('D:/dev-infra');
   });
 

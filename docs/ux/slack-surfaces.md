@@ -18,7 +18,7 @@
 
 PR identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되지 않았으면 `owner/repo #N`이다. 알림용 대체 텍스트가
 이 모양을 그대로 싣고, 카드 본문은 같은 사실을 `저장소`(`owner/repo · #N`)와 `Project` 칸으로 나눠 싣는다. §2 예시의
-`[toneandmove] PR #184`는 이 identity를 축약한 것이다.
+`[sample-app] PR #184`는 이 identity를 축약한 것이다.
 
 ### 1.1 카드 시각 문법
 
@@ -59,7 +59,7 @@ PR identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되�
 ### 2.1 PR 최초 발견·리뷰 진행 중
 
 ```text
-🟡 [toneandmove] PR #184 · 결제 중복 처리 방지
+🟡 [sample-app] PR #184 · 결제 중복 처리 방지
 
 무엇이 바뀌나
 같은 결제 요청이 여러 번 들어와도 한 번만 처리되도록 수정했습니다.
@@ -90,7 +90,7 @@ PR identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되�
 같은 루트 메시지를 갱신한다.
 
 ```text
-⚠️ [toneandmove] PR #184 · 결제 중복 처리 방지
+⚠️ [sample-app] PR #184 · 결제 중복 처리 방지
 
 현재
 리뷰에서 예외 상황 1개 발견 → 수정 중
@@ -110,7 +110,7 @@ PR identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되�
 ### 2.3 Review·CI 통과, merge 준비
 
 ```text
-🟢 [toneandmove] PR #184 · 결제 중복 처리 방지
+🟢 [sample-app] PR #184 · 결제 중복 처리 방지
 
 현재
 리뷰 통과 · CI 통과 · 병합 준비 완료
@@ -129,7 +129,7 @@ PR identity는 Project가 등록됐으면 `[Project] owner/repo #N`, 등록되�
 ### 2.4 Merge 완료
 
 ```text
-✅ [toneandmove] PR #184 · 결제 중복 처리 방지
+✅ [sample-app] PR #184 · 결제 중복 처리 방지
 
 병합 완료
 
@@ -146,7 +146,7 @@ Review ✅ · CI ✅ · Merge ✅
 ### 2.5 PR thread
 
 ```text
-[toneandmove] PR #184 · 결제 중복 처리 방지
+[sample-app] PR #184 · 결제 중복 처리 방지
 │
 ├─ 13:21 PR 생성
 ├─ 13:39 ⚠️ 리뷰에서 예외 상황 발견
@@ -399,17 +399,17 @@ application receipt가 전달 신호이고, 대상 Gate의 `pending`→`resolved
 ```text
 #pr-digest
 
-🟢 [toneandmove] PR #184 · 결제 중복 처리 방지
+🟢 [sample-app] PR #184 · 결제 중복 처리 방지
 리뷰와 CI가 통과해 병합 준비가 끝났습니다.
 
-⚠️ [letter] PR #52 · 이메일 인증 개선
+⚠️ [other-app] PR #52 · 이메일 인증 개선
 리뷰에서 예외 상황 하나가 발견되어 수정 중입니다.
 ```
 
 ```text
 #agent-runs
 
-⚠️ [letter] RUN-27 · 결정 필요
+⚠️ [other-app] RUN-27 · 결정 필요
 편지를 삭제한 뒤 수신자에게 기존 알림을 유지할지 결정이 필요합니다.
 
 [A 유지] [B 제거] [직접 입력]

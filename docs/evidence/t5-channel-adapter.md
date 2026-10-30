@@ -672,14 +672,14 @@ claude --resume <session-id>
 
 ```text
 tcp#2 tcp <session-id-2> term_df8bf929-... pane <pane-key>
-tcp#3 tcp c4d18686-2f88-4eca-8512-2fee50e528af term_07ecc0b1-... pane 8e3b6677-...:442d21bd-...
+tcp#3 tcp <session-id-3> term_07ecc0b1-... pane <pane-key>
 ```
 
 `target_session`으로 지목해 push:
 
 ```text
-fanout target= 88510fdb-...  delivered_to= 1  connected= 2
-fanout target= c4d18686-...  delivered_to= 1  connected= 2
+fanout target= <session-id-2>  delivered_to= 1  connected= 2
+fanout target= <session-id-3>  delivered_to= 1  connected= 2
 receipt from tcp#2 ev_routeA processed
 receipt from tcp#3 ev_routeB processed
 ```
@@ -687,8 +687,8 @@ receipt from tcp#3 ev_routeB processed
 ### 근거 3 — Fresh/Resume
 
 ```text
-claude                                        → CLAUDE_CODE_SESSION_ID = 7de6d430-e6bc-4b84-bf19-ddc4ebfae22d  (fresh)
-claude --dangerously-load-...                 → CLAUDE_CODE_SESSION_ID = 828805fb-b7e5-408a-afc0-71bb2b024389  (fresh)
+claude                                        → CLAUDE_CODE_SESSION_ID = <fresh-session-id-a>  (fresh)
+claude --dangerously-load-...                 → CLAUDE_CODE_SESSION_ID = <fresh-session-id-b>  (fresh)
 claude --resume <session-id> --dangerously-load-...
                                               → CLAUDE_CODE_SESSION_ID = <session-id>  (동일)
 ```

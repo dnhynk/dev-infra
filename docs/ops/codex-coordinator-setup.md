@@ -56,7 +56,7 @@ Pop-Location
 `./plugins/orca-orchestration`으로 가리킨다.
 
 ```powershell
-codex plugin marketplace add D:\dev-infra --json
+codex plugin marketplace add <repo-root> --json
 codex plugin add orca-orchestration@dev-infra --json
 codex plugin list --json
 ```

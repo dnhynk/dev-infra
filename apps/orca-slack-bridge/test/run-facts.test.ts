@@ -26,8 +26,8 @@ function ok<T>(value: T): Read<T> {
   return { kind: 'value', value };
 }
 
-const REPO_ID = 'ccb3c8ee-6d9e-42af-af36-9fdac6566fcc';
-const OTHER_REPO_ID = '0409601c-4119-4b29-ae29-e814b8853e11';
+const REPO_ID = 'c0c0c0c0-0000-4000-8000-000000000001';
+const OTHER_REPO_ID = '0a0a0a0a-0000-4000-8000-000000000002';
 
 const CONFIG: BridgeConfig = {
   slack: null,
