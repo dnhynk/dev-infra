@@ -1405,7 +1405,7 @@ ID: OD-084
 근거:
   - 무인 운용에서 멈춤은 대부분 터미널 프롬프트로 나타난다. Gate는 coordinator가 만들기로
     **결정한** 것이라 자발성에 기대고, 그 자발성이 깨지면 아무 데도 나타나지 않는다. 실제로
-    2026-08-29에 Academic coordinator가 SQLCipher 설치 결정을 터미널 프롬프트로 띄웠고 Slack에
+    2026-08-29에 한 프로젝트의 coordinator가 SQLCipher 설치 결정을 터미널 프롬프트로 띄웠고 Slack에
     아무것도 오지 않았다.
   - 기존 관측은 `worker-show`의 `agentWait` 하나였고 그것은 `{source, reason}` 두 문자열이다.
     무엇을 묻는지도, 답할 방법도 없었다. 게다가 coordinator는 Dispatch가 아니라 그 조회에

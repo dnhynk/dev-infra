@@ -573,7 +573,7 @@ review의 "핵심 comment"와 `Merge Ready`는 API 단일 필드가 아니라 Br
 | `repo-a` (public) | 31 | 전부 `COMMENTED` | null | 1 |
 | `repo-b` | 36 | 0건 | null | 2 |
 | `repo-c` | 49 | 0건 | null | 0 |
-| `PostFeel` | 22 | 0건 | null | 1 |
+| `repo-d` | 22 | 0건 | null | 1 |
 
 **`reviewDecision`은 모든 repository에서 null이다.** `repo-a`의 31개 PR에 `APPROVED`나 `CHANGES_REQUESTED`가 한 건도 없다. 원인은 구조적이다 — PR author와 review author가 같은 계정(`dnhynk`)이고 GitHub은 자기 PR을 스스로 approve할 수 없게 막는다. 단일 계정 workflow에서는 formal verdict가 원리적으로 불가능하다.
 

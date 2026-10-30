@@ -126,14 +126,14 @@ describe('parseOrcaRepositoryList', () => {
     // name — three of eleven on the operator's machine, permanently and silently.
     const got = parseOrcaRepositoryList(envelope([row({
       gitRemoteIdentity: {
-        canonicalKey: 'github.com/dnhynk/Academic-Platform',
+        canonicalKey: 'github.com/example-org/Repo-E',
         remoteName: 'origin',
-        remoteUrl: 'https://github.com/dnhynk/Academic-Platform.git',
+        remoteUrl: 'https://github.com/example-org/Repo-E.git',
       },
     })]));
     expect(got.rows[0]).toMatchObject({
       status: 'valid',
-      identity: { canonicalKey: 'github.com/dnhynk/academic-platform' },
+      identity: { canonicalKey: 'github.com/example-org/repo-e' },
     });
     expect(got.diagnostics).toEqual([]);
   });
@@ -142,9 +142,9 @@ describe('parseOrcaRepositoryList', () => {
     // Case folding must not weaken what this check exists for: two sides naming different repos.
     const got = parseOrcaRepositoryList(envelope([row({
       gitRemoteIdentity: {
-        canonicalKey: 'github.com/dnhynk/OTHER-Platform',
+        canonicalKey: 'github.com/example-org/OTHER-Repo',
         remoteName: 'origin',
-        remoteUrl: 'https://github.com/dnhynk/Academic-Platform.git',
+        remoteUrl: 'https://github.com/example-org/Repo-E.git',
       },
     })]));
     expect(got.rows[0]).toMatchObject({ status: 'canonical_conflict' });

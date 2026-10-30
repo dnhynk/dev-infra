@@ -63,7 +63,7 @@ The Korean documents refer to build stages and log entries by short codes.
 | D2 | Gate cards, and writing Slack decisions to Orca |
 | D3 | Waking the coordinator after a decision (Claude Code channel adapter, Codex terminal route) |
 | O1 | Always-on operation: daemon, Windows login task, status and logs |
-| T1 to T5 | Platform probes run on 2026-08-23 before the build stages |
+| T1 to T5 | Platform probes run on 2026-08-23 to settle open questions for C2, D1, D2 and D3 |
 | DL-nnn, OD-nnn | Entries in the decision log and the open-decisions log |
 
 ## Evidence

@@ -98,7 +98,7 @@ function parseRow(value: unknown, rowIndex: number): RepositoryDiscoveryRow {
   // 대소문자를 접어 대조한다. Bridge가 계산한 key는 계약대로 `<owner-lower>/<repo-lower>`인데
   // Orca가 반환하는 `canonicalKey`는 원래 대소문자를 보존한다. exact 비교하면 이름에 대문자가
   // 하나라도 있는 repository가 전부 `canonical_conflict`로 영구 차단된다 — 실측에서 11개 중
-  // `Home_Compass`·`PostFeel`·`MS` 셋이 그렇게 막혀 있었다.
+  // 저장소 세 곳이 그렇게 막혀 있었다.
   //
   // 이 검사의 목적은 두 쪽이 **서로 다른 repository**를 가리키는 것을 잡는 것이다. GitHub은
   // owner/name을 대소문자 구분 없이 취급하므로 대소문자만 다른 두 값은 같은 repository이고,

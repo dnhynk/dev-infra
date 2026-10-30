@@ -7,7 +7,7 @@ import { cursorDelta, hasPromptAnchor, parseTerminalPrompt } from '../src/termin
 /**
  * 실제 Claude Code 세션 화면.
  *
- * 2026-08-29에 막혀 있던 Academic-Platform coordinator 터미널에서 `orca terminal read --screen`
+ * 2026-08-29에 막혀 있던 한 coordinator 터미널에서 `orca terminal read --screen`
  * 으로 그대로 받아 왔다. 손으로 만든 화면이 아니라 이 기능이 실제로 상대할 화면이다.
  */
 const LIVE_SCREEN: readonly string[] = JSON.parse(
