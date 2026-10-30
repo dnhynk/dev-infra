@@ -248,7 +248,8 @@ coordinator가 만들기로 결정한 것이라 자발성에 기대고, 그 자�
 Dispatch가 아니라 `worker-show`의 `agentWait`에 잡히지 않으므로, 이 경로가 없으면 coordinator의
 멈춤은 관측 표면 어디에도 없다.
 
-카드의 버튼은 `orca terminal send`로 답한다. 순서가 안전성 전부다.
+카드의 버튼은 `orca terminal send`로 답한다. 클릭은 Gate 결정과 같은 team·App·owner allowlist
+(`slack.ownerUserIds`)를 통과해야 확정되고, 통과하지 못한 클릭은 ACK만 하고 버린다. 전송 순서가 안전성 전부다.
 
 1. 화면을 다시 읽어 지문을 대조한다. 다르면 보내지 않는다.
 2. 커서를 목표까지 옮긴다. 이동은 선택이 아니라 되돌릴 수 있다.

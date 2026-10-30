@@ -23,7 +23,7 @@ const HANDLE = 'term_0bb89f84-bd61-4ffe-9dce-1c05d9e197f0';
 const AT = '2026-08-29T11:18:27.177Z';
 
 /** 운영 config와 같은 모양. teamId는 실제 워크스페이스 형식을 따른다. */
-const CONFIG = { teamId: 'T0FAKETEAM1' } as unknown as SlackConfig;
+const CONFIG = { teamId: 'T0FAKETEAM1', ownerUserIds: ['U0BRUSER01'] } as unknown as SlackConfig;
 
 /**
  * Slack이 버튼 클릭에 보내는 봉투.
@@ -225,7 +225,7 @@ describe('터미널 프롬프트 버튼 처리', () => {
       const button = buttonFromCard(card, 1);
       const outcomes: string[] = [];
       const handler = new TerminalPromptActionHandler({
-        config: { teamId: 'T_OTHER' } as unknown as SlackConfig,
+        config: { teamId: 'T_OTHER', ownerUserIds: ['U0BRUSER01'] } as unknown as SlackConfig,
         store, now: () => new Date(AT),
         onOutcome: (outcome) => outcomes.push(outcome),
       });
@@ -235,6 +235,34 @@ describe('터미널 프롬프트 버튼 처리', () => {
         ack: () => {},
       });
       expect(outcomes).toEqual(['team_mismatch']);
+      expect(store.findActiveTerminalPrompt(HANDLE)?.state).toBe('open');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('owner 목록에 없는 사람의 클릭은 ACK만 하고 확정하지 않는다', async () => {
+    const store = new SqliteDigestStore(path);
+    try {
+      const card = seed(store);
+      const button = buttonFromCard(card, 1);
+      const outcomes: string[] = [];
+      let acked = 0;
+      let woken = 0;
+      const handler = new TerminalPromptActionHandler({
+        config: { teamId: 'T0FAKETEAM1', ownerUserIds: ['U0OWNER01'] } as unknown as SlackConfig,
+        store, now: () => new Date(AT),
+        onOutcome: (outcome) => outcomes.push(outcome),
+        wake: () => { woken += 1; },
+      });
+      await handler.handle({
+        type: 'interactive',
+        body: clickPayload(button.actionId, button.value),
+        ack: () => { acked += 1; },
+      });
+      expect(outcomes).toEqual(['unauthorized_owner']);
+      expect(acked).toBe(1);
+      expect(woken).toBe(0);
       expect(store.findActiveTerminalPrompt(HANDLE)?.state).toBe('open');
     } finally {
       store.close();
