@@ -5,7 +5,7 @@ description: Run heavy tests, benchmarks or training on the owned u22 server ove
 
 # Shared compute (u22)
 
-SSH alias `compute` = `hyun@u22`: 48 cores / 96 threads, ~256 GiB RAM, four separate 24 GiB TITAN RTX cards (not one 96 GiB card). Allowed GPU indexes are [0,2,3]; GPU1 stays excluded. No sudo or docker on u22.
+SSH alias `compute` = `hyun@u22`: 48 cores / 96 threads, ~251 GiB RAM, four separate 24 GiB TITAN RTX cards (not one 96 GiB card). Allowed GPU indexes are [0,2,3]; GPU1 stays excluded. No sudo or docker on u22.
 
 ## Commands
 
@@ -13,7 +13,7 @@ SSH alias `compute` = `hyun@u22`: 48 cores / 96 threads, ~256 GiB RAM, four sepa
 python -B D:\dev-infra\skills\shared-compute\scripts\compute.py status
 ```
 
-`snapshot REPO`, `submit REPO --cpu N --memory-mb N --timeout SECONDS -- COMMAND ARG...`, `logs JOB`, `fetch JOB NEW_DIRECTORY`, `cancel JOB`. Use only these SSH subcommands; the `aws-*` and `oci-*` subcommands are retired.
+`snapshot REPO`, `submit REPO --cpu N --memory-mb N --timeout SECONDS -- COMMAND ARG...`, `logs JOB`, `fetch JOB NEW_DIRECTORY`, `cancel JOB`.
 
 ## Rules
 
