@@ -23,7 +23,7 @@ import remote
 
 
 class AdaptiveAdmissionTests(unittest.TestCase):
-    policy = {'capacity_mode': 'adaptive', 'gpus': [0, 2, 3]}
+    policy = {'capacity_mode': 'adaptive', 'gpus': [0, 1, 2]}
 
     def snapshot(self, threads=8, total=32768, available=16384, idle=1):
         return {'cpu_ids': list(range(threads)), 'cpu_idle_fraction': {cpu: idle for cpu in range(threads)},

@@ -15,7 +15,7 @@ The server policy uses `capacity_mode=adaptive`: there are no fixed CPU, RAM, jo
 - RAM must fit both physical MemTotal minus all nominal reservations and current MemAvailable minus the unconsumed part of active reservations. Outside jobs are not isolated, so availability can change after the check.
 - Concurrency is bounded only by real resources; each job reserves at least one thread and positive RAM.
 - Every job needs an explicit finite lifetime covering startup, waits, compute and reporting; the supervisor enforces it.
-- GPUs are reserved with CPU/RAM. Allowed indexes are [0,2,3]. GPU1 is excluded because of reported VRAM corruption; do not add it or stop its quarantine service without a separate diagnosis. Admission refuses cards with external occupancy or unreadable metadata.
+- GPUs are reserved with CPU/RAM. Allowed indexes are [0,1,2] (three cards). Admission refuses cards with external occupancy or unreadable metadata.
 - New jobs record `admission_observation` (hardware and RAM availability, idle slots, reserved CPU IDs, active count, lifetime). An observation is not a guarantee of future availability.
 
 ## Enforcement limits

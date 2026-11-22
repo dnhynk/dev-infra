@@ -5,7 +5,7 @@ description: Run heavy tests, benchmarks or training on the owned u22 server ove
 
 # Shared compute (u22)
 
-SSH alias `compute` = `hyun@u22`: 48 cores / 96 threads, ~251 GiB RAM, four separate 24 GiB TITAN RTX cards (not one 96 GiB card). Allowed GPU indexes are [0,2,3]; GPU1 stays excluded. No sudo or docker on u22.
+SSH alias `compute` = `hyun@u22`: 48 cores / 96 threads, ~251 GiB RAM, three separate 24 GiB TITAN RTX cards, indexes [0,1,2] (not one 72 GiB card). No sudo or docker on u22.
 
 ## Commands
 
